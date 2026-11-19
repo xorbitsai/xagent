@@ -1920,6 +1920,44 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
             },
         },
         {
+            "app_id": "cosmos",
+            "name": "Azure Cosmos DB",
+            "description": "Connect an Azure Cosmos DB (NoSQL API) account with its endpoint and a read-only key to list containers, run read-only SQL queries and read items from one database. Read-only.",
+            "icon": "https://www.google.com/s2/favicons?domain=azure.microsoft.com&sz=128",
+            "transport": "stdio",
+            "provider_name": None,
+            "category": "Operations",
+            "oauth_scopes": None,
+            # Hidden until verified against a live Cosmos DB account -- the
+            # tests mock the SDK, and that a read-only key works for reads is
+            # documented, not yet observed.
+            "is_visible_in_connector": False,
+            # Key-based (non-oauth), like aws: the endpoint, key and database
+            # are per-user values on the encrypted per-user env path. The
+            # endpoint is user-supplied, so the module accepts only
+            # *.documents.azure.{com,us,cn} account hosts and sends through
+            # the public-only session. required_env has no optional slots, so
+            # the database is required; container tools are pinned to it.
+            "launch_config": {
+                "command": "python",
+                "args": ["-m", "xagent.web.tools.mcp.cosmos"],
+                "required_env": ["COSMOS_ENDPOINT", "COSMOS_KEY", "COSMOS_DATABASE"],
+                # The server has no write tool; this allowlist is the second
+                # guard (see mcp_tool_allowlist.py).
+                "read_only_tools": [
+                    "cosmos_list_databases",
+                    "cosmos_list_containers",
+                    "cosmos_query_container",
+                    "cosmos_read_item",
+                ],
+                "builtin_provenance": {
+                    "registry": "xagent",
+                    "app_id": "cosmos",
+                    "version": 1,
+                },
+            },
+        },
+        {
             "app_id": "freshdesk",
             "name": "Freshdesk",
             "description": "Connect your Freshdesk helpdesk (with your tenant subdomain and a per-user API key from Profile settings -> Your API Key) to look up, create and update tickets, read and post conversations, and search contacts and agents.",

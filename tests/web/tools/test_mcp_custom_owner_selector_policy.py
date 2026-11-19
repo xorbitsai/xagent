@@ -150,13 +150,13 @@ def _authorization(configs: list[dict]) -> str:
     return configs[0]["config"]["headers"]["Authorization"]
 
 
-def _assert_rejected(configs: list[dict]) -> None:
+def _assert_rejected(configs: list[dict], refused=OWNER_B) -> None:
     assert len(configs) == 1
     assert configs[0]["transport"] == "unavailable"
     assert configs[0]["config"]["reason"] == "config_load_failed"
     assert "actor-b-token" not in str(configs)
-    # The rejection must not echo the selected owner key either.
-    assert OWNER_B not in str(configs)
+    # The rejection must not echo the selected owner value either.
+    assert str(refused).strip() not in str(configs)
 
 
 @pytest.mark.asyncio
@@ -192,8 +192,7 @@ async def test_selector_owner_must_match_exactly(seeded, value) -> None:
         mcp_auth_context={str(seeded.server.id): {"resource_owner_key": value}},
     ).get_mcp_server_configs()
 
-    assert configs[0]["transport"] == "unavailable"
-    assert configs[0]["config"]["reason"] == "config_load_failed"
+    _assert_rejected(configs, refused=value)
 
 
 @pytest.mark.asyncio
@@ -267,3 +266,91 @@ async def test_a_resolver_token_is_unaffected_by_a_foreign_selector(seeded) -> N
     ).get_mcp_server_configs()
 
     assert _authorization(configs) == "Bearer resolver-token"
+
+
+@pytest.mark.asyncio
+async def test_a_resolver_returning_none_still_hits_the_foreign_selector_guard(
+    seeded,
+) -> None:
+    # The guard sits after the resolver fall-through: the resolver is asked
+    # first, and only when it declines does the foreign selector get rejected.
+    calls: list = []
+
+    async def resolver(request) -> ResolvedToken | None:
+        calls.append(request)
+        return None
+
+    set_oauth_token_resolver_hook(resolver)
+    configs = await _config(
+        seeded,
+        policy=_policy(),
+        mcp_auth_context={str(seeded.server.id): {"resource_owner_key": OWNER_B}},
+    ).get_mcp_server_configs()
+
+    _assert_rejected(configs)
+    assert len(calls) == 1
+    assert calls[0].provider == "custom-remote"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("context_owner", "selector_owner", "allowed"),
+    [(OWNER_A, OWNER_B, False), (OWNER_B, OWNER_A, True)],
+)
+async def test_runtime_selector_replaces_the_context_entry_for_the_guard(
+    seeded, context_owner, selector_owner, allowed
+) -> None:
+    # The runtime selector replaces the context entry, so the guard must check
+    # the merged value, not either input alone.
+    configs = await _config(
+        seeded,
+        policy=_policy(),
+        mcp_auth_context={str(seeded.server.id): {"resource_owner_key": context_owner}},
+        auth_selector={"resource_owner_key": selector_owner},
+    ).get_mcp_server_configs()
+
+    if allowed:
+        assert _authorization(configs) == "Bearer actor-a-token"
+    else:
+        _assert_rejected(configs)
+
+
+def _make_static_bearer(seeded) -> None:
+    seeded.server.auth = {
+        "type": "bearer",
+        "bearer_token": encrypt_value("static-token"),
+    }
+    seeded.db.commit()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("form", ["mcp_auth_context", "auth_selector"])
+async def test_static_auth_server_rejects_a_foreign_selector_fail_closed(
+    seeded, form
+) -> None:
+    # Pins a deliberate fail-closed choice: a foreign selector is never
+    # legitimate under a policy, even though a static server never reads it.
+    _make_static_bearer(seeded)
+    selector = {"resource_owner_key": OWNER_B}
+    if form == "mcp_auth_context":
+        config = _config(
+            seeded,
+            policy=_policy(),
+            mcp_auth_context={str(seeded.server.id): selector},
+        )
+    else:
+        config = _config(seeded, policy=_policy(), auth_selector=selector)
+
+    configs = await config.get_mcp_server_configs()
+
+    _assert_rejected(configs)
+    assert "static-token" not in str(configs)
+
+
+@pytest.mark.asyncio
+async def test_static_auth_server_without_a_selector_keeps_its_token(seeded) -> None:
+    _make_static_bearer(seeded)
+
+    configs = await _config(seeded, policy=_policy()).get_mcp_server_configs()
+
+    assert _authorization(configs) == "Bearer static-token"

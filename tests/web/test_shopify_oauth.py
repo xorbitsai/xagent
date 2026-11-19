@@ -889,10 +889,11 @@ def _held_grant(
     access_token: str = "held-access",
     resource_owner_key: str | None = None,
     expires_in: timedelta | None = timedelta(hours=1),
+    connector: str = TEST_APP_ID,
 ) -> UserOAuth:
     grant = UserOAuth(
         user_id=user.id,
-        provider=TEST_APP_ID,
+        provider=connector,
         oauth_provider=oauth_provider,
         resource_owner_key=resource_owner_key,
         access_token=access_token,
@@ -1076,7 +1077,7 @@ def test_a_store_lock_timeout_asks_to_try_again(shopify_db, monkeypatch):
     response = _callback(db, _login_state(db, user))
 
     assert response.status_code == 503
-    assert b"try again" in response.body
+    assert b"start connecting the store again" in response.body
     assert response.headers["cache-control"] == "no-store"
     assert calls == []
     assert _grant(db, user) is None
@@ -1110,25 +1111,44 @@ def test_another_owner_of_the_same_account_holds_the_store_too(shopify_db):
     """An actor (e.g. a Toby member) and the account's own connection are
     separate owners with separate tokens, so either one holds the store
     against the other."""
-    from xagent.web.services.shopify_store_locks import (
-        shopify_store_held_by_another_owner,
-    )
+    from xagent.web.services.shopify_store_locks import shopify_store_holder
 
     db, user = shopify_db
     _held_grant(db, user, resource_owner_key="toby:w1:u1")
 
-    def held_against(resource_owner_key):
-        return shopify_store_held_by_another_owner(
+    def holder_against(resource_owner_key, connector_key=TEST_APP_ID):
+        return shopify_store_holder(
             db,
             provider="shopify",
             store="acme",
             user_id=user.id,
             resource_owner_key=resource_owner_key,
+            connector_key=connector_key,
         )
 
-    assert held_against(None) is True
-    assert held_against("toby:w1:u2") is True
-    assert held_against("toby:w1:u1") is False
+    assert holder_against(None) == "another_owner"
+    assert holder_against("toby:w1:u2") == "another_owner"
+    assert holder_against("toby:w1:u1") is None
+    # The same owner through another connector of this Shopify app would hold
+    # a second token that retires the first.
+    assert holder_against("toby:w1:u1", "shopify-catalog-copy") == (
+        "another_connection"
+    )
+
+
+def test_a_store_held_by_the_same_owner_through_another_connector_is_refused(
+    shopify_db, monkeypatch
+):
+    db, user = shopify_db
+    _held_grant(db, user, connector="shopify-catalog-copy")
+    calls = _mock_shopify_http(monkeypatch)
+
+    response = _callback(db, _login_state(db, user))
+
+    assert response.status_code == 409
+    assert b"another connection" in response.body
+    assert b"another user" not in response.body
+    assert calls == []
 
 
 def _probe_store_lock(db) -> bool:

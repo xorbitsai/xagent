@@ -18,7 +18,7 @@ app can still retire each other's tokens.
 """
 
 from datetime import datetime, timedelta, timezone
-from typing import Any
+from typing import Any, Literal
 
 from sqlalchemy import func
 from sqlalchemy.orm import Session
@@ -26,6 +26,7 @@ from sqlalchemy.orm import Session
 from ..models.shopify_store_lock import ShopifyStoreLock
 from ..models.user_oauth import UserOAuth
 from ..shopify_oauth import is_shopify_provider
+from .time_utils import coerce_utc
 
 # Shopify issues each refresh token for at most 90 days, and a refresh can
 # only shorten that. A grant whose access token expired longer ago than that
@@ -62,36 +63,43 @@ def lock_shopify_store(db: Session, *, provider: str, store: str) -> None:
     db.query(ShopifyStoreLock).filter_by(**key).with_for_update().one()
 
 
-def shopify_store_held_by_another_owner(
+def shopify_store_holder(
     db: Session,
     *,
     provider: str,
     store: str,
     user_id: int | None,
     resource_owner_key: str | None,
-) -> bool:
-    """Whether another owner has a live grant of ``provider`` for ``store``.
+    connector_key: str,
+) -> Literal["another_owner", "another_connection"] | None:
+    """Who else holds a live grant of ``provider`` for ``store``, if anyone.
 
     An owner is a user's own connection (``resource_owner_key`` is NULL) or
-    one actor of that user, the same split ``UserOAuth`` stores grants by. A
-    grant whose access token was cleared (a dead refresh token) or cannot be
-    decrypted no longer holds the store: its owner has to reconnect anyway.
-    Nor does one past Shopify's refresh token lifetime: an owner who stopped
-    using the store never triggers the failed refresh that would clear it.
-    Call it under :func:`lock_shopify_store` so the answer still holds when
-    the grant is stored.
+    one actor of that user, the same split ``UserOAuth`` stores grants by.
+    The same owner's grant under another connector (``UserOAuth.provider``)
+    is another connection: a reconnect replaces only the same connector's
+    grant, so both would be live and retire each other. A grant whose access
+    token was cleared (a dead refresh token) or cannot be decrypted no longer
+    holds the store: its owner has to reconnect anyway. Nor does one past
+    Shopify's refresh token lifetime: an owner who stopped using the store
+    never triggers the failed refresh that would clear it. Call it under
+    :func:`lock_shopify_store` so the answer still holds when the grant is
+    stored.
     """
     grants = db.query(UserOAuth).filter(
         func.lower(UserOAuth.oauth_provider) == provider.lower(),
         func.lower(UserOAuth.instance_url) == store.lower(),
     )
     now = datetime.now(timezone.utc)
-    return any(
-        grant.access_token
-        and not _past_refresh_window(grant.expires_at, now)
-        and (grant.user_id, grant.resource_owner_key) != (user_id, resource_owner_key)
-        for grant in grants
-    )
+    holder: Literal["another_owner", "another_connection"] | None = None
+    for grant in grants:
+        if not grant.access_token or _past_refresh_window(grant.expires_at, now):
+            continue
+        if (grant.user_id, grant.resource_owner_key) != (user_id, resource_owner_key):
+            return "another_owner"
+        if grant.provider != connector_key:
+            holder = "another_connection"
+    return holder
 
 
 def _past_refresh_window(expires_at: Any, now: datetime) -> bool:
@@ -100,10 +108,9 @@ def _past_refresh_window(expires_at: Any, now: datetime) -> bool:
     The refresh token was issued with the access token, no later than its
     expiry. A grant with no expiry is a non-expiring token and never lapses.
     """
+    expires_at = coerce_utc(expires_at)
     if expires_at is None:
         return False
-    if expires_at.tzinfo is None:
-        expires_at = expires_at.replace(tzinfo=timezone.utc)
     return bool(expires_at + SHOPIFY_REFRESH_TOKEN_LIFETIME < now)
 
 

@@ -148,7 +148,7 @@ from ..services.oauth_revocation_fences import (
 from ..services.oauth_state_claims import claim_oauth_state
 from ..services.shopify_store_locks import (
     lock_shopify_store,
-    shopify_store_held_by_another_owner,
+    shopify_store_holder,
 )
 from ..services.trigger_rate_limit import remote_ip_from_request
 from ..services.user_oauth import (
@@ -5717,18 +5717,18 @@ def _generic_oauth_callback(
             # or another callback for the store waits for the stored grant.
             try:
                 lock_shopify_store(db, provider=provider, store=bound_account)
-                held_elsewhere = shopify_store_held_by_another_owner(
+                holder = shopify_store_holder(
                     db,
                     provider=provider,
                     store=bound_account,
                     user_id=user_id,
                     resource_owner_key=resource_owner_key,
+                    connector_key=app_id or provider,
                 )
             except OperationalError as exc:
                 # A lock or busy timeout while another callback or refresh
-                # for the store holds it: nothing was exchanged, so trying
-                # again is safe.
-                db.rollback()
+                # for the store holds it. Nothing was exchanged, but this
+                # flow's state is spent: the merchant starts over.
                 logger.warning(
                     "Shopify store lock unavailable (%s)", type(exc).__name__
                 )
@@ -5740,12 +5740,13 @@ def _generic_oauth_callback(
                 )
                 return _oauth_popup_feedback_response(
                     "Cannot connect Shopify",
-                    "Another connection to this Shopify store is in progress. "
-                    "Please try again in a moment.",
+                    "The connection could not be completed. Close this window "
+                    "and start connecting the store again.",
                     status_code=503,
                 )
-            if held_elsewhere:
-                db.rollback()
+            # The callback's own transaction ends when it returns, releasing
+            # the store (see generic_oauth_callback).
+            if holder == "another_owner":
                 _log_oauth_callback_rejection(
                     provider,
                     "store_connected_elsewhere",
@@ -5756,6 +5757,19 @@ def _generic_oauth_callback(
                     "Cannot connect Shopify",
                     "This Shopify store is already connected by another user. "
                     "To connect it yourself, ask them to disconnect it first.",
+                    status_code=409,
+                )
+            if holder == "another_connection":
+                _log_oauth_callback_rejection(
+                    provider,
+                    "store_connected_through_another_connector",
+                    app_id=app_id,
+                    actor_flow=is_actor_flow,
+                )
+                return _oauth_popup_feedback_response(
+                    "Cannot connect Shopify",
+                    "This Shopify store is already connected through another "
+                    "connection of yours. Disconnect that connection first.",
                     status_code=409,
                 )
 

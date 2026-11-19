@@ -149,6 +149,9 @@ UNAVAILABLE_MCP_APP_SCOPED_GRANT_MESSAGE = (
 _ACTOR_OAUTH_REFRESH_LOCKS: WeakValueDictionary[
     tuple[int, int, str, str], asyncio.Lock
 ] = WeakValueDictionary()
+# How often an actor resolution rereads a Shopify grant's store when the
+# grant moved to another store between the read and the row lock.
+_ACTOR_SHOPIFY_STORE_ATTEMPTS = 3
 _SHOPIFY_OAUTH_REFRESH_LOCKS: WeakValueDictionary[
     tuple[int, int, str], asyncio.Lock
 ] = WeakValueDictionary()
@@ -4873,6 +4876,43 @@ class WebToolConfig(BaseToolConfig):
             oauth_db.rollback()
             oauth_db.close()
 
+    @staticmethod
+    def _lock_actor_oauth_namespace(
+        oauth_db: Any,
+        actor_query: Any,
+        *,
+        user_id: int,
+        resource_owner_key: str,
+        app_id: str,
+    ) -> Any:
+        """Lock the actor namespace for this app and return its newest grant."""
+        from ...web.models.user_oauth import UserOAuth
+
+        if oauth_db.get_bind().dialect.name == "sqlite":
+            oauth_db.execute(
+                text(
+                    "UPDATE user_oauth SET id = id "
+                    "WHERE user_id = :user_id "
+                    "AND resource_owner_key = :resource_owner_key "
+                    "AND provider = :provider"
+                ),
+                {
+                    "user_id": user_id,
+                    "resource_owner_key": resource_owner_key,
+                    "provider": app_id,
+                },
+            )
+        else:
+            actor_query = actor_query.with_for_update()
+        # See the ordinary-flow branches in _resolve_legacy_oauth_access_
+        # token for why this is ordered rather than left arbitrary: the
+        # lock above prevents a *new* duplicate from forming during this
+        # resolution, but doesn't retroactively fix a namespace that
+        # already has more than one row from before locking existed (or
+        # from a provider whose identity backfill can't always derive a
+        # non-NULL provider_user_id).
+        return actor_query.order_by(UserOAuth.id.desc()).first()
+
     async def _resolve_actor_oauth_access_token_in_worker(
         self,
         *,
@@ -4913,48 +4953,51 @@ class WebToolConfig(BaseToolConfig):
                 user_id=user_id,
                 resource_owner_key=resource_owner_key,
             ).filter(UserOAuth.provider == app_id)
-            # A Shopify grant's store is locked before its row, the order the
-            # callback takes them in (store, then the replaced row), so the
-            # two never wait on each other. Only the store column is read
-            # here: a loaded row would not be refreshed by the locking read.
-            peeked = (
-                actor_query.with_entities(UserOAuth.instance_url)
-                .order_by(UserOAuth.id.desc())
-                .first()
-                if isinstance(provider_name, str) and is_shopify_provider(provider_name)
-                else None
+            shopify = isinstance(provider_name, str) and is_shopify_provider(
+                provider_name
             )
-            peeked_store = shopify_store_of(
-                provider_name, peeked.instance_url if peeked else None
-            )
-            if peeked_store is not None:
-                shopify_store_locks.lock_shopify_store(
-                    oauth_db, provider=str(provider_name), store=peeked_store
+            for _attempt in range(_ACTOR_SHOPIFY_STORE_ATTEMPTS):
+                # A Shopify grant's store is locked before its row, the order
+                # the callback takes them in (store, then the replaced row),
+                # so the two never wait on each other. Only the store column
+                # is read here: a loaded row would not be refreshed by the
+                # locking read.
+                peeked = (
+                    actor_query.with_entities(UserOAuth.instance_url)
+                    .order_by(UserOAuth.id.desc())
+                    .first()
+                    if shopify
+                    else None
                 )
-            if oauth_db.get_bind().dialect.name == "sqlite":
-                oauth_db.execute(
-                    text(
-                        "UPDATE user_oauth SET id = id "
-                        "WHERE user_id = :user_id "
-                        "AND resource_owner_key = :resource_owner_key "
-                        "AND provider = :provider"
-                    ),
-                    {
-                        "user_id": user_id,
-                        "resource_owner_key": resource_owner_key,
-                        "provider": app_id,
-                    },
+                peeked_store = shopify_store_of(
+                    provider_name, peeked.instance_url if peeked else None
                 )
+                if peeked_store is not None:
+                    shopify_store_locks.lock_shopify_store(
+                        oauth_db, provider=str(provider_name), store=peeked_store
+                    )
+                oauth_account = self._lock_actor_oauth_namespace(
+                    oauth_db,
+                    actor_query,
+                    user_id=user_id,
+                    resource_owner_key=resource_owner_key,
+                    app_id=app_id,
+                )
+                locked_store = shopify_store_of(
+                    provider_name,
+                    oauth_account.instance_url if oauth_account else None,
+                )
+                if (locked_store or "").lower() == (peeked_store or "").lower():
+                    break
+                # The actor reconnected to another store (or connected at
+                # all) after the peek. Locking that store now, with the row
+                # held, would invert the callback's order and can deadlock:
+                # release everything and read the store again.
+                oauth_db.rollback()
             else:
-                actor_query = actor_query.with_for_update()
-            # See the ordinary-flow branches in _resolve_legacy_oauth_access_
-            # token for why this is ordered rather than left arbitrary: the
-            # lock above prevents a *new* duplicate from forming during this
-            # resolution, but doesn't retroactively fix a namespace that
-            # already has more than one row from before locking existed (or
-            # from a provider whose identity backfill can't always derive a
-            # non-NULL provider_user_id).
-            oauth_account = actor_query.order_by(UserOAuth.id.desc()).first()
+                raise RuntimeError(
+                    "Shopify actor grant kept changing store during resolution"
+                )
             logger.info(
                 "OAUTH CONFIG: Checked actor app credential for user %s. Found: %s",
                 user_id,

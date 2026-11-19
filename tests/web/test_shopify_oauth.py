@@ -1356,8 +1356,12 @@ def _record_lock_order(engine) -> tuple[list, object]:
         sql = " ".join(statement.split()).lower()
         key = id(conn.connection.dbapi_connection)
         if sql.startswith("insert into shopify_store_locks"):
-            events.append((key, "store", tuple(parameters)))
-        elif sql.startswith("update user_oauth set id = id"):
+            values = parameters.values() if isinstance(parameters, dict) else parameters
+            events.append((key, "store", tuple(values)))
+        elif sql.startswith("update user_oauth set id = id") or (
+            # PostgreSQL locks the actor's grant row with SELECT ... FOR UPDATE.
+            "from user_oauth" in sql and sql.endswith("for update")
+        ):
             events.append((key, "row", None))
 
     def on_end(conn):
@@ -1487,3 +1491,34 @@ def test_an_actor_grant_that_appears_after_the_store_read_is_locked_store_first(
     _assert_no_new_store_lock_after_a_row_lock(events)
     assert resolution.access_token == "rotated-access"
     assert len(posted) == 1
+
+
+def test_an_actor_refresh_gives_up_on_a_grant_that_keeps_changing_store(
+    shopify_db, monkeypatch
+):
+    from xagent.web.services import shopify_store_locks
+
+    db, user = shopify_db
+    grant = _held_grant(
+        db, user, resource_owner_key="toby:w1:u1", expires_in=-timedelta(minutes=1)
+    )
+    grant_id = grant.id
+    posted = _fake_refresh_client(monkeypatch)
+    real_lock = shopify_store_locks.lock_shopify_store
+    peeked_stores: list[str] = []
+
+    def lock_after_a_move(session, *, store, **kwargs):
+        peeked_stores.append(store)
+        with sessionmaker(bind=db.get_bind())() as other:
+            row = other.get(UserOAuth, grant_id)
+            row.instance_url = "beta" if row.instance_url == "acme" else "acme"
+            other.commit()
+        return real_lock(session, store=store, **kwargs)
+
+    monkeypatch.setattr(shopify_store_locks, "lock_shopify_store", lock_after_a_move)
+
+    with pytest.raises(RuntimeError, match="kept changing store"):
+        _resolve_actor_shopify(db, user.id)
+
+    assert peeked_stores == ["acme", "beta", "acme"]
+    assert posted == []

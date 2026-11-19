@@ -23,6 +23,7 @@ from xagent.web import oauth_account_hosts
 from xagent.web.api import auth as auth_api
 from xagent.web.models.database import Base
 from xagent.web.models.user import User
+from xagent.web.models.user_oauth import UserOAuth
 from xagent.web.services.shopify_store_locks import lock_shopify_store
 from xagent.web.tools import config as tool_config
 
@@ -197,3 +198,40 @@ def test_an_actor_refresh_locks_the_store_before_its_grant_row(shopify_pg, monke
         if "from user_oauth" in s and s.endswith("for update")
     )
     assert store_lock < row_lock
+
+
+def test_an_actor_refresh_whose_grant_moved_store_never_locks_a_store_after_it(
+    shopify_pg, monkeypatch
+):
+    """The actor reconnects to another store between the refresh reading the
+    store and locking the grant row. Locking the new store with the row held
+    could deadlock with that store's callback; the refresh starts over."""
+    from xagent.web.services import shopify_store_locks
+
+    db, user = shopify_pg
+    grant = shop._held_grant(
+        db, user, resource_owner_key="toby:w1:u1", expires_in=-timedelta(minutes=1)
+    )
+    grant_id = grant.id
+    posted = shop._fake_refresh_client(monkeypatch)
+    real_lock = shopify_store_locks.lock_shopify_store
+    moved: list[bool] = []
+
+    def lock_after_a_move(session, **kwargs):
+        if not moved:
+            moved.append(True)
+            with sessionmaker(bind=db.get_bind())() as other:
+                other.get(UserOAuth, grant_id).instance_url = "beta"
+                other.commit()
+        return real_lock(session, **kwargs)
+
+    monkeypatch.setattr(shopify_store_locks, "lock_shopify_store", lock_after_a_move)
+    events, remove = shop._record_lock_order(db.get_bind())
+    try:
+        resolution = shop._resolve_actor_shopify(db, user.id)
+    finally:
+        remove()
+
+    shop._assert_no_new_store_lock_after_a_row_lock(events)
+    assert resolution.access_token == "rotated-access"
+    assert len(posted) == 1

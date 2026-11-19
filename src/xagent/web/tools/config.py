@@ -4989,10 +4989,18 @@ class WebToolConfig(BaseToolConfig):
                 )
                 if (locked_store or "").lower() == (peeked_store or "").lower():
                     break
-                # The actor reconnected to another store (or connected at
-                # all) after the peek. Locking that store now, with the row
-                # held, would invert the callback's order and can deadlock:
-                # release everything and read the store again.
+                # The grant changed after the peek: the actor reconnected to
+                # another store, connected at all, or disconnected (on
+                # PostgreSQL a same-store reconnect also lands here when the
+                # locking read waited for the old row's delete). Locking
+                # another store now, with the row held, would invert the
+                # callback's order and can deadlock: release everything and
+                # read the store again.
+                logger.info(
+                    "OAUTH CONFIG: Actor Shopify grant changed store during "
+                    "resolution for user %s; retrying",
+                    user_id,
+                )
                 oauth_db.rollback()
             else:
                 raise RuntimeError(

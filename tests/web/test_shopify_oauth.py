@@ -888,7 +888,7 @@ def _held_grant(
     oauth_provider: str | None = "shopify",
     access_token: str = "held-access",
     resource_owner_key: str | None = None,
-    expires_in: timedelta = timedelta(hours=1),
+    expires_in: timedelta | None = timedelta(hours=1),
 ) -> UserOAuth:
     grant = UserOAuth(
         user_id=user.id,
@@ -899,7 +899,9 @@ def _held_grant(
         refresh_token="held-refresh",
         instance_url=store,
         provider_user_id=SHOP_GID,
-        expires_at=datetime.now(timezone.utc) + expires_in,
+        expires_at=None
+        if expires_in is None
+        else datetime.now(timezone.utc) + expires_in,
     )
     db.add(grant)
     db.commit()
@@ -975,11 +977,19 @@ def test_a_store_not_held_by_a_live_grant_of_this_app_can_be_connected(
     assert _grant(db, user) is not None
 
 
+@pytest.mark.parametrize(
+    "expires_in",
+    [
+        pytest.param(-timedelta(days=89), id="within-the-refresh-window"),
+        # A token without an expiry never lapses.
+        pytest.param(None, id="non-expiring"),
+    ],
+)
 def test_an_expired_access_token_still_holds_the_store_within_the_refresh_window(
-    shopify_db, monkeypatch
+    shopify_db, monkeypatch, expires_in
 ):
     db, user = shopify_db
-    _held_grant(db, _other_user(db), expires_in=-timedelta(days=89))
+    _held_grant(db, _other_user(db), expires_in=expires_in)
     calls = _mock_shopify_http(monkeypatch)
 
     response = _callback(db, _login_state(db, user))
@@ -1073,23 +1083,25 @@ def test_a_store_lock_timeout_asks_to_try_again(shopify_db, monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "failure",
+    ("failure", "expected_status"),
     [
-        pytest.param({"token": {"error": "invalid_request"}}, id="exchange-error"),
+        pytest.param({"token": {"error": "invalid_request"}}, 400, id="exchange-error"),
         pytest.param(
-            {"token": _token_response(scope="write_products")}, id="missing-scope"
+            {"token": _token_response(scope="write_products")},
+            400,
+            id="missing-scope",
         ),
     ],
 )
 def test_a_callback_that_fails_after_locking_releases_the_store(
-    shopify_db, monkeypatch, failure
+    shopify_db, monkeypatch, failure, expected_status
 ):
     db, user = shopify_db
     _mock_shopify_http(monkeypatch, **failure)
 
     response = _callback(db, _login_state(db, user))
 
-    assert response.status_code != 200
+    assert response.status_code == expected_status
     assert _grant(db, user) is None
     assert _probe_store_lock(db) is True
 

@@ -36,7 +36,7 @@ from pydantic import (
     field_validator,
 )
 from sqlalchemy import or_, text
-from sqlalchemy.exc import IntegrityError, SQLAlchemyError
+from sqlalchemy.exc import IntegrityError, OperationalError, SQLAlchemyError
 from sqlalchemy.orm import Session, object_session
 from starlette.responses import JSONResponse
 
@@ -5197,7 +5197,11 @@ def generic_oauth_callback(
         # here, so the store is free as soon as the callback returns rather
         # than when the request's session closes.
         if db is not None and is_shopify_provider(provider) and db.in_transaction():
-            db.rollback()
+            try:
+                db.rollback()
+            except SQLAlchemyError:
+                # The session closes with the request and rolls back then.
+                logger.warning("Could not end the Shopify callback transaction")
 
 
 def _generic_oauth_callback(
@@ -5720,7 +5724,7 @@ def _generic_oauth_callback(
                     user_id=user_id,
                     resource_owner_key=resource_owner_key,
                 )
-            except SQLAlchemyError as exc:
+            except OperationalError as exc:
                 # A lock or busy timeout while another callback or refresh
                 # for the store holds it: nothing was exchanged, so trying
                 # again is safe.

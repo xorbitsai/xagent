@@ -152,6 +152,7 @@ _ACTOR_OAUTH_REFRESH_LOCKS: WeakValueDictionary[
 # How often an actor resolution rereads a Shopify grant's store when the
 # grant moved to another store between the read and the row lock.
 _ACTOR_SHOPIFY_STORE_ATTEMPTS = 3
+_SHOPIFY_LOCK_EXPIRY_MARGIN = timedelta(minutes=1)
 _SHOPIFY_OAUTH_REFRESH_LOCKS: WeakValueDictionary[
     tuple[int, int, str], asyncio.Lock
 ] = WeakValueDictionary()
@@ -1340,7 +1341,14 @@ def _oauth_token_refresh_due(oauth_account: Any) -> bool:
         return False
     if expires_at.tzinfo is None:
         expires_at = expires_at.replace(tzinfo=timezone.utc)
-    return bool(expires_at <= datetime.now(timezone.utc) + OAUTH_TOKEN_EXPIRY_SKEW)
+    # A minute beyond the refresh's own skew: the refresh reads the clock
+    # again later, and a token due by then must not be refreshed unlocked.
+    return bool(
+        expires_at
+        <= datetime.now(timezone.utc)
+        + OAUTH_TOKEN_EXPIRY_SKEW
+        + _SHOPIFY_LOCK_EXPIRY_MARGIN
+    )
 
 
 def _lock_shopify_store_and_reread(

@@ -1,8 +1,8 @@
 """switch the Shopify connector from pasted Admin API tokens to per-store OAuth
 
-Revision ID: 20261116_shopify_oauth
+Revision ID: 20261119_shopify_oauth
 Revises: 20261117_chat_message_metadata
-Create Date: 2026-11-16
+Create Date: 2026-11-19
 
 Hard switch (#2810), as Zendesk did (20261012_zendesk_oauth): existing
 token connections are deleted and merchants reconnect through OAuth. Shopify
@@ -28,7 +28,7 @@ from xagent.builtin_identity import builtin_provenance_identity
 
 logger = logging.getLogger(__name__)
 
-revision: str = "20261116_shopify_oauth"
+revision: str = "20261119_shopify_oauth"
 down_revision: Union[str, None] = "20261117_chat_message_metadata"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
@@ -88,9 +88,10 @@ OAUTH_PROVIDER_STATIC_FIELDS = {
     "email_path": "",
     "default_scopes": [],
 }
-# Children of mcp_servers this repository defines, children first. Other
-# tables pointing at mcp_servers.id (a downstream deployment's own) are found
-# through their foreign keys.
+# Children of mcp_servers this repository defines, children first; all are
+# ON DELETE CASCADE. Other tables pointing at mcp_servers.id (a downstream
+# deployment's own) are found through their foreign keys and handled by their
+# own ON DELETE rule.
 KNOWN_SERVER_CHILDREN = (
     ("mcp_oauth_flow_states", "mcp_server_id"),
     ("mcp_oauth_grants", "mcp_server_id"),
@@ -204,48 +205,132 @@ def _catalog_row(bind: sa.engine.Connection) -> Any | None:
     )
 
 
-def _server_children(bind: sa.engine.Connection) -> list[tuple[str, str]]:
-    """Every (table, column) whose rows point at an mcp_servers row."""
-    inspector = sa.inspect(bind)
-    tables = set(inspector.get_table_names())
-    children = [
-        (table, column)
-        for table, column in KNOWN_SERVER_CHILDREN
-        if column in _columns(bind, table)
-    ]
-    known = {table for table, _column in KNOWN_SERVER_CHILDREN}
-    for table in sorted(tables - known - {"mcp_servers"}):
-        for foreign_key in inspector.get_foreign_keys(table):
-            if foreign_key.get("referred_table") != "mcp_servers":
-                continue
-            if foreign_key.get("referred_columns") != ["id"]:
-                continue
-            for column in foreign_key.get("constrained_columns") or ():
-                children.append((table, column))
-    return children
+def _foreign_keys(
+    bind: sa.engine.Connection, inspector: Any, table: str
+) -> list[tuple[str, str | None, str, str]]:
+    """(referred table, referred column, constrained column, ON DELETE rule)
+    for each foreign key of ``table``.
+
+    SQLite is read through its own pragma: SQLAlchemy's reflection drops the
+    ON DELETE rule of a key declared inline on the column.
+    """
+    if bind.dialect.name == "sqlite":
+        rows = bind.exec_driver_sql(f'PRAGMA foreign_key_list("{table}")').all()
+        # id, seq, table, from, to, on_update, on_delete, match; a missing
+        # "to" means the referred table's primary key.
+        return [
+            (str(row[2]), row[4] or "id", str(row[3]), str(row[6] or "NO ACTION"))
+            for row in rows
+        ]
+    found = []
+    for foreign_key in inspector.get_foreign_keys(table):
+        referred = foreign_key.get("referred_columns") or []
+        options = foreign_key.get("options") or {}
+        rule = str(options.get("ondelete") or "NO ACTION")
+        constrained = foreign_key.get("constrained_columns") or []
+        if len(referred) != 1 or len(constrained) != 1:
+            continue
+        found.append(
+            (str(foreign_key.get("referred_table")), referred[0], constrained[0], rule)
+        )
+    return found
+
+
+def _referencing(
+    bind: sa.engine.Connection,
+    inspector: Any,
+    tables: set[str],
+    parent: str,
+    skip: set[str],
+) -> list[tuple[str, str, str]]:
+    """Every (table, column, ON DELETE rule) that points at ``parent.id``."""
+    found = []
+    for table in sorted(tables - skip - {parent}):
+        for referred_table, referred_column, column, rule in _foreign_keys(
+            bind, inspector, table
+        ):
+            if referred_table == parent and referred_column == "id":
+                found.append((table, column, rule.upper()))
+    return found
+
+
+def _release_references(
+    bind: sa.engine.Connection,
+    inspector: Any,
+    tables: set[str],
+    parent: str,
+    ids: list[int],
+    skip: set[str],
+) -> None:
+    """Do what each reference's ON DELETE rule would do to rows pointing at
+    ``parent`` rows ``ids``, explicitly: a migration connection may not
+    enforce foreign keys (SQLite without the pragma)."""
+    for table, column, rule in _referencing(bind, inspector, tables, parent, skip):
+        child = sa.table(table, sa.column(column, sa.Integer), sa.column("id"))
+        hit = child.c[column].in_(ids)
+        if (
+            bind.execute(sa.select(sa.literal(1)).select_from(child).where(hit)).first()
+            is None
+        ):
+            continue
+        if rule == "SET NULL":
+            bind.execute(sa.update(child).where(hit).values({column: None}))
+        elif rule == "CASCADE":
+            if _referencing(bind, inspector, tables, table, set()):
+                if "id" not in _columns(bind, table):
+                    raise RuntimeError(
+                        f"Cannot migrate Shopify connector: {table} has rows to "
+                        "delete and is referenced by other tables, but has no id "
+                        "column to follow"
+                    )
+                child_ids = [
+                    int(row[0])
+                    for row in bind.execute(sa.select(child.c.id).where(hit))
+                ]
+                _release_references(bind, inspector, tables, table, child_ids, set())
+            bind.execute(sa.delete(child).where(hit))
+        else:
+            raise RuntimeError(
+                f"Cannot migrate Shopify connector: {table}.{column} references "
+                f"{parent} rows this migration deletes with ON DELETE {rule}; "
+                "remove or detach those rows first"
+            )
 
 
 def _delete_servers_and_dependents(
     bind: sa.engine.Connection, *, name: str, transport: str, matches: Any
-) -> None:
+) -> list[int]:
+    """Delete the matching servers and what hangs off them; return the ids of
+    servers with the same name and transport that were kept."""
     required = {"id", "name", "transport", "command", "args", "auth"}
     if not required.issubset(_columns(bind, "mcp_servers")):
-        return
-    rows = bind.execute(
-        sa.select(*(MCP_SERVERS.c[column] for column in sorted(required))).where(
-            MCP_SERVERS.c.name == name,
-            MCP_SERVERS.c.transport == transport,
-        )
-    ).mappings()
+        return []
+    rows = list(
+        bind.execute(
+            sa.select(*(MCP_SERVERS.c[column] for column in sorted(required))).where(
+                MCP_SERVERS.c.name == name,
+                MCP_SERVERS.c.transport == transport,
+            )
+        ).mappings()
+    )
     server_ids = [int(row["id"]) for row in rows if matches(row)]
+    kept = [int(row["id"]) for row in rows if not matches(row)]
     if not server_ids:
-        return
+        return kept
     # Explicit, because a migration connection may not enforce the
     # foreign keys' ON DELETE CASCADE (SQLite without the pragma).
-    for table_name, column in _server_children(bind):
+    known = set()
+    for table_name, column in KNOWN_SERVER_CHILDREN:
+        known.add(table_name)
+        if column not in _columns(bind, table_name):
+            continue
         child = sa.table(table_name, sa.column(column, sa.Integer))
         bind.execute(sa.delete(child).where(child.c[column].in_(server_ids)))
+    inspector = sa.inspect(bind)
+    tables = set(inspector.get_table_names())
+    _release_references(bind, inspector, tables, "mcp_servers", server_ids, known)
     bind.execute(sa.delete(MCP_SERVERS).where(MCP_SERVERS.c.id.in_(server_ids)))
+    return kept
 
 
 def _delete_token_connections(bind: sa.engine.Connection) -> None:
@@ -266,9 +351,19 @@ def _delete_token_connections(bind: sa.engine.Connection) -> None:
             and _is_official(auth.get("builtin_provenance"))
         )
 
-    _delete_servers_and_dependents(
+    kept = _delete_servers_and_dependents(
         bind, name=APP_ID, transport="stdio", matches=is_official_token_server
     )
+    if kept:
+        # The builtin app treats a server named exactly after it as a second
+        # candidate, so the OAuth connector cannot resolve while these exist.
+        logger.warning(
+            "Kept MCP server(s) %s named %r: they are not provably the builtin "
+            "token connector, but they block the builtin Shopify OAuth "
+            "connector until renamed or removed",
+            kept,
+            APP_ID,
+        )
     # Toby personal connections keep their own encrypted copy of the token.
     if "app_id" in _columns(bind, "actor_mcp_server_connections"):
         bind.execute(
@@ -337,6 +432,35 @@ def upgrade() -> None:
     _delete_token_connections(bind)
 
 
+def _remove_inserted_oauth_provider(bind: sa.engine.Connection) -> None:
+    """Remove the provider row exactly as the upgrade inserted it: the
+    static fields match and no credential was filled in since."""
+    configured_fields = ("client_id", "client_secret", "redirect_uri")
+    required = {"provider_name", *OAUTH_PROVIDER_STATIC_FIELDS, *configured_fields}
+    if not required.issubset(_columns(bind, "oauth_providers")):
+        return
+    row = (
+        bind.execute(
+            sa.select(*(OAUTH_PROVIDERS.c[name] for name in sorted(required))).where(
+                OAUTH_PROVIDERS.c.provider_name == APP_ID
+            )
+        )
+        .mappings()
+        .first()
+    )
+    if row is None or any(
+        row[name] != expected for name, expected in OAUTH_PROVIDER_STATIC_FIELDS.items()
+    ):
+        return
+    # An admin who entered credentials in the provider settings owns the row
+    # now; deleting it would destroy their secret.
+    if any(row[name] for name in configured_fields):
+        return
+    bind.execute(
+        sa.delete(OAUTH_PROVIDERS).where(OAUTH_PROVIDERS.c.provider_name == APP_ID)
+    )
+
+
 def _delete_oauth_connections(bind: sa.engine.Connection) -> None:
     def is_shopify_oauth_server(row: Any) -> bool:
         auth = row["auth"]
@@ -364,13 +488,12 @@ def downgrade() -> None:
     if not _oauth_catalog_row(row):
         logger.warning(
             "Leaving the Shopify catalog row unchanged: it is not the shape "
-            "20261116_shopify_oauth created"
+            "20261119_shopify_oauth created"
         )
         return
 
-    # The provider row stays: nothing proves this migration inserted it, and
-    # a blank one is inert. Visibility returns to the token connector's
-    # shipped default rather than a guess at an earlier operator setting.
+    # Visibility returns to the token connector's shipped default rather than
+    # a guess at an earlier operator setting.
     values: dict[str, object] = {
         "transport": "stdio",
         "provider_name": None,
@@ -386,3 +509,4 @@ def downgrade() -> None:
         .values(**values)
     )
     _delete_oauth_connections(bind)
+    _remove_inserted_oauth_provider(bind)

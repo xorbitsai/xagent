@@ -29,6 +29,8 @@ from sqlalchemy import (
     select,
 )
 
+from tests.shared.postgres_disposable import disposable_database_factory
+
 VERSIONS = Path(__file__).parent.parent.parent / "src/xagent/migrations/versions"
 OFFICIAL_MARKER = {"registry": "xagent", "app_id": "shopify", "version": 1}
 LEGACY_ARGS = ["-m", "xagent.web.tools.mcp.shopify"]
@@ -46,7 +48,7 @@ def _load(file_name: str, module_name: str):
 
 
 def _load_migration():
-    return _load("20261116_migrate_shopify_to_oauth.py", "shopify_oauth_migration")
+    return _load("20261119_migrate_shopify_to_oauth.py", "shopify_oauth_migration")
 
 
 def _load_seed():
@@ -560,8 +562,10 @@ def test_operator_provider_row_survives_upgrade_and_downgrade(database):
 # ---------- downgrade --------------------------------------------------------
 
 
-def test_downgrade_restores_the_legacy_row_and_keeps_the_provider(database):
-    """The provider row stays: nothing proves this migration inserted it."""
+def test_downgrade_restores_the_legacy_row_and_removes_the_inserted_provider(
+    database,
+):
+    """The blank provider row the upgrade inserted goes, as Zendesk's does."""
     connection, tables = database
     _seed_legacy(connection, tables)
     migration = _run(connection, "upgrade")
@@ -575,7 +579,30 @@ def test_downgrade_restores_the_legacy_row_and_keeps_the_provider(database):
     assert app["description"] == legacy["description"]
     # The legacy connector shipped visible.
     assert app["is_visible_in_connector"] is True
-    assert len(_ids(connection, tables["oauth_providers"])) == 1
+    assert _ids(connection, tables["oauth_providers"]) == []
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        pytest.param({"redirect_uri": "https://example.test/cb"}, id="configured"),
+        pytest.param({"auth_url": "https://example.test/auth"}, id="edited-static"),
+    ],
+)
+def test_downgrade_keeps_a_provider_row_an_operator_changed(database, overrides):
+    connection, tables = database
+    _seed_legacy(connection, tables)
+    migration = _run(connection, "upgrade")
+    providers = tables["oauth_providers"]
+    connection.execute(
+        providers.update()
+        .where(providers.c.provider_name == "shopify")
+        .values(**overrides)
+    )
+
+    _run(connection, "downgrade", migration)
+
+    assert len(_ids(connection, providers)) == 1
 
 
 def test_downgrade_removes_oauth_servers_and_voids_grants(database):
@@ -640,3 +667,180 @@ def test_upgrade_downgrade_upgrade_round_trip(database):
 
     assert dict(_app(connection, tables)) == switched
     assert len(_ids(connection, tables["oauth_providers"])) == 1
+
+
+# ---------- downstream tables by their ON DELETE rule -----------------------
+
+
+def _create(connection, ddl: str) -> None:
+    connection.exec_driver_sql(ddl)
+
+
+def test_upgrade_nulls_a_downstream_set_null_reference(database):
+    """A downstream history table keeps its rows; only the reference goes."""
+    connection, tables = database
+    _create(
+        connection,
+        "CREATE TABLE usage_history (id INTEGER PRIMARY KEY, server_id INTEGER "
+        "REFERENCES mcp_servers(id) ON DELETE SET NULL)",
+    )
+    _seed_legacy(connection, tables)
+    connection.exec_driver_sql("INSERT INTO usage_history VALUES (7, 1)")
+
+    _run(connection, "upgrade")
+
+    assert _ids(connection, tables["mcp_servers"]) == []
+    rows = connection.exec_driver_sql("SELECT id, server_id FROM usage_history").all()
+    assert [tuple(row) for row in rows] == [(7, None)]
+
+
+def test_upgrade_deletes_the_children_of_a_downstream_cascade_table(database):
+    connection, tables = database
+    _create(
+        connection,
+        "CREATE TABLE team_links (id INTEGER PRIMARY KEY, server_id INTEGER "
+        "REFERENCES mcp_servers(id) ON DELETE CASCADE)",
+    )
+    _create(
+        connection,
+        "CREATE TABLE team_link_notes (id INTEGER PRIMARY KEY, link_id INTEGER "
+        "REFERENCES team_links(id) ON DELETE CASCADE)",
+    )
+    _seed_legacy(connection, tables)
+    connection.exec_driver_sql("INSERT INTO team_links VALUES (5, 1)")
+    connection.exec_driver_sql("INSERT INTO team_link_notes VALUES (9, 5)")
+
+    _run(connection, "upgrade")
+
+    assert connection.exec_driver_sql("SELECT id FROM team_links").all() == []
+    assert connection.exec_driver_sql("SELECT id FROM team_link_notes").all() == []
+
+
+@pytest.mark.parametrize(
+    "rule", [pytest.param("RESTRICT"), pytest.param("", id="no-rule")]
+)
+def test_upgrade_refuses_to_delete_through_a_protecting_reference(database, rule):
+    """A reference that protects its rows stops the migration instead of
+    losing them, and names the table to fix."""
+    connection, tables = database
+    clause = f" ON DELETE {rule}" if rule else ""
+    _create(
+        connection,
+        "CREATE TABLE audit_trail (id INTEGER PRIMARY KEY, server_id INTEGER "
+        f"REFERENCES mcp_servers(id){clause})",
+    )
+    _seed_legacy(connection, tables)
+    connection.exec_driver_sql("INSERT INTO audit_trail VALUES (3, 1)")
+
+    with pytest.raises(RuntimeError, match="audit_trail"):
+        _run(connection, "upgrade")
+
+
+def test_a_protecting_reference_without_rows_does_not_block(database):
+    connection, tables = database
+    _create(
+        connection,
+        "CREATE TABLE audit_trail (id INTEGER PRIMARY KEY, server_id INTEGER "
+        "REFERENCES mcp_servers(id) ON DELETE RESTRICT)",
+    )
+    _seed_legacy(connection, tables)
+
+    _run(connection, "upgrade")
+
+    assert _ids(connection, tables["mcp_servers"]) == []
+
+
+# ---------- kept servers that block the builtin OAuth connect ---------------
+
+
+def test_upgrade_warns_about_a_kept_server_named_shopify(database, caplog):
+    """A kept stdio server named exactly `shopify` is a second candidate for
+    the builtin app, so the OAuth connector cannot resolve until it is
+    renamed or removed; the operator has to hear about it."""
+    connection, tables = database
+    connection.execute(tables["public_mcp_apps"].insert().values(**_legacy_row()))
+    _add_legacy_server(connection, tables, server_id=4, auth=None)
+
+    with caplog.at_level("WARNING"):
+        _run(connection, "upgrade")
+
+    assert _ids(connection, tables["mcp_servers"]) == [4]
+    warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+    assert any("4" in message and "shopify" in message for message in warnings)
+
+
+def test_upgrade_does_not_warn_when_nothing_named_shopify_is_kept(database, caplog):
+    connection, tables = database
+    _seed_legacy(connection, tables)
+
+    with caplog.at_level("WARNING"):
+        _run(connection, "upgrade")
+
+    assert [r for r in caplog.records if r.levelname == "WARNING"] == []
+
+
+# ---------- PostgreSQL --------------------------------------------------------
+# The foreign-key discovery above reads PostgreSQL's catalog through
+# SQLAlchemy's inspector, not SQLite's pragma, and the full migration chain
+# starts from an empty database, so it never reaches that path. Each test here
+# runs in its own disposable database.
+
+
+@pytest.fixture
+def postgresql_engine_factory():
+    with disposable_database_factory("xagent_shopify_oauth") as make:
+        yield make
+
+
+@pytest.mark.postgresql
+def test_postgresql_upgrade_follows_each_downstream_on_delete_rule(
+    postgresql_engine_factory,
+):
+    engine = postgresql_engine_factory("fk-rules")
+    metadata = MetaData()
+    tables = _schema(metadata)
+    metadata.create_all(engine)
+    with engine.begin() as connection:
+        _create(
+            connection,
+            "CREATE TABLE usage_history (id INTEGER PRIMARY KEY, server_id INTEGER "
+            "REFERENCES mcp_servers(id) ON DELETE SET NULL)",
+        )
+        _create(
+            connection,
+            "CREATE TABLE team_link_notes (id INTEGER PRIMARY KEY, link_id INTEGER "
+            "REFERENCES saas_team_mcp_servers(id) ON DELETE CASCADE)",
+        )
+        _seed_legacy(connection, tables)
+        connection.exec_driver_sql("INSERT INTO usage_history VALUES (7, 1)")
+        connection.exec_driver_sql("INSERT INTO team_link_notes VALUES (9, 1)")
+
+        _run(connection, "upgrade")
+
+        assert _ids(connection, tables["mcp_servers"]) == []
+        assert all(ids == [] for ids in _child_ids(connection, tables).values())
+        history = connection.exec_driver_sql("SELECT id, server_id FROM usage_history")
+        assert [tuple(row) for row in history] == [(7, None)]
+        notes = connection.exec_driver_sql("SELECT id FROM team_link_notes").all()
+        assert notes == []
+
+
+@pytest.mark.postgresql
+def test_postgresql_upgrade_refuses_a_protecting_reference(postgresql_engine_factory):
+    engine = postgresql_engine_factory("fk-restrict")
+    metadata = MetaData()
+    tables = _schema(metadata)
+    metadata.create_all(engine)
+    with engine.connect() as connection:
+        transaction = connection.begin()
+        _create(
+            connection,
+            "CREATE TABLE audit_trail (id INTEGER PRIMARY KEY, server_id INTEGER "
+            "REFERENCES mcp_servers(id) ON DELETE RESTRICT)",
+        )
+        _seed_legacy(connection, tables)
+        connection.exec_driver_sql("INSERT INTO audit_trail VALUES (3, 1)")
+
+        with pytest.raises(RuntimeError, match="audit_trail"):
+            _run(connection, "upgrade")
+        transaction.rollback()

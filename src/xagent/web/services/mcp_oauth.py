@@ -439,6 +439,7 @@ async def register_mcp_oauth_public_client(
     authorization_server: OAuthAuthorizationServerMetadata,
     *,
     redirect_uri: str,
+    client_name: str,
 ) -> MCPOAuthClientRegistration:
     """Register an RFC 7591 public client for one MCP authorization server."""
 
@@ -454,7 +455,7 @@ async def register_mcp_oauth_public_client(
     )
     request_payload = {
         "application_type": _dcr_application_type(redirect_uri),
-        "client_name": "Xagent",
+        "client_name": client_name,
         "grant_types": ["authorization_code", "refresh_token"],
         "redirect_uris": [redirect_uri],
         "response_types": ["code"],

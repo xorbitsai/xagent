@@ -137,6 +137,7 @@ def _prepared() -> mcp_api._PreparedMCPOAuthConnect:
         client_secret=None,
         token_endpoint_auth_method="none",
         registration_lookup_hash=None,
+        registration_client_name=None,
         selected_scope="records.read",
         selected_resource=URL,
     )

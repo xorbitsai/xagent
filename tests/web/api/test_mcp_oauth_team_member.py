@@ -166,7 +166,7 @@ class Env:
             self.discovery_calls += 1
             return _discovery(self.discovery_resource)
 
-        async def fake_register(_server, *, redirect_uri):
+        async def fake_register(_server, *, redirect_uri, client_name):
             self.register_calls += 1
             if self.on_register is not None:
                 self.on_register()
@@ -843,6 +843,20 @@ async def test_team_member_connect_keeps_this_callback_after_redirect_uri_edit(e
     flow = env.db.query(MCPOAuthFlowState).one()
     client = env.db.get(MCPOAuthClient, flow.mcp_oauth_client_id)
     assert client.redirect_uri == callback
+
+
+@pytest.mark.asyncio
+async def test_team_member_connect_stores_the_registered_client_name(env, monkeypatch):
+    monkeypatch.setenv("XAGENT_MCP_OAUTH_CLIENT_NAME", "Tobybot")
+
+    response = await env.connect()
+
+    assert response.status_code == 303
+    env.db.expire_all()
+    flow = env.db.query(MCPOAuthFlowState).one()
+    client = env.db.get(MCPOAuthClient, flow.mcp_oauth_client_id)
+    assert client.client_id == "dynamic-client"
+    assert client.registration_client_name == "Tobybot"
 
 
 @pytest.mark.asyncio

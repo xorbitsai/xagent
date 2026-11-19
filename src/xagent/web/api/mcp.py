@@ -48,6 +48,7 @@ from sqlalchemy.orm.exc import StaleDataError
 
 from ...config import (
     get_app_base_url,
+    get_mcp_oauth_client_name,
     get_mcp_tool_init_timeout_seconds,
     get_public_api_base_url,
     get_session_secret,
@@ -1175,6 +1176,7 @@ def _upsert_mcp_oauth_client(
     token_endpoint_auth_method: str,
     redirect_uri: str,
     registration_lookup_hash: str | None = None,
+    registration_client_name: str | None = None,
 ) -> MCPOAuthClient:
     issuer = _bounded_mcp_oauth_value(
         str(discovery.authorization_server.issuer), field_name="issuer"
@@ -1234,6 +1236,7 @@ def _upsert_mcp_oauth_client(
             mcp_server_id=server_id,
             lookup_hash=lookup_hash,
             registration_lookup_hash=registration_lookup_hash,
+            registration_client_name=registration_client_name,
             issuer=issuer,
             client_id=client_id,
         )
@@ -1601,6 +1604,7 @@ def _persist_mcp_oauth_connect_flow(
     token_endpoint_auth_method: str,
     redirect_uri: str,
     registration_lookup_hash: str | None,
+    registration_client_name: str | None,
     resource_owner_key: str,
     selected_issuer: str,
     selected_resource: str,
@@ -1637,6 +1641,7 @@ def _persist_mcp_oauth_connect_flow(
             token_endpoint_auth_method=token_endpoint_auth_method,
             redirect_uri=redirect_uri,
             registration_lookup_hash=registration_lookup_hash,
+            registration_client_name=registration_client_name,
         )
 
         state_value = secrets.token_urlsafe(32)
@@ -1750,6 +1755,7 @@ def _persist_team_member_mcp_oauth_connect_flow(
             token_endpoint_auth_method=prepared.token_endpoint_auth_method,
             redirect_uri=prepared.discovered.redirect_uri,
             registration_lookup_hash=prepared.registration_lookup_hash,
+            registration_client_name=prepared.registration_client_name,
         )
         state_value = secrets.token_urlsafe(32)
         code_verifier = secrets.token_urlsafe(64)
@@ -7401,6 +7407,7 @@ class _PreparedMCPOAuthConnect:
     client_secret: str | None
     token_endpoint_auth_method: str
     registration_lookup_hash: str | None
+    registration_client_name: str | None
     selected_scope: str
     selected_resource: str
 
@@ -7450,6 +7457,7 @@ async def _resolve_mcp_oauth_connect_client(
     redirect_uri = discovered.redirect_uri
     selected_issuer = discovered.selected_issuer
     registration_lookup_hash: str | None = None
+    registration_client_name: str | None = None
     client_id = _configured_mcp_oauth_value(None, auth_config, "client_id")
     client_secret = _configured_mcp_oauth_value(None, auth_config, "client_secret")
     if client_id:
@@ -7474,10 +7482,12 @@ async def _resolve_mcp_oauth_connect_client(
                 },
             )
     else:
+        registration_client_name = get_mcp_oauth_client_name()
         registration_lookup_hash = mcp_oauth_client_registration_lookup_hash(
             server_id,
             selected_issuer,
             redirect_uri,
+            client_name=registration_client_name,
         )
         registered_client = (
             db.query(MCPOAuthClient)
@@ -7500,6 +7510,7 @@ async def _resolve_mcp_oauth_connect_client(
                 registration = await register_mcp_oauth_public_client(
                     discovery.authorization_server,
                     redirect_uri=redirect_uri,
+                    client_name=registration_client_name,
                 )
             except MCPOAuthDiscoveryError as exc:
                 raise HTTPException(
@@ -7520,6 +7531,7 @@ async def _resolve_mcp_oauth_connect_client(
         client_secret=client_secret,
         token_endpoint_auth_method=token_endpoint_auth_method,
         registration_lookup_hash=registration_lookup_hash,
+        registration_client_name=registration_client_name,
         selected_scope=selected_scope,
         selected_resource=selected_resource,
     )
@@ -7692,6 +7704,7 @@ async def _connect_mcp_oauth_for_owner(
         token_endpoint_auth_method=prepared.token_endpoint_auth_method,
         redirect_uri=discovered.redirect_uri,
         registration_lookup_hash=prepared.registration_lookup_hash,
+        registration_client_name=prepared.registration_client_name,
         resource_owner_key=resource_owner_key,
         selected_issuer=discovered.selected_issuer,
         selected_resource=prepared.selected_resource,

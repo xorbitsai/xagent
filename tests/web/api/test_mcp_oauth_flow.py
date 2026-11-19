@@ -60,7 +60,18 @@ from xagent.web.services.mcp_oauth import (
     MCP_OAUTH_SCOPE_MAX_LENGTH,
     MCP_OAUTH_TOKEN_ENDPOINT_AUTH_METHOD_MAX_LENGTH,
     MCP_OAUTH_TOKEN_TYPE_MAX_LENGTH,
+    resolve_mcp_oauth_runtime_auth,
 )
+
+
+@pytest.fixture(autouse=True)
+def default_mcp_oauth_client_name(monkeypatch):
+    """Register under the default client name unless a test sets another one.
+
+    The name may come from ``.env`` or the inherited environment, and several
+    tests here expect the default registration body and lookup hash.
+    """
+    monkeypatch.delenv("XAGENT_MCP_OAUTH_CLIENT_NAME", raising=False)
 
 
 @pytest.fixture()
@@ -193,6 +204,8 @@ def _add_oauth_client(
     client_secret: str | None = None,
     token_endpoint_auth_method: str = "none",
     metadata_json: dict | None = None,
+    registration_lookup_hash: str | None = None,
+    registration_client_name: str | None = None,
 ) -> MCPOAuthClient:
     client = MCPOAuthClient(
         mcp_server_id=server.id,
@@ -204,6 +217,8 @@ def _add_oauth_client(
         token_endpoint_auth_method=token_endpoint_auth_method,
         redirect_uri="https://xagent.example.com/api/mcp/oauth/callback",
         metadata_json=metadata_json,
+        registration_lookup_hash=registration_lookup_hash,
+        registration_client_name=registration_client_name,
     )
     db.add(client)
     db.flush()
@@ -843,6 +858,7 @@ def test_connect_producer_first_blocks_disconnect_until_flow_commit(
         token_endpoint_auth_method="none",
         redirect_uri="https://xagent.example.com/api/mcp/oauth/callback",
         registration_lookup_hash=None,
+        registration_client_name=None,
         resource_owner_key=f"xagent:user:{user.id}",
         selected_issuer="https://auth.example.com",
         selected_resource="https://mcp.example.com/mcp",
@@ -1627,6 +1643,272 @@ async def test_connect_dynamically_registers_public_client_when_client_id_is_emp
     assert db.query(MCPOAuthClient).count() == 1
 
 
+def _add_legacy_registered_client(
+    db, server: MCPServer, *, client_id: str = "legacy-client"
+) -> tuple[MCPOAuthClient, str]:
+    """A row registered before the client name was stored: NULL name."""
+    redirect_uri = "https://xagent.example.com/api/mcp/oauth/callback"
+    legacy_hash = mcp_oauth_client_registration_lookup_hash(
+        server.id,
+        "https://auth.example.com",
+        redirect_uri,
+        client_name=None,
+    )
+    client = _add_oauth_client(
+        db,
+        server,
+        client_id=client_id,
+        registration_lookup_hash=legacy_hash,
+        registration_client_name=None,
+    )
+    db.commit()
+    return client, legacy_hash
+
+
+@pytest.mark.asyncio
+async def test_connect_reuses_a_registration_made_under_the_default_name(
+    db_session, monkeypatch
+):
+    db, user, _ = db_session
+    server = _add_mcp_oauth_server(
+        db,
+        user,
+        client_id="",
+        client_secret=None,
+        token_endpoint_auth_method="none",
+    )
+    legacy_client, _ = _add_legacy_registered_client(db, server)
+
+    async def fake_discover(*args, **kwargs):
+        return _discovery()
+
+    async def fail_dcr(*args, **kwargs):
+        raise AssertionError("a registered client must be reused, not re-registered")
+
+    monkeypatch.setattr(mcp_api, "discover_mcp_oauth_metadata", fake_discover)
+    monkeypatch.setattr(mcp_api, "register_mcp_oauth_public_client", fail_dcr)
+
+    response = await connect_mcp_oauth(
+        server.id,
+        MCPOAuthConnectRequest(redirect_after="/settings/mcp"),
+        user,
+        db,
+    )
+
+    query = parse_qs(urlparse(response.headers["location"]).query)
+    assert query["client_id"] == ["legacy-client"]
+    assert db.query(MCPOAuthClient).count() == 1
+    flow = db.query(MCPOAuthFlowState).one()
+    assert flow.mcp_oauth_client_id == legacy_client.id
+    assert legacy_client.registration_client_name is None
+
+
+@pytest.mark.asyncio
+async def test_connect_registers_again_when_the_client_name_changed(
+    db_session, monkeypatch
+):
+    db, user, _ = db_session
+    monkeypatch.setenv("XAGENT_MCP_OAUTH_CLIENT_NAME", "Tobybot")
+    server = _add_mcp_oauth_server(
+        db,
+        user,
+        client_id="",
+        client_secret=None,
+        token_endpoint_auth_method="none",
+    )
+    legacy_client, legacy_hash = _add_legacy_registered_client(db, server)
+    registration_calls: list[tuple[str, str]] = []
+
+    async def fake_discover(*args, **kwargs):
+        return _discovery()
+
+    async def fake_register(_server, *, redirect_uri, client_name):
+        registration_calls.append((redirect_uri, client_name))
+        return SimpleNamespace(
+            client_id="tobybot-client", token_endpoint_auth_method="none"
+        )
+
+    monkeypatch.setattr(mcp_api, "discover_mcp_oauth_metadata", fake_discover)
+    monkeypatch.setattr(mcp_api, "register_mcp_oauth_public_client", fake_register)
+
+    response = await connect_mcp_oauth(
+        server.id,
+        MCPOAuthConnectRequest(redirect_after="/settings/mcp"),
+        user,
+        db,
+    )
+
+    assert registration_calls == [
+        ("https://xagent.example.com/api/mcp/oauth/callback", "Tobybot")
+    ]
+    query = parse_qs(urlparse(response.headers["location"]).query)
+    assert query["client_id"] == ["tobybot-client"]
+    old_client, new_client = db.query(MCPOAuthClient).order_by(MCPOAuthClient.id).all()
+    assert old_client.id == legacy_client.id
+    assert old_client.client_id == "legacy-client"
+    assert old_client.registration_lookup_hash == legacy_hash
+    assert old_client.registration_client_name is None
+    assert new_client.client_id == "tobybot-client"
+    assert new_client.registration_client_name == "Tobybot"
+    assert new_client.registration_lookup_hash == (
+        mcp_oauth_client_registration_lookup_hash(
+            server.id,
+            "https://auth.example.com",
+            "https://xagent.example.com/api/mcp/oauth/callback",
+            client_name="Tobybot",
+        )
+    )
+    flow = db.query(MCPOAuthFlowState).one()
+    assert flow.mcp_oauth_client_id == new_client.id
+
+
+@pytest.mark.asyncio
+async def test_connect_reuses_a_registration_made_under_the_configured_name(
+    db_session, monkeypatch
+):
+    db, user, _ = db_session
+    monkeypatch.setenv("XAGENT_MCP_OAUTH_CLIENT_NAME", "Tobybot")
+    server = _add_mcp_oauth_server(
+        db,
+        user,
+        client_id="",
+        client_secret=None,
+        token_endpoint_auth_method="none",
+    )
+    tobybot_hash = mcp_oauth_client_registration_lookup_hash(
+        server.id,
+        "https://auth.example.com",
+        "https://xagent.example.com/api/mcp/oauth/callback",
+        client_name="Tobybot",
+    )
+    tobybot_client = _add_oauth_client(
+        db,
+        server,
+        client_id="tobybot-client",
+        registration_lookup_hash=tobybot_hash,
+        registration_client_name="Tobybot",
+    )
+    db.commit()
+
+    async def fake_discover(*args, **kwargs):
+        return _discovery()
+
+    async def fail_dcr(*args, **kwargs):
+        raise AssertionError("a registered client must be reused, not re-registered")
+
+    monkeypatch.setattr(mcp_api, "discover_mcp_oauth_metadata", fake_discover)
+    monkeypatch.setattr(mcp_api, "register_mcp_oauth_public_client", fail_dcr)
+
+    response = await connect_mcp_oauth(
+        server.id,
+        MCPOAuthConnectRequest(redirect_after="/settings/mcp"),
+        user,
+        db,
+    )
+
+    query = parse_qs(urlparse(response.headers["location"]).query)
+    assert query["client_id"] == ["tobybot-client"]
+    assert db.query(MCPOAuthClient).count() == 1
+    flow = db.query(MCPOAuthFlowState).one()
+    assert flow.mcp_oauth_client_id == tobybot_client.id
+
+
+@pytest.mark.asyncio
+async def test_existing_grant_refreshes_with_the_client_that_issued_it(
+    db_session, monkeypatch
+):
+    db, user, _ = db_session
+    monkeypatch.setenv("XAGENT_MCP_OAUTH_CLIENT_NAME", "Tobybot")
+    server = _add_mcp_oauth_server(
+        db,
+        user,
+        client_id="",
+        client_secret=None,
+        token_endpoint_auth_method="none",
+    )
+    legacy_client, _ = _add_legacy_registered_client(db, server)
+
+    async def fake_discover(*args, **kwargs):
+        return _discovery()
+
+    async def fake_register(_server, *, redirect_uri, client_name):
+        return SimpleNamespace(
+            client_id="tobybot-client", token_endpoint_auth_method="none"
+        )
+
+    monkeypatch.setattr(mcp_api, "discover_mcp_oauth_metadata", fake_discover)
+    monkeypatch.setattr(mcp_api, "register_mcp_oauth_public_client", fake_register)
+
+    await connect_mcp_oauth(
+        server.id,
+        MCPOAuthConnectRequest(redirect_after="/settings/mcp"),
+        user,
+        db,
+    )
+    assert db.query(MCPOAuthClient).count() == 2
+
+    grant = MCPOAuthGrant(
+        mcp_server_id=server.id,
+        user_id=user.id,
+        mcp_oauth_client_id=legacy_client.id,
+        resource_owner_key=mcp_api._default_resource_owner_key(user.id),
+        issuer="https://auth.example.com",
+        resource="https://mcp.example.com/mcp",
+        scope="records.read",
+        access_token=mcp_api.encrypt_value("old-access-token"),
+        refresh_token=mcp_api.encrypt_value("old-refresh-token"),
+        token_type="Bearer",
+        status="active",
+        expires_at=mcp_api._utc_now() - timedelta(minutes=1),
+    )
+    db.add(grant)
+    db.commit()
+
+    token_requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        token_requests.append(request)
+        return httpx.Response(
+            200,
+            json={
+                "access_token": "refreshed-access-token",
+                "token_type": "Bearer",
+                "expires_in": 3600,
+            },
+        )
+
+    refresh_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    monkeypatch.setattr(
+        mcp_oauth_service,
+        "create_mcp_oauth_http_client",
+        lambda **kwargs: refresh_client,
+    )
+
+    runtime_auth = await resolve_mcp_oauth_runtime_auth(
+        db,
+        server_id=server.id,
+        user_id=user.id,
+        auth_config=mcp_api._get_mcp_oauth_config(server),
+        resource_owner_key=mcp_api._default_resource_owner_key(user.id),
+    )
+
+    assert runtime_auth.refreshed is True
+    assert runtime_auth.access_token == "refreshed-access-token"
+    assert runtime_auth.grant_id == grant.id
+    assert len(token_requests) == 1
+    assert str(token_requests[0].url) == "https://auth.example.com/token"
+    form = parse_qs(token_requests[0].content.decode())
+    assert form["client_id"] == ["legacy-client"]
+    assert form["refresh_token"] == ["old-refresh-token"]
+    assert (
+        db.query(MCPOAuthClient)
+        .filter(MCPOAuthClient.client_id == "tobybot-client")
+        .one()
+        .registration_client_name
+        == "Tobybot"
+    )
+
+
 def test_default_mcp_oauth_redirect_uri_prefers_public_api_base(monkeypatch):
     monkeypatch.setenv("XAGENT_PUBLIC_API_BASE_URL", "https://api.xagent.test/base/")
     monkeypatch.setenv("XAGENT_APP_BASE_URL", "https://frontend.xagent.test/")
@@ -1757,6 +2039,7 @@ def test_dynamic_client_conflict_adopts_registered_winner(db_session, monkeypatc
         server.id,
         "https://auth.example.com",
         "https://xagent.example.com/api/mcp/oauth/callback",
+        client_name=None,
     )
     flush_calls = 0
 

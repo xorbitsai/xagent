@@ -1986,21 +1986,6 @@ def test_list_collections_forwards_query(monkeypatch):
     assert "$query: String!" in body["query"]
 
 
-def test_shopify_app_registry_requires_store_domain_and_token():
-    from xagent.web.builtin_mcp_registry import get_builtin_public_mcp_app_rows
-
-    shopify_app = next(
-        row for row in get_builtin_public_mcp_app_rows() if row["app_id"] == "shopify"
-    )
-    assert shopify_app["provider_name"] is None
-    assert shopify_app["category"] == "Commerce"
-    assert shopify_app["transport"] == "stdio"
-    assert shopify_app["launch_config"]["required_env"] == [
-        "SHOPIFY_STORE_DOMAIN",
-        "SHOPIFY_ACCESS_TOKEN",
-    ]
-
-
 def test_custom_shopify_catalog_row_is_not_overlaid_as_builtin():
     from types import SimpleNamespace
 
@@ -2029,3 +2014,82 @@ def test_custom_shopify_catalog_row_is_not_overlaid_as_builtin():
     assert rendered["name"] == "Custom Shopify"
     assert rendered["launch_config"] == custom_launch
     assert is_builtin_public_mcp_app("shopify") is True
+
+
+# ---------- expired or revoked authorization (#2810) --------------------------
+
+_REAL_GRANTED_ADMIN_SCOPES = shopify._granted_admin_scopes
+_REVOKED_BODY = {
+    "errors": "[API] Invalid API key or access token (unrecognized login or "
+    "wrong password) shpat_test_token"
+}
+
+
+@pytest.mark.parametrize("mutation", [False, True])
+def test_graphql_401_asks_to_reconnect_without_retrying_or_leaking(
+    monkeypatch, mutation
+):
+    """An OAuth token expires or is revoked; retrying cannot heal that, and a
+    401 means the write never ran, so the outcome is not indeterminate."""
+    post = Mock(return_value=MockResponse(status_code=401, json_data=_REVOKED_BODY))
+    monkeypatch.setattr(shopify.requests, "post", post)
+
+    with pytest.raises(RuntimeError) as excinfo:
+        shopify._graphql("query { shop { id } }", mutation=mutation)
+
+    assert not isinstance(excinfo.value, shopify.MutationOutcomeIndeterminate)
+    message = str(excinfo.value)
+    assert "reconnect Shopify" in message
+    assert "shpat_test_token" not in message
+    assert post.call_count == 1
+
+
+def test_graphql_401_hint_survives_a_long_error_body(monkeypatch):
+    """A WAF or HTML 401 page can fill the error-length cap on its own; the
+    reconnect hint must still reach the tool result."""
+    page = "<html>" + "x" * 5000 + "</html>"
+    monkeypatch.setattr(
+        shopify.requests,
+        "post",
+        Mock(return_value=MockResponse(status_code=401, text=page, json_raises=True)),
+    )
+
+    with pytest.raises(RuntimeError) as excinfo:
+        shopify._graphql("query { shop { id } }")
+
+    assert "reconnect Shopify" in shopify._error(str(excinfo.value))
+
+
+def test_scope_check_401_asks_to_reconnect(monkeypatch):
+    monkeypatch.setattr(
+        shopify.requests,
+        "get",
+        Mock(return_value=MockResponse(status_code=401, json_data=_REVOKED_BODY)),
+    )
+
+    with pytest.raises(RuntimeError) as excinfo:
+        _REAL_GRANTED_ADMIN_SCOPES()
+
+    message = str(excinfo.value)
+    assert "reconnect Shopify" in message
+    assert "shpat_test_token" not in message
+
+
+def test_graphql_403_is_not_reported_as_an_expired_authorization(monkeypatch):
+    """A 403 is a permission problem, not a dead token."""
+    monkeypatch.setattr(
+        shopify.requests,
+        "post",
+        Mock(
+            return_value=MockResponse(
+                status_code=403, json_data={"errors": "Access denied"}
+            )
+        ),
+    )
+
+    with pytest.raises(RuntimeError) as excinfo:
+        shopify._graphql("query { shop { id } }")
+
+    message = str(excinfo.value)
+    assert "Access denied" in message
+    assert "reconnect Shopify" not in message

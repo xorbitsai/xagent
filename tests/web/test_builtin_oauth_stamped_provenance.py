@@ -51,7 +51,7 @@ STAMPED_BUILTIN_OAUTH_APPS = {
     "whatsapp": "meta",
 }
 # Stamped too, but hidden until verified, so the actor paths refuse them.
-HIDDEN_STAMPED_BUILTIN_OAUTH_APPS = {"zendesk"}
+HIDDEN_STAMPED_BUILTIN_OAUTH_APPS = {"zendesk", "shopify"}
 
 
 @pytest.fixture

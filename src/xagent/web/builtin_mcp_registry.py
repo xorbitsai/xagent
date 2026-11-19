@@ -327,6 +327,27 @@ def get_builtin_oauth_provider_rows() -> list[dict[str, Any]]:
             "default_scopes": ["read"],
         },
         {
+            "provider_name": "shopify",
+            "name": "Shopify",
+            # Left blank so SHOPIFY_CLIENT_ID/SHOPIFY_CLIENT_SECRET/
+            # SHOPIFY_REDIRECT_URI are read at request time, as for Zendesk.
+            "client_id": "",
+            "client_secret": "",
+            # Every Shopify endpoint lives on the store's own
+            # {store}.myshopify.com host, so the authorize and token URLs come
+            # from the code-owned OAUTH_ACCOUNT_HOSTS entry. Shopify has no
+            # userinfo endpoint: the callback reads the shop's identity
+            # through shopify_oauth.fetch_shopify_shop_identity.
+            "auth_url": "",
+            "token_url": "",
+            "redirect_uri": "",
+            "userinfo_url": "",
+            "user_id_path": "",
+            "email_path": "",
+            # The connector's scopes come from its catalog row.
+            "default_scopes": [],
+        },
+        {
             "provider_name": "salesforce",
             "name": "Salesforce",
             "client_id": os.environ.get("SALESFORCE_CLIENT_ID", ""),
@@ -2067,34 +2088,34 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
         {
             "app_id": "shopify",
             "name": "Shopify",
-            "description": "Connect a Shopify custom app with a store label (for example, acme for acme.myshopify.com) and Admin API access token. Grant write_products, write_orders, and read_customers; read_all_orders is optional for orders older than 60 days.",
+            "description": "Connect to Shopify to search and manage products, look up and update orders, and look up customers and collections. Orders older than 60 days need the read_all_orders scope, which is not requested.",
             "icon": "https://www.google.com/s2/favicons?domain=shopify.com&sz=128",
-            "transport": "stdio",
-            "provider_name": None,
+            "transport": "oauth",
+            "provider_name": "shopify",
             "category": "Commerce",
-            "oauth_scopes": None,
-            "is_visible_in_connector": True,
+            # Exactly the scopes the callback requires
+            # (shopify_oauth.SHOPIFY_REQUIRED_SCOPES). read_all_orders also
+            # needs Shopify's approval, so it is not requested.
+            "oauth_scopes": ["write_products", "write_orders", "read_customers"],
+            # Hidden until verified against a development store, as Zendesk
+            # was. Shopify App Store installs must not ask for the store
+            # name, so production shows it only once the Shopify-initiated
+            # install entry exists. Not builtin-protected: an operator shows
+            # it without a redeploy.
+            "is_visible_in_connector": False,
+            # Per-store OAuth (#2810). The store handle the grant was issued
+            # for is stored as instance_url and injected next to the token,
+            # so the connector always calls the store the token belongs to.
             "launch_config": {
                 "command": "python",
                 "args": ["-m", "xagent.web.tools.mcp.shopify"],
-                "required_env": [
-                    "SHOPIFY_STORE_DOMAIN",
-                    "SHOPIFY_ACCESS_TOKEN",
-                ],
-                "required_admin_scopes": [
-                    "write_products",
-                    "write_orders",
-                    "read_customers",
-                ],
-                "optional_admin_scopes": ["read_all_orders"],
-                # Compatibility metadata only. Current main ignores this
-                # field; a later actor-scoped stdio runtime can recognize
-                # that credentials are personal without this PR enabling
-                # delegated/Toby access or bypassing current isolation.
-                "credential_scope": "personal",
-                # Stable ownership marker used by the seed migration. It is
-                # intentionally inside launch_config because current main
-                # has no dedicated catalog-provenance column.
+                "env_mapping": {
+                    "SHOPIFY_ACCESS_TOKEN": "access_token",
+                    "SHOPIFY_STORE_DOMAIN": "instance_url",
+                },
+                # Stable ownership marker. It is intentionally inside
+                # launch_config because current main has no dedicated
+                # catalog-provenance column.
                 "builtin_provenance": {
                     "registry": "xagent",
                     "app_id": "shopify",
@@ -2595,7 +2616,8 @@ def seed_builtin_oauth_and_public_mcp_apps(bind: Connection) -> None:
         )
         builtin_app_rows = get_builtin_public_mcp_app_rows()
         protected_server_identities = (
-            ("shopify", "Shopify", "shopify"),
+            # An OAuth catalog connect names the server after the app.
+            ("shopify", "Shopify", "Shopify"),
             ("excel", "Excel", "Excel"),
             ("whatsapp", "WhatsApp Business", "WhatsApp Business"),
             ("planner", "Planner", "Planner"),

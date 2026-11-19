@@ -145,6 +145,7 @@ UNVERIFIABLE: dict[str, str] = {
     "linkedin": _TOKEN_FIRST,
     "slack": _TOKEN_FIRST,
     "zendesk": "the token endpoint is on the customer's own subdomain",
+    "shopify": "the token endpoint is on the merchant's own store host",
     "deputy": "the token endpoint is on the customer's own install",
 }
 # Pre-registered MCP clients, by credential provider. HubSpot answered a

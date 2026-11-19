@@ -330,6 +330,19 @@ def _throttle_wait_seconds(status_code: int, payload: Any) -> float | None:
     return 1.0
 
 
+# Shopify access tokens last an hour and are refreshed when a task starts, so
+# a 401 means the token expired during a long task, or the authorization was
+# revoked (the app was uninstalled). Retrying the request heals neither. A 403
+# is a permission problem instead and keeps its own message.
+# The hint leads the message: the error text is capped, and a long 401 body
+# (an HTML or WAF page) would otherwise push the hint past the cap.
+_REAUTHORIZE_HINT = (
+    "Shopify rejected the access token: it may have expired during a long "
+    "task, so try again in a new task; if that also fails, the authorization "
+    "was revoked, so reconnect Shopify."
+)
+
+
 class MutationOutcomeIndeterminate(RuntimeError):
     """The request may have reached Shopify, so retrying could duplicate a write."""
 
@@ -341,7 +354,7 @@ def _raise_response_shape(message: str, *, mutation: bool) -> NoReturn:
 
 
 def _granted_admin_scopes() -> set[str]:
-    """Read the scopes granted to the current custom-app token."""
+    """Read the scopes granted to the current access token."""
     try:
         response = requests.get(
             _scopes_url(),
@@ -357,6 +370,10 @@ def _granted_admin_scopes() -> set[str]:
         raise RuntimeError(
             "Shopify scope validation returned an unexpected redirect "
             f"(HTTP {response.status_code})"
+        )
+    if response.status_code == 401:
+        raise RuntimeError(
+            f"{_REAUTHORIZE_HINT} (Shopify scope validation failed, HTTP 401)"
         )
     if response.status_code >= 400:
         raise RuntimeError(
@@ -504,6 +521,10 @@ def _graphql(
         message = (
             f"Shopify API error (status {response.status_code}): {_safe_text(detail)}"
         )
+        if response.status_code == 401:
+            # Shopify rejected the token before running anything, so even a
+            # mutation's outcome is known; retrying cannot heal it.
+            raise RuntimeError(f"{_REAUTHORIZE_HINT} {message}")
         if mutation and response.status_code >= 500:
             raise MutationOutcomeIndeterminate(
                 message

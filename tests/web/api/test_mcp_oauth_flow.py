@@ -64,6 +64,16 @@ from xagent.web.services.mcp_oauth import (
 )
 
 
+@pytest.fixture(autouse=True)
+def default_mcp_oauth_client_name(monkeypatch):
+    """Register under the default client name unless a test sets another one.
+
+    The name may come from ``.env`` or the inherited environment, and several
+    tests here expect the default registration body and lookup hash.
+    """
+    monkeypatch.delenv("XAGENT_MCP_OAUTH_CLIENT_NAME", raising=False)
+
+
 @pytest.fixture()
 def db_session(tmp_path):
     db_path = tmp_path / "mcp-oauth.db"
@@ -1660,7 +1670,6 @@ async def test_connect_reuses_a_registration_made_under_the_default_name(
     db_session, monkeypatch
 ):
     db, user, _ = db_session
-    monkeypatch.delenv("XAGENT_MCP_OAUTH_CLIENT_NAME", raising=False)
     server = _add_mcp_oauth_server(
         db,
         user,

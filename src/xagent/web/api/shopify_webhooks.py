@@ -11,20 +11,23 @@ compliance topics (``customers/data_request``, ``customers/redact`` and
 - ``shop/redact`` (about 48 hours after an uninstall): the same deletion, again,
   in case anything was left behind. The grant is everything this deployment
   keeps about a store.
+- ``customers/redact`` and ``customers/data_request``: no per-customer records
+  are kept, so these are acknowledged and logged without the customer's
+  details.
 
-A grant written after the event happened (``X-Shopify-Triggered-At``) is kept:
-Shopify retries for hours and does not deliver in order, so a late
-``app/uninstalled`` must not delete the grant of a merchant who has since
-reconnected. Without a usable time every grant for the store is deleted.
+A grant written after the uninstall is kept: the uninstall revoked the
+store's token, so only a new install writes one, and Shopify retries for hours
+without keeping order, so a late delivery must not delete the grant of a
+merchant who has since reconnected. The uninstall happened at
+``X-Shopify-Triggered-At`` for ``app/uninstalled`` and
+``SHOP_REDACT_DELAY`` before it for ``shop/redact``. Without a usable time
+every grant for the store is deleted.
 
 The store is matched by its label (``<label>.myshopify.com`` in the body) or
 by the shop's id, which the callback stores as the grant's identity
 (``gid://shopify/Shop/<id>``). Grants of an administrator-created
 ``shopify-*`` provider row belong to another Shopify app, signed with another
 secret, and are not touched.
-- ``customers/redact`` and ``customers/data_request``: no per-customer records
-  are kept, so these are acknowledged and logged without the customer's
-  details.
 
 Shopify signs the raw body, not the headers (``verify_shopify_webhook``), so
 the store comes from the signed body, and a topic that deletes data must carry
@@ -32,8 +35,8 @@ its own body shape: a signed customer request relabelled ``shop/redact``
 deletes nothing. Every topic is idempotent, so retries and repeated deliveries
 are harmless.
 
-A multi-region deployment (xagent-saas) reuses :func:`read_shopify_webhook`
-and :func:`apply_shopify_webhook` to apply one delivery on every region, since
+A multi-region deployment (xagent-saas) reuses
+:func:`receive_verified_shopify_webhook` to apply one delivery on every region, since
 Shopify sends it to a single address and no region knows where a store's
 grants live.
 """
@@ -43,7 +46,7 @@ import logging
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, cast
 
 from fastapi import APIRouter, Depends, Request, Response
@@ -74,6 +77,8 @@ TOPIC_CUSTOMERS_DATA_REQUEST = "customers/data_request"
 _STORE_DELETING_TOPICS = frozenset({TOPIC_APP_UNINSTALLED, TOPIC_SHOP_REDACT})
 _CUSTOMER_TOPICS = frozenset({TOPIC_CUSTOMERS_REDACT, TOPIC_CUSTOMERS_DATA_REQUEST})
 _SHOP_GID_PREFIX = "gid://shopify/Shop/"
+# Shopify sends shop/redact this long after the uninstall.
+SHOP_REDACT_DELAY = timedelta(hours=48)
 # Header values are unsigned; only a plain id is worth putting in a log line.
 _LOGGABLE_ID = re.compile(r"[A-Za-z0-9-]{1,64}")
 
@@ -238,13 +243,16 @@ def _delete_store_grants(db: Session, webhook: ShopifyWebhook) -> tuple[int, int
         )
         .all()
     )
+    uninstalled_at = webhook.triggered_at
+    if uninstalled_at is not None and webhook.topic == TOPIC_SHOP_REDACT:
+        uninstalled_at -= SHOP_REDACT_DELAY
     kept = 0
     for grant in grants:
         written_at = _written_at(grant)
         if (
-            webhook.triggered_at is not None
+            uninstalled_at is not None
             and written_at is not None
-            and written_at > webhook.triggered_at
+            and written_at > uninstalled_at
         ):
             kept += 1
             continue

@@ -347,6 +347,58 @@ def test_a_late_event_keeps_a_grant_written_after_it(client, shopify_db):
     assert _stores(db) == [("shopify", "acme", "actor:toby:1")]
 
 
+def test_a_reconnect_after_the_uninstall_survives_a_late_uninstall(client, shopify_db):
+    """The callback writes a new row on reconnect: only created_at is set."""
+    _, db, user, _ = shopify_db
+    uninstalled_at = datetime(2026, 11, 19, 7, 0, tzinfo=timezone.utc)
+    reconnected = _grant(user)
+    reconnected.created_at = uninstalled_at + timedelta(minutes=5)
+    db.add(reconnected)
+    db.commit()
+    assert db.query(UserOAuth).one().updated_at is None
+
+    response = _post(
+        client, "app/uninstalled", UNINSTALLED, triggered_at="2026-11-19T07:00:00Z"
+    )
+
+    assert response.status_code == 200
+    assert _stores(db) == [("shopify", "acme", None)]
+
+
+def test_a_grant_written_at_the_event_time_goes(client, shopify_db):
+    _, db, user, _ = shopify_db
+    grant = _grant(user)
+    grant.created_at = datetime(2026, 11, 19, 7, 0, tzinfo=timezone.utc)
+    db.add(grant)
+    db.commit()
+    response = _post(
+        client, "app/uninstalled", UNINSTALLED, triggered_at="2026-11-19T07:00:00Z"
+    )
+    assert response.status_code == 200
+    assert _stores(db) == []
+
+
+def test_shop_redact_keeps_a_reinstall_from_the_48_hours_before_it(client, shopify_db):
+    """shop/redact comes 48 hours after the uninstall; a merchant who
+    reinstalled in between keeps the new grant, and older ones go."""
+    _, db, user, other = shopify_db
+    redact_at = datetime(2026, 11, 21, 7, 0, tzinfo=timezone.utc)
+    reinstalled = _grant(user)
+    reinstalled.created_at = redact_at - timedelta(hours=40)
+    before_uninstall = _grant(other)
+    before_uninstall.created_at = redact_at - timedelta(hours=50)
+    db.add_all([reinstalled, before_uninstall])
+    db.commit()
+
+    response = _post(
+        client, "shop/redact", SHOP_REDACT, triggered_at="2026-11-21T07:00:00Z"
+    )
+
+    assert response.status_code == 200
+    db.expire_all()
+    assert [grant.user_id for grant in db.query(UserOAuth).all()] == [user.id]
+
+
 @pytest.mark.parametrize("triggered_at", [None, "yesterday", "2026-11-19T07:00:00"])
 def test_without_a_usable_event_time_every_grant_for_the_store_goes(
     client, shopify_db, triggered_at

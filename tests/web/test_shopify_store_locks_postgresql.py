@@ -105,54 +105,20 @@ def test_the_callback_holds_its_store_through_the_code_exchange(
     assert _lock_is_free(db, "acme") is True
 
 
-def test_concurrent_refreshes_in_one_event_loop_take_turns(shopify_pg, monkeypatch):
-    """The second resolution waits for the store off the event loop, so the
-    first one's refresh can finish and the second uses its token."""
+def test_two_owners_refreshing_one_store_take_turns_off_the_event_loop(
+    shopify_pg, monkeypatch
+):
+    """The second owner waits for the store lock off the event loop, so the
+    first one's refresh finishes and the loop keeps running meanwhile."""
     db, user = shopify_pg
-    shop._held_grant(db, user, expires_in=-timedelta(minutes=1))
-    posted: list[str] = []
 
-    class SlowAsyncClient:
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, exc_type, exc, tb):
-            return None
-
-        async def post(self, url, **kwargs):
-            posted.append(url)
-            await asyncio.sleep(0.2)
-            return shop._Response(
-                {
-                    "access_token": "rotated-access",
-                    "refresh_token": "rotated-refresh",
-                    "expires_in": 3600,
-                }
-            )
-
-    monkeypatch.setattr(tool_config, "create_public_async_client", SlowAsyncClient)
-    factory = sessionmaker(bind=db.get_bind(), autoflush=False, autocommit=False)
-
-    async def resolve_twice():
-        config = tool_config.WebToolConfig(
-            db=None, request=None, db_factory=factory, user_id=user.id
-        )
-        return await asyncio.wait_for(
-            asyncio.gather(
-                *(
-                    config._resolve_legacy_oauth_access_token(
-                        provider_name="shopify", app_id=shop.TEST_APP_ID
-                    )
-                    for _ in range(2)
-                )
-            ),
-            timeout=10,
-        )
-
-    resolutions = asyncio.run(resolve_twice())
+    resolutions, most_in_flight, ticks = shop.refresh_two_owners_at_once(
+        db, user, monkeypatch, timeout=10
+    )
 
     assert [r.access_token for r in resolutions] == ["rotated-access"] * 2
-    assert len(posted) == 1
+    assert most_in_flight == 1
+    assert ticks >= 20
 
 
 def test_an_actor_refresh_locks_the_store_before_its_grant_row(shopify_pg, monkeypatch):

@@ -1242,6 +1242,39 @@ def test_a_token_that_needs_no_refresh_does_not_wait_for_the_store(
     assert posted == []
 
 
+@pytest.mark.parametrize("failure", ["transient", "permanent"])
+def test_a_failed_refresh_releases_the_store(shopify_db, monkeypatch, failure):
+    db, user = shopify_db
+    grant = _held_grant(db, user, expires_in=-timedelta(minutes=1))
+    if failure == "permanent":
+        # No refresh token: the grant can never be refreshed.
+        grant.refresh_token = None
+        db.commit()
+    posted: list = []
+
+    class FailingAsyncClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return None
+
+        async def post(self, url, **kwargs):
+            posted.append(url)
+            return _Response({"errors": "unavailable"}, status_code=503)
+
+    monkeypatch.setattr(tool_config, "create_public_async_client", FailingAsyncClient)
+
+    resolution = _resolve_shopify(db, user.id)
+
+    assert resolution.access_token is None
+    assert resolution.credential_present is True
+    # A transient failure is retried within the refresh; a missing refresh
+    # token never reaches the provider.
+    assert bool(posted) == (failure == "transient")
+    assert _probe_store_lock(db) is True
+
+
 def test_a_refresh_that_waited_for_the_store_uses_the_newer_token(
     shopify_db, monkeypatch
 ):
@@ -1325,15 +1358,19 @@ def test_an_actor_refresh_locks_the_store_before_its_grant(shopify_db, monkeypat
     assert store_lock < row_lock
 
 
-def test_concurrent_refreshes_in_one_event_loop_take_turns(shopify_db, monkeypatch):
-    """Two tool calls of one process resolve the same expired grant at once.
-    The store lock is waited for off the event loop: waiting on it there
-    would stop the loop, and with it the refresh that holds the lock."""
+def refresh_two_owners_at_once(db, user, monkeypatch, *, timeout: float):
+    """Two owners of one store resolve their expired grants in one event loop.
+
+    Different owners take different in-process locks, so only the database
+    store lock makes them take turns. Returns the resolutions, the most
+    refreshes in flight at once, and how often the loop ticked meanwhile.
+    """
     import asyncio
 
-    db, user = shopify_db
+    bob = _other_user(db)
     _held_grant(db, user, expires_in=-timedelta(minutes=1))
-    posted: list = []
+    _held_grant(db, bob, expires_in=-timedelta(minutes=1))
+    in_flight: list[int] = [0, 0]
 
     class SlowAsyncClient:
         async def __aenter__(self):
@@ -1343,8 +1380,12 @@ def test_concurrent_refreshes_in_one_event_loop_take_turns(shopify_db, monkeypat
             return None
 
         async def post(self, url, **kwargs):
-            posted.append(url)
-            await asyncio.sleep(0.2)
+            in_flight[0] += 1
+            in_flight[1] = max(in_flight[1], in_flight[0])
+            try:
+                await asyncio.sleep(0.2)
+            finally:
+                in_flight[0] -= 1
             return _Response(
                 {
                     "access_token": "rotated-access",
@@ -1356,27 +1397,55 @@ def test_concurrent_refreshes_in_one_event_loop_take_turns(shopify_db, monkeypat
     monkeypatch.setattr(tool_config, "create_public_async_client", SlowAsyncClient)
     factory = sessionmaker(bind=db.get_bind(), autoflush=False, autocommit=False)
 
-    async def resolve_twice():
-        config = tool_config.WebToolConfig(
-            db=None, request=None, db_factory=factory, user_id=user.id
-        )
-        return await asyncio.wait_for(
-            asyncio.gather(
-                *(
-                    config._resolve_legacy_oauth_access_token(
-                        provider_name="shopify", app_id=TEST_APP_ID
-                    )
-                    for _ in range(2)
-                )
-            ),
-            timeout=4,
-        )
+    async def resolve_both():
+        ticks = 0
+        done = False
 
-    resolutions = asyncio.run(resolve_twice())
+        async def tick():
+            nonlocal ticks
+            while not done:
+                ticks += 1
+                await asyncio.sleep(0.01)
+
+        ticker = asyncio.create_task(tick())
+        try:
+            resolutions = await asyncio.wait_for(
+                asyncio.gather(
+                    *(
+                        tool_config.WebToolConfig(
+                            db=None, request=None, db_factory=factory, user_id=uid
+                        )._resolve_legacy_oauth_access_token(
+                            provider_name="shopify", app_id=TEST_APP_ID
+                        )
+                        for uid in (user.id, bob.id)
+                    )
+                ),
+                timeout=timeout,
+            )
+        finally:
+            done = True
+            await ticker
+        return resolutions, ticks
+
+    resolutions, ticks = asyncio.run(resolve_both())
+    return resolutions, in_flight[1], ticks
+
+
+def test_two_owners_refreshing_one_store_take_turns_off_the_event_loop(
+    shopify_db, monkeypatch
+):
+    """The store lock is waited for off the event loop: waiting on it there
+    would stop the loop, and with it the refresh that holds the lock."""
+    db, user = shopify_db
+
+    resolutions, most_in_flight, ticks = refresh_two_owners_at_once(
+        db, user, monkeypatch, timeout=4
+    )
 
     assert [r.access_token for r in resolutions] == ["rotated-access"] * 2
-    # The second one waited and used the first one's token.
-    assert len(posted) == 1
+    assert most_in_flight == 1
+    # Two 0.2 s refreshes in turn, with the loop free throughout.
+    assert ticks >= 20
 
 
 @pytest.mark.parametrize(

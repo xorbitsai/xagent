@@ -3173,7 +3173,7 @@ def test_legacy_oauth_session_uses_engine_when_caller_is_connection_bound():
     caller_db = Session(bind=connection)
     cfg = WebToolConfig(db=caller_db, request=None, user_id=1)
 
-    oauth_db = cfg._new_legacy_oauth_session()
+    oauth_db = cfg._legacy_oauth_session_factory()()
     try:
         assert caller_db.get_bind() is connection
         assert oauth_db.get_bind() is engine

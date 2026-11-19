@@ -4476,10 +4476,6 @@ class WebToolConfig(BaseToolConfig):
             )
         return cast(Callable[[], Any], self.get_session_factory())
 
-    def _new_legacy_oauth_session(self) -> Any:
-        """Open the transaction owner for legacy OAuth token maintenance."""
-        return self._legacy_oauth_session_factory()()
-
     async def _finish_legacy_oauth_access_token_resolution(
         self,
         *,
@@ -5044,12 +5040,12 @@ class WebToolConfig(BaseToolConfig):
                 if (locked_store or "").lower() == (peeked_store or "").lower():
                     break
                 # The grant changed after the peek: the actor reconnected to
-                # another store, connected at all, or disconnected (on
-                # PostgreSQL a same-store reconnect also lands here when the
-                # locking read waited for the old row's delete). Locking
-                # another store now, with the row held, would invert the
-                # callback's order and can deadlock: release everything and
-                # read the store again.
+                # another store, connected at all, or disconnected. (A
+                # reconnect to the peeked store cannot land here: it holds
+                # that store's lock until it commits.) Locking another store
+                # now, with the row held, would invert the callback's order
+                # and can deadlock: release everything and read the store
+                # again.
                 logger.info(
                     "OAUTH CONFIG: Actor Shopify grant changed store during "
                     "resolution for user %s; retrying",

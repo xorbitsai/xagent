@@ -43,6 +43,16 @@ ENCRYPTED_COLUMNS = {
     "agent_triggers": ("secret_encrypted",),
     "trigger_runs": ("payload_snapshot",),
     "global_memory_embedding_authority": ("api_key_encrypted",),
+    # Ciphertext copied verbatim from the columns above by the revocation
+    # outbox triggers (models.credential_revocation). Its client_id holds an
+    # MCP client's plain id or a GitHub app's encrypted one; only
+    # Fernet-shaped values are rotated, so both are handled.
+    "credential_revocations": (
+        "access_token",
+        "refresh_token",
+        "client_id",
+        "client_secret",
+    ),
 }
 _REQUIRED_CIPHERTEXT = {
     ("models", "_api_key_encrypted"),
@@ -68,6 +78,8 @@ _ENV_COLUMNS = {
 # token must not prevent unrelated accounts or admin recovery from starting.
 _RECOVERABLE_TABLES = {
     "user_oauth",
+    # The outbox worker fails one unreadable record without touching others.
+    "credential_revocations",
     "mcp_oauth_flow_states",
     "task_runtime_secrets",
     "trigger_runs",

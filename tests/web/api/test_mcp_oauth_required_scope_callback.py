@@ -180,13 +180,11 @@ def _token_response(monkeypatch, token_data: dict) -> list:
     async def fake_exchange(**_kwargs):
         return dict(token_data)
 
-    async def record_revoke(snapshot):
+    def record_revoke(_db, snapshot):
         revoked.append(snapshot)
 
     monkeypatch.setattr(mcp_api, "_exchange_mcp_oauth_code", fake_exchange)
-    monkeypatch.setattr(
-        mcp_api, "_revoke_mcp_oauth_issued_token_externally", record_revoke
-    )
+    monkeypatch.setattr(mcp_api, "_enqueue_mcp_oauth_issued_token", record_revoke)
     return revoked
 
 

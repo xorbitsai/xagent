@@ -301,6 +301,7 @@ def _copy_shared_google_credentials(
     """
     setattr(target, "oauth_provider", GOOGLE_OAUTH_ISSUER)
     for field in (
+        "oauth_client_id",
         "access_token",
         "refresh_token",
         "expires_at",

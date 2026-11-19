@@ -1,8 +1,10 @@
-"""Fence builtin OAuth grant revocations against concurrent callbacks.
+"""Fence OAuth grant revocations against concurrent callbacks.
 
-GitHub and Google revoke a whole grant per upstream account and OAuth client.
-A disconnect revokes only once no local row references that account any more
-(``has_other_builtin_oauth_reference``), but a concurrent callback for the
+GitHub and Google revoke a whole grant per upstream account and OAuth client;
+an MCP authorization server may end a whole authorization the same way.
+The credential revocation outbox worker (``services.credential_revocations``)
+revokes a deleted credential only once no local row references that account
+any more (``has_other_builtin_oauth_reference``), but a concurrent callback for the
 same account may already have exchanged its code -- its tokens belong to the
 very grant about to be revoked -- without having committed its row yet. The
 revoke would then succeed and the callback would store dead credentials and
@@ -43,11 +45,23 @@ from sqlalchemy.orm import Session
 
 from ..models.oauth_revocation_fence import OAuthRevocationFence
 
+# The fence ``provider`` of an MCP authorization; its ``provider_user_id`` is
+# ``models.mcp_oauth.mcp_oauth_authorization_key``. An MCP authorization server
+# may end a whole authorization when one of its tokens is revoked, so a
+# revocation and a reconnect of the same authorization share a fence exactly
+# like a GitHub or Google account does.
+MCP_OAUTH_FENCE_PROVIDER = "mcp_oauth"
+
 # How long an opened fence refuses callbacks if its revoker never closes it.
 OAUTH_REVOCATION_FENCE_WINDOW = timedelta(minutes=2)
 # The provider call must start at least this long before the fence lapses,
 # covering its own timeouts; a revoker delayed past that skips the call.
 OAUTH_REVOCATION_CALL_MARGIN = timedelta(minutes=1)
+# The bound on a whole provider operation started inside a fence (DNS
+# resolution, address failover and every request). Shorter than the call
+# margin, so an operation that starts while it may has ended before the fence
+# lapses.
+OAUTH_REVOCATION_CALL_TIMEOUT = timedelta(seconds=45)
 # A closed fence keeps refusing callbacks for this long past the end of the
 # provider call: a callback host whose clock runs ahead of the revoker's
 # would otherwise record an exchange start after the close although its

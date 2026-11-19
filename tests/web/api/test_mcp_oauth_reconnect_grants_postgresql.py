@@ -27,8 +27,10 @@ from tests.shared.postgres_disposable import disposable_database_factory
 from xagent.core.utils.encryption import decrypt_value, encrypt_value
 from xagent.web.api import mcp as mcp_api
 from xagent.web.models import MCPOAuthClient, MCPOAuthFlowState, MCPOAuthGrant
+from xagent.web.models.credential_revocation import CredentialRevocation
 from xagent.web.models.database import Base
 from xagent.web.models.mcp import MCPServer, UserMCPServer
+from xagent.web.models.oauth_revocation_fence import OAuthRevocationFence
 from xagent.web.models.public_mcp import PublicMCPApp
 from xagent.web.models.user import User
 from xagent.web.services import mcp_oauth as mcp_oauth_service
@@ -58,7 +60,9 @@ def factory():
                 PublicMCPApp.__table__,
                 MCPOAuthClient.__table__,
                 MCPOAuthGrant.__table__,
+                OAuthRevocationFence.__table__,
                 MCPOAuthFlowState.__table__,
+                CredentialRevocation.__table__,
             ],
         )
         yield sessionmaker(bind=engine, autoflush=False, autocommit=False)
@@ -77,16 +81,11 @@ def provider(monkeypatch):
             "scope": NARROW,
         }
 
-    async def no_revocation(_snapshot):
+    def no_revocation(_db, _snapshot):
         return None
 
     monkeypatch.setattr(mcp_api, "_exchange_mcp_oauth_code", exchange_code)
-    monkeypatch.setattr(
-        mcp_api, "_revoke_mcp_oauth_issued_token_externally", no_revocation
-    )
-    monkeypatch.setattr(
-        mcp_api, "_revoke_mcp_oauth_grant_snapshot_externally", no_revocation
-    )
+    monkeypatch.setattr(mcp_api, "_enqueue_mcp_oauth_issued_token", no_revocation)
 
 
 def _seed(factory, *, earlier_expired: bool = False) -> dict[str, int]:
@@ -319,12 +318,13 @@ def test_reconnect_waits_for_a_refresh_of_the_grant_it_replaces(
     assert (grant_id == seed["earlier_id"]) is keeps_the_earlier_row
 
 
-def test_tokens_issued_to_a_revoked_grant_are_revoked_with_no_row_lock_held(
+def test_tokens_issued_to_a_revoked_grant_are_enqueued_for_revocation(
     factory, monkeypatch
 ):
-    """The refresh finds its grant revoked under ``FOR UPDATE``. The provider
-    call for the pair it was issued must not run inside that transaction: from
-    another connection the row is lockable while the revocation is sent."""
+    """The refresh finds its grant revoked under ``FOR UPDATE``. The pair it
+    was issued is stored nowhere, so it is enqueued in the credential
+    revocation outbox -- behind the record the status change itself wrote for
+    the grant's old tokens -- and nothing calls the provider inline."""
     seed = _seed(factory, earlier_expired=True)
 
     async def fake_refresh(_client, *, refresh_token, resource, client=None, **_kwargs):
@@ -335,32 +335,19 @@ def test_tokens_issued_to_a_revoked_grant_are_revoked_with_no_row_lock_held(
             other.commit()
         return {"access_token": "refreshed-access-token", "refresh_token": "rotated"}
 
-    revoked: list[tuple[str, str | None, bool]] = []
-
-    async def record_revocation(snapshot):
-        with factory() as other:
-            lockable = (
-                other.execute(
-                    text(
-                        "SELECT id FROM mcp_oauth_grants WHERE id = :id "
-                        "FOR UPDATE NOWAIT"
-                    ),
-                    {"id": seed["earlier_id"]},
-                ).first()
-                is not None
-            )
-            other.rollback()
-        revoked.append((snapshot.access_token, snapshot.refresh_token, lockable))
-
     monkeypatch.setattr(mcp_oauth_service, "_refresh_mcp_oauth_grant", fake_refresh)
-    monkeypatch.setattr(
-        mcp_api, "_revoke_mcp_oauth_issued_token_externally", record_revocation
-    )
 
     with pytest.raises(mcp_oauth_service.MCPOAuthRuntimeError):
         _resolve(factory, seed)
 
-    assert revoked == [("refreshed-access-token", "rotated", True)]
+    with factory() as db:
+        revoked, issued = db.query(CredentialRevocation).order_by(
+            CredentialRevocation.id
+        )
+        assert decrypt_value(revoked.access_token) == "earlier-access-token"
+        assert decrypt_value(issued.access_token) == "refreshed-access-token"
+        assert decrypt_value(issued.refresh_token) == "rotated"
+        assert issued.grant_key == revoked.grant_key
     assert _owner_grants(factory) == [
         (seed["earlier_id"], FULL, "revoked", "earlier-access-token")
     ]

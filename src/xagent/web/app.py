@@ -1255,6 +1255,65 @@ async def stop_task_cleanup_retry_task(app_instance: FastAPI) -> None:
             )
 
 
+def start_credential_revocation_task(
+    app_instance: FastAPI,
+) -> asyncio.Task[Any] | None:
+    """Start the credential revocation outbox worker for this process.
+
+    Runs in every deployment and every web process: any deletion of an OAuth
+    credential enqueues a revocation (``models.credential_revocation``), and
+    this worker is the only code that revokes it with the provider. Several
+    replicas running it is safe -- the claim skips records another replica
+    holds, and only the oldest open record of a grant is ever claimable.
+
+    Guarded under pytest like the sibling loops; a test that means to exercise
+    the starter opts in through ``credential_revocation_allowed_in_tests``.
+    """
+
+    from .models.database import get_session_local
+    from .services.credential_revocations import run_credential_revocation_loop
+
+    existing_task = cast(
+        asyncio.Task[Any] | None,
+        getattr(app_instance.state, "credential_revocation_task", None),
+    )
+    if existing_task is not None and not existing_task.done():
+        return existing_task
+
+    if os.getenv("PYTEST_CURRENT_TEST") and not getattr(
+        app_instance.state, "credential_revocation_allowed_in_tests", False
+    ):
+        logger.info("Skipping credential revocation loop (test environment)")
+        return None
+
+    task = asyncio.create_task(run_credential_revocation_loop(get_session_local()))
+    app_instance.state.credential_revocation_task = task
+    logger.info("Started credential revocation loop")
+    return task
+
+
+async def stop_credential_revocation_task(app_instance: FastAPI) -> None:
+    """Cancel and drain this process's credential revocation loop.
+
+    Cancelling is enough: an interrupted attempt keeps its lease, which
+    lapses and is retried, and revocation is idempotent.
+    """
+
+    task = getattr(app_instance.state, "credential_revocation_task", None)
+    app_instance.state.credential_revocation_task = None
+    if task is None:
+        return
+    if not task.done():
+        logger.info("Cancelling credential revocation loop...")
+        task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+    except Exception as exc:
+        logger.error("Credential revocation loop stopped after failure", exc_info=exc)
+
+
 #: How long shutdown waits for the retention purge loop to stop on its own
 #: before cancelling it. One task's purge has to finish first, and a purge is
 #: a handful of indexed deletes -- not a bound anyone should have to tune, so
@@ -2308,6 +2367,7 @@ async def _start_local_runtime_loops(app_instance: FastAPI) -> None:
     start_retention_purge_task(app_instance)
     start_browser_session_sweep_task(app_instance)
     start_task_cleanup_retry_task(app_instance)
+    start_credential_revocation_task(app_instance)
 
 
 async def _initialize_database_and_admit_runtime(app_instance: FastAPI) -> None:
@@ -2973,6 +3033,7 @@ async def _stop_runtime_loops(*, keep_command_dispatcher: bool = False) -> None:
     await stop_retention_purge_task(app)
     await stop_browser_session_sweep_task(app)
     await stop_task_cleanup_retry_task(app)
+    await stop_credential_revocation_task(app)
     await stop_uploaded_file_recovery_task(app)
     await stop_task_auto_resume_task(app)
     await stop_task_lease_recovery_task(app)

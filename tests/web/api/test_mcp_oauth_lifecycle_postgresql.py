@@ -23,6 +23,7 @@ from xagent.web.api import mcp as mcp_api
 from xagent.web.models import MCPOAuthClient, MCPOAuthFlowState, MCPOAuthGrant
 from xagent.web.models.database import Base
 from xagent.web.models.mcp import MCPServer, UserMCPServer
+from xagent.web.models.oauth_revocation_fence import OAuthRevocationFence
 from xagent.web.models.public_mcp import PublicMCPApp
 from xagent.web.models.user import User
 from xagent.web.services import connector_team_scope
@@ -43,6 +44,7 @@ def postgresql_engine():
                 PublicMCPApp.__table__,
                 MCPOAuthClient.__table__,
                 MCPOAuthGrant.__table__,
+                OAuthRevocationFence.__table__,
                 MCPOAuthFlowState.__table__,
             ],
         )
@@ -360,6 +362,7 @@ def test_producer_first_holds_lifecycle_locks_until_grant_commit(
         mcp_api._upsert_mcp_oauth_grant(
             producer_db,
             flow_state=locked_flow,
+            exchange_started_at=mcp_api._utc_now(),
             token_data={
                 "access_token": "postgres-issued-token",
                 "token_type": "Bearer",

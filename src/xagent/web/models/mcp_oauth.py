@@ -81,6 +81,31 @@ def mcp_oauth_grant_lookup_hash(
     )
 
 
+def mcp_oauth_authorization_key(
+    *,
+    mcp_server_id: object,
+    user_id: object,
+    resource_owner_key: object,
+    client_id: object,
+    issuer: object,
+    resource: object,
+) -> str:
+    """Identify one owner's authorization at an MCP authorization server.
+
+    The identity a reconnect keeps and a provider-side revocation may end as
+    a whole: the same owner, server, issuer and resource, and the same
+    *remote* OAuth ``client_id``. The local client row id is deliberately
+    not part of it: SQLite hands a deleted row's id to the next insert, so a
+    recreated server's different client could otherwise pass for the old
+    one. The credential revocation outbox fences its provider call on this
+    key, and an OAuth callback checks the same fence before it stores a
+    grant (see ``services.oauth_revocation_fences``).
+    """
+    return _lookup_hash(
+        (mcp_server_id, user_id, resource_owner_key, client_id, issuer, resource)
+    )
+
+
 class MCPOAuthClient(Base):  # type: ignore
     """OAuth client metadata for an existing HTTP MCP server."""
 

@@ -57,10 +57,13 @@ BINDING_AUTHORIZED_CATEGORIES: frozenset[str] = frozenset({ToolCategory.SSH.valu
 # excludes them. Legacy allow-list / per-user override paths do a plain name
 # intersection and are not aware of this set, so they can still drop these.
 # Intrinsic tools that exist only while a host has registered the hook behind
-# them (``set_connector_resolver_hook``). They are admitted like the others
-# when present; with no hook the creator builds nothing.
+# them (``set_connector_resolver_hook``, ``set_result_card_source_resolver``).
+# They are admitted like the others when present; with no hook the creator
+# builds nothing. (``show_result_card`` is spelled out here because
+# ``core.agent`` cannot be imported this early; a test pins it to
+# ``RESULT_CARD_TOOL_NAME``.)
 HOST_REGISTERED_INTRINSIC_TOOL_NAMES: frozenset[str] = frozenset(
-    {"find_app_connection"}
+    {"find_app_connection", "show_result_card"}
 )
 INTRINSIC_TOOL_NAMES: frozenset[str] = (
     frozenset({"get_current_time", "validate_local_time"})
@@ -82,6 +85,10 @@ class ToolMetadata(BaseModel):
     # selection (``ToolSelectionSpec.compute_allowed_names``) matches by
     # structured equality instead of re-parsing the tool name.
     source_server: Optional[str] = None
+    # What kind of connector ``source_server`` names: ``"mcp"`` (an MCP server)
+    # or ``"custom_api"`` (a user-defined Custom API), or ``None`` when the
+    # tool has no connector origin. The same name can exist in both kinds.
+    source_kind: Optional[str] = None
     # Optional logical group used by generic agent-control heuristics that
     # should treat related tools as one repeated action stream.
     decision_group: Optional[str] = None
@@ -194,6 +201,7 @@ class AbstractBaseTool(ABC, Tool):
             has_state=self.state_type() is not None,
             category=getattr(self, "category", ToolCategory.OTHER),
             source_server=getattr(self, "source_server", None),
+            source_kind=getattr(self, "source_kind", None),
             decision_group=getattr(self, "decision_group", None),
             read_only=getattr(self, "read_only", False),
             # read_only implies concurrency_safe; fall back to the explicit flag.

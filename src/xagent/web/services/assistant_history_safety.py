@@ -1,5 +1,6 @@
 """Client-safety policy for persisted assistant history."""
 
+from ...core.agent.result_card import RESULT_CARD_MESSAGE_TYPE
 from .client_error_messages import CLIENT_SAFE_TASK_FAILURE
 
 LEGACY_ASSISTANT_RESPONSE_MESSAGE_TYPE = "chat_response"
@@ -15,6 +16,7 @@ KNOWN_SAFE_ASSISTANT_MESSAGE_TYPES = frozenset(
         "assistant",
         "question",
         "question_superseded",
+        RESULT_CARD_MESSAGE_TYPE,
     }
 )
 

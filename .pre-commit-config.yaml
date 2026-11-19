@@ -72,6 +72,7 @@ repos:
           - cloudpickle
           - exa-py
           - slack-sdk==3.43.0
+          - azure-cosmos==4.17.1
           - limits
           # Pin limits' `deprecated` dependency to the project's resolved
           # version (uv.lock). Unpinned, the mypy hook env pulls deprecated

@@ -309,3 +309,133 @@ def test_a_result_card_message_is_displayed_in_the_list_count() -> None:
         db.commit()
     (listed,) = client.get("/api/conversation-logs", headers=headers).json()["logs"]
     assert listed["message_count"] == 2
+
+
+CARD = {
+    "title": "Open deals",
+    "source": {"name": "Cosmos", "app_id": None, "logo": None},
+    "items": ["Contoso"],
+    "footnote": None,
+}
+
+
+def test_public_steps_skip_a_result_card_message() -> None:
+    """SDK readers get no step for a card: it is not a question and has no step type.
+
+    This pins existing behaviour the card relies on (``_is_question_agent_message``
+    drops any agent message that asks nothing), not a change made for cards.
+    """
+    steps = map_trace_events_to_public_steps(
+        [
+            _event(
+                "agent_message",
+                {
+                    "message": "Open deals",
+                    "message_type": "result_card",
+                    "expect_response": False,
+                    "visible": True,
+                    "metadata": {"display": "result_card", "result_card": CARD},
+                },
+            ),
+            _event("ai_message", {"content": "done"}),
+        ]
+    )
+    assert [s["data"]["content"] for s in steps] == ["done"]
+
+
+def _add_v2_agent_message(task_id: int, key: str, data: dict, at: datetime):
+    from xagent.web.services.task_execution_event_writer import append_fact_no_commit
+
+    with _direct_db_session() as db:
+        append_fact_no_commit(
+            db,
+            task_id=task_id,
+            kind="agent_message",
+            key=key,
+            run_id="run-1",
+            turn_id="t1",
+            payload={"data": data, "protocol_event_id": key},
+            occurred_at=at,
+        )
+        db.commit()
+
+
+def _card_data(**overrides) -> dict:
+    data = {
+        "message": CARD["title"],
+        "message_type": "result_card",
+        "expect_response": False,
+        "visible": True,
+        "metadata": {"display": "result_card", "result_card": CARD},
+    }
+    data.update(overrides)
+    return data
+
+
+def test_v2_conversation_log_counts_a_card_like_the_detail_view_and_v1() -> None:
+    headers = _admin_headers()
+    _, task_id = _trigger_task(storage_version=2)
+    _add_v2_input(task_id, "u1", "hello", None, STAMP)
+    _add_v2_agent_message(task_id, "card", _card_data(), STAMP.replace(hour=14))
+    # A plain progress message and a message that only claims to be a card
+    # are not part of the conversation.
+    _add_v2_agent_message(
+        task_id,
+        "progress",
+        {"message": "working", "message_type": "info", "expect_response": False},
+        STAMP.replace(hour=15),
+    )
+    _add_v2_agent_message(
+        task_id,
+        "fake",
+        _card_data(message="fake", metadata={}),
+        STAMP.replace(hour=16),
+    )
+
+    detail = client.get(f"/api/conversation-logs/{task_id}", headers=headers)
+    assert detail.status_code == 200, detail.text
+    assert [m["content"] for m in detail.json()["transcript"]] == [
+        "hello",
+        CARD["title"],
+    ]
+    assert detail.json()["log"]["message_count"] == 2
+    (listed,) = client.get("/api/conversation-logs", headers=headers).json()["logs"]
+    assert listed["message_count"] == 2
+    assert listed["last_activity_at"].startswith("2026-01-01T14:00:00")
+
+
+def test_websocket_replay_of_a_legacy_task_carries_a_result_card() -> None:
+    from xagent.web.api.websocket import _load_historical_stream_snapshot_sync
+
+    _admin_headers()
+    user_id = _admin_id()
+    task_id = _create_task_row(user_id=user_id, title="Card")
+    metadata = {"display": "result_card", "result_card": CARD}
+    with _direct_db_session() as db:
+        for content, message_metadata in (
+            ("Open deals", metadata),
+            ("Malformed card", {"display": "result_card"}),
+        ):
+            db.add(
+                TaskChatMessage(
+                    task_id=task_id,
+                    user_id=user_id,
+                    role="assistant",
+                    content=content,
+                    message_type="result_card",
+                    message_metadata=message_metadata,
+                )
+            )
+        db.commit()
+    snapshot = _load_historical_stream_snapshot_sync(
+        task_id, actor_user_id=user_id, actor_is_admin=True
+    )
+    assert snapshot is not None
+    replayed = {
+        event["data"]["content"]: event["data"]
+        for event in snapshot.events
+        if event.get("event_type") == "agent_message"
+    }
+    assert replayed["Open deals"]["message_type"] == "result_card"
+    assert replayed["Open deals"]["metadata"] == metadata
+    assert "metadata" not in replayed["Malformed card"]

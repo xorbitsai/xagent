@@ -19,6 +19,7 @@ from sqlalchemy.orm import relationship
 from sqlalchemy.schema import Index, UniqueConstraint
 from sqlalchemy.sql import func
 
+from ...config import DEFAULT_MCP_OAUTH_CLIENT_NAME
 from .database import Base
 
 
@@ -46,17 +47,30 @@ def mcp_oauth_client_registration_lookup_hash(
     mcp_server_id: object,
     issuer: object,
     redirect_uri: object,
+    *,
+    client_name: str | None,
 ) -> str:
-    """Identify one reusable public-client registration profile."""
+    """Identify one reusable public-client registration profile.
 
-    return _lookup_hash(
-        (
-            mcp_server_id,
-            issuer,
-            redirect_uri,
-            "public-auth-code-pkce-v1",
-        )
+    For an existing row, pass the row's own ``registration_client_name``
+    (``None`` when the column is NULL), never the current configuration; only
+    a new registration passes the name it is about to send. A caller that
+    copies a row to another database must copy that column too and recompute
+    from it.
+    ``client_name`` is required so formerly valid three-argument calls fail
+    instead of labelling a row with the default name. A ``None`` or default
+    name keeps the historical four-part hash.
+    """
+
+    parts: tuple[object, ...] = (
+        mcp_server_id,
+        issuer,
+        redirect_uri,
+        "public-auth-code-pkce-v1",
     )
+    if client_name is not None and client_name != DEFAULT_MCP_OAUTH_CLIENT_NAME:
+        parts += (client_name,)
+    return _lookup_hash(parts)
 
 
 def mcp_oauth_grant_lookup_hash(
@@ -105,6 +119,10 @@ class MCPOAuthClient(Base):  # type: ignore
     )
     lookup_hash = Column(String(64), nullable=False)
     registration_lookup_hash = Column(String(64), nullable=True)
+    # The client_name sent when this row was dynamically registered. NULL for a
+    # static client and for a row registered before this column existed, when
+    # every registration sent the default name.
+    registration_client_name = Column(String(255), nullable=True)
     issuer = Column(String(1000), nullable=False)
     authorization_endpoint = Column(String(1000), nullable=False)
     token_endpoint = Column(String(1000), nullable=False)

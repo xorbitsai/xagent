@@ -2002,6 +2002,29 @@ CONNECTOR_CHECKS: Mapping[str, ConnectorChecks] = {
             ),
         ),
     ),
+    "cosmos": ConnectorChecks(
+        "cosmos",
+        reads=(
+            # The L3 probe reads the configured database and lists its
+            # containers, which covers that tool.
+            _declared_l3("cosmos"),
+            ReadCheck(
+                "cosmos.list_databases",
+                "cosmos_list_databases",
+                {},
+                assertions=(
+                    StatusSuccess(),
+                    HasKeys((), ("databases", "configured_database", "truncated")),
+                    IsType(("databases",), "array"),
+                    IsType(("truncated",), "boolean"),
+                ),
+            ),
+        ),
+        exemptions=_exemptions(
+            issue=_TIER_2,
+            reads=("cosmos_query_container", "cosmos_read_item"),
+        ),
+    ),
     "deputy": ConnectorChecks(
         "deputy",
         reads=(

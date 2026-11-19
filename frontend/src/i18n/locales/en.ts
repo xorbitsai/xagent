@@ -2214,6 +2214,7 @@ Build when you need.`,
   },
   workspace: {
     openNavigation: "Open navigation",
+    accountMenu: "Account menu",
     closeNavigation: "Close navigation",
     startNew: "Start something new",
     newTask: "New task",

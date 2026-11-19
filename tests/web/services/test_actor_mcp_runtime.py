@@ -858,12 +858,12 @@ def test_builtin_provenance_version_drift_does_not_disable_actor_stdio(
     db: Session, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setenv("XAGENT_TOBY_PERSONAL_STDIO_ENABLED", "true")
-    app = _seed_app(db, app_id="shopify")
+    app = _seed_app(db, app_id="jira-ticket")
     launch = deepcopy(app.launch_config)
     launch["builtin_provenance"]["version"] = 999
     app.launch_config = launch
     db.flush()
-    adapter = _FakeAdapter(_identity(app), _credentials_for("shopify"))
+    adapter = _FakeAdapter(_identity(app), _credentials_for("jira-ticket"))
 
     result = resolve_actor_mcp_stdio_configs(
         db,
@@ -888,7 +888,7 @@ def test_builtin_provenance_version_drift_does_not_disable_actor_stdio(
         ("optional_admin_scopes", ["write_customers"]),
         (
             "builtin_provenance",
-            {"registry": "attacker", "app_id": "shopify", "version": 1},
+            {"registry": "attacker", "app_id": "jira-ticket", "version": 1},
         ),
     ],
 )
@@ -899,12 +899,12 @@ def test_trusted_launch_fingerprint_drift_fails_closed_before_secret_read(
     drifted_value: object,
 ) -> None:
     monkeypatch.setenv("XAGENT_TOBY_PERSONAL_STDIO_ENABLED", "true")
-    app = _seed_app(db, app_id="shopify")
+    app = _seed_app(db, app_id="jira-ticket")
     launch = deepcopy(app.launch_config)
     launch[field_name] = drifted_value
     app.launch_config = launch
     db.flush()
-    adapter = _FakeAdapter(_identity(app), _credentials_for("shopify"))
+    adapter = _FakeAdapter(_identity(app), _credentials_for("jira-ticket"))
 
     result = resolve_actor_mcp_stdio_configs(
         db,

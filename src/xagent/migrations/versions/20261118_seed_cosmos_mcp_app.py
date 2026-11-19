@@ -1,7 +1,7 @@
 """seed built-in read-only Azure Cosmos DB (key-based) MCP connector
 
 Revision ID: 20261118_seed_cosmos_mcp_app
-Revises: 20261117_seed_chargebee_mcp_app
+Revises: 20261117_chat_message_metadata
 Create Date: 2026-11-18 00:00:00.000000
 
 """
@@ -21,7 +21,7 @@ logger = logging.getLogger(__name__)
 
 # revision identifiers, used by Alembic.
 revision: str = "20261118_seed_cosmos_mcp_app"
-down_revision: Union[str, None] = "20261117_seed_chargebee_mcp_app"
+down_revision: Union[str, None] = "20261117_chat_message_metadata"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 

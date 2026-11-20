@@ -34,6 +34,7 @@ from .context.execution import (
 )
 from .context.memory_retrieval import MEMORY_RETRIEVAL_SCOPE_FINGERPRINT_METADATA_KEY
 from .deferred_tools import DEFAULT_PRELOAD_TOKEN_BUDGET
+from .live_input import LiveInputAdmission, LiveInputOffer
 from .structured_output import StructuredOutputFormat, _attach_structured_output
 from .trace import Tracer
 from .transcript import normalize_transcript_messages
@@ -382,6 +383,28 @@ class AgentService:
 
     def supports_live_control(self) -> bool:
         return True
+
+    def offer_live_user_message(
+        self,
+        execution_id: str,
+        *,
+        execution_message: str,
+        display_message: str,
+        turn_id: str,
+        admission: LiveInputAdmission,
+    ) -> LiveInputOffer:
+        if self._execution_adapter is None:
+            return LiveInputOffer.NO_LIVE_RUN
+        return cast(
+            LiveInputOffer,
+            self._execution_adapter.offer_live_user_message(
+                execution_id,
+                execution_message=execution_message,
+                display_message=display_message,
+                turn_id=turn_id,
+                admission=admission,
+            ),
+        )
 
     async def post_user_message(
         self,

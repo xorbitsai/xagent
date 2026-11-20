@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 from enum import Enum
 from typing import TYPE_CHECKING, Any, Callable
 
+from .live_input import LiveInputAdmission, LiveInputOffer
 from .runner import UserMessageInjectionOutcome, UserMessageInjectionResult
 
 if TYPE_CHECKING:
@@ -247,6 +248,26 @@ class ExecutionRegistry:
             turn_id=turn_id,
             request_interrupt=request_interrupt,
             reason=reason,
+        )
+
+    def offer_live_user_message(
+        self,
+        execution_id: str,
+        *,
+        execution_message: str,
+        display_message: str,
+        turn_id: str,
+        admission: LiveInputAdmission,
+    ) -> LiveInputOffer:
+        handle = self.get(execution_id)
+        if handle is None:
+            return LiveInputOffer.NO_LIVE_RUN
+        return handle.runner.offer_live_user_message(
+            execution_id,
+            execution_message=execution_message,
+            display_message=display_message,
+            turn_id=turn_id,
+            admission=admission,
         )
 
     async def post_user_message(

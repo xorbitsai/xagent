@@ -216,6 +216,13 @@ class _AutoChildRuntime:
     async def finish_cache_session(self) -> None:
         await self.parent.finish_cache_session()
 
+    async def admit_live_user_messages(
+        self, context: Any, *, tools_settled: bool
+    ) -> int:
+        return await self.parent.admit_live_user_messages(
+            context, tools_settled=tools_settled
+        )
+
     def clear_interrupt(self) -> None:
         self.parent.clear_interrupt()
 

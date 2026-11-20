@@ -727,6 +727,69 @@ def test_non_zoom_provider_does_not_set_prompt_login(db_session):
     assert "prompt" not in qs
 
 
+@pytest.mark.parametrize("provider_name", ["microsoft", "Microsoft"])
+def test_microsoft_bare_login_sets_prompt_select_account(db_session, provider_name):
+    """Entra ID silently signs in the browser's sole existing Microsoft
+    session when the authorize request carries no prompt, so the user never
+    gets to choose (or sign in to) a different account."""
+    db, user = db_session
+    token = _token_for(user)
+
+    provider = _provider(
+        auth_url="https://login.microsoftonline.com/common/oauth2/v2.0/authorize",
+        default_scopes=["User.Read"],
+        redirect_uri="https://app.example.com/cb",
+    )
+    resp = generic_oauth_login(
+        provider=provider_name,
+        token=token,
+        app_id=None,
+        redirect=None,
+        db=db,
+        db_provider=provider,
+    )
+
+    qs = parse_qs(urlparse(_location(resp)).query)
+    assert qs.get("prompt") == ["select_account"]
+
+
+MICROSOFT_APP_IDS = sorted(
+    row["app_id"]
+    for row in get_builtin_public_mcp_app_rows()
+    if row["provider_name"] == "microsoft"
+)
+
+
+@pytest.mark.parametrize("app_id", MICROSOFT_APP_IDS)
+def test_microsoft_connector_login_sets_prompt_select_account(db_session, app_id):
+    """Connector (app-scoped) connects share the bare login's authorize
+    request, so every Microsoft Graph connector must show the account
+    picker too."""
+    db, user = db_session
+    token = _token_for(user)
+    app_row = get_builtin_public_mcp_app(app_id)
+    assert app_row is not None
+    db.add(PublicMCPApp(**app_row))
+    db.commit()
+
+    provider = _provider(
+        auth_url="https://login.microsoftonline.com/common/oauth2/v2.0/authorize",
+        default_scopes=["User.Read"],
+        redirect_uri="https://app.example.com/cb",
+    )
+    resp = generic_oauth_login(
+        provider="microsoft",
+        token=token,
+        app_id=app_id,
+        redirect=None,
+        db=db,
+        db_provider=provider,
+    )
+
+    qs = parse_qs(urlparse(_location(resp)).query)
+    assert qs.get("prompt") == ["select_account"]
+
+
 def test_meta_login_uses_comma_separated_canonical_scopes_for_builtin_app(
     db_session, monkeypatch
 ):
@@ -1078,13 +1141,6 @@ def test_excel_login_requests_refresh_permission(db_session):
     assert resp.status_code == 307
     scopes = parse_qs(urlparse(_location(resp)).query)["scope"][0].split()
     assert set(scopes) == {"User.Read", "Files.ReadWrite", "offline_access"}
-
-
-MICROSOFT_APP_IDS = sorted(
-    row["app_id"]
-    for row in get_builtin_public_mcp_app_rows()
-    if row["provider_name"] == "microsoft"
-)
 
 
 def test_microsoft_app_id_discovery_is_not_empty():

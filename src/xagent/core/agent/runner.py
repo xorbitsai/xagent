@@ -117,6 +117,10 @@ from .runtime import (
 
 logger = logging.getLogger(__name__)
 
+# Longest an outside cancellation of a run is held back while one taken live
+# user message is being claimed, written and finished.
+LIVE_INPUT_CANCEL_GRACE_SECONDS = 3.0
+
 # ``ACCEPTED_TURN_IDS_METADATA_KEY`` (defined in ``context.execution`` so child
 # contexts can drop it) holds the turn ids of the user messages this execution
 # has durably accepted, as a list of ``[turn_id, digest]`` pairs (oldest
@@ -620,7 +624,7 @@ class AgentRunner:
             if self._accepts_live_input():
                 runtime.live_input = LiveInputMailbox()
                 runtime._live_input_injector = partial(
-                    self._inject_live_input, execution_id
+                    self._admit_live_input_until_finished, execution_id
                 )
             self._active_controls[execution_id] = ExecutionControl(
                 runtime=runtime,
@@ -1694,6 +1698,69 @@ class AgentRunner:
         if accepted and accepted != AgentRunner._turn_content_digest(execution_message):
             return LiveInputOffer.CONFLICT
         return LiveInputOffer.ALREADY_ACCEPTED
+
+    async def _admit_live_input_until_finished(
+        self, execution_id: str, item: LiveUserInput
+    ) -> LiveInputResult:
+        """Run ``_inject_live_input`` so an outside cancellation cannot split it.
+
+        A taken message moves from the mailbox to the ledger to the context.
+        The only point where the run may be cancelled is between two messages;
+        from the moment a message is taken until its outcome is recorded, a
+        cancellation of the running task is held back and re-raised, as the
+        same exception object, once the message has finished. The outcome of
+        the message then depends only on the results of its own steps.
+
+        The cancellation is held back for at most
+        ``LIVE_INPUT_CANCEL_GRACE_SECONDS``, counted from the first one. When
+        that expires the work is cancelled and the cancellation is re-raised
+        at once; the work records its outcome in the background.
+        """
+        work = asyncio.ensure_future(self._inject_live_input(execution_id, item))
+        self._live_input_tasks.add(work)
+        work.add_done_callback(self._live_input_tasks.discard)
+        loop = asyncio.get_running_loop()
+        cancellation: asyncio.CancelledError | None = None
+        deadline = 0.0
+        while True:
+            try:
+                if cancellation is None:
+                    return await asyncio.shield(work)
+                await asyncio.wait({work}, timeout=max(0.0, deadline - loop.time()))
+                break
+            except asyncio.CancelledError as error:
+                current = asyncio.current_task()
+                if current is None or current.cancelling() == 0:
+                    raise
+                if cancellation is None:
+                    cancellation = error
+                    deadline = loop.time() + LIVE_INPUT_CANCEL_GRACE_SECONDS
+        if work.done():
+            outcome = "completed"
+            if not work.cancelled():
+                failure = work.exception()
+                if failure is not None:
+                    logger.error(
+                        "live input for %s turn %s failed while the run was being"
+                        " cancelled",
+                        execution_id,
+                        item.turn_id,
+                        exc_info=failure,
+                    )
+        else:
+            outcome = "grace_expired"
+            work.cancel()
+            logger.warning(
+                "live input for %s turn %s did not finish within %.1fs of the run"
+                " being cancelled",
+                execution_id,
+                item.turn_id,
+                LIVE_INPUT_CANCEL_GRACE_SECONDS,
+            )
+        increment_counter(
+            "xagent.live_input.cancel_deferred", attributes={"outcome": outcome}
+        )
+        raise cancellation
 
     async def _inject_live_input(
         self, execution_id: str, item: LiveUserInput

@@ -12,6 +12,7 @@ import pytest
 from xagent.core.tools.core.RAG_tools.core.schemas import (
     CollectionDocumentMetadata,
     CollectionInfo,
+    IngestionConfig,
     ListCollectionsResult,
 )
 from xagent.web.api import kb as kb_api
@@ -164,3 +165,47 @@ async def test_scan_timeout_comes_from_config(monkeypatch):
 
     assert excinfo.value.status_code == 503
     assert configured_timeouts == [1]
+
+
+@pytest.mark.asyncio
+async def test_listed_config_names_the_bound_embedding_model(monkeypatch):
+    def configured(name, *, bound, dimension, config_model):
+        return _collection(name).model_copy(
+            update={
+                "embedding_model_id": bound,
+                "embedding_dimension": dimension,
+                "ingestion_config": IngestionConfig(embedding_model_id=config_model),
+            }
+        )
+
+    async def scan(user_id, is_admin=False):
+        collections = [
+            configured(
+                "switched", bound="new-model", dimension=1024, config_model="old-model"
+            ),
+            configured("unbound", bound=None, dimension=None, config_model="old-model"),
+            configured(
+                "no-dimension",
+                bound="new-model",
+                dimension=None,
+                config_model="old-model",
+            ),
+        ]
+        return ListCollectionsResult(
+            status="success", collections=collections, total_count=3, message="ok"
+        )
+
+    monkeypatch.setattr(kb_api, "list_collections", scan)
+    monkeypatch.setattr(kb_api, "visible_team_knowledge_bases", lambda _db, _uid: [])
+
+    result = await kb_api.list_collections_api(
+        _user=SimpleNamespace(id=1, is_admin=False), db=None
+    )
+
+    by_name = {collection.name: collection for collection in result.collections}
+    assert by_name["switched"].ingestion_config.embedding_model_id == "new-model"
+    assert by_name["switched"].embedding_model_id == "new-model"
+    # An unbound collection's first ingest still takes its model from the config.
+    assert by_name["unbound"].ingestion_config.embedding_model_id == "old-model"
+    # Without a dimension the collection is not initialized, so ingest still uses the config.
+    assert by_name["no-dimension"].ingestion_config.embedding_model_id == "old-model"

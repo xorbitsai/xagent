@@ -218,7 +218,7 @@ def _saas_seed(value: Any) -> int | None:
             field="seed",
             allowed_values={"seed": [0, SAAS_VIDEO_MAX_SEED]},
         )
-    return value
+    return int(value)
 
 
 class XinferenceVideoModel(BaseVideoModel):

@@ -491,6 +491,47 @@ async def test_offer_while_a_taken_message_is_admitted() -> None:
     assert other.events == []
 
 
+@pytest.mark.parametrize("compacted", [False, True])
+@pytest.mark.parametrize("text", ["seen", "other"])
+async def test_offer_and_injection_classify_a_known_turn_alike(
+    compacted: bool, text: str
+) -> None:
+    runner, _ = manual_runner()
+    context = runner.context_manager.get_context(EID)
+    assert context is not None
+    seen = context.add_user_message("seen", metadata={"turn_id": "old"})
+    runner._record_accepted_turn(context, seen)
+    if compacted:
+        context.messages.remove(seen)
+    offered = runner.offer_live_user_message(
+        EID,
+        execution_message=text,
+        display_message=text,
+        turn_id="old",
+        admission=RecordingAdmission(),
+    )
+    if text == "seen":
+        assert offered is LiveInputOffer.ALREADY_ACCEPTED
+        result = await runner.inject_user_message(
+            EID,
+            execution_message=text,
+            display_message=text,
+            turn_id="old",
+            request_interrupt=False,
+        )
+        assert result.outcome is UserMessageInjectionOutcome.POSTED_REPLAY
+    else:
+        assert offered is LiveInputOffer.CONFLICT
+        with pytest.raises(UserMessageInjectionConflictError):
+            await runner.inject_user_message(
+                EID,
+                execution_message=text,
+                display_message=text,
+                turn_id="old",
+                request_interrupt=False,
+            )
+
+
 # --------------------------------------------------------------------------
 # Safe point
 # --------------------------------------------------------------------------

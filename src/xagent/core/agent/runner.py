@@ -277,6 +277,14 @@ class UserMessageInjectionConflictError(ValueError):
     """The turn identity conflicts with an existing message, before any write."""
 
 
+class _TurnReplay(Enum):
+    """How a turn id relates to what a context has already accepted."""
+
+    NEW = "new"  # Neither in the context nor in its record of accepted turns.
+    ACCEPTED = "accepted"  # Already accepted with the same text.
+    CONFLICT = "conflict"  # Already accepted with different text.
+
+
 class InjectionDisposition(str, Enum):
     """What one injection attempt means for the input it carried.
 
@@ -1368,35 +1376,14 @@ class AgentRunner:
                         context=context, outcome=UserMessageInjectionOutcome.NOT_POSTED
                     )
                 if requested_turn_id is not None:
-                    for existing in context.messages:
-                        existing_metadata = getattr(existing, "metadata", None)
-                        if (
-                            getattr(existing, "role", None) != "user"
-                            or not isinstance(existing_metadata, dict)
-                            or existing_metadata.get("turn_id") != requested_turn_id
-                        ):
-                            continue
-                        if existing.content != resolved_execution_message:
-                            raise UserMessageInjectionConflictError(
-                                "turn_id is already associated with a different user message"
-                            )
-                        return self._replay_accepted_turn(
-                            execution_id,
-                            context,
-                            request_interrupt=request_interrupt
-                            and not gate.run_finishing,
-                            reason=reason,
+                    replay = self._classify_turn_replay(
+                        context, requested_turn_id, resolved_execution_message
+                    )
+                    if replay is _TurnReplay.CONFLICT:
+                        raise UserMessageInjectionConflictError(
+                            "turn_id is already associated with a different user message"
                         )
-                    # Compaction may have dropped the message itself; the
-                    # metadata record of accepted turns survives it.
-                    accepted = self._accepted_turn_digest(context, requested_turn_id)
-                    if accepted is not None:
-                        if accepted and accepted != self._turn_content_digest(
-                            resolved_execution_message
-                        ):
-                            raise UserMessageInjectionConflictError(
-                                "turn_id is already associated with a different user message"
-                            )
+                    if replay is _TurnReplay.ACCEPTED:
                         return self._replay_accepted_turn(
                             execution_id,
                             context,
@@ -1676,11 +1663,13 @@ class AgentRunner:
             or mailbox.closed
         ):
             return LiveInputOffer.NO_LIVE_RUN
-        replay = self._live_input_replay_offer(
+        replay = self._classify_turn_replay(
             context, normalized_turn_id, execution_message
         )
-        if replay is not None:
-            return replay
+        if replay is _TurnReplay.CONFLICT:
+            return LiveInputOffer.CONFLICT
+        if replay is _TurnReplay.ACCEPTED:
+            return LiveInputOffer.ALREADY_ACCEPTED
         return mailbox.offer(
             LiveUserInput(
                 turn_id=normalized_turn_id,
@@ -1689,31 +1678,6 @@ class AgentRunner:
                 admission=admission,
             )
         )
-
-    @staticmethod
-    def _live_input_replay_offer(
-        context: ExecutionContext, turn_id: str, execution_message: str
-    ) -> LiveInputOffer | None:
-        """Answer for a turn id the context already holds, else None."""
-        for existing in context.messages:
-            existing_metadata = getattr(existing, "metadata", None)
-            if (
-                getattr(existing, "role", None) != "user"
-                or not isinstance(existing_metadata, dict)
-                or existing_metadata.get("turn_id") != turn_id
-            ):
-                continue
-            if existing.content != execution_message:
-                return LiveInputOffer.CONFLICT
-            return LiveInputOffer.ALREADY_ACCEPTED
-        # Compaction may have dropped the message itself; the metadata record
-        # of accepted turns survives it.
-        accepted = AgentRunner._accepted_turn_digest(context, turn_id)
-        if accepted is None:
-            return None
-        if accepted and accepted != AgentRunner._turn_content_digest(execution_message):
-            return LiveInputOffer.CONFLICT
-        return LiveInputOffer.ALREADY_ACCEPTED
 
     async def _admit_live_input_until_finished(
         self, execution_id: str, item: LiveUserInput
@@ -1931,6 +1895,34 @@ class AgentRunner:
             context=context,
             outcome=UserMessageInjectionOutcome.POSTED_REPLAY,
         )
+
+    @staticmethod
+    def _classify_turn_replay(
+        context: ExecutionContext, turn_id: str, execution_message: str
+    ) -> _TurnReplay:
+        """Whether ``context`` already holds ``turn_id``, and with which text.
+
+        The first user message carrying ``turn_id`` decides. When compaction
+        has dropped it, the record of accepted turns decides; a turn recorded
+        without a digest matches any text.
+        """
+        for existing in context.messages:
+            existing_metadata = getattr(existing, "metadata", None)
+            if (
+                getattr(existing, "role", None) != "user"
+                or not isinstance(existing_metadata, dict)
+                or existing_metadata.get("turn_id") != turn_id
+            ):
+                continue
+            if existing.content != execution_message:
+                return _TurnReplay.CONFLICT
+            return _TurnReplay.ACCEPTED
+        accepted = AgentRunner._accepted_turn_digest(context, turn_id)
+        if accepted is None:
+            return _TurnReplay.NEW
+        if accepted and accepted != AgentRunner._turn_content_digest(execution_message):
+            return _TurnReplay.CONFLICT
+        return _TurnReplay.ACCEPTED
 
     @staticmethod
     def _turn_content_digest(content: str) -> str:

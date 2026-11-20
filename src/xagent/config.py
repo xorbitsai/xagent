@@ -1321,7 +1321,7 @@ def get_mcp_oauth_proxy_url() -> str | None:
 
 
 def get_mcp_oauth_callback_base_url() -> str | None:
-    """Return the base URL advertised in MCP OAuth Dynamic Client Registration.
+    """Return the origin advertised in MCP OAuth Dynamic Client Registration.
 
     Priority:
         1. XAGENT_MCP_OAUTH_CALLBACK_BASE_URL environment variable
@@ -1329,19 +1329,29 @@ def get_mcp_oauth_callback_base_url() -> str | None:
            (XAGENT_PUBLIC_API_BASE_URL, else XAGENT_APP_BASE_URL)
 
     Some authorization servers name a client by its redirect host on their
-    consent page. This value changes only the advertised ``redirect_uri``;
-    the browser's state cookie stays on the deployment's own site. The ingress
-    for this base URL must answer ``GET /api/mcp/oauth/callback`` with a
-    redirect to the same path and query on that site. Clients with a
-    pre-registered ``client_id`` keep the deployment's own callback, which is
-    what their registration holds. After it changes, servers register again on
-    their next connect, and existing grants keep refreshing with their own
-    client rows.
+    consent page. This value changes only the ``redirect_uri`` that dynamic
+    registration advertises; the browser's state cookie stays on the
+    deployment's own site. The ingress for this origin must answer
+    ``GET /api/mcp/oauth/callback`` with a redirect to the same path and query
+    on that site. Clients with a pre-registered ``client_id`` keep the
+    deployment's own callback, which is what their registration holds. After
+    it changes, servers register again on their next connect, and existing
+    grants keep refreshing with their own client rows.
+
+    Raises ``ValueError`` for a value that is not an absolute http(s) origin:
+    a path, query, fragment or credentials are rejected. A path cannot work,
+    because the state cookie is scoped to ``/api/mcp``.
     """
-    return _reject_url_userinfo(
+    value = _reject_url_userinfo(
         MCP_OAUTH_CALLBACK_BASE_URL,
         _normalized_http_env_url(MCP_OAUTH_CALLBACK_BASE_URL),
     )
+    if value is not None and urlsplit(value).path:
+        raise ValueError(
+            f"Invalid {MCP_OAUTH_CALLBACK_BASE_URL} value: {value!r}. "
+            "Expected an origin without a path."
+        )
+    return value
 
 
 def get_mcp_oauth_client_name() -> str:

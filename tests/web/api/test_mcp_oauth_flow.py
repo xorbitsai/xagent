@@ -1922,25 +1922,17 @@ def test_mcp_oauth_callback_base_url_moves_only_the_advertised_callback(
     monkeypatch,
 ):
     monkeypatch.setenv("XAGENT_PUBLIC_API_BASE_URL", "https://api.xagent.test/")
+    site_callback = "https://api.xagent.test/api/mcp/oauth/callback"
+    # Compose passes an unset variable through as an empty string.
+    monkeypatch.setenv("XAGENT_MCP_OAUTH_CALLBACK_BASE_URL", "")
+    assert mcp_api._default_mcp_oauth_redirect_uri() == site_callback
+
     monkeypatch.setenv("XAGENT_MCP_OAUTH_CALLBACK_BASE_URL", " https://brand.test/ ")
 
     assert mcp_api._default_mcp_oauth_redirect_uri() == (
         "https://brand.test/api/mcp/oauth/callback"
     )
-    assert mcp_api._mcp_oauth_callback_site_redirect_uri() == (
-        "https://api.xagent.test/api/mcp/oauth/callback"
-    )
-
-
-@pytest.mark.parametrize(
-    "value",
-    ["brand.test", "https://brand.test/?x=1", "https://user:pass@brand.test"],
-)
-def test_mcp_oauth_callback_base_url_rejects_invalid_values(monkeypatch, value):
-    monkeypatch.setenv("XAGENT_MCP_OAUTH_CALLBACK_BASE_URL", value)
-
-    with pytest.raises(ValueError, match="XAGENT_MCP_OAUTH_CALLBACK_BASE_URL"):
-        mcp_api._default_mcp_oauth_redirect_uri()
+    assert mcp_api._mcp_oauth_callback_site_redirect_uri() == site_callback
 
 
 @pytest.mark.asyncio
@@ -3577,6 +3569,9 @@ async def test_callback_exchanges_code_and_stores_encrypted_grant(
     db_session, monkeypatch
 ):
     monkeypatch.setenv("XAGENT_APP_BASE_URL", "https://app.example.com/")
+    # The token request must repeat the client row's redirect URI, not
+    # whatever this deployment would advertise now.
+    monkeypatch.setenv("XAGENT_MCP_OAUTH_CALLBACK_BASE_URL", "https://brand.test")
     db, user, _ = db_session
     server = _add_mcp_oauth_server(db, user)
     client = _add_oauth_client(
@@ -3619,6 +3614,9 @@ async def test_callback_exchanges_code_and_stores_encrypted_grant(
         assert form["code_verifier"] == "verifier-123"
         assert form["resource"] == "https%3A%2F%2Fmcp.example.com%2Fmcp"
         assert form["client_secret"] == "client-secret"
+        assert form["redirect_uri"] == (
+            "https%3A%2F%2Fxagent.example.com%2Fapi%2Fmcp%2Foauth%2Fcallback"
+        )
         return httpx.Response(
             200,
             json={

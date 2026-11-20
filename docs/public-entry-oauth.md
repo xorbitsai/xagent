@@ -112,8 +112,10 @@ optional list when enabled. Unknown modes and unavailable config fail closed.
 Builtin retains source/origin/provider/type message checks. MCP retains null
 opener and status polling; closing the popup is never proof of success.
 
-MCP keeps its existing flow/client/callback/registration hash; only proof-cookie
-write moves to the old-host bootstrap. The flow uses relative
+With `XAGENT_MCP_OAUTH_CALLBACK_BASE_URL` unset, MCP keeps its existing
+flow/client/callback/registration hash; only proof-cookie write moves to the
+old-host bootstrap. That variable is a separate opt-in (see the end of this
+document). The flow uses relative
 `/auth/mcp-complete`, a credential-free public frontend page. The hosting edge must
 allow that exact path without region cookies. Legacy `redirect_after` behavior is
 unchanged. New error redirects use only a controlled error code.
@@ -135,3 +137,19 @@ Additional prerequisites:
 - Unconfigured deployments (`XAGENT_PUBLIC_ENTRIES_JSON` unset) keep the exact
   legacy frontend origin and Google error mapping; the strict origin validation
   applies only to explicit entries.
+
+## Advertised MCP OAuth callback (separate opt-in)
+
+`XAGENT_MCP_OAUTH_CALLBACK_BASE_URL` (`get_mcp_oauth_callback_base_url()`) is
+independent of the public entries above. It changes only the `redirect_uri`
+that MCP dynamic client registration advertises, on an origin (no path) whose
+ingress redirects `GET /api/mcp/oauth/callback`, query unchanged, to the
+deployment's own callback. The state cookie, the hand-off and the authorization
+entry stay where they are, so the rest of the callback runs on the deployment's
+own site as before. Clients with a pre-registered `client_id` keep the
+deployment's own callback. Unset keeps the advertised callback, the
+registration hash and the member start-site check unchanged. Set, the
+registration hash changes, so each server registers again on its next connect;
+existing grants keep refreshing with the client that issued them. Put the
+ingress forward in place before setting the variable, and unset the variable
+everywhere, then let in-flight authorizations expire, before removing it.

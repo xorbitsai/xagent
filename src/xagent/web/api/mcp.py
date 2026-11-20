@@ -1119,11 +1119,11 @@ def _team_member_mcp_oauth_definition_refusal(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="MCP OAuth server requires a URL",
         )
-    configured_redirect_uri = (
-        _configured_mcp_oauth_value(None, auth, "redirect_uri")
-        or _default_mcp_oauth_redirect_uri()
-    )
-    if configured_redirect_uri not in _deployment_mcp_oauth_redirect_uris():
+    configured_redirect_uri = _configured_mcp_oauth_value(None, auth, "redirect_uri")
+    if (
+        configured_redirect_uri is not None
+        and configured_redirect_uri not in _deployment_mcp_oauth_redirect_uris()
+    ):
         return HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail={

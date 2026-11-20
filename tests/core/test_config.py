@@ -69,6 +69,7 @@ from xagent.config import (
     MAX_TRACE_PAYLOAD_BYTES,
     MAX_UPLOAD_SIZE,
     MCP_OAUTH_ALLOW_PRIVATE_HOSTS,
+    MCP_OAUTH_CALLBACK_BASE_URL,
     MCP_OAUTH_CLIENT_NAME,
     MCP_OAUTH_PROXY_URL,
     MCP_TOOL_INIT_TIMEOUT_SECONDS,
@@ -192,6 +193,7 @@ from xagent.config import (
     get_max_trace_payload_bytes,
     get_max_upload_size_bytes,
     get_mcp_oauth_allow_private_hosts,
+    get_mcp_oauth_callback_base_url,
     get_mcp_oauth_client_name,
     get_mcp_oauth_proxy_url,
     get_mcp_tool_init_timeout_seconds,
@@ -485,6 +487,9 @@ class TestEnvironmentVariableConstants:
 
     def test_mcp_oauth_proxy_url_constant(self):
         assert MCP_OAUTH_PROXY_URL == "XAGENT_MCP_OAUTH_PROXY_URL"
+
+    def test_mcp_oauth_callback_base_url_constant(self):
+        assert MCP_OAUTH_CALLBACK_BASE_URL == "XAGENT_MCP_OAUTH_CALLBACK_BASE_URL"
 
     def test_mcp_oauth_client_name_constant(self):
         assert MCP_OAUTH_CLIENT_NAME == "XAGENT_MCP_OAUTH_CLIENT_NAME"
@@ -824,6 +829,33 @@ class TestMCPOAuthConfig:
         monkeypatch.setenv(MCP_OAUTH_PROXY_URL, value)
         with pytest.raises(ValueError, match="XAGENT_MCP_OAUTH_PROXY_URL"):
             get_mcp_oauth_proxy_url()
+
+    def test_callback_base_url_returns_none_when_unset_or_blank(self, monkeypatch):
+        monkeypatch.delenv(MCP_OAUTH_CALLBACK_BASE_URL, raising=False)
+        assert get_mcp_oauth_callback_base_url() is None
+
+        for blank in ("", "   "):
+            monkeypatch.setenv(MCP_OAUTH_CALLBACK_BASE_URL, blank)
+            assert get_mcp_oauth_callback_base_url() is None
+
+    def test_callback_base_url_is_trimmed(self, monkeypatch):
+        monkeypatch.setenv(MCP_OAUTH_CALLBACK_BASE_URL, " https://brand.example.com/ ")
+        assert get_mcp_oauth_callback_base_url() == "https://brand.example.com"
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            "brand.example.com",
+            "https://brand.example.com/?x=1",
+            "https://brand.example.com/#x",
+            "https://user:pass@brand.example.com",
+            "https://brand.example.com/prefix",
+        ],
+    )
+    def test_callback_base_url_rejects_invalid_values(self, monkeypatch, value):
+        monkeypatch.setenv(MCP_OAUTH_CALLBACK_BASE_URL, value)
+        with pytest.raises(ValueError, match="XAGENT_MCP_OAUTH_CALLBACK_BASE_URL"):
+            get_mcp_oauth_callback_base_url()
 
     def test_client_name_defaults_when_unset_or_blank(self, monkeypatch):
         monkeypatch.delenv(MCP_OAUTH_CLIENT_NAME, raising=False)

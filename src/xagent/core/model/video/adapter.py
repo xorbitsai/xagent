@@ -13,6 +13,10 @@ from .ark import ArkVideoModel
 from .base import BaseVideoModel, BilledVideoTaskError, VideoGenerationCapabilities
 from .xinference import XinferenceVideoModel
 
+# Provider variant for the xinference-saas prepaid video API (top-level fields,
+# no ``kwargs``). An explicit provider value, not URL sniffing, selects it.
+XINFERENCE_SAAS_PROVIDER = "xinference-saas"
+
 
 async def get_video_generation_capabilities(
     models: Mapping[str, BaseVideoModel],
@@ -102,10 +106,15 @@ def create_video_model(
         raise TypeError(f"Invalid model type: {type(model_config).__name__}")
 
     provider = canonical_provider_name(model_config.model_provider)
-    if provider not in {"volcengine-ark", "byteplus-ark", "xinference"}:
+    if provider not in {
+        "volcengine-ark",
+        "byteplus-ark",
+        "xinference",
+        XINFERENCE_SAAS_PROVIDER,
+    }:
         raise ValueError(f"Unsupported video model provider: {provider}")
 
-    if provider == "xinference":
+    if provider in {"xinference", XINFERENCE_SAAS_PROVIDER}:
         model: BaseVideoModel = XinferenceVideoModel(
             model_name=model_config.model_name,
             api_key=model_config.api_key,
@@ -113,6 +122,7 @@ def create_video_model(
             timeout=model_config.timeout,
             abilities=model_config.abilities,
             model_id=model_id,
+            saas_api=provider == XINFERENCE_SAAS_PROVIDER,
         )
     else:
         model = ArkVideoModel(

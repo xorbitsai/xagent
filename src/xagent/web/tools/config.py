@@ -2381,6 +2381,9 @@ class WebToolConfig(BaseToolConfig):
         self._cached_music_models: Optional[Dict[str, Any]] = None
         self._cached_music_model: Optional[Any] = None
         self._cached_mcp_configs: Optional[List[Dict[str, Any]]] = None
+        # Advanced by every invalidation of that cache; a scan that started
+        # before one must not publish its result.
+        self._mcp_config_cache_generation = 0
         # Catalog projection for one MCP config-load pass (see
         # ``_catalog_entries_for_pass``); reset at the start of every pass.
         self._catalog_entries: tuple[Any, ...] | None = None
@@ -2635,7 +2638,13 @@ class WebToolConfig(BaseToolConfig):
         from ...core.tools.adapters.vibe.mcp_tools import discard_mcp_load_reuse
 
         self._cached_mcp_configs = None
+        self._mcp_config_cache_generation += 1
         discard_mcp_load_reuse(self)
+
+    def _discard_runtime_derived_caches(self) -> None:
+        """Drop everything a per-turn change makes stale: the MCP configs and the prepared runtime."""
+        self._discard_cached_mcp_configs()
+        self.discard_prepared_factory_runtime()
 
     async def get_mcp_server_configs(self) -> List[Dict[str, Any]]:
         """Load MCP server configurations from database."""
@@ -2656,8 +2665,10 @@ class WebToolConfig(BaseToolConfig):
             # before failing.
             self._discard_cached_mcp_configs()
 
+        generation = self._mcp_config_cache_generation
         configs = await self._load_mcp_server_configs()
-        self._store_mcp_config_cache_if_cacheable(configs)
+        if generation == self._mcp_config_cache_generation:
+            self._store_mcp_config_cache_if_cacheable(configs)
         return configs
 
     def _refused_mcp_server_configs(self, reason: str) -> List[Dict[str, Any]]:
@@ -2804,9 +2815,32 @@ class WebToolConfig(BaseToolConfig):
             return False
         self._connector_runtime_turn_id = normalized_turn_id
         self._connector_runtime_view = None
-        self._discard_cached_mcp_configs()
-        self._factory_runtime_snapshot = None
-        self._pending_runtime_policy = None
+        self._discard_runtime_derived_caches()
+        return True
+
+    def set_tool_selection_spec(
+        self, tool_selection_spec: Optional[Any], *, include_mcp_tools: bool
+    ) -> bool:
+        """Switch the tool selection of a reused tool config.
+
+        ``WebToolConfig`` instances are cached with ``AgentService`` by task,
+        and the selection is fixed when they are built. An agent whose tools
+        were edited since must not keep running a task on the old selection
+        until the cached instance happens to expire.
+
+        No-op for an equal selection: specs are frozen value objects whose
+        members are frozensets, so equality ignores the order the categories
+        were stored in.
+        """
+
+        if (
+            self._tool_selection_spec == tool_selection_spec
+            and self._include_mcp_tools == include_mcp_tools
+        ):
+            return False
+        self._tool_selection_spec = tool_selection_spec
+        self._include_mcp_tools = include_mcp_tools
+        self._discard_runtime_derived_caches()
         return True
 
     def set_mcp_actor_execution_identity(
@@ -2817,9 +2851,7 @@ class WebToolConfig(BaseToolConfig):
         if self._mcp_actor_execution_identity == identity:
             return False
         self._mcp_actor_execution_identity = identity
-        self._discard_cached_mcp_configs()
-        self._factory_runtime_snapshot = None
-        self._pending_runtime_policy = None
+        self._discard_runtime_derived_caches()
         return True
 
     def set_execution_scope(self, scope: Optional[Any]) -> bool:
@@ -2854,9 +2886,7 @@ class WebToolConfig(BaseToolConfig):
         ):
             return False
         self._execution_scope = scope
-        self._discard_cached_mcp_configs()
-        self._factory_runtime_snapshot = None
-        self._pending_runtime_policy = None
+        self._discard_runtime_derived_caches()
         return True
 
     def _parse_numeric_task_id(self) -> Optional[int]:

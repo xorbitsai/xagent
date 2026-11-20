@@ -168,8 +168,10 @@ from .task_setup_snapshot import (
     MemoryPolicyTaskFields,
     RuntimeUserFields,
     TaskModelOverride,
+    TaskModelOverrideError,
     TaskOwnerMismatchError,
     TaskSetupSnapshot,
+    apply_task_model_override,
     detach_runtime_user_fields,
     load_memory_policy_task_fields_sync,
     load_task_setup_snapshot_sync,
@@ -712,15 +714,19 @@ def _build_tool_selection_spec_for_task(
     omit_published_agent_tools: bool = False,
     include_mcp_tools: bool = False,
     excluded_tool_categories: frozenset[str] = frozenset(),
+    announce: bool = True,
 ) -> Any:
-    """Single SSOT normalizer for chat reconstruct + snapshot paths.
+    """Single SSOT normalizer from raw inputs to a :class:`ToolSelectionSpec`.
 
-    Both ``_build_tools_for_task`` (reconstruct) and
-    ``get_agent_for_task`` (snapshot) translate the same raw inputs
-    (``agent_config['tool_categories']`` + optional workforce worker
-    tool names) into a :class:`ToolSelectionSpec`. Centralising the
-    call here keeps the two paths in lockstep and avoids the 30-line
-    copy / paste that used to live in each.
+    Translates ``agent_config['tool_categories']`` + optional workforce
+    worker tool names into the spec. Its three readers --
+    ``_build_tools_for_task`` (reconstruct), ``get_agent_for_task``
+    (snapshot build) and ``_sync_tool_selection`` (a reused runtime) -- do
+    not call it directly: they go through ``_resolve_task_tool_selection``,
+    which also derives the exclusion set and the MCP gate, so the three
+    cannot drift apart.
+
+    ``announce=False`` skips the log line, for a reader that only compares.
 
     ``excluded_tool_categories`` is the task model override's requested
     exclusion set (see ``_task_model_override_excluded_categories``); a plain
@@ -755,6 +761,8 @@ def _build_tool_selection_spec_for_task(
         spec = with_mcp_tools(spec)
     if omit_published_agent_tools:
         spec = without_published_agent_tools(spec)
+    if not announce:
+        return spec
     if spec.is_all():
         logger.info(
             f"Task {task_id} has no tool_categories restriction "
@@ -766,6 +774,65 @@ def _build_tool_selection_spec_for_task(
             f"{type(spec).__name__} with categories={tool_categories}"
         )
     return spec
+
+
+def _include_mcp_tools(tool_selection_spec: Optional[Any], *, force: bool) -> bool:
+    """A tool config's MCP gate: forced, or asked for by the selection itself.
+
+    Actor-marked tasks must load their exact owner-scoped builtin servers.
+    Ordinary agents retain the explicit-category cost gate.
+    """
+    return force or _spec_wants_mcp(tool_selection_spec)
+
+
+@dataclass(frozen=True)
+class _TaskToolSelection:
+    """What a task run's tool config is built from: the selection and the MCP gate."""
+
+    spec: Any
+    force_mcp_tools: bool
+
+    @property
+    def include_mcp_tools(self) -> bool:
+        return _include_mcp_tools(self.spec, force=self.force_mcp_tools)
+
+
+def _resolve_task_tool_selection(
+    agent_config: Optional[dict],
+    workforce_runtime: Optional[WorkforceTaskRuntime],
+    model_override_snapshot: Optional[TaskSetupSnapshot],
+    *,
+    task_id: int,
+    actor_marked: bool,
+    announce: bool = True,
+) -> _TaskToolSelection:
+    """The one derivation of a task run's tool selection and MCP gate.
+
+    Shared by the reconstruct build, the snapshot build and the sync of a
+    reused runtime. ``model_override_snapshot`` is the snapshot the run's
+    task model override was applied to (or a plain one): its requested
+    exclusion set turns off the actor-marked ``mcp`` add-back and the forced
+    MCP config load together, and only ever removes tools (see
+    ``_task_model_override_excluded_categories``). ``agent_config`` must be
+    that same snapshot's, so the categories the override removed are already
+    gone from it.
+    """
+    excluded_tool_categories = _task_model_override_excluded_categories(
+        model_override_snapshot
+    )
+    spec = _build_tool_selection_spec_for_task(
+        agent_config,
+        workforce_runtime,
+        task_id=task_id,
+        omit_published_agent_tools=actor_marked,
+        include_mcp_tools=actor_marked,
+        excluded_tool_categories=excluded_tool_categories,
+        announce=announce,
+    )
+    return _TaskToolSelection(
+        spec=spec,
+        force_mcp_tools=actor_marked and "mcp" not in excluded_tool_categories,
+    )
 
 
 def _mcp_failure_policy_for_task_source(source: object) -> MCPFailurePolicy:
@@ -963,9 +1030,9 @@ async def create_default_tools(
             "durable_storage_segments": durable_storage_segments,
         },
         execution_scope=scope,
-        # Actor-marked tasks must load their exact owner-scoped builtin
-        # servers. Ordinary agents retain the explicit-category cost gate.
-        include_mcp_tools=force_mcp_tools or _spec_wants_mcp(tool_selection_spec),
+        include_mcp_tools=_include_mcp_tools(
+            tool_selection_spec, force=force_mcp_tools
+        ),
         task_id=task_id,  # Pass task_id for browser session tracking
         browser_tools_enabled=True,  # Enable browser automation tools
         allowed_collections=allowed_collections,  # Agent Builder knowledge bases
@@ -2243,9 +2310,6 @@ class AgentServiceManager:
         mcp_actor_execution_identity: MCPActorExecutionIdentity | None = None,
     ) -> tuple[list[Any], Any]:
         """Build the tool set configured for a web task."""
-        excluded_tool_categories = _task_model_override_excluded_categories(
-            task_setup_snapshot
-        )
         excluded_model_ids = _task_model_override_excluded_model_ids(
             task_setup_snapshot
         )
@@ -2315,15 +2379,14 @@ class AgentServiceManager:
                         "agent tools"
                     )
 
-        actor_execution = mcp_runtime_authorization_policy is not None
-        tool_selection_spec = _build_tool_selection_spec_for_task(
+        tool_selection = _resolve_task_tool_selection(
             agent_config,
             workforce_runtime,
+            task_setup_snapshot,
             task_id=task_id,
-            omit_published_agent_tools=actor_execution,
-            include_mcp_tools=actor_execution,
-            excluded_tool_categories=excluded_tool_categories,
+            actor_marked=mcp_runtime_authorization_policy is not None,
         )
+        tool_selection_spec = tool_selection.spec
         workspace_owner_id = int(task.user_id)
         # Actor-logical access policy + CA mount intent, built by
         # the single shared projection (see build_chat_workspace_binding's
@@ -2388,10 +2451,7 @@ class AgentServiceManager:
             connector_runtime_turn_id=connector_runtime_turn_id,
             mcp_runtime_authorization_policy=mcp_runtime_authorization_policy,
             mcp_actor_execution_identity=mcp_actor_execution_identity,
-            # Same override exclusion as the selection-spec add-back above;
-            # only removes tools (see
-            # ``_task_model_override_excluded_categories``).
-            force_mcp_tools=actor_execution and "mcp" not in excluded_tool_categories,
+            force_mcp_tools=tool_selection.force_mcp_tools,
             mcp_failure_policy=_mcp_failure_policy_for_task_source(task.source),
             mcp_load_summary_tracer=parent_tracer,
             mcp_load_summary_trace_task_id=str(task_id),
@@ -3161,18 +3221,15 @@ class AgentServiceManager:
                     prepare_root=workspace_binding.prepare_root,
                 )
 
-                excluded_tool_categories = _task_model_override_excluded_categories(
-                    snapshot
-                )
                 excluded_model_ids = _task_model_override_excluded_model_ids(snapshot)
-                tool_selection_spec = _build_tool_selection_spec_for_task(
+                tool_selection = _resolve_task_tool_selection(
                     agent_config,
                     workforce_runtime,
+                    snapshot,
                     task_id=task_id,
-                    omit_published_agent_tools=actor_marked,
-                    include_mcp_tools=actor_marked,
-                    excluded_tool_categories=excluded_tool_categories,
+                    actor_marked=actor_marked,
                 )
+                tool_selection_spec = tool_selection.spec
 
                 tools = await create_default_tools(
                     db,
@@ -3231,11 +3288,7 @@ class AgentServiceManager:
                     connector_runtime_turn_id=connector_runtime_turn_id,
                     mcp_runtime_authorization_policy=(mcp_runtime_authorization_policy),
                     mcp_actor_execution_identity=mcp_actor_execution_identity,
-                    # Same override exclusion as the selection-spec add-back
-                    # above; only removes tools (see
-                    # ``_task_model_override_excluded_categories``).
-                    force_mcp_tools=actor_marked
-                    and "mcp" not in excluded_tool_categories,
+                    force_mcp_tools=tool_selection.force_mcp_tools,
                     mcp_failure_policy=_mcp_failure_policy_for_task_source(
                         task.source if task is not None else None
                     ),
@@ -3467,10 +3520,119 @@ class AgentServiceManager:
         self._agent_owner_ids[task_id] = runtime_user_id
         self._agent_scope_fingerprints[task_id] = fingerprint
         self._record_model_override(task_id, requested_model_override)
+        if not rebuilt_this_call:
+            await self._sync_tool_selection(
+                task_id,
+                task_setup_snapshot,
+                actor_marked=actor_marked,
+                model_override=requested_model_override,
+                task_owner_user_id=runtime_user_id,
+                db=db,
+            )
         self._sync_connector_runtime_turn(task_id, connector_runtime_turn_id)
         self._sync_mcp_actor_execution_identity(task_id, mcp_actor_execution_identity)
         self._sync_execution_scope(task_id, scope)
         return self._agents[task_id]
+
+    async def _sync_tool_selection(
+        self,
+        task_id: int,
+        task_setup_snapshot: Optional[TaskSetupSnapshot],
+        *,
+        actor_marked: bool,
+        model_override: Optional[TaskModelOverride],
+        task_owner_user_id: Optional[int],
+        db: Optional[Session],
+    ) -> None:
+        """Apply the task's current tool selection to a reused AgentService.
+
+        The selection is baked into the cached tool config when the runtime is
+        built. Without this, a task whose agent's ``tool_categories`` changed
+        (edited in the builder, or by a host that just connected an app for
+        it) keeps running warm or waiting on the old selection until the
+        cached instance expires.
+
+        What is refreshed is the selection spec and the MCP gate, derived by
+        ``_resolve_task_tool_selection`` exactly as a build derives them.
+        Everything else fixed at build time stays as built: knowledge bases,
+        skills, and a workforce run's worker agents and tool overrides. A
+        workforce task is therefore left alone altogether, because its spec
+        names the worker agents and must not disagree with the build-time
+        ``allowed_agent_ids`` next to it.
+
+        ``model_override`` is the override this instance runs with, which a
+        lookup without one keeps while the run is in progress or waiting. The
+        selection is derived with that override applied, so the categories it
+        excluded stay excluded; when it can no longer be applied to the
+        agent's selection, the selection is left as it is.
+
+        A lookup without a setup snapshot (the reply and A2A resume paths)
+        loads one here, since those paths resume the waiting run on this same
+        instance. A failed load leaves the selection alone.
+
+        Timing: a run reported as running is left alone and the next lookup
+        applies the change. The swap itself only marks the tools for a
+        rebuild; a tool list already built is not changed under the turn using
+        it, and ``AgentService`` repeats a build the invalidation lands in the
+        middle of.
+        """
+        agent = self._agents.get(task_id)
+        tool_config = getattr(agent, "tool_config", None)
+        if (
+            agent is None
+            or tool_config is None
+            or not hasattr(tool_config, "set_tool_selection_spec")
+        ):
+            return
+        if self._agent_run_executing(agent, task_id):
+            return
+        snapshot = task_setup_snapshot
+        if snapshot is None:
+            try:
+                snapshot = await _load_task_setup_snapshot_for_agent(
+                    task_id, task_owner_user_id, db
+                )
+            except Exception:  # noqa: BLE001 - the turn keeps its built selection
+                logger.warning(
+                    "Failed to load the tool selection of cached task %s; "
+                    "its selection is left as built",
+                    task_id,
+                    exc_info=True,
+                )
+                return
+            if snapshot is None or self._agent_run_executing(agent, task_id):
+                return
+        if snapshot.workforce_runtime is not None:
+            return
+        if model_override is not None and snapshot.model_override is not model_override:
+            try:
+                snapshot = apply_task_model_override(snapshot, model_override)
+            except TaskModelOverrideError:
+                return
+        selection = _resolve_task_tool_selection(
+            snapshot.agent_config,
+            snapshot.workforce_runtime,
+            snapshot,
+            task_id=task_id,
+            actor_marked=actor_marked,
+            announce=False,
+        )
+        if tool_config.set_tool_selection_spec(
+            selection.spec, include_mcp_tools=selection.include_mcp_tools
+        ):
+            logger.info(
+                "Refreshing tools for task %s: its tool selection changed", task_id
+            )
+            agent.invalidate_tools()
+
+    @staticmethod
+    def _agent_run_executing(agent: Any, task_id: int) -> bool:
+        """Whether the service reports a turn of the task as running."""
+        try:
+            status = agent.get_execution_status(str(task_id))
+            return bool(status and status.get("is_running"))
+        except Exception:  # noqa: BLE001 - unknown: leave a possible live run alone
+            return True
 
     def _agent_run_in_progress(self, task_id: int) -> bool:
         """Whether the cached AgentService has a running or resumable execution."""

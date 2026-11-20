@@ -43,6 +43,10 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# The most builds one call makes (the first and up to two repeats) when the
+# tools are invalidated while they are being built.
+_MAX_TOOL_BUILD_PASSES = 3
+
 _UNSET = object()
 
 
@@ -163,6 +167,9 @@ class AgentService:
         # cheap; the signature naturally invalidates when policy
         # changes later, restoring upstream's rebuild semantics.
         self._tool_policy_signature: Any | None = None
+        # Bumped by ``invalidate_tools`` so a build that was awaiting when the
+        # invalidation arrived does not mark its result as current.
+        self._tool_invalidation_generation = 0
         if self._tools_initialized and self.tool_config:
             try:
                 has_async_policy_refresh = callable(
@@ -269,6 +276,7 @@ class AgentService:
 
         self._tools_initialized = False
         self._tool_policy_signature = None
+        self._tool_invalidation_generation += 1
 
     def _refresh_task_runtime_context(self) -> None:
         """Refresh prompt and model preferences from the current tool contribution."""
@@ -915,6 +923,30 @@ class AgentService:
             return None
 
     async def _ensure_tools_initialized(self) -> None:
+        """Build the tools unless they are current, from the config as it is now.
+
+        ``invalidate_tools`` can be called while a build is awaiting: a
+        lookup for the same task that changed the tool config (a new connector
+        turn, a changed tool selection). That build read part of the old
+        config, so its result must not be kept as current; the build is
+        repeated. After ``_MAX_TOOL_BUILD_PASSES`` the tools stay marked for a
+        rebuild and the next turn builds them again.
+        """
+        for _ in range(_MAX_TOOL_BUILD_PASSES):
+            generation = self._tool_invalidation_generation
+            await self._initialize_tools_once()
+            if generation == self._tool_invalidation_generation:
+                return
+            self._tools_initialized = False
+            self._tool_policy_signature = None
+        logger.warning(
+            "Tools of %s were invalidated during each of %d builds; this turn runs on "
+            "the last build and the next turn builds again",
+            self.id,
+            _MAX_TOOL_BUILD_PASSES,
+        )
+
+    async def _initialize_tools_once(self) -> None:
         if self.tool_config:
             try:
                 from ..tools.adapters.vibe.factory import ToolFactory

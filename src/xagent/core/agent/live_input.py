@@ -40,6 +40,19 @@ class LiveInputResult(str, Enum):
     UNKNOWN = "unknown"
 
 
+def result_without_injection(claim: LiveInputClaim) -> LiveInputResult:
+    """The result for a message that was not injected after ``claim``.
+
+    A claimed message that was not injected, and one that was not claimed,
+    are handed back. Any claim this cannot interpret stays unknown.
+    """
+    if claim is LiveInputClaim.TAKEN:
+        return LiveInputResult.TAKEN
+    if claim is LiveInputClaim.CLAIMED or claim is LiveInputClaim.UNAVAILABLE:
+        return LiveInputResult.RETURNED
+    return LiveInputResult.UNKNOWN
+
+
 class LiveInputAdmission(Protocol):
     """Owner-supplied hooks that decide and record what happens to a message."""
 

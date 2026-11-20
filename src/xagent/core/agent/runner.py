@@ -98,6 +98,7 @@ from .live_input import (
     LiveInputOffer,
     LiveInputResult,
     LiveUserInput,
+    result_without_injection,
 )
 from .result import (
     FINAL_ANSWER_KEYS,
@@ -1765,14 +1766,10 @@ class AgentRunner:
         except BaseException:
             await self._finish_live_input_shielded(item, LiveInputResult.UNKNOWN)
             raise
-        if claim is LiveInputClaim.TAKEN:
-            return await self._finish_live_input_shielded(item, LiveInputResult.TAKEN)
-        if claim is LiveInputClaim.UNAVAILABLE:
-            return await self._finish_live_input_shielded(
-                item, LiveInputResult.RETURNED
-            )
         if claim is not LiveInputClaim.CLAIMED:
-            return await self._finish_live_input_shielded(item, LiveInputResult.UNKNOWN)
+            return await self._finish_live_input_shielded(
+                item, result_without_injection(claim)
+            )
 
         escaped: BaseException | None = None
         posted: UserMessageInjectionOutcome | None = None

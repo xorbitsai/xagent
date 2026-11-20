@@ -119,7 +119,12 @@ from .runtime import (
 logger = logging.getLogger(__name__)
 
 # Longest an outside cancellation of a run is held back while one taken live
-# user message is being claimed, written and finished.
+# user message is being claimed, written and finished. Every outside
+# cancellation is held back alike, whatever caused it, a lost task lease
+# included: the runner cannot tell them apart. Writes that the owner of the
+# execution fences by its own ownership check still refuse to land once
+# ownership has moved; writes it does not fence may land up to this long
+# after.
 LIVE_INPUT_CANCEL_GRACE_SECONDS = 3.0
 
 # ``ACCEPTED_TURN_IDS_METADATA_KEY`` (defined in ``context.execution`` so child
@@ -1695,7 +1700,9 @@ class AgentRunner:
         The cancellation is held back for at most
         ``LIVE_INPUT_CANCEL_GRACE_SECONDS``, counted from the first one. When
         that expires the work is cancelled and the cancellation is re-raised
-        at once; the work records its outcome in the background.
+        at once; the work records its outcome in the background. This applies
+        to every outside cancellation, including one that follows a lost task
+        lease.
         """
         work = asyncio.ensure_future(self._inject_live_input(execution_id, item))
         self._live_input_tasks.add(work)

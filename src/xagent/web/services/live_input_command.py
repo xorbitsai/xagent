@@ -3,9 +3,9 @@
 The command executor runs in the task process that holds the task lease. It
 only reads in-memory state and returns in milliseconds, because commands of
 one task execute one at a time and a stop request must not queue behind it.
-The message waits in the running execution's mailbox; the delivery ledger is
-touched later, by ``DeliveryLedgerAdmission``, when the execution reaches a
-safe point and asks to claim the message.
+The message waits in the running execution's mailbox, in memory only; the
+delivery ledger is touched later, by ``DeliveryLedgerAdmission``, when the
+execution reaches a safe point and asks to claim the message.
 
 Who the sender is and whether they may still spend quota is decided by the
 registered ``LiveInputHost``; this module never inspects identities.
@@ -86,7 +86,11 @@ def parse_live_input_payload(command: ClaimedTaskCommand) -> LiveInputPayload | 
 
 
 class LiveInputHost(Protocol):
-    """What the embedding application supplies for live input."""
+    """What the embedding application supplies for live input.
+
+    A ``queued`` command result is held in process memory only; see
+    ``execute_live_input_command`` for what the host has to reconcile.
+    """
 
     def authorize(self, db: Session, payload: LiveInputPayload) -> int | None:
         """Revalidate the sender; return the task owner's user id, or ``None``."""
@@ -163,7 +167,14 @@ class _ClaimOutcome:
 
 
 class DeliveryLedgerAdmission:
-    """Records a live message in the delivery ledger around its injection."""
+    """Records a live message in the delivery ledger around its injection.
+
+    Its ledger writes are keyed by task and turn id and are not fenced by the
+    task lease, so after a lost lease they can still land while the runner
+    holds the run's cancellation back (``LIVE_INPUT_CANCEL_GRACE_SECONDS``).
+    The injection's checkpoint is written under the run's task lease and is
+    refused once the lease has moved to another runner.
+    """
 
     def __init__(self, payload: LiveInputPayload, host: LiveInputHost) -> None:
         self._payload = payload
@@ -404,6 +415,14 @@ async def execute_live_input_command(
 
     Reads memory only. Notices to the browser are published in the background
     so a slow event bus cannot hold up the commands queued behind this one.
+
+    ``queued`` means only that the message is waiting in this process's
+    memory. If the process exits before the run reaches its safe point,
+    nothing records the message and no ``live_input_returned`` is published;
+    a command that fails before it reaches this executor publishes none
+    either. A host must therefore settle a message it has no notice for once
+    the run named by the command's ``target_run_id`` is no longer executing,
+    matching the command by its id and run id.
     """
 
     payload = parse_live_input_payload(command)

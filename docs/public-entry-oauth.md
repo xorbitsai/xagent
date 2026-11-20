@@ -142,14 +142,19 @@ Additional prerequisites:
 
 `XAGENT_MCP_OAUTH_CALLBACK_BASE_URL` (`get_mcp_oauth_callback_base_url()`) is
 independent of the public entries above. It changes only the `redirect_uri`
-that MCP dynamic client registration advertises, on an origin (no path) whose
-ingress redirects `GET /api/mcp/oauth/callback`, query unchanged, to the
-deployment's own callback. The state cookie, the hand-off and the authorization
-entry stay where they are, so the rest of the callback runs on the deployment's
-own site as before. Clients with a pre-registered `client_id` keep the
-deployment's own callback. Unset keeps the advertised callback, the
-registration hash and the member start-site check unchanged. Set, the
-registration hash changes, so each server registers again on its next connect;
-existing grants keep refreshing with the client that issued them. Put the
-ingress forward in place before setting the variable, and unset the variable
-everywhere, then let in-flight authorizations expire, before removing it.
+that MCP dynamic client registration advertises, on an https origin (no path)
+whose ingress redirects `GET /api/mcp/oauth/callback`, query unchanged, to the
+deployment's own callback. That forward must target a fixed, configured host
+and the fixed `/api/mcp/oauth/callback` path, never a host or path taken from
+the request; otherwise it is an open redirect carrying the authorization code.
+
+The state cookie, the hand-off and the authorization entry stay where they are,
+so the rest of the callback runs on the deployment's own site as before, and the
+member start-site check always compares with the deployment's own callback.
+Clients with a pre-registered `client_id` keep the deployment's own callback.
+Unset keeps the advertised callback and the registration hash unchanged. Set,
+the registration hash changes, so each server registers again on its next
+connect; existing grants keep refreshing with the client that issued them. Put
+the ingress forward in place before setting the variable, and unset the
+variable everywhere, then let in-flight authorizations expire, before removing
+it.

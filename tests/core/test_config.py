@@ -842,6 +842,10 @@ class TestMCPOAuthConfig:
         monkeypatch.setenv(MCP_OAUTH_CALLBACK_BASE_URL, " https://brand.example.com/ ")
         assert get_mcp_oauth_callback_base_url() == "https://brand.example.com"
 
+    def test_callback_base_url_accepts_an_http_loopback_origin(self, monkeypatch):
+        monkeypatch.setenv(MCP_OAUTH_CALLBACK_BASE_URL, "http://localhost:8000")
+        assert get_mcp_oauth_callback_base_url() == "http://localhost:8000"
+
     @pytest.mark.parametrize(
         "value",
         [
@@ -852,6 +856,7 @@ class TestMCPOAuthConfig:
             "https://brand.example.com/prefix",
             "https://brand.example.com?",
             "https://brand.example.com#",
+            "http://brand.example.com",
         ],
     )
     def test_callback_base_url_rejects_invalid_values(self, monkeypatch, value):

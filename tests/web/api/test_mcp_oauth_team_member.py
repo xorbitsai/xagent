@@ -10,6 +10,7 @@ exchange.
 from __future__ import annotations
 
 import json
+import logging
 import re
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
@@ -1087,7 +1088,12 @@ async def test_team_member_callback_site_ignores_the_advertised_callback_base(
 
 
 @pytest.mark.asyncio
-async def test_team_member_treats_a_blank_configured_callback_as_unset(env):
+async def test_team_member_treats_a_blank_configured_callback_as_unset(
+    env, monkeypatch
+):
+    monkeypatch.setenv(
+        "XAGENT_MCP_OAUTH_CALLBACK_BASE_URL", "https://brand.example.com"
+    )
     env.edit_auth(redirect_uri="   ")
 
     assert mcp_api._team_member_mcp_oauth_definition_refusal(env.server) is None
@@ -1095,7 +1101,23 @@ async def test_team_member_treats_a_blank_configured_callback_as_unset(env):
 
     assert response.status_code == 303
     query = parse_qs(urlparse(response.headers["location"]).query)
-    assert query["redirect_uri"] == [mcp_api._default_mcp_oauth_redirect_uri()]
+    assert query["redirect_uri"] == ["https://brand.example.com/api/mcp/oauth/callback"]
+
+
+def test_listing_offers_no_member_sign_in_for_an_invalid_callback_base(
+    env, monkeypatch, caplog
+):
+    env.edit_auth(redirect_uri=mcp_api._mcp_oauth_callback_site_redirect_uri())
+    env.db.expire_all()
+    monkeypatch.setenv("XAGENT_MCP_OAUTH_CALLBACK_BASE_URL", "http://brand.example.com")
+
+    with caplog.at_level(logging.WARNING, logger=mcp_api.logger.name):
+        assert mcp_api._team_member_sign_in_host(env.server) is None
+
+    assert any(
+        "callback configuration is invalid" in record.getMessage()
+        for record in caplog.records
+    )
 
 
 @pytest.mark.asyncio

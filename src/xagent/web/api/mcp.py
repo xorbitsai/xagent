@@ -689,15 +689,8 @@ def _default_mcp_oauth_redirect_uri() -> str:
     """
     advertised_base_url = get_mcp_oauth_callback_base_url()
     if advertised_base_url:
-        return f"{advertised_base_url.rstrip('/')}/api/mcp/oauth/callback"
+        return f"{advertised_base_url}/api/mcp/oauth/callback"
     return _mcp_oauth_callback_site_redirect_uri()
-
-
-def _deployment_mcp_oauth_redirect_uris() -> frozenset[str]:
-    """Both spellings of this deployment's own MCP OAuth callback."""
-    return frozenset(
-        {_default_mcp_oauth_redirect_uri(), _mcp_oauth_callback_site_redirect_uri()}
-    )
 
 
 def _safe_mcp_oauth_redirect_after(value: str | None) -> str:
@@ -1119,12 +1112,13 @@ def _team_member_mcp_oauth_definition_refusal(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="MCP OAuth server requires a URL",
         )
-    # A blank value means unset here, as it does when the flow starts.
+    # A blank value means unset here, as it does when the flow starts. A set
+    # value must be the advertised callback or this deployment's own one.
     configured_redirect_uri = _configured_mcp_oauth_value(None, auth, "redirect_uri")
-    if (
-        configured_redirect_uri
-        and configured_redirect_uri not in _deployment_mcp_oauth_redirect_uris()
-    ):
+    if configured_redirect_uri and configured_redirect_uri not in {
+        _default_mcp_oauth_redirect_uri(),
+        _mcp_oauth_callback_site_redirect_uri(),
+    }:
         return HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail={
@@ -3732,9 +3726,21 @@ def _team_member_sign_in_host(server: MCPServer) -> str | None:
     ``_team_member_mcp_oauth_definition_refusal``), the URL gives no host, or
     the definition's configured OAuth resource differs from its URL, which the
     member path refuses after discovery as ``resource_mismatch``. The caller has
-    already checked that the resource and issuer parse.
+    already checked that the resource and issuer parse. An invalid
+    ``XAGENT_MCP_OAUTH_CALLBACK_BASE_URL`` offers no sign-in here; the connect
+    itself reports it.
     """
-    if _team_member_mcp_oauth_definition_refusal(server) is not None:
+    try:
+        refusal = _team_member_mcp_oauth_definition_refusal(server)
+    except ValueError as exc:
+        logger.warning(
+            "Listing team MCP OAuth connector without member sign-in, the "
+            "callback configuration is invalid: server_id=%s error=%s",
+            server.id,
+            type(exc).__name__,
+        )
+        return None
+    if refusal is not None:
         return None
     url = str(server.url)
     host = _display_host(url)

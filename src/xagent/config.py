@@ -1338,18 +1338,28 @@ def get_mcp_oauth_callback_base_url() -> str | None:
     it changes, servers register again on their next connect, and existing
     grants keep refreshing with their own client rows.
 
-    Raises ``ValueError`` for a value that is not an absolute http(s) origin:
-    a path, query, fragment or credentials are rejected. A path cannot work,
-    because the state cookie is scoped to ``/api/mcp``.
+    Raises ``ValueError`` for a value that is not an https origin (or an http
+    loopback origin, which dynamic registration also allows): a path, query,
+    fragment or credentials are rejected. A path cannot work, because the state
+    cookie is scoped to ``/api/mcp``.
     """
     value = _reject_url_userinfo(
         MCP_OAUTH_CALLBACK_BASE_URL,
         _normalized_http_env_url(MCP_OAUTH_CALLBACK_BASE_URL),
     )
-    if value is not None and (urlsplit(value).path or "?" in value or "#" in value):
+    if value is None:
+        return None
+    parts = urlsplit(value)
+    loopback = (parts.hostname or "").lower() in {"localhost", "127.0.0.1", "::1"}
+    if (
+        parts.path
+        or "?" in value
+        or "#" in value
+        or not (parts.scheme == "https" or (parts.scheme == "http" and loopback))
+    ):
         raise ValueError(
             f"Invalid {MCP_OAUTH_CALLBACK_BASE_URL} value: {value!r}. "
-            "Expected an origin without a path."
+            "Expected an https origin (or an http loopback origin) without a path."
         )
     return value
 

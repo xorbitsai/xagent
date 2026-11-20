@@ -549,7 +549,8 @@ class PatternRuntime:
         between a tool call and its result would detach the pair from the model
         input. Interruption is checked before each message is taken, so a stop
         request leaves the rest in the mailbox for the owner to hand back. Each
-        message that is applied becomes the current turn.
+        message that is applied becomes the current turn. A taken message stays
+        known to the mailbox until its injector returns or raises.
         """
         if not tools_settled or self._active_tool_tasks:
             raise RuntimeError(
@@ -567,7 +568,11 @@ class PatternRuntime:
             item = mailbox.take_next()
             if item is None:
                 break
-            if await injector(item) is LiveInputResult.APPLIED:
+            try:
+                result = await injector(item)
+            finally:
+                mailbox.settle(item)
+            if result is LiveInputResult.APPLIED:
                 applied += 1
                 self.active_turn_id = self._dag_turn_id(context)
         return applied

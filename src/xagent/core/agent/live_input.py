@@ -69,10 +69,18 @@ class LiveInputOffer(str, Enum):
 
 
 class LiveInputMailbox:
-    """Ordered, closable queue of messages waiting for a safe point."""
+    """Ordered, closable queue of messages waiting for a safe point.
+
+    A message stays known by its turn id from the moment it is queued until
+    the execution has settled it: first while it waits, then, once taken,
+    while it is being admitted. An offer of a turn id the mailbox still knows
+    is answered from that entry instead of being queued again.
+    """
 
     def __init__(self) -> None:
         self._items: deque[LiveUserInput] = deque()
+        # Taken messages that have not been settled yet, by turn id.
+        self._taken: dict[str, LiveUserInput] = {}
         self._closed = False
 
     @property
@@ -82,10 +90,14 @@ class LiveInputMailbox:
     def offer(self, item: LiveUserInput) -> LiveInputOffer:
         if self._closed:
             return LiveInputOffer.NO_LIVE_RUN
-        for queued in self._items:
-            if queued.turn_id != item.turn_id:
-                continue
-            if queued.execution_message == item.execution_message:
+        known = self._taken.get(item.turn_id)
+        if known is None:
+            known = next(
+                (queued for queued in self._items if queued.turn_id == item.turn_id),
+                None,
+            )
+        if known is not None:
+            if known.execution_message == item.execution_message:
                 return LiveInputOffer.ALREADY_QUEUED
             return LiveInputOffer.CONFLICT
         self._items.append(item)
@@ -94,7 +106,14 @@ class LiveInputMailbox:
     def take_next(self) -> LiveUserInput | None:
         if not self._items:
             return None
-        return self._items.popleft()
+        item = self._items.popleft()
+        self._taken[item.turn_id] = item
+        return item
+
+    def settle(self, item: LiveUserInput) -> None:
+        """Forget a taken ``item`` once the execution is done admitting it."""
+        if self._taken.get(item.turn_id) is item:
+            del self._taken[item.turn_id]
 
     def pending(self) -> bool:
         return bool(self._items)

@@ -294,6 +294,21 @@ def test_mailbox_orders_dedupes_and_closes() -> None:
     assert mailbox.offer(make_item("c")) is LiveInputOffer.NO_LIVE_RUN
 
 
+def test_mailbox_answers_for_a_taken_message_until_settled() -> None:
+    mailbox = LiveInputMailbox()
+    assert mailbox.offer(make_item("a")) is LiveInputOffer.QUEUED
+    taken = mailbox.take_next()
+    assert taken is not None
+    assert not mailbox.pending()
+    assert mailbox.offer(make_item("a")) is LiveInputOffer.ALREADY_QUEUED
+    assert mailbox.offer(make_item("a", "other")) is LiveInputOffer.CONFLICT
+    # Only the object that was taken can settle it.
+    mailbox.settle(make_item("a"))
+    assert mailbox.offer(make_item("a", "other")) is LiveInputOffer.CONFLICT
+    mailbox.settle(taken)
+    assert mailbox.offer(make_item("a")) is LiveInputOffer.QUEUED
+
+
 # --------------------------------------------------------------------------
 # Offer
 # --------------------------------------------------------------------------
@@ -446,6 +461,36 @@ async def test_offer_during_react_preamble(monkeypatch: pytest.MonkeyPatch) -> N
     assert LIVE_TEXT in str(rig.llm.requests[1])
 
 
+async def test_offer_while_a_taken_message_is_admitted() -> None:
+    gate = asyncio.Event()
+    first = RecordingAdmission(gate=gate)
+    same = RecordingAdmission()
+    other = RecordingAdmission()
+    answers: list[LiveInputOffer] = []
+    rig = make_rig([tool_calls("w1"), final_answer()], ("w1",))
+
+    async def repeat_offers() -> None:
+        for _ in range(500):
+            if "claim" in first.events:
+                break
+            await asyncio.sleep(0.005)
+        answers.append(rig.offer(same, turn_id="dup"))
+        answers.append(rig.offer(other, turn_id="dup", text=LIVE_TEXT + "-other"))
+        gate.set()
+
+    async def on_start(_: str) -> None:
+        assert rig.offer(first, turn_id="dup") is LiveInputOffer.QUEUED
+        asyncio.ensure_future(repeat_offers())
+
+    rig.tools["w1"].on_start = on_start
+    result = await rig.start()
+    assert result["success"] is True
+    assert answers == [LiveInputOffer.ALREADY_QUEUED, LiveInputOffer.CONFLICT]
+    assert first.events == ["claim", LiveInputResult.APPLIED]
+    assert same.events == []
+    assert other.events == []
+
+
 # --------------------------------------------------------------------------
 # Safe point
 # --------------------------------------------------------------------------
@@ -527,6 +572,20 @@ async def test_forced_answer_turn_keeps_mailbox(
     assert result["success"] is True
     assert adm.events == [LiveInputResult.RETURNED]
     assert LIVE_TEXT not in str(rig.llm.requests[-1])
+
+
+async def test_taken_message_is_settled_when_its_admission_raises() -> None:
+    runtime = PatternRuntime(execution_id=EID)
+    runtime.live_input = LiveInputMailbox()
+
+    async def injector(item: LiveUserInput) -> LiveInputResult:
+        raise asyncio.CancelledError()
+
+    runtime._live_input_injector = injector
+    assert runtime.live_input.offer(make_item("t1")) is LiveInputOffer.QUEUED
+    with pytest.raises(asyncio.CancelledError):
+        await runtime.admit_live_user_messages(None, tools_settled=True)
+    assert runtime.live_input.offer(make_item("t1")) is LiveInputOffer.QUEUED
 
 
 # --------------------------------------------------------------------------

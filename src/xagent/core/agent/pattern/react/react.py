@@ -1899,7 +1899,9 @@ class ReActPattern(AgentPattern):
         # success means a final response was delivered, not that the requested
         # work succeeded; use the existing partial/blocked outcome contract.
         result.update(
-            termination_reason="max_iterations", iterations=self.max_iterations
+            termination_reason="max_iterations",
+            iterations=self.max_iterations,
+            live_input_iteration_grant=self.live_input_iteration_grant,
         )
         return result
 

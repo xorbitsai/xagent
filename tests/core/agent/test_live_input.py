@@ -113,8 +113,11 @@ def tool_calls(*names: str) -> dict[str, Any]:
     }
 
 
-def final_answer() -> dict[str, Any]:
-    arguments = json.dumps({"answer": "done", "response_language": "English"})
+def final_answer(outcome: str | None = None) -> dict[str, Any]:
+    args = {"answer": "done", "response_language": "English"}
+    if outcome is not None:
+        args["outcome"] = outcome
+    arguments = json.dumps(args)
     return {
         "content": "",
         "tool_calls": [
@@ -1772,3 +1775,21 @@ async def test_live_input_iteration_grant_survives_resume() -> None:
     # The resumed run keeps working past max_iterations up to the raised cap.
     assert result["success"] is False
     assert len(tool.calls) == max_iterations + GRANT - start
+
+
+async def test_iteration_limit_delivery_reports_the_grant() -> None:
+    max_iterations = UNCAPPED_MAX_ITERATIONS
+    rig = rig_with_offered_messages(
+        1,
+        [tool_calls("w1")] * (max_iterations + GRANT - 1)
+        + [final_answer(outcome="partial")],
+        max_iterations=max_iterations,
+    )
+    result = await rig.start()
+    # The answer delivered at the cap reports the allowance as the failure
+    # result does.
+    assert result["success"] is True
+    assert result["termination_reason"] == "max_iterations"
+    assert result["iterations"] == max_iterations
+    assert result["live_input_iteration_grant"] == GRANT
+    assert len(rig.tools["w1"].calls) == max_iterations + GRANT

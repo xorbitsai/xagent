@@ -1240,6 +1240,13 @@ class ReActPattern(AgentPattern):
                         self.live_input_iteration_grant
                         + LIVE_INPUT_ITERATION_GRANT * applied
                     )
+                    # Saved now: the checkpoint each message wrote was built
+                    # from the pattern state before this allowance, and the
+                    # next pattern checkpoint (before_llm) comes only after
+                    # routing and compaction.
+                    await runtime.checkpoint(
+                        "live_input_applied", context=context, pattern=self
+                    )
 
             route_messages = self._messages_for_llm(
                 context,
@@ -2823,9 +2830,16 @@ class ReActPattern(AgentPattern):
 
         max_iterations plus the allowance the live user messages applied to
         this run have added; the allowance is 0 for a run that applied none
-        and never exceeds max_iterations. The allowance is saved with the
-        pattern's next checkpoint; a run resumed from the checkpoint the
-        injection itself wrote has the message without its allowance.
+        and never exceeds max_iterations. The safe point saves it in a
+        checkpoint right after applying messages. The checkpoint each message
+        writes for itself is built from the pattern state before that, so a
+        run resumed from one has the message without its allowance. A run
+        resumes from such a checkpoint when it stops after a message was
+        written and before the safe point's checkpoint is written: for
+        example when it is cancelled during the safe point's admission, since
+        the cancellation is re-raised once the message being admitted is
+        finished, or when the process exits while a later message of the same
+        safe point is being written.
         """
         return self.max_iterations + self.live_input_iteration_grant
 

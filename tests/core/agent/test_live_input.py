@@ -25,6 +25,7 @@ from xagent.core.agent import (
     Agent,
     AgentExecutionAdapter,
     AgentExecutionConfig,
+    ExecutionContext,
     PatternRuntime,
     ReActPattern,
 )
@@ -1519,14 +1520,24 @@ def rig_with_offered_messages(
     rig = make_rig(
         [*script, *rest],
         ("w1",),
-        pattern=ReActPattern(
-            max_iterations=max_iterations,
-            repeated_tool_decision_after_consecutive_tool_calls=None,
-            repeated_tool_decision_after_consecutive_work_tool_calls=None,
-        ),
+        pattern=tool_only_pattern(max_iterations),
     )
     holder.append(rig)
     return rig
+
+
+def tool_only_pattern(max_iterations: int) -> ReActPattern:
+    return ReActPattern(
+        max_iterations=max_iterations,
+        repeated_tool_decision_after_consecutive_tool_calls=None,
+        repeated_tool_decision_after_consecutive_work_tool_calls=None,
+    )
+
+
+def live_messages_in(checkpoint: dict[str, Any]) -> int:
+    """How many live messages the context saved in ``checkpoint`` holds."""
+    messages = (checkpoint.get("context") or {}).get("messages") or []
+    return sum(str(message.get("content")).count(LIVE_TEXT) for message in messages)
 
 
 @pytest.mark.parametrize(
@@ -1699,3 +1710,65 @@ async def test_live_input_iteration_grant_stops_at_max_iterations() -> None:
     assert len(rig.tools["w1"].calls) == 2 * max_iterations
     last_request = " ".join(str(m.get("content")) for m in rig.llm.requests[-1])
     assert all(f"{LIVE_TEXT}{index}" in last_request for index in range(3))
+
+
+@pytest.mark.parametrize(
+    ("offers", "claim", "saves"),
+    [
+        pytest.param([1], LiveInputClaim.CLAIMED, 1, id="one"),
+        pytest.param([3], LiveInputClaim.CLAIMED, 1, id="three_at_one_safe_point"),
+        pytest.param([1, 1], LiveInputClaim.CLAIMED, 2, id="two_safe_points"),
+        pytest.param([1], LiveInputClaim.UNAVAILABLE, 0, id="returned"),
+    ],
+)
+async def test_live_input_iteration_grant_is_saved_at_the_safe_point(
+    offers: list[int], claim: LiveInputClaim, saves: int
+) -> None:
+    rig = rig_with_offered_messages(
+        offers, [final_answer()], max_iterations=UNCAPPED_MAX_ITERATIONS, claim=claim
+    )
+    await rig.start()
+    checkpoints = rig.runtimes[0].checkpoints
+    # One save for each safe point that applied a message, none otherwise.
+    labels = [checkpoint["label"] for checkpoint in checkpoints]
+    assert labels.count("live_input_applied") == saves
+    # The first pattern checkpoint to hold a new message is that save, and
+    # every pattern checkpoint holds the allowance of the messages it holds.
+    held = [live_messages_in(checkpoint) for checkpoint in checkpoints]
+    first_to_hold_more = [
+        checkpoint["label"]
+        for checkpoint, before, now in zip(checkpoints, [0, *held], held)
+        if now > before
+    ]
+    assert first_to_hold_more == ["live_input_applied"] * saves
+    assert [
+        checkpoint["pattern_state"]["live_input_iteration_grant"]
+        for checkpoint in checkpoints
+    ] == [GRANT * count for count in held]
+
+
+async def test_live_input_iteration_grant_survives_resume() -> None:
+    max_iterations = UNCAPPED_MAX_ITERATIONS
+    rig = rig_with_offered_messages(1, [final_answer()], max_iterations=max_iterations)
+    await rig.start()
+    saved = next(
+        checkpoint
+        for checkpoint in rig.runtimes[0].checkpoints
+        if checkpoint["label"] == "live_input_applied"
+    )
+    resumed = tool_only_pattern(max_iterations)
+    resumed.load_state(json.loads(json.dumps(saved["pattern_state"])))
+    start = resumed.current_iteration
+    assert start >= 1
+    tool = ProbeTool("w1")
+    context = ExecutionContext(execution_id=EID)
+    context.add_user_message("hello")
+    result = await resumed.run(
+        context=context,
+        tools=[tool],
+        llm=ScriptedLLM([tool_calls("w1")] * (max_iterations + GRANT + 5)),
+        runtime=PatternRuntime(execution_id=EID),
+    )
+    # The resumed run keeps working past max_iterations up to the raised cap.
+    assert result["success"] is False
+    assert len(tool.calls) == max_iterations + GRANT - start

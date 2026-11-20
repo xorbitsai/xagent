@@ -1793,3 +1793,73 @@ async def test_iteration_limit_delivery_reports_the_grant() -> None:
     assert result["iterations"] == max_iterations
     assert result["live_input_iteration_grant"] == GRANT
     assert len(rig.tools["w1"].calls) == max_iterations + GRANT
+
+
+async def test_live_input_mixed_batch_grants_only_the_applied_message() -> None:
+    max_iterations = UNCAPPED_MAX_ITERATIONS
+    holder: list[Rig] = []
+
+    async def offer_claimed_then_unavailable() -> Any:
+        for index, claim in enumerate(
+            (LiveInputClaim.CLAIMED, LiveInputClaim.UNAVAILABLE)
+        ):
+            offer = holder[0].offer(
+                RecordingAdmission(claim),
+                turn_id=f"live-{index}",
+                text=f"{LIVE_TEXT}{index}",
+            )
+            assert offer is LiveInputOffer.QUEUED
+        return tool_calls("w1")
+
+    rig = make_rig(
+        [
+            offer_claimed_then_unavailable,
+            *[tool_calls("w1")] * (max_iterations + 2 * GRANT + 5),
+        ],
+        ("w1",),
+        pattern=tool_only_pattern(max_iterations),
+    )
+    holder.append(rig)
+    result = await rig.start()
+    assert result["live_input_iteration_grant"] == GRANT
+    assert len(rig.tools["w1"].calls) == max_iterations + GRANT
+
+
+async def test_live_input_replay_of_a_turn_written_after_queueing_adds_grant() -> None:
+    max_iterations = UNCAPPED_MAX_ITERATIONS
+    holder: list[Rig] = []
+    outcomes: list[UserMessageInjectionOutcome] = []
+
+    async def queue_then_write_directly() -> Any:
+        rig = holder[0]
+        offer = rig.offer(RecordingAdmission(), turn_id="dup", text=LIVE_TEXT)
+        assert offer is LiveInputOffer.QUEUED
+        # The same turn reaches the context through the ordinary injection
+        # path before the loop takes the queued copy at its safe point.
+        written = await rig.runner.inject_user_message(
+            EID,
+            execution_message=LIVE_TEXT,
+            display_message=LIVE_TEXT,
+            turn_id="dup",
+            request_interrupt=False,
+        )
+        outcomes.append(written.outcome)
+        return tool_calls("w1")
+
+    rig = make_rig(
+        [
+            queue_then_write_directly,
+            *[tool_calls("w1")] * (max_iterations + 2 * GRANT + 5),
+        ],
+        ("w1",),
+        pattern=tool_only_pattern(max_iterations),
+    )
+    holder.append(rig)
+    result = await rig.start()
+    assert outcomes == [UserMessageInjectionOutcome.POSTED_FRESH]
+    # The queued copy finds its turn already accepted: it counts as applied
+    # and adds the allowance once, without a second copy of the message.
+    assert result["live_input_iteration_grant"] == GRANT
+    assert len(rig.tools["w1"].calls) == max_iterations + GRANT
+    last_request = " ".join(str(m.get("content")) for m in rig.llm.requests[-1])
+    assert last_request.count(LIVE_TEXT) == 1

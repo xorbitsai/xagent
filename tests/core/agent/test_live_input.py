@@ -560,7 +560,7 @@ async def test_live_input_waits_for_the_whole_batch(
     )
 
 
-@pytest.mark.parametrize("call_site", ["loop-top", "between-segments", "tool-running"])
+@pytest.mark.parametrize("call_site", ["settled", "pending-tool-call", "tool-running"])
 async def test_admit_requires_settled_tools(call_site: str) -> None:
     runtime = PatternRuntime(execution_id=EID)
     runtime.live_input = LiveInputMailbox()
@@ -572,17 +572,16 @@ async def test_admit_requires_settled_tools(call_site: str) -> None:
 
     runtime._live_input_injector = injector
     runtime.live_input.offer(make_item())
-    pattern = ReActPattern()
-    if call_site == "loop-top":
-        assert await pattern._admit_live_inputs_at_safe_point(runtime, None) == 1
+    if call_site == "settled":
+        assert await runtime.admit_live_user_messages(None, tools_settled=True) == 1
         assert taken == ["t1"]
         return
-    if call_site == "between-segments":
-        pattern.pending_tool_calls = [{"id": "c", "name": "w", "args": {}}]
-    else:
+    if call_site == "tool-running":
         runtime._active_tool_tasks.add(asyncio.get_running_loop().create_future())
     with pytest.raises(RuntimeError):
-        await pattern._admit_live_inputs_at_safe_point(runtime, None)
+        await runtime.admit_live_user_messages(
+            None, tools_settled=call_site != "pending-tool-call"
+        )
     assert runtime.live_input.pending() and taken == []
 
 

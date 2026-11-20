@@ -869,9 +869,6 @@ class ReActPattern(AgentPattern):
         self.tool_choice = tool_choice
         self.reasoning_mode = ReActReasoningMode(reasoning_mode)
         self.finalize_after_tool_result = finalize_after_tool_result
-        # Whether this loop takes user messages from the runtime mailbox at
-        # its safe point; decided once on entry to the tool-calling loop.
-        self._live_input_open = False
         # In-turn tool concurrency (default off). When enabled, consecutive
         # concurrency-safe tool calls in a single turn run as a concurrent
         # batch bounded by ``tool_max_concurrency``.
@@ -1143,7 +1140,9 @@ class ReActPattern(AgentPattern):
             )
         )
         self._spill_reader_present = spill_read_tool is not None
-        self._live_input_open = (
+        # Whether this loop takes user messages from the runtime mailbox at
+        # its safe point; decided once, on entry.
+        live_input_open = (
             isinstance(getattr(runtime, "live_input", None), LiveInputMailbox)
             and not self.finalize_after_tool_result
         )
@@ -1220,8 +1219,12 @@ class ReActPattern(AgentPattern):
             if interrupted is not None:
                 return interrupted
 
-            if self._live_input_open and not force_final_answer_now:
-                await self._admit_live_inputs_at_safe_point(runtime, context)
+            if live_input_open and not force_final_answer_now:
+                # Pending tool calls were executed at the top of this iteration,
+                # so the batch is settled here.
+                await runtime.admit_live_user_messages(
+                    context, tools_settled=not self.pending_tool_calls
+                )
 
             route_messages = self._messages_for_llm(
                 context,
@@ -6812,18 +6815,6 @@ class ReActPattern(AgentPattern):
                     "failed or the user explicitly requested a revision."
                 )
         return ""
-
-    async def _admit_live_inputs_at_safe_point(
-        self, runtime: PatternRuntime, context: Any
-    ) -> int:
-        """Take queued user messages into the context once the batch is settled.
-
-        ``tools_settled`` is computed here, from this pattern's own state, so
-        no caller can assert it for a call site where tool calls are pending.
-        """
-        return await runtime.admit_live_user_messages(
-            context, tools_settled=not self.pending_tool_calls
-        )
 
     async def _interrupt_if_requested(
         self,

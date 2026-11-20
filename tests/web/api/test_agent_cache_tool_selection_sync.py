@@ -70,6 +70,12 @@ class _Model(BaseLLM):
         return ""
 
 
+# The models the agent resolved, as in the neighbouring tests: a snapshot that
+# carries none makes the build fall back to a default model read from the
+# environment (``OPENAI_API_KEY`` and friends), which CI does not have.
+MODEL = _Model()
+
+
 def _snapshot(
     tool_categories: list[str] | None, *, actor_marked: bool = False
 ) -> TaskSetupSnapshot:
@@ -92,10 +98,10 @@ def _snapshot(
         runtime_user=RuntimeUserFields(id=1, is_admin=False),
         has_reconstructable_history=False,
         task_pattern="single_call",
-        task_llm=None,
-        task_fast_llm=None,
-        task_vision_llm=None,
-        task_compact_llm=None,
+        task_llm=MODEL,
+        task_fast_llm=MODEL,
+        task_vision_llm=MODEL,
+        task_compact_llm=MODEL,
         agent=AgentRuntimeFields(
             id=7,
             name="selection-agent",
@@ -104,7 +110,7 @@ def _snapshot(
             agent_creator_user_id=1,
         ),
         agent_config={
-            "llms": (None, None, None, None),
+            "llms": (MODEL, MODEL, MODEL, MODEL),
             "execution_mode": "flash",
             "instructions": "be terse",
             "skills": [],

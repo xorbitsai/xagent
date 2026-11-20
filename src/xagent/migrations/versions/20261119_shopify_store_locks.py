@@ -1,14 +1,14 @@
 """Lock one Shopify store's token grants and refreshes against each other.
 
 Revision ID: 20261119_shopify_store_locks
-Revises: 20261119_mcp_oauth_client_name
+Revises: 20261118_seed_cosmos_mcp_app
 """
 
 import sqlalchemy as sa
 from alembic import op
 
 revision = "20261119_shopify_store_locks"
-down_revision = "20261119_mcp_oauth_client_name"
+down_revision = "20261118_seed_cosmos_mcp_app"
 branch_labels = None
 depends_on = None
 

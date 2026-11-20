@@ -1935,13 +1935,17 @@ class AgentServiceManager:
                 f"Cannot set memory similarity threshold for non-existent task {task_id}"
             )
 
-    def running_agent_for_task(self, task_id: int) -> AgentService | None:
-        """The cached runtime for ``task_id``, without building or touching it.
+    def agent_for_run(self, task_id: int, run_id: str | None) -> AgentService | None:
+        """The cached runtime of ``task_id`` if run ``run_id`` owns it.
 
-        Unlike ``get_agent_for_task`` this neither advances the run
-        generation nor swaps the outbound handler, so a caller that only
-        needs to look can use it from a hot path.
+        Builds, advances and swaps nothing, so a hot path may call it. ``None``
+        when no runtime is cached, when the cached one belongs to another run,
+        or when ``run_id`` is ``None``: a runtime cached without a run id cannot
+        be told apart from one built for a different run. The runtime is
+        returned whether or not it is executing right now.
         """
+        if run_id is None or self._agent_run_ids.get(task_id) != run_id:
+            return None
         return self._agents.get(task_id)
 
     def _load_persisted_conversation_history(self, task_id: int, db: Session) -> None:

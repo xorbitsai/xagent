@@ -412,6 +412,9 @@ async def test_claim_error_after_write_is_raised(
 
 @pytest.fixture
 def manager(monkeypatch: pytest.MonkeyPatch) -> Any:
+    from xagent.web.services.agent_service_manager import AgentServiceManager
+
+    real = AgentServiceManager()
     offers: list[dict[str, Any]] = []
 
     def offer(eid: str, **kwargs: Any) -> LiveInputOffer:
@@ -419,14 +422,16 @@ def manager(monkeypatch: pytest.MonkeyPatch) -> Any:
         return fake.offer_result
 
     service = SimpleNamespace(offer_live_user_message=offer)
+
+    def cache(task_id: int, run_id: str | None) -> None:
+        real._agents[task_id] = service  # type: ignore[assignment]
+        if run_id is not None:
+            real._agent_run_ids[task_id] = run_id
+
     fake: Any = SimpleNamespace(
-        running_agent_for_task=lambda task_id: service,
-        _agent_run_ids={},
-        offers=offers,
-        service=service,
-        offer_result=LiveInputOffer.QUEUED,
+        cache=cache, offers=offers, service=service, offer_result=LiveInputOffer.QUEUED
     )
-    monkeypatch.setattr(lic, "get_agent_manager", lambda: fake)
+    monkeypatch.setattr(lic, "get_agent_manager", lambda: real)
     return fake
 
 
@@ -462,7 +467,7 @@ async def test_live_input_executor_touches_no_database(
 
     monkeypatch.setattr(lic, "run_db_io_cancellation_safe", forbidden)
     monkeypatch.setattr("xagent.web.models.database.get_session_local", forbidden)
-    manager._agent_run_ids[task.id] = RUN
+    manager.cache(task.id, RUN)
     result = await _execute_durable_task_command(command(task))
     assert result == {"result": "queued"}
     assert host.authorized == [] and host.applied == []
@@ -503,7 +508,6 @@ async def test_executor_reports_not_started_before_control_registers(
     monkeypatch.setattr(
         lic, "increment_counter", lambda name, **kw: counted.append(name)
     )
-    manager.running_agent_for_task = lambda task_id: None
     running_tasks[task.id] = object()
     result = await lic.execute_live_input_command(command(task))
     await settle()
@@ -512,19 +516,49 @@ async def test_executor_reports_not_started_before_control_registers(
     assert [f["reason"] for f in published] == ["not_started"]
 
 
+@pytest.mark.parametrize(
+    "recorded,target",
+    [("another-run", RUN), (None, None)],
+    ids=["other-run", "no-run-id"],
+)
 async def test_executor_run_mismatch_broadcasts_run_ended(
     task: Any,
     manager: Any,
     running_tasks: dict,
     host: FakeHost,
     published: list,
+    recorded: str | None,
+    target: str | None,
 ) -> None:
-    manager._agent_run_ids[task.id] = "another-run"
-    result = await lic.execute_live_input_command(command(task))
+    manager.cache(task.id, recorded)
+    result = await lic.execute_live_input_command(command(task, target_run_id=target))
     await settle()
     assert result == {"result": "run_ended"}
     assert [f["reason"] for f in published] == ["run_ended"]
     assert manager.offers == []
+
+
+@pytest.mark.parametrize(
+    "recorded,asked,found",
+    [
+        (RUN, RUN, True),
+        (RUN, "other", False),
+        (None, None, False),
+        (RUN, None, False),
+        (None, RUN, False),
+    ],
+)
+def test_agent_for_run_matches_only_the_named_run(
+    recorded: str | None, asked: str | None, found: bool
+) -> None:
+    from xagent.web.services.agent_service_manager import AgentServiceManager
+
+    manager = AgentServiceManager()
+    service = object()
+    manager._agents[7] = service  # type: ignore[assignment]
+    if recorded is not None:
+        manager._agent_run_ids[7] = recorded
+    assert (manager.agent_for_run(7, asked) is service) is found
 
 
 def test_host_registration_is_single_and_idempotent() -> None:
@@ -714,7 +748,7 @@ async def test_executor_branches(
     result: str,
     reason: str | None,
 ) -> None:
-    manager._agent_run_ids[task.id] = RUN
+    manager.cache(task.id, RUN)
     manager.offer_result = offer
     if with_host:
         lic.register_live_input_host(FakeHost(1))

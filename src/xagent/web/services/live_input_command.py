@@ -415,12 +415,8 @@ async def execute_live_input_command(
         _publish_in_background(payload.task_id, payload.turn_id, "unavailable")
         return _done("no_host")
 
-    manager = get_agent_manager()
-    service = manager.running_agent_for_task(payload.task_id)
-    if (
-        service is not None
-        and manager._agent_run_ids.get(payload.task_id) == command.target_run_id
-    ):
+    service = get_agent_manager().agent_for_run(payload.task_id, command.target_run_id)
+    if service is not None:
         offer = service.offer_live_user_message(
             str(payload.task_id),
             execution_message=payload.message,

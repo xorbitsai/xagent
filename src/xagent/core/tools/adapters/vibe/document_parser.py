@@ -1,5 +1,4 @@
 import asyncio
-import logging
 from typing import Any, Mapping
 
 from pydantic import BaseModel
@@ -14,8 +13,6 @@ from ...core.document_parser import (
     parse_document_with_output,
 )
 from .base import AbstractBaseTool, ToolVisibility
-
-logger = logging.getLogger(__name__)
 
 
 class DocumentParseTool(AbstractBaseTool):
@@ -47,14 +44,13 @@ class DocumentParseTool(AbstractBaseTool):
     async def run_json_async(self, args: Mapping[str, Any]) -> Any:
         tool_args = DocumentParseArgs.model_validate(args)
         if self.workspace:
-            try:
-                tool_args.file_path = str(
-                    self.workspace.resolve_path_with_search(tool_args.file_path)
-                )
-            except Exception as e:
-                logger.warning(
-                    f"Failed to resolve output path through workspace: {e}, using non workspace path"
-                )
+            # The workspace is the only containment check on this read. Its
+            # ValueError (path outside the allowed directories) and
+            # FileNotFoundError propagate so the call fails instead of falling
+            # back to the path as given.
+            tool_args.file_path = str(
+                self.workspace.resolve_path_with_search(tool_args.file_path)
+            )
         return await parse_document(tool_args)
 
 
@@ -93,15 +89,14 @@ class DocumentParseWithOutputTool(AbstractBaseTool):
     async def run_json_async(self, args: Mapping[str, Any]) -> Any:
         tool_args = DocumentParseWithOutputArgs.model_validate(args)
         if self.workspace:
-            try:
-                tool_args.file_path = str(
-                    self.workspace.resolve_path_with_search(tool_args.file_path)
-                )
-                tool_args.output_path = str(
-                    self.workspace.resolve_path(tool_args.output_path)
-                )
-            except Exception as e:
-                logger.warning(
-                    f"Failed to resolve output path through workspace: {e}, using non workspace path"
-                )
+            # Both paths are resolved before any parsing or writing. The
+            # workspace is the only containment check on the output write, so
+            # a rejected path fails the call rather than being opened as given.
+            # resolve_write_path also refuses the engine-owned output subtree.
+            tool_args.file_path = str(
+                self.workspace.resolve_path_with_search(tool_args.file_path)
+            )
+            tool_args.output_path = str(
+                self.workspace.resolve_write_path(tool_args.output_path)
+            )
         return await parse_document_with_output(tool_args)

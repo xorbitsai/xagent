@@ -1,0 +1,384 @@
+"""Commands that hand a user message to a run that is already executing.
+
+The command executor runs in the task process that holds the task lease. It
+only reads in-memory state and returns in milliseconds, because commands of
+one task execute one at a time and a stop request must not queue behind it.
+The message waits in the running execution's mailbox; the delivery ledger is
+touched later, by ``DeliveryLedgerAdmission``, when the execution reaches a
+safe point and asks to claim the message.
+
+Who the sender is and whether they may still spend quota is decided by the
+registered ``LiveInputHost``; this module never inspects identities.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import hashlib
+import logging
+import threading
+from dataclasses import dataclass, field
+from typing import Any, Protocol
+
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
+from sqlalchemy.orm import Session
+
+from ...core.agent.live_input import (
+    LiveInputClaim,
+    LiveInputOffer,
+    LiveInputResult,
+)
+from . import task_execution as task_execution_service
+from .agent_service_manager import get_agent_manager
+from .chat_history_service import (
+    DELIVERY_DISPATCHED,
+    DELIVERY_FAILED,
+    DELIVERY_OUTCOME_UNKNOWN,
+    claim_user_message_delivery_no_commit,
+    inspect_user_message_delivery,
+    mark_user_message_delivery_sync,
+    withdraw_pending_user_message_delivery_sync,
+)
+from .db_runtime import run_db_io_cancellation_safe
+from .task_command_transport import ClaimedTaskCommand
+from .task_events import publish_task_event
+
+logger = logging.getLogger(__name__)
+
+LIVE_INPUT_COMMAND_SCOPE = "live_input"
+LIVE_INPUT_COMMAND_PREFIX = "live:"
+
+
+def live_input_command_id(run_id: str, turn_id: str, attempt: int) -> str:
+    """Command id for the ``attempt``-th delivery try of one message in one run."""
+
+    digest = hashlib.sha256(f"{run_id}\x1f{turn_id}\x1f{attempt}".encode()).hexdigest()
+    return f"{LIVE_INPUT_COMMAND_PREFIX}{digest[:48]}"
+
+
+@dataclass(frozen=True)
+class LiveInputPayload:
+    """The validated payload of a live input command."""
+
+    task_id: int
+    turn_id: str
+    message: str
+    fields: dict[str, Any] = field(default_factory=dict)
+
+
+def parse_live_input_payload(command: ClaimedTaskCommand) -> LiveInputPayload | None:
+    """Parse ``command``'s payload, or ``None`` when it is not well formed."""
+
+    payload = command.payload
+    message = payload.get("message")
+    turn_id = payload.get("turn_id")
+    if not isinstance(message, str) or not isinstance(turn_id, str):
+        return None
+    if not message.strip() or not turn_id.strip():
+        return None
+    return LiveInputPayload(
+        task_id=command.task_id,
+        turn_id=turn_id.strip(),
+        message=message,
+        fields={k: v for k, v in payload.items() if k not in {"message", "turn_id"}},
+    )
+
+
+class LiveInputHost(Protocol):
+    """What the embedding application supplies for live input."""
+
+    def authorize(self, db: Session, payload: LiveInputPayload) -> int | None:
+        """Revalidate the sender; return the task owner's user id, or ``None``."""
+
+    def record_applied(self, payload: LiveInputPayload) -> None:
+        """Meter one message that was written into the run (best effort)."""
+
+
+_host_lock = threading.Lock()
+_host: LiveInputHost | None = None
+
+
+def register_live_input_host(host: LiveInputHost) -> None:
+    """Register the process-wide host; the same object again is a no-op."""
+
+    global _host
+    with _host_lock:
+        if _host is host:
+            return
+        if _host is not None:
+            raise ValueError("A live input host is already registered")
+        _host = host
+
+
+def unregister_live_input_host() -> LiveInputHost | None:
+    global _host
+    with _host_lock:
+        host, _host = _host, None
+        return host
+
+
+def registered_live_input_host() -> LiveInputHost | None:
+    with _host_lock:
+        return _host
+
+
+def live_input_returned_frame(
+    task_id: int, turn_id: str, reason: str
+) -> dict[str, Any]:
+    return {
+        "type": "live_input_returned",
+        "task_id": task_id,
+        "turn_id": turn_id,
+        "reason": reason,
+    }
+
+
+async def _publish_returned(task_id: int, turn_id: str, reason: str) -> None:
+    try:
+        await publish_task_event(
+            live_input_returned_frame(task_id, turn_id, reason), task_id
+        )
+    except Exception:
+        logger.warning(
+            "live input notice %s failed for task %s", reason, task_id, exc_info=True
+        )
+
+
+_background: set[asyncio.Task[None]] = set()
+
+
+def _publish_in_background(task_id: int, turn_id: str, reason: str) -> None:
+    task = asyncio.ensure_future(_publish_returned(task_id, turn_id, reason))
+    _background.add(task)
+    task.add_done_callback(_background.discard)
+
+
+@dataclass
+class _ClaimOutcome:
+    claim: LiveInputClaim
+    owner_user_id: int | None = None
+    claimed: bool = False
+    withdrawn: bool = False
+    refused: bool = False
+
+
+class DeliveryLedgerAdmission:
+    """Records a live message in the delivery ledger around its injection."""
+
+    def __init__(self, payload: LiveInputPayload, host: LiveInputHost) -> None:
+        self._payload = payload
+        self._host = host
+        self._claimed = False
+        self._withdrawn = False
+        self._refused = False
+
+    def _claim_sync(self) -> _ClaimOutcome:
+        from ..models.database import get_session_local
+
+        payload = self._payload
+        with get_session_local()() as db:
+            try:
+                owner = self._host.authorize(db, payload)
+            except SQLAlchemyError:
+                logger.warning("live input authorization read failed", exc_info=True)
+                return _ClaimOutcome(LiveInputClaim.UNAVAILABLE)
+            if owner is None:
+                return _ClaimOutcome(LiveInputClaim.UNAVAILABLE, refused=True)
+            try:
+                claim = claim_user_message_delivery_no_commit(
+                    db,
+                    payload.task_id,
+                    owner,
+                    payload.message,
+                    attachments=None,
+                    turn_id=payload.turn_id,
+                )
+                db.commit()
+            except IntegrityError:
+                db.rollback()
+                winner = inspect_user_message_delivery(
+                    db,
+                    payload.task_id,
+                    payload.message,
+                    attachments=None,
+                    turn_id=payload.turn_id,
+                )
+                if winner is None:
+                    return _ClaimOutcome(LiveInputClaim.UNAVAILABLE)
+                return _ClaimOutcome(LiveInputClaim.TAKEN)
+            except Exception:
+                logger.warning("live input claim commit failed", exc_info=True)
+                try:
+                    db.rollback()
+                except Exception:
+                    logger.warning("live input claim rollback failed", exc_info=True)
+                return self._after_failed_commit(owner)
+        if claim.claimed:
+            return _ClaimOutcome(LiveInputClaim.CLAIMED, owner, claimed=True)
+        return _ClaimOutcome(LiveInputClaim.TAKEN, owner)
+
+    def _after_failed_commit(self, owner: int) -> _ClaimOutcome:
+        payload = self._payload
+        try:
+            withdrawn = withdraw_pending_user_message_delivery_sync(
+                payload.task_id, payload.turn_id
+            )
+            if not withdrawn:
+                from ..models.database import get_session_local
+
+                with get_session_local()() as db:
+                    withdrawn = (
+                        inspect_user_message_delivery(
+                            db,
+                            payload.task_id,
+                            payload.message,
+                            attachments=None,
+                            turn_id=payload.turn_id,
+                        )
+                        is None
+                    )
+        except Exception:
+            logger.warning("live input claim withdrawal failed", exc_info=True)
+            return _ClaimOutcome(LiveInputClaim.UNKNOWN, owner)
+        if withdrawn:
+            # The commit may have succeeded before it failed, so the claim is
+            # treated as made and then taken back.
+            return _ClaimOutcome(
+                LiveInputClaim.UNAVAILABLE, owner, claimed=True, withdrawn=True
+            )
+        return _ClaimOutcome(LiveInputClaim.UNKNOWN, owner)
+
+    async def claim(self) -> LiveInputClaim:
+        outcome = await run_db_io_cancellation_safe(self._claim_sync)
+        self._claimed = outcome.claimed
+        self._withdrawn = outcome.withdrawn
+        self._refused = outcome.refused
+        return outcome.claim
+
+    async def _mark(self, status: str) -> str | None:
+        payload = self._payload
+        try:
+            transition = await run_db_io_cancellation_safe(
+                lambda: mark_user_message_delivery_sync(
+                    payload.task_id, payload.turn_id, status
+                )
+            )
+        except Exception:
+            logger.warning(
+                "live input delivery marker %s failed for task %s",
+                status,
+                payload.task_id,
+                exc_info=True,
+            )
+            return None
+        if transition.outcome != "updated":
+            logger.info(
+                "live input delivery marker %s left task %s row at %s",
+                status,
+                payload.task_id,
+                transition.status,
+            )
+        return transition.outcome
+
+    async def _withdraw(self) -> bool:
+        payload = self._payload
+        try:
+            return await run_db_io_cancellation_safe(
+                lambda: withdraw_pending_user_message_delivery_sync(
+                    payload.task_id, payload.turn_id
+                )
+            )
+        except Exception:
+            logger.warning("live input withdrawal failed", exc_info=True)
+            return False
+
+    async def _record_applied(self) -> None:
+        payload = self._payload
+        try:
+            await run_db_io_cancellation_safe(
+                lambda: self._host.record_applied(payload)
+            )
+        except Exception:
+            logger.warning("live input metering failed", exc_info=True)
+
+    def _notify(self, reason: str) -> None:
+        _publish_in_background(self._payload.task_id, self._payload.turn_id, reason)
+
+    async def finish(self, result: LiveInputResult) -> None:
+        if result is LiveInputResult.APPLIED:
+            await self._mark(DELIVERY_DISPATCHED)
+            await self._record_applied()
+        elif result is LiveInputResult.RETURNED:
+            if not self._claimed:
+                self._notify("unavailable" if self._refused else "run_ended")
+            elif self._withdrawn or await self._withdraw():
+                self._notify("not_applied")
+            else:
+                await self._finish_unknown()
+        elif result is LiveInputResult.TAKEN:
+            self._notify("taken")
+        elif result is LiveInputResult.REFUSED:
+            await self._mark(DELIVERY_FAILED)
+            self._notify("refused")
+        elif result is LiveInputResult.CONFLICT:
+            await self._mark(DELIVERY_FAILED)
+            self._notify("conflict")
+        else:
+            await self._finish_unknown()
+
+    async def _finish_unknown(self) -> None:
+        await self._mark(DELIVERY_OUTCOME_UNKNOWN)
+        self._notify("outcome_unknown")
+
+
+def _done(result: str) -> dict[str, Any]:
+    return {"result": result}
+
+
+async def execute_live_input_command(
+    command: ClaimedTaskCommand,
+) -> dict[str, Any] | None:
+    """Offer one claimed live input command to the run in this process.
+
+    Reads memory only. Notices to the browser are published in the background
+    so a slow event bus cannot hold up the commands queued behind this one.
+    """
+
+    payload = parse_live_input_payload(command)
+    if payload is None:
+        logger.error("Malformed live input command %s", command.command_id)
+        return _done("malformed")
+    host = registered_live_input_host()
+    if host is None:
+        _publish_in_background(payload.task_id, payload.turn_id, "unavailable")
+        return _done("no_host")
+
+    manager = get_agent_manager()
+    service = manager.running_agent_for_task(payload.task_id)
+    if (
+        service is not None
+        and manager._agent_run_ids.get(payload.task_id) == command.target_run_id
+    ):
+        offer = service.offer_live_user_message(
+            str(payload.task_id),
+            execution_message=payload.message,
+            display_message=payload.message,
+            turn_id=payload.turn_id,
+            admission=DeliveryLedgerAdmission(payload, host),
+        )
+        if offer in (LiveInputOffer.QUEUED, LiveInputOffer.ALREADY_QUEUED):
+            return _done("queued")
+        if offer is LiveInputOffer.ALREADY_ACCEPTED:
+            return _done("already_applied")
+        if offer is LiveInputOffer.CONFLICT:
+            _publish_in_background(payload.task_id, payload.turn_id, "conflict")
+            return _done("conflict")
+        if offer is LiveInputOffer.UNSUPPORTED:
+            _publish_in_background(payload.task_id, payload.turn_id, "run_ended")
+            return _done("unsupported")
+
+    if payload.task_id in task_execution_service.background_task_manager.running_tasks:
+        _publish_in_background(payload.task_id, payload.turn_id, "not_started")
+        return _done("not_started")
+    _publish_in_background(payload.task_id, payload.turn_id, "run_ended")
+    return _done("run_ended")

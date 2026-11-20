@@ -144,6 +144,10 @@ from .file_turn import (
 from .file_turn import (
     resolve_turn_file_infos,
 )
+from .live_input_command import (
+    LIVE_INPUT_COMMAND_SCOPE,
+    execute_live_input_command,
+)
 from .managed_file_ref import (
     DurableObjectIntegrityError,
     DurableStorageOperationError,
@@ -4725,13 +4729,16 @@ async def _execute_durable_task_command(
         # socket, and delivery ledger from first-party rows. A MESSAGE that
         # names a scope is not that command: "external" belongs to the
         # embedding application's execution core, reached through the
-        # registered seam, and any other value names a core that does not
-        # exist here -- running the first-party core against it would inject
-        # the message while attributing it to the wrong audience. Equality
-        # rather than set membership so an unhashable payload value lands in
-        # the terminal rejection instead of raising ``TypeError`` into the
-        # retry path.
+        # registered seam, "live_input" is a message for a run already
+        # executing in this process and is handled by its own module, and
+        # any other value names a core that does not exist here -- running
+        # the first-party core against it would inject the message while
+        # attributing it to the wrong audience. Equality rather than set
+        # membership so an unhashable payload value lands in the terminal
+        # rejection instead of raising ``TypeError`` into the retry path.
         scope_value = command.payload["scope"]
+        if scope_value == LIVE_INPUT_COMMAND_SCOPE:
+            return await execute_live_input_command(command)
         if scope_value != EXTERNAL_COMMAND_SCOPE:
             raise TaskCommandRejected(
                 f"Message command {command.command_id} names task scope "

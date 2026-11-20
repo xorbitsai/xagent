@@ -64,6 +64,7 @@ from ...core.tools.core.RAG_tools.core.parser_registry import (
 from ...core.tools.core.RAG_tools.core.schemas import (
     ChunkStrategy,
     CollectionDocumentMetadata,
+    CollectionInfo,
     CollectionOperationResult,
     FusionConfig,
     IngestionConfig,
@@ -4679,6 +4680,25 @@ async def ingest_cloud(
     return results
 
 
+def _with_bound_embedding_model(collection: CollectionInfo) -> CollectionInfo:
+    # Ingest and search use the binding; the stored config holds the model the
+    # last ingest request named, and a switch never rewrites it.
+    bound = (collection.embedding_model_id or "").strip() or None
+    config = collection.ingestion_config
+    if (
+        not collection.is_initialized
+        or bound is None
+        or config is None
+        or config.embedding_model_id == bound
+    ):
+        return collection
+    return collection.model_copy(
+        update={
+            "ingestion_config": config.model_copy(update={"embedding_model_id": bound})
+        }
+    )
+
+
 @kb_router.get(
     "/collections",
     response_model=ListCollectionsResult,
@@ -4764,7 +4784,10 @@ async def list_collections_api(
                         "can_delete": ref.can_delete,
                     }
                 )
-        merged_collections = list(collections_by_name.values())
+        merged_collections = [
+            _with_bound_embedding_model(collection)
+            for collection in collections_by_name.values()
+        ]
         result = result.model_copy(
             update={
                 "collections": merged_collections,

@@ -373,6 +373,7 @@ FORM_ANSWER_CONTINUATION_ENABLED = "XAGENT_FORM_ANSWER_CONTINUATION_ENABLED"
 MCP_OAUTH_ALLOW_PRIVATE_HOSTS = "XAGENT_MCP_OAUTH_ALLOW_PRIVATE_HOSTS"
 MCP_OAUTH_PROXY_URL = "XAGENT_MCP_OAUTH_PROXY_URL"
 MCP_OAUTH_CLIENT_NAME = "XAGENT_MCP_OAUTH_CLIENT_NAME"
+MCP_OAUTH_CALLBACK_BASE_URL = "XAGENT_MCP_OAUTH_CALLBACK_BASE_URL"
 DEFAULT_MCP_OAUTH_CLIENT_NAME = "Xagent"
 HUBSPOT_MCP_CLIENT_ID = "XAGENT_HUBSPOT_MCP_CLIENT_ID"
 HUBSPOT_MCP_CLIENT_SECRET = "XAGENT_HUBSPOT_MCP_CLIENT_SECRET"
@@ -1317,6 +1318,30 @@ def get_mcp_oauth_proxy_url() -> str | None:
             "Expected an absolute HTTP(S) proxy URL."
         )
     return value
+
+
+def get_mcp_oauth_callback_base_url() -> str | None:
+    """Return the base URL advertised in MCP OAuth Dynamic Client Registration.
+
+    Priority:
+        1. XAGENT_MCP_OAUTH_CALLBACK_BASE_URL environment variable
+        2. None: the callback is advertised on the deployment's own site
+           (XAGENT_PUBLIC_API_BASE_URL, else XAGENT_APP_BASE_URL)
+
+    Some authorization servers name a client by its redirect host on their
+    consent page. This value changes only the advertised ``redirect_uri``;
+    the browser's state cookie stays on the deployment's own site. The ingress
+    for this base URL must answer ``GET /api/mcp/oauth/callback`` with a
+    redirect to the same path and query on that site. Clients with a
+    pre-registered ``client_id`` keep the deployment's own callback, which is
+    what their registration holds. After it changes, servers register again on
+    their next connect, and existing grants keep refreshing with their own
+    client rows.
+    """
+    return _reject_url_userinfo(
+        MCP_OAUTH_CALLBACK_BASE_URL,
+        _normalized_http_env_url(MCP_OAUTH_CALLBACK_BASE_URL),
+    )
 
 
 def get_mcp_oauth_client_name() -> str:

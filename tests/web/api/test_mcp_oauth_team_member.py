@@ -1042,6 +1042,78 @@ async def test_team_member_regional_request_must_start_on_the_callback_site(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("host", ["brand.example.com", "callback.example.com"])
+async def test_team_member_callback_site_ignores_the_advertised_callback_base(
+    env, monkeypatch, host
+):
+    """The state cookie stays on the deployment's own site, so members start there."""
+    monkeypatch.setenv("XAGENT_APP_BASE_URL", "https://callback.example.com")
+    monkeypatch.setenv(
+        "XAGENT_MCP_OAUTH_CALLBACK_BASE_URL", "https://brand.example.com"
+    )
+    monkeypatch.setenv("XAGENT_DUAL_ENTRY_OAUTH_ENABLED", "true")
+    monkeypatch.setenv(
+        "XAGENT_PUBLIC_ENTRIES_JSON",
+        json.dumps(
+            [
+                {
+                    "origin": origin,
+                    "region_cookie_domain": None,
+                    "google_oidc_redirect_uri": (
+                        origin + "/api/auth/oidc/google/callback"
+                    ),
+                }
+                for origin in (
+                    "https://callback.example.com",
+                    "https://brand.example.com",
+                )
+            ]
+        ),
+    )
+
+    if host == "callback.example.com":
+        response = await env.connect(request=_regional_request(host))
+        assert response.status_code == 303
+        query = parse_qs(urlparse(response.headers["location"]).query)
+        assert query["redirect_uri"] == [
+            "https://brand.example.com/api/mcp/oauth/callback"
+        ]
+        return
+
+    with pytest.raises(HTTPException) as excinfo:
+        await env.connect(request=_regional_request(host))
+    assert _http_error(excinfo)[1]["code"] == "member_regional_oauth_unsupported"
+    assert env.db.query(MCPOAuthFlowState).count() == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("which", ["advertised", "site"])
+async def test_team_member_accepts_either_spelling_of_the_deployment_callback(
+    env, monkeypatch, which
+):
+    monkeypatch.setenv(
+        "XAGENT_MCP_OAUTH_CALLBACK_BASE_URL", "https://brand.example.com"
+    )
+    configured = (
+        mcp_api._default_mcp_oauth_redirect_uri()
+        if which == "advertised"
+        else mcp_api._mcp_oauth_callback_site_redirect_uri()
+    )
+    assert configured != (
+        mcp_api._mcp_oauth_callback_site_redirect_uri()
+        if which == "advertised"
+        else mcp_api._default_mcp_oauth_redirect_uri()
+    )
+    env.edit_auth(redirect_uri=configured)
+
+    response = await env.connect()
+
+    assert response.status_code == 303
+    query = parse_qs(urlparse(response.headers["location"]).query)
+    assert query["redirect_uri"] == [configured]
+
+
+@pytest.mark.asyncio
 async def test_team_member_regional_request_without_public_entries_is_not_rejected(
     env, monkeypatch
 ):

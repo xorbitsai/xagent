@@ -1918,6 +1918,113 @@ def test_default_mcp_oauth_redirect_uri_prefers_public_api_base(monkeypatch):
     )
 
 
+def test_mcp_oauth_callback_base_url_moves_only_the_advertised_callback(
+    monkeypatch,
+):
+    monkeypatch.setenv("XAGENT_PUBLIC_API_BASE_URL", "https://api.xagent.test/")
+    monkeypatch.setenv("XAGENT_MCP_OAUTH_CALLBACK_BASE_URL", " https://brand.test/ ")
+
+    assert mcp_api._default_mcp_oauth_redirect_uri() == (
+        "https://brand.test/api/mcp/oauth/callback"
+    )
+    assert mcp_api._mcp_oauth_callback_site_redirect_uri() == (
+        "https://api.xagent.test/api/mcp/oauth/callback"
+    )
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["brand.test", "https://brand.test/?x=1", "https://user:pass@brand.test"],
+)
+def test_mcp_oauth_callback_base_url_rejects_invalid_values(monkeypatch, value):
+    monkeypatch.setenv("XAGENT_MCP_OAUTH_CALLBACK_BASE_URL", value)
+
+    with pytest.raises(ValueError, match="XAGENT_MCP_OAUTH_CALLBACK_BASE_URL"):
+        mcp_api._default_mcp_oauth_redirect_uri()
+
+
+@pytest.mark.asyncio
+async def test_dynamic_registration_advertises_the_configured_callback_base(
+    db_session, monkeypatch
+):
+    db, user, _ = db_session
+    monkeypatch.setenv("XAGENT_PUBLIC_API_BASE_URL", "https://api.xagent.test")
+    monkeypatch.setenv("XAGENT_MCP_OAUTH_CALLBACK_BASE_URL", "https://brand.test")
+    server = _add_mcp_oauth_server(
+        db,
+        user,
+        client_id="",
+        client_secret=None,
+        redirect_uri=None,
+        token_endpoint_auth_method="none",
+    )
+    registration_calls: list[str] = []
+
+    async def fake_discover(*args, **kwargs):
+        return _discovery()
+
+    async def fake_register(_server, *, redirect_uri, client_name):
+        registration_calls.append(redirect_uri)
+        return SimpleNamespace(
+            client_id="brand-client", token_endpoint_auth_method="none"
+        )
+
+    monkeypatch.setattr(mcp_api, "discover_mcp_oauth_metadata", fake_discover)
+    monkeypatch.setattr(mcp_api, "register_mcp_oauth_public_client", fake_register)
+
+    response = await connect_mcp_oauth(
+        server.id,
+        MCPOAuthConnectRequest(redirect_after="/settings/mcp"),
+        user,
+        db,
+    )
+
+    advertised = "https://brand.test/api/mcp/oauth/callback"
+    assert registration_calls == [advertised]
+    query = parse_qs(urlparse(response.headers["location"]).query)
+    assert query["redirect_uri"] == [advertised]
+    client = db.query(MCPOAuthClient).one()
+    assert client.redirect_uri == advertised
+    assert client.registration_lookup_hash == mcp_oauth_client_registration_lookup_hash(
+        server.id,
+        "https://auth.example.com",
+        advertised,
+        client_name=None,
+    )
+
+
+@pytest.mark.asyncio
+async def test_preregistered_client_keeps_the_deployment_callback(
+    db_session, monkeypatch
+):
+    db, user, _ = db_session
+    monkeypatch.setenv("XAGENT_PUBLIC_API_BASE_URL", "https://api.xagent.test")
+    monkeypatch.setenv("XAGENT_MCP_OAUTH_CALLBACK_BASE_URL", "https://brand.test")
+    server = _add_mcp_oauth_server(db, user, redirect_uri=None)
+
+    async def fake_discover(*args, **kwargs):
+        return _discovery()
+
+    async def fail_dcr(*args, **kwargs):
+        raise AssertionError("a pre-registered client must not register")
+
+    monkeypatch.setattr(mcp_api, "discover_mcp_oauth_metadata", fake_discover)
+    monkeypatch.setattr(mcp_api, "register_mcp_oauth_public_client", fail_dcr)
+
+    response = await connect_mcp_oauth(
+        server.id,
+        MCPOAuthConnectRequest(redirect_after="/settings/mcp"),
+        user,
+        db,
+    )
+
+    site_callback = "https://api.xagent.test/api/mcp/oauth/callback"
+    query = parse_qs(urlparse(response.headers["location"]).query)
+    assert query["client_id"] == ["client-123"]
+    assert query["redirect_uri"] == [site_callback]
+    assert db.query(MCPOAuthClient).one().redirect_uri == site_callback
+
+
 @pytest.mark.asyncio
 async def test_connect_without_client_id_or_registration_endpoint_requires_preregistration(
     db_session, monkeypatch

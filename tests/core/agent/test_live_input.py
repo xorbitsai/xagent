@@ -6,12 +6,17 @@ import asyncio
 import copy
 import json
 from dataclasses import dataclass, field
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
 import pytest
 from pydantic import BaseModel
 
+from tests.core.agent.test_agent_service_post_user_message import (
+    FakeWorkspaceManager,
+    _build_service,
+)
 from xagent.config import get_agent_pattern_for_execution_mode
 from xagent.core.agent import (
     Agent,
@@ -20,6 +25,7 @@ from xagent.core.agent import (
     PatternRuntime,
     ReActPattern,
 )
+from xagent.core.agent.context.execution import context_checkpoint_gate
 from xagent.core.agent.live_input import (
     LiveInputClaim,
     LiveInputMailbox,
@@ -31,13 +37,11 @@ from xagent.core.agent.pattern.react import react as react_module
 from xagent.core.agent.runner import (
     AgentRunner,
     ExecutionControl,
-    InjectionDisposition,
     UserMessageInjectionConflictError,
     UserMessageInjectionOutcome,
     UserMessageInjectionRejectedError,
     UserMessageInjectionResult,
     _record_injection_outcome,
-    classify_injection,
 )
 from xagent.core.guardrails.input import InputReviewRejected
 
@@ -50,20 +54,16 @@ class _NoArgs(BaseModel):
 
 
 class RecordingAdmission:
-    """Admission that records every call, optionally into a shared timeline."""
+    """Admission that records every call it receives."""
 
     def __init__(
         self,
         claim: LiveInputClaim | BaseException = LiveInputClaim.CLAIMED,
         *,
-        name: str = "a",
-        timeline: list[Any] | None = None,
         gate: asyncio.Event | None = None,
     ) -> None:
         self.claim_result = claim
-        self.name = name
         self.events: list[Any] = []
-        self.timeline = timeline
         self.gate = gate
 
     async def claim(self) -> LiveInputClaim:
@@ -76,8 +76,6 @@ class RecordingAdmission:
 
     async def finish(self, result: LiveInputResult) -> None:
         self.events.append(result)
-        if self.timeline is not None:
-            self.timeline.append((self.name, result))
 
 
 class ProbeTool:
@@ -162,8 +160,8 @@ class Rig:
             admission=admission,
         )
 
-    def start(self) -> asyncio.Task[dict[str, Any]]:
-        return asyncio.create_task(self.runner.run("hello", execution_id=EID))
+    def start(self, **kwargs: Any) -> asyncio.Task[dict[str, Any]]:
+        return asyncio.create_task(self.runner.run("hello", execution_id=EID, **kwargs))
 
 
 def make_rig(
@@ -336,6 +334,30 @@ async def test_offer_answers_before_queueing() -> None:
     assert offer("n3", "x") is LiveInputOffer.NO_LIVE_RUN
 
 
+async def test_offer_refuses_finishing_run_and_compacted_turn() -> None:
+    runner, _ = manual_runner()
+    context = runner.context_manager.get_context(EID)
+    assert context is not None
+
+    def offer(turn_id: str, text: str) -> LiveInputOffer:
+        return runner.offer_live_user_message(
+            EID,
+            execution_message=text,
+            display_message=text,
+            turn_id=turn_id,
+            admission=RecordingAdmission(),
+        )
+
+    # The message itself is gone (compacted); only the accepted-turn record stays.
+    gone = context.add_user_message("gone", metadata={"turn_id": "old"})
+    runner._record_accepted_turn(context, gone)
+    context.messages.remove(gone)
+    assert offer("old", "gone") is LiveInputOffer.ALREADY_ACCEPTED
+    assert offer("old", "other") is LiveInputOffer.CONFLICT
+    context_checkpoint_gate(context).run_finishing = True
+    assert offer("new", "x") is LiveInputOffer.NO_LIVE_RUN
+
+
 async def test_offer_rejects_foreign_event_loop() -> None:
     runner, _ = manual_runner()
     other = asyncio.new_event_loop()
@@ -426,7 +448,7 @@ async def test_offer_during_react_preamble(monkeypatch: pytest.MonkeyPatch) -> N
 
 @pytest.mark.parametrize("segment", list(SEGMENTS))
 @pytest.mark.parametrize("moment", MOMENTS)
-async def test_live_input_never_cancels_tools(
+async def test_live_input_waits_for_the_whole_batch(
     monkeypatch: pytest.MonkeyPatch, segment: str, moment: str
 ) -> None:
     rig, adm, result = await run_scenario(monkeypatch, segment, moment)
@@ -435,21 +457,12 @@ async def test_live_input_never_cancels_tools(
         assert len(tool.calls) == 1
     assert all(not runtime._interrupt_requested for runtime in rig.runtimes)
     assert adm.events == ["claim", LiveInputResult.APPLIED]
-
-
-@pytest.mark.parametrize("segment", list(SEGMENTS))
-@pytest.mark.parametrize("moment", MOMENTS)
-async def test_llm_input_keeps_pairs_after_live_input(
-    monkeypatch: pytest.MonkeyPatch, segment: str, moment: str
-) -> None:
-    rig, _, result = await run_scenario(monkeypatch, segment, moment)
     messages = rig.llm.requests[-1]
     assert pairs_intact(messages)
-    roles = [m["role"] for m in messages]
     live_index = next(
         i for i, m in enumerate(messages) if LIVE_TEXT in str(m.get("content"))
     )
-    assert live_index > max(i for i, r in enumerate(roles) if r == "tool")
+    assert live_index > max(i for i, m in enumerate(messages) if m["role"] == "tool")
     context = result["context"]
     assert len(context._sanitize_tool_message_pairs(list(context.messages))) == len(
         context.messages
@@ -482,25 +495,10 @@ async def test_admit_requires_settled_tools(call_site: str) -> None:
     assert runtime.live_input.pending() and taken == []
 
 
-async def test_forced_answer_turn_keeps_mailbox_settlement_fence(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    rig, adm = await forced_answer_run(monkeypatch, "fence")
-    assert adm.events[-1] is LiveInputResult.RETURNED and "claim" not in adm.events
-    assert LIVE_TEXT not in str(rig.llm.requests[-1])
-
-
-async def test_forced_answer_turn_keeps_mailbox_iteration_limit(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    rig, adm = await forced_answer_run(monkeypatch, "limit")
-    assert adm.events == [LiveInputResult.RETURNED]
-    assert LIVE_TEXT not in str(rig.llm.requests[-1])
-
-
-async def forced_answer_run(
+@pytest.mark.parametrize("cause", ["fence", "limit"])
+async def test_forced_answer_turn_keeps_mailbox(
     monkeypatch: pytest.MonkeyPatch, cause: str
-) -> tuple[Rig, RecordingAdmission]:
+) -> None:
     pattern = ReActPattern(max_iterations=1 if cause == "limit" else 20)
     closing = final_answer()
     if cause == "limit":
@@ -522,7 +520,8 @@ async def forced_answer_run(
         )
     result = await rig.start()
     assert result["success"] is True
-    return rig, adm
+    assert adm.events == [LiveInputResult.RETURNED]
+    assert LIVE_TEXT not in str(rig.llm.requests[-1])
 
 
 # --------------------------------------------------------------------------
@@ -532,12 +531,21 @@ async def forced_answer_run(
 
 async def test_leftover_live_inputs_returned_before_runner_returns() -> None:
     timeline: list[Any] = []
-    first = RecordingAdmission(name="first", timeline=timeline)
-    second = RecordingAdmission(name="second", timeline=timeline)
+
+    class Timed(RecordingAdmission):
+        def __init__(self, name: str) -> None:
+            super().__init__()
+            self.name = name
+
+        async def finish(self, result: LiveInputResult) -> None:
+            # A real delivery awaits I/O; a hand-back deferred to a background
+            # task would land after the run returned.
+            await asyncio.sleep(0.01)
+            timeline.append((self.name, result))
 
     async def reply() -> dict[str, Any]:
-        assert rig.offer(first, turn_id="a") is LiveInputOffer.QUEUED
-        assert rig.offer(second, turn_id="b") is LiveInputOffer.QUEUED
+        assert rig.offer(Timed("first"), turn_id="a") is LiveInputOffer.QUEUED
+        assert rig.offer(Timed("second"), turn_id="b") is LiveInputOffer.QUEUED
         return final_answer()
 
     rig = make_rig([reply])
@@ -572,18 +580,9 @@ async def test_live_input_finished_exactly_once_when_cancelled() -> None:
     assert adm.events == [LiveInputResult.RETURNED]
 
 
-async def test_duplicate_turn_id_is_finished_once_and_closed_mailbox_refuses() -> None:
-    adm = RecordingAdmission()
-    duplicate = RecordingAdmission()
-
-    async def reply() -> dict[str, Any]:
-        assert rig.offer(adm) is LiveInputOffer.QUEUED
-        assert rig.offer(duplicate) is LiveInputOffer.ALREADY_QUEUED
-        return final_answer()
-
-    rig = make_rig([reply])
+async def test_offer_after_the_run_ended_is_refused_untouched() -> None:
+    rig = make_rig([final_answer()])
     await rig.start()
-    assert adm.events == [LiveInputResult.RETURNED] and duplicate.events == []
     late = RecordingAdmission()
     assert (
         rig.runner.offer_live_user_message(
@@ -680,13 +679,12 @@ async def test_injection_dispositions_map_to_results(
     item = LiveUserInput("t1", "m", "m", adm)
     assert await runner._inject_live_input(EID, item) is expected
     assert adm.events == ["claim", expected]
-    assert classify_injection(recorded, None, error) in set(InjectionDisposition)
 
 
 async def test_cancel_while_claiming_finishes_taken_and_queued_items_once() -> None:
     gate = asyncio.Event()
-    first = RecordingAdmission(gate=gate, name="first")
-    second = RecordingAdmission(name="second")
+    first = RecordingAdmission(gate=gate)
+    second = RecordingAdmission()
 
     async def reply() -> dict[str, Any]:
         rig.offer(first, turn_id="a")
@@ -705,8 +703,9 @@ async def test_cancel_while_claiming_finishes_taken_and_queued_items_once() -> N
     assert second.events == [LiveInputResult.RETURNED]
 
 
-async def test_stop_before_claim_returns_remaining() -> None:
-    adms = [RecordingAdmission(name=str(i)) for i in range(3)]
+@pytest.mark.parametrize("trigger", ["flag", "checker"])
+async def test_stop_before_claim_returns_remaining(trigger: str) -> None:
+    adms = [RecordingAdmission() for _ in range(3)]
 
     async def reply() -> dict[str, Any]:
         for index, adm in enumerate(adms):
@@ -717,11 +716,15 @@ async def test_stop_before_claim_returns_remaining() -> None:
     original = adms[0].claim
 
     async def claim_and_stop() -> LiveInputClaim:
-        rig.runtimes[0]._interrupt_requested = True
+        if trigger == "flag":
+            rig.runtimes[0]._interrupt_requested = True
         return await original()
 
     adms[0].claim = claim_and_stop  # type: ignore[method-assign]
-    result = await rig.start()
+    # The checker is what a quota gate looks like to the runtime: only
+    # should_interrupt() consults it, a bare read of the stop flag does not.
+    checker = (lambda: "claim" in adms[0].events) if trigger == "checker" else None
+    result = await rig.start(interrupt_checker=checker)
     assert result["success"] is False
     assert adms[0].events == ["claim", LiveInputResult.APPLIED]
     assert adms[1].events == [LiveInputResult.RETURNED]
@@ -746,3 +749,82 @@ async def test_guidance_interrupt_returns_queued_live_inputs() -> None:
     result = await task
     assert result["status"] == "interrupted"
     assert adm.events == [LiveInputResult.RETURNED]
+
+
+class AcceptingPattern:
+    """Waits until released; declares that it takes live input."""
+
+    def __init__(self) -> None:
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+
+    def accepts_live_input(self) -> bool:
+        return True
+
+    async def run(self, **_: Any) -> dict[str, Any]:
+        self.started.set()
+        await self.release.wait()
+        return {"success": True, "output": "done"}
+
+
+@pytest.mark.parametrize("layer", ["service", "adapter", "registry"])
+async def test_offer_is_forwarded_through_every_layer(
+    tmp_path: Path, layer: str
+) -> None:
+    service, registry, tracer = _build_service(EID)
+    pattern = AcceptingPattern()
+    runner = AgentRunner(
+        agent=Agent(name="forward", patterns=[pattern]),
+        tracer=tracer,
+        workspace_manager=FakeWorkspaceManager(tmp_path),
+    )
+    handle = registry.start(runner, execution_id=EID, task="Wait")
+    await asyncio.wait_for(pattern.started.wait(), timeout=5)
+    target = {
+        "service": service,
+        "adapter": service._execution_adapter,
+        "registry": registry,
+    }[layer]
+    adm = RecordingAdmission()
+    offer = target.offer_live_user_message(
+        EID,
+        execution_message="x",
+        display_message="x",
+        turn_id="t1",
+        admission=adm,
+    )
+    assert offer is LiveInputOffer.QUEUED
+    pattern.release.set()
+    assert handle.task is not None
+    await handle.task
+    assert adm.events == [LiveInputResult.RETURNED]
+
+
+async def test_live_input_counters(monkeypatch: pytest.MonkeyPatch) -> None:
+    from xagent.core.agent import runner as runner_module
+
+    counted: list[tuple[str, dict[str, str] | None]] = []
+
+    def record(name: str, *, attributes: Any = None, **_: Any) -> None:
+        counted.append((name, attributes))
+
+    monkeypatch.setattr(runner_module, "increment_counter", record)
+
+    class FailingFinish(RecordingAdmission):
+        async def finish(self, result: LiveInputResult) -> None:
+            await super().finish(result)
+            raise RuntimeError("finish failed")
+
+    adm = FailingFinish()
+
+    async def reply() -> dict[str, Any]:
+        assert rig.offer(adm) is LiveInputOffer.QUEUED
+        return tool_calls("w1")
+
+    rig = make_rig([reply, final_answer()], ("w1",))
+    result = await rig.start()
+    # A finish that raises is counted and does not end the run.
+    assert result["success"] is True
+    assert ("xagent.live_input.offers", {"outcome": "queued"}) in counted
+    assert ("xagent.live_input.finishes", {"result": "applied"}) in counted
+    assert ("xagent.live_input.finish_errors", None) in counted

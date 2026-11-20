@@ -1608,6 +1608,27 @@ class AgentRunner:
         After ``QUEUED`` the admission is finished exactly once by the
         execution; after any other answer it has not been touched.
         """
+        offer = self._offer_live_user_message(
+            execution_id,
+            execution_message=execution_message,
+            display_message=display_message,
+            turn_id=turn_id,
+            admission=admission,
+        )
+        increment_counter(
+            "xagent.live_input.offers", attributes={"outcome": offer.value}
+        )
+        return offer
+
+    def _offer_live_user_message(
+        self,
+        execution_id: str,
+        *,
+        execution_message: str,
+        display_message: str,
+        turn_id: str,
+        admission: LiveInputAdmission,
+    ) -> LiveInputOffer:
         normalized_turn_id = turn_id.strip() if isinstance(turn_id, str) else ""
         if (
             not normalized_turn_id
@@ -1761,6 +1782,9 @@ class AgentRunner:
         counter: str = "xagent.live_input.finish_errors",
         level: int = logging.ERROR,
     ) -> LiveInputResult:
+        increment_counter(
+            "xagent.live_input.finishes", attributes={"result": result.value}
+        )
         try:
             await item.admission.finish(result)
         except Exception:

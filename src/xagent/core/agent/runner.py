@@ -11,6 +11,7 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, replace
 from enum import Enum
+from functools import partial
 from pathlib import Path
 from typing import Any, cast
 from uuid import uuid4
@@ -47,6 +48,7 @@ from ..model.chat.exceptions import MODEL_PROVIDER_FAILURE_KINDS, ModelProviderE
 from ..model.chat.routing_context import xinference_routing_key
 from ..model.chat.token_context import token_usage_observer
 from ..model.intent import enter_goal, exit_goal
+from ..runtime_performance import increment_counter
 from ..task_runtime import (
     PREFERRED_INPUT_MODALITIES_METADATA_KEY,
     normalize_input_modalities,
@@ -89,6 +91,15 @@ from .interruption import (
     interruption_reason_value,
 )
 from .language import reset_output_language_to_request_context
+from .live_input import (
+    LiveInputAdmission,
+    LiveInputClaim,
+    LiveInputMailbox,
+    LiveInputOffer,
+    LiveInputResult,
+    LiveUserInput,
+    result_without_injection,
+)
 from .result import (
     FINAL_ANSWER_KEYS,
     extract_assistant_message,
@@ -106,6 +117,15 @@ from .runtime import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Longest an outside cancellation of a run is held back while one taken live
+# user message is being claimed, written and finished. Every outside
+# cancellation is held back alike, whatever caused it, a lost task lease
+# included: the runner cannot tell them apart. Writes that the owner of the
+# execution fences by its own ownership check still refuse to land once
+# ownership has moved; writes it does not fence may land up to this long
+# after.
+LIVE_INPUT_CANCEL_GRACE_SECONDS = 3.0
 
 # ``ACCEPTED_TURN_IDS_METADATA_KEY`` (defined in ``context.execution`` so child
 # contexts can drop it) holds the turn ids of the user messages this execution
@@ -171,6 +191,8 @@ class ExecutionControl:
 
     runtime: PatternRuntime
     task: str | None
+    # The event loop that runs this execution; live input must be offered from it.
+    event_loop: asyncio.AbstractEventLoop | None = None
 
 
 class UserMessageInjectionOutcome(str, Enum):
@@ -259,6 +281,14 @@ class UserMessageInjectionRejectedError(RuntimeError):
 
 class UserMessageInjectionConflictError(ValueError):
     """The turn identity conflicts with an existing message, before any write."""
+
+
+class _TurnReplay(Enum):
+    """How a turn id relates to what a context has already accepted."""
+
+    NEW = "new"  # Neither in the context nor in its record of accepted turns.
+    ACCEPTED = "accepted"  # Already accepted with the same text.
+    CONFLICT = "conflict"  # Already accepted with different text.
 
 
 class InjectionDisposition(str, Enum):
@@ -375,6 +405,8 @@ class AgentRunner:
         self.outbound_message_handler = outbound_message_handler
         self.budget_policy_provider = budget_policy_provider
         self._active_controls: dict[str, ExecutionControl] = {}
+        # Background work that hands unadmitted live input back after an exit.
+        self._live_input_tasks: set[asyncio.Task[Any]] = set()
 
     async def run(
         self,
@@ -601,9 +633,24 @@ class AgentRunner:
             ):
                 runtime.inline_file_delivery = InlineFileDelivery(workspace)
             context_checkpoint_gate(context).run_finishing = False
+            runtime.live_input = None
+            runtime._live_input_injector = None
+            # Live input is taken only while every pattern run so far takes it,
+            # so a run whose first pattern does not never gets a mailbox.
+            first_pattern = next(
+                iter(getattr(self.agent, "patterns", None) or []), None
+            )
+            if first_pattern is not None and self._pattern_accepts_live_input(
+                first_pattern
+            ):
+                runtime.live_input = LiveInputMailbox()
+                runtime._live_input_injector = partial(
+                    self._admit_live_input_until_finished, execution_id
+                )
             self._active_controls[execution_id] = ExecutionControl(
                 runtime=runtime,
                 task=task,
+                event_loop=asyncio.get_running_loop(),
             )
         except BaseException:
             if context is not None:
@@ -697,6 +744,17 @@ class AgentRunner:
             try:
                 await self._setup_tools(tools, task_id=execution_id)
                 for pattern in patterns:
+                    live_mailbox = runtime.live_input
+                    if (
+                        live_mailbox is not None
+                        and not self._pattern_accepts_live_input(pattern)
+                    ):
+                        # This pattern does not take live input, so the run stops
+                        # taking it for good: later offers answer UNSUPPORTED and
+                        # what was waiting is handed back now, in order, before
+                        # the pattern starts.
+                        runtime.live_input = None
+                        await self._return_live_inputs(live_mailbox.close())
                     load_pattern_checkpoint(pattern, checkpoint)
                     self._reconcile_memory_retrieval_cache(
                         context,
@@ -972,6 +1030,8 @@ class AgentRunner:
             # An injection already holding the gate may finish; later live inputs
             # must use the deferred owner, which drains that gate before reloading.
             context_checkpoint_gate(context).run_finishing = True
+            if runtime.live_input is not None:
+                self._return_live_inputs_in_background(runtime.live_input.close())
             # With no run left the checkpoint is authoritative again; another
             # process may extend it before this one sees the next input.
             self._release_idle_context(execution_id, context)
@@ -1322,35 +1382,14 @@ class AgentRunner:
                         context=context, outcome=UserMessageInjectionOutcome.NOT_POSTED
                     )
                 if requested_turn_id is not None:
-                    for existing in context.messages:
-                        existing_metadata = getattr(existing, "metadata", None)
-                        if (
-                            getattr(existing, "role", None) != "user"
-                            or not isinstance(existing_metadata, dict)
-                            or existing_metadata.get("turn_id") != requested_turn_id
-                        ):
-                            continue
-                        if existing.content != resolved_execution_message:
-                            raise UserMessageInjectionConflictError(
-                                "turn_id is already associated with a different user message"
-                            )
-                        return self._replay_accepted_turn(
-                            execution_id,
-                            context,
-                            request_interrupt=request_interrupt
-                            and not gate.run_finishing,
-                            reason=reason,
+                    replay = self._classify_turn_replay(
+                        context, requested_turn_id, resolved_execution_message
+                    )
+                    if replay is _TurnReplay.CONFLICT:
+                        raise UserMessageInjectionConflictError(
+                            "turn_id is already associated with a different user message"
                         )
-                    # Compaction may have dropped the message itself; the
-                    # metadata record of accepted turns survives it.
-                    accepted = self._accepted_turn_digest(context, requested_turn_id)
-                    if accepted is not None:
-                        if accepted and accepted != self._turn_content_digest(
-                            resolved_execution_message
-                        ):
-                            raise UserMessageInjectionConflictError(
-                                "turn_id is already associated with a different user message"
-                            )
+                    if replay is _TurnReplay.ACCEPTED:
                         return self._replay_accepted_turn(
                             execution_id,
                             context,
@@ -1562,6 +1601,289 @@ class AgentRunner:
             outcome=UserMessageInjectionOutcome.POSTED_FRESH,
         )
 
+    @staticmethod
+    def _pattern_accepts_live_input(pattern: Any) -> bool:
+        accepts = getattr(pattern, "accepts_live_input", None)
+        return callable(accepts) and accepts() is True
+
+    def offer_live_user_message(
+        self,
+        execution_id: str,
+        *,
+        execution_message: str,
+        display_message: str,
+        turn_id: str,
+        admission: LiveInputAdmission,
+    ) -> LiveInputOffer:
+        """Queue a user message for the safe point of a running execution.
+
+        Synchronous, and valid only on the event loop that runs the execution.
+        After ``QUEUED`` the admission is finished exactly once by the
+        execution; after any other answer it has not been touched.
+        """
+        offer = self._offer_live_user_message(
+            execution_id,
+            execution_message=execution_message,
+            display_message=display_message,
+            turn_id=turn_id,
+            admission=admission,
+        )
+        increment_counter(
+            "xagent.live_input.offers", attributes={"outcome": offer.value}
+        )
+        return offer
+
+    def _offer_live_user_message(
+        self,
+        execution_id: str,
+        *,
+        execution_message: str,
+        display_message: str,
+        turn_id: str,
+        admission: LiveInputAdmission,
+    ) -> LiveInputOffer:
+        normalized_turn_id = turn_id.strip() if isinstance(turn_id, str) else ""
+        if (
+            not normalized_turn_id
+            or execution_message is None
+            or display_message is None
+        ):
+            raise ValueError(
+                "offer_live_user_message requires a turn_id and both messages"
+            )
+        control = self._active_controls.get(execution_id)
+        if control is None:
+            return LiveInputOffer.NO_LIVE_RUN
+        if control.event_loop is not asyncio.get_running_loop():
+            raise RuntimeError(
+                "offer_live_user_message must be called on the event loop "
+                "that runs the execution"
+            )
+        mailbox = control.runtime.live_input
+        if mailbox is None:
+            return LiveInputOffer.UNSUPPORTED
+        context = self.context_manager.get_context(execution_id)
+        if (
+            context is None
+            or context_checkpoint_gate(context).run_finishing
+            or mailbox.closed
+        ):
+            return LiveInputOffer.NO_LIVE_RUN
+        replay = self._classify_turn_replay(
+            context, normalized_turn_id, execution_message
+        )
+        if replay is _TurnReplay.CONFLICT:
+            return LiveInputOffer.CONFLICT
+        if replay is _TurnReplay.ACCEPTED:
+            return LiveInputOffer.ALREADY_ACCEPTED
+        return mailbox.offer(
+            LiveUserInput(
+                turn_id=normalized_turn_id,
+                execution_message=execution_message,
+                display_message=display_message,
+                admission=admission,
+            )
+        )
+
+    async def _admit_live_input_until_finished(
+        self, execution_id: str, item: LiveUserInput
+    ) -> LiveInputResult:
+        """Run ``_inject_live_input`` so an outside cancellation cannot split it.
+
+        A taken message moves from the mailbox to the ledger to the context.
+        The only point where the run may be cancelled is between two messages;
+        from the moment a message is taken until its outcome is recorded, a
+        cancellation of the running task is held back and re-raised, as the
+        same exception object, once the message has finished. The outcome of
+        the message then depends only on the results of its own steps.
+
+        The cancellation is held back for at most
+        ``LIVE_INPUT_CANCEL_GRACE_SECONDS``, counted from the first one. When
+        that expires the work is cancelled and the cancellation is re-raised
+        at once; the work records its outcome in the background. This applies
+        to every outside cancellation, including one that follows a lost task
+        lease.
+        """
+        work = asyncio.ensure_future(self._inject_live_input(execution_id, item))
+        self._live_input_tasks.add(work)
+        work.add_done_callback(self._live_input_tasks.discard)
+        loop = asyncio.get_running_loop()
+        cancellation: asyncio.CancelledError | None = None
+        deadline = 0.0
+        while True:
+            try:
+                if cancellation is None:
+                    return await asyncio.shield(work)
+                await asyncio.wait({work}, timeout=max(0.0, deadline - loop.time()))
+                break
+            except asyncio.CancelledError as error:
+                current = asyncio.current_task()
+                if current is None or current.cancelling() == 0:
+                    raise
+                if cancellation is None:
+                    cancellation = error
+                    deadline = loop.time() + LIVE_INPUT_CANCEL_GRACE_SECONDS
+        if work.done():
+            outcome = "completed"
+            if not work.cancelled():
+                failure = work.exception()
+                if failure is not None:
+                    logger.error(
+                        "live input for %s turn %s failed while the run was being"
+                        " cancelled",
+                        execution_id,
+                        item.turn_id,
+                        exc_info=failure,
+                    )
+        else:
+            outcome = "grace_expired"
+            work.cancel()
+            logger.warning(
+                "live input for %s turn %s did not finish within %.1fs of the run"
+                " being cancelled",
+                execution_id,
+                item.turn_id,
+                LIVE_INPUT_CANCEL_GRACE_SECONDS,
+            )
+        increment_counter(
+            "xagent.live_input.cancel_deferred", attributes={"outcome": outcome}
+        )
+        raise cancellation
+
+    async def _inject_live_input(
+        self, execution_id: str, item: LiveUserInput
+    ) -> LiveInputResult:
+        """Claim one taken mailbox item and write it into the live context.
+
+        The caller has already removed ``item`` from the mailbox, so this
+        method owns finishing its admission exactly once, including when it is
+        cancelled.
+        """
+        try:
+            claim = await item.admission.claim()
+        except Exception:
+            logger.error(
+                "live input claim failed for %s turn %s",
+                execution_id,
+                item.turn_id,
+                exc_info=True,
+            )
+            increment_counter("xagent.live_input.claim_errors")
+            claim = LiveInputClaim.UNKNOWN
+        except BaseException:
+            await self._finish_live_input_shielded(item, LiveInputResult.UNKNOWN)
+            raise
+        if claim is not LiveInputClaim.CLAIMED:
+            return await self._finish_live_input_shielded(
+                item, result_without_injection(claim)
+            )
+
+        escaped: BaseException | None = None
+        posted: UserMessageInjectionOutcome | None = None
+        with track_user_message_injection() as attempt:
+            try:
+                posted = (
+                    await self.inject_user_message(
+                        execution_id,
+                        execution_message=item.execution_message,
+                        display_message=item.display_message,
+                        turn_id=item.turn_id,
+                        request_interrupt=False,
+                        reason="live user message",
+                    )
+                ).outcome
+            except BaseException as error:
+                escaped = error
+            disposition = classify_injection(attempt.outcome, posted, escaped)
+        result = self._live_input_result(disposition, escaped, execution_id, item)
+        outcome = await self._finish_live_input_shielded(item, result)
+        if escaped is not None and not isinstance(escaped, Exception):
+            raise escaped
+        return outcome
+
+    @staticmethod
+    def _live_input_result(
+        disposition: InjectionDisposition,
+        escaped: BaseException | None,
+        execution_id: str,
+        item: LiveUserInput,
+    ) -> LiveInputResult:
+        if disposition is InjectionDisposition.ACCEPTED:
+            return LiveInputResult.APPLIED
+        if disposition is InjectionDisposition.UNKNOWN:
+            return LiveInputResult.UNKNOWN
+        if disposition is InjectionDisposition.FAILED_BEFORE_WRITE:
+            if isinstance(escaped, InputReviewRejected):
+                return LiveInputResult.REFUSED
+            if isinstance(escaped, UserMessageInjectionConflictError):
+                return LiveInputResult.CONFLICT
+            logger.error(
+                "live input for %s turn %s failed before any write",
+                execution_id,
+                item.turn_id,
+                exc_info=escaped,
+            )
+        return LiveInputResult.RETURNED
+
+    async def _finish_live_input(
+        self,
+        item: LiveUserInput,
+        result: LiveInputResult,
+        *,
+        counter: str = "xagent.live_input.finish_errors",
+        level: int = logging.ERROR,
+    ) -> LiveInputResult:
+        increment_counter(
+            "xagent.live_input.finishes", attributes={"outcome": result.value}
+        )
+        try:
+            await item.admission.finish(result)
+        except Exception:
+            logger.log(
+                level,
+                "live input finish(%s) failed for turn %s",
+                result.value,
+                item.turn_id,
+                exc_info=True,
+            )
+            increment_counter(counter)
+        return result
+
+    async def _finish_live_input_shielded(
+        self, item: LiveUserInput, result: LiveInputResult
+    ) -> LiveInputResult:
+        """Finish an admission so that cancelling the caller cannot cut it short."""
+        task = asyncio.ensure_future(self._finish_live_input(item, result))
+        self._live_input_tasks.add(task)
+        task.add_done_callback(self._live_input_tasks.discard)
+        return await asyncio.shield(task)
+
+    async def _return_live_inputs(self, items: list[LiveUserInput]) -> None:
+        """Hand back unadmitted input in order; a cancellation passes the rest on."""
+        for index, item in enumerate(items):
+            try:
+                await self._finish_live_input_shielded(item, LiveInputResult.RETURNED)
+            except BaseException:
+                self._return_live_inputs_in_background(items[index + 1 :])
+                raise
+
+    def _return_live_inputs_in_background(self, items: list[LiveUserInput]) -> None:
+        if not items:
+            return
+
+        async def hand_back() -> None:
+            for item in items:
+                await self._finish_live_input(
+                    item,
+                    LiveInputResult.RETURNED,
+                    counter="xagent.live_input.return_errors",
+                    level=logging.WARNING,
+                )
+
+        task = asyncio.ensure_future(hand_back())
+        self._live_input_tasks.add(task)
+        task.add_done_callback(self._live_input_tasks.discard)
+
     def _replay_accepted_turn(
         self,
         execution_id: str,
@@ -1577,6 +1899,34 @@ class AgentRunner:
             context=context,
             outcome=UserMessageInjectionOutcome.POSTED_REPLAY,
         )
+
+    @staticmethod
+    def _classify_turn_replay(
+        context: ExecutionContext, turn_id: str, execution_message: str
+    ) -> _TurnReplay:
+        """Whether ``context`` already holds ``turn_id``, and with which text.
+
+        The first user message carrying ``turn_id`` decides. When compaction
+        has dropped it, the record of accepted turns decides; a turn recorded
+        without a digest matches any text.
+        """
+        for existing in context.messages:
+            existing_metadata = getattr(existing, "metadata", None)
+            if (
+                getattr(existing, "role", None) != "user"
+                or not isinstance(existing_metadata, dict)
+                or existing_metadata.get("turn_id") != turn_id
+            ):
+                continue
+            if existing.content != execution_message:
+                return _TurnReplay.CONFLICT
+            return _TurnReplay.ACCEPTED
+        accepted = AgentRunner._accepted_turn_digest(context, turn_id)
+        if accepted is None:
+            return _TurnReplay.NEW
+        if accepted and accepted != AgentRunner._turn_content_digest(execution_message):
+            return _TurnReplay.CONFLICT
+        return _TurnReplay.ACCEPTED
 
     @staticmethod
     def _turn_content_digest(content: str) -> str:
@@ -2406,9 +2756,14 @@ class AgentRunner:
         # Once closed, late live input takes the existing deferred-post path;
         # callbacks and tool teardown must not reopen this acceptance window.
         gate = context_checkpoint_gate(context)
+        leftover_inputs: list[LiveUserInput] = []
         async with gate.shared():
             gate.run_finishing = True
+            if runtime.live_input is not None:
+                leftover_inputs = runtime.live_input.close()
             result["injection_outcome_unknown"] = gate.injection_uncertain
+        # Handed back before the run returns, in the order they were offered.
+        await self._return_live_inputs(leftover_inputs)
         budget = active_execution_budget.get()
         if budget is not None and runtime.budget_owner:
             if result.get("status") not in {

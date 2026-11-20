@@ -5,7 +5,7 @@ import hashlib
 import inspect
 import json
 import logging
-from collections.abc import Mapping
+from collections.abc import Awaitable, Mapping
 from contextlib import nullcontext
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
@@ -89,6 +89,7 @@ from .context.execution import (
     context_checkpoint_gate,
     derive_compact_threshold,
 )
+from .live_input import LiveInputMailbox, LiveInputResult, LiveUserInput
 from .prompt_prefix import PROMPT_PREFIX_KEY, PromptPrefixObserver
 from .result import normalize_tool_failure_code, tool_result_succeeded
 from .streaming import merge_streamed_tool_call_arguments
@@ -481,6 +482,13 @@ class PatternRuntime:
         default_factory=AgentCacheSession, init=False, repr=False
     )
     _cache_pattern_count: int = field(default=0, init=False, repr=False)
+    # Messages offered while the execution runs wait here for a safe point.
+    # None means this execution does not take live input.
+    live_input: LiveInputMailbox | None = None
+    # Admits one mailbox item on behalf of the owner of this execution.
+    _live_input_injector: (
+        Callable[[LiveUserInput], Awaitable[LiveInputResult]] | None
+    ) = field(default=None, init=False, repr=False)
 
     async def _sync_cache_phase(self) -> None:
         phase = (
@@ -531,6 +539,43 @@ class PatternRuntime:
             self.request_interrupt(self.interrupt_reason)
             return True
         return False
+
+    async def admit_live_user_messages(
+        self, context: Any, *, tools_settled: bool
+    ) -> int:
+        """Admit queued live input into ``context``; return how many were applied.
+
+        Only valid where no tool call is pending or running: a user message
+        between a tool call and its result would detach the pair from the model
+        input. Interruption is checked before each message is taken, so a stop
+        request leaves the rest in the mailbox for the owner to hand back. Each
+        message that is applied becomes the current turn. A taken message stays
+        known to the mailbox until its injector returns or raises.
+        """
+        if not tools_settled or self._active_tool_tasks:
+            raise RuntimeError(
+                "Live user messages can only be admitted when no tool call is "
+                "pending or running."
+            )
+        mailbox = self.live_input
+        injector = self._live_input_injector
+        if mailbox is None or injector is None or not mailbox.pending():
+            return 0
+        applied = 0
+        while mailbox.pending():
+            if await self.should_interrupt():
+                break
+            item = mailbox.take_next()
+            if item is None:
+                break
+            try:
+                result = await injector(item)
+            finally:
+                mailbox.settle(item)
+            if result is LiveInputResult.APPLIED:
+                applied += 1
+                self.active_turn_id = self._dag_turn_id(context)
+        return applied
 
     async def _before_work_call(self) -> bool:
         # Budget admission is separate from interruption polling: a response

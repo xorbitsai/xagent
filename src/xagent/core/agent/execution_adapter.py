@@ -19,6 +19,7 @@ from .interruption import (
     classify_run_result,
     interruption_reason_value,
 )
+from .live_input import LiveInputAdmission, LiveInputOffer
 from .pattern import AutoPattern, DAGPattern, LLMPlanGenerator, ReActPattern
 from .registry import ExecutionRegistry
 from .result import (
@@ -229,6 +230,23 @@ class AgentExecutionAdapter:
             result=result,
             execution_type=execution_type,
             execution_id=execution_id,
+        )
+
+    def offer_live_user_message(
+        self,
+        execution_id: str,
+        *,
+        execution_message: str,
+        display_message: str,
+        turn_id: str,
+        admission: LiveInputAdmission,
+    ) -> LiveInputOffer:
+        return self.registry.offer_live_user_message(
+            execution_id,
+            execution_message=execution_message,
+            display_message=display_message,
+            turn_id=turn_id,
+            admission=admission,
         )
 
     async def post_user_message(

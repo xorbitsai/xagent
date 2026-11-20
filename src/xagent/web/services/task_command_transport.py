@@ -327,6 +327,10 @@ def _canonical_payload(payload: dict[str, Any]) -> str:
 # ``reserved=True`` is the sweeper's door into the namespace; it has no
 # production caller until the sweeper lands, and tests exercise it.
 AUTO_RESUME_COMMAND_PREFIX = "auto-resume:"
+# Command ids of live input commands (a user message offered to a run that is
+# already executing). The id builder lives with the executor; the prefix is
+# reserved here so no other ingress can stage one.
+LIVE_INPUT_COMMAND_PREFIX = "live:"
 # Command ids of a planned release's hand-over pauses (``release_handover``).
 # Reserved like the auto-resume namespace, but staged with ``handover=True``,
 # not ``reserved``: they are ordinary pause commands, not background ones.
@@ -353,13 +357,16 @@ def command_id_has_prefix(column: Any, prefix: str) -> Any:
     return func.substr(column, 1, len(prefix)) == prefix
 
 
-def _normalize_command_id(command_id: str, *, reserved: bool = False) -> str:
+def _normalize_command_id(
+    command_id: str, *, reserved: bool = False, reserved_live: bool = False
+) -> str:
     """Strip and validate a caller-supplied command_id.
 
     Shared by every normalization site in this module so the accepted format
     -- 1-64 URL-safe characters -- cannot drift between them. The
     ``auto-resume:`` namespace is refused unless ``reserved`` says the caller
-    is the auto-resume sweeper.
+    is the auto-resume sweeper, and the ``live:`` namespace is refused unless
+    ``reserved_live`` says the caller is staging a live input command.
     """
 
     normalized = command_id.strip()
@@ -369,6 +376,8 @@ def _normalize_command_id(command_id: str, *, reserved: bool = False) -> str:
         raise ValueError(
             f"command_id prefix {AUTO_RESUME_COMMAND_PREFIX!r} is reserved"
         )
+    if not reserved_live and normalized.startswith(LIVE_INPUT_COMMAND_PREFIX):
+        raise ValueError(f"command_id prefix {LIVE_INPUT_COMMAND_PREFIX!r} is reserved")
     return normalized
 
 
@@ -506,13 +515,15 @@ def stage_task_command(
     target_run_id: str | None = None,
     reserved: bool = False,
     handover: bool = False,
+    reserved_live: bool = False,
 ) -> StagedTaskCommand:
     """Add an idempotent command row to the session without ending its transaction.
 
     ``reserved`` admits the auto-resume sweeper's command id namespace;
     every other caller leaves it False, so no ingress can stage one.
     ``handover`` does the same for a release hand-over's pause ids
-    (``release_handover``).
+    (``release_handover``), and ``reserved_live`` for the ids of live input
+    commands.
 
     Never calls ``db.commit()``, ``db.rollback()``, or the dispatcher notify --
     the caller owns the transaction boundary and decides what durability means
@@ -570,7 +581,9 @@ def stage_task_command(
        writer, including the dispatcher's claim, blocks for that whole span.
     """
 
-    normalized_id = _normalize_command_id(command_id, reserved=reserved)
+    normalized_id = _normalize_command_id(
+        command_id, reserved=reserved, reserved_live=reserved_live
+    )
     if not handover and normalized_id.startswith(HANDOVER_COMMAND_PREFIX):
         raise ValueError(f"command_id prefix {HANDOVER_COMMAND_PREFIX!r} is reserved")
     resolved_task_id = int(task_id)
@@ -791,7 +804,9 @@ def classify_task_command_conflict(
 
     Normalizes command_id the same way stage_task_command does -- strip plus
     full-format validation, not strip alone -- so a lookup here targets the
-    same row a duplicate-command race would have inserted.
+    same row a duplicate-command race would have inserted. It accepts only
+    ids that need no reserved namespace; a ``live:`` or ``auto-resume:`` id is
+    refused here as it is by ``enqueue_task_command``.
 
     Call only after the caller has rolled back the transaction the failed
     stage happened on -- this queries post-rollback state to tell apart a

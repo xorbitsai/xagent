@@ -155,6 +155,14 @@ class PatternResult:
 class AgentPattern(ABC):
     """Abstract interface for agent execution patterns."""
 
+    def accepts_live_input(self) -> bool:
+        """Whether a user message arriving mid-run can enter this pattern's loop.
+
+        The runner asks this before the pattern starts, so it must not depend
+        on anything the pattern learns while running.
+        """
+        return False
+
     @abstractmethod
     async def run(
         self,

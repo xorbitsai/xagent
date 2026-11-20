@@ -150,6 +150,7 @@ from ...deferred_tools import (
 )
 from ...grounding import evidence_facts, grounding_rule
 from ...language import effective_output_language, final_answer_language_rule
+from ...live_input import LiveInputMailbox
 from ...prompt_composition import (
     BUILTIN_TOOL_ORIGIN,
     CALL_KIND_DECISION,
@@ -810,6 +811,9 @@ def _unavailable_tool_call_names(
 class ReActPattern(AgentPattern):
     """Minimal ReAct loop for the execution runtime."""
 
+    def accepts_live_input(self) -> bool:
+        return not self.finalize_after_tool_result
+
     def __init__(
         self,
         llm: Any | None = None,
@@ -1136,6 +1140,12 @@ class ReActPattern(AgentPattern):
             )
         )
         self._spill_reader_present = spill_read_tool is not None
+        # Whether this loop takes user messages from the runtime mailbox at
+        # its safe point; decided once, on entry.
+        live_input_open = (
+            isinstance(getattr(runtime, "live_input", None), LiveInputMailbox)
+            and not self.finalize_after_tool_result
+        )
         spill_read_schema = (
             None
             if spill_read_tool is None
@@ -1208,6 +1218,13 @@ class ReActPattern(AgentPattern):
             )
             if interrupted is not None:
                 return interrupted
+
+            if live_input_open and not force_final_answer_now:
+                # Pending tool calls were executed at the top of this iteration,
+                # so the batch is settled here.
+                await runtime.admit_live_user_messages(
+                    context, tools_settled=not self.pending_tool_calls
+                )
 
             route_messages = self._messages_for_llm(
                 context,
@@ -6843,8 +6860,9 @@ class ReActPattern(AgentPattern):
         The turn equality is what makes the guard strictly per-turn: the
         runner stamps a fresh turn_id on every user message (initial and
         injected), and ``active_turn_id`` is re-resolved from the latest user
-        message at each pattern start — so an explicit repeat requested in a
-        later turn always executes, while an intra-turn resume of the
+        message at each pattern start, and again whenever a live user message
+        is admitted at the loop's safe point — so an explicit repeat requested
+        in a later turn always executes, while an intra-turn resume of the
         checkpointed ledger keeps suppressing the replay.
 
         An ordinary completion is keyed by its original ``turn_id``. A
@@ -7325,7 +7343,8 @@ class ReActPattern(AgentPattern):
 
         ``runtime.active_turn_id`` carries the durable turn_id: on the real
         ``PatternRuntime`` it's set in ``on_pattern_start`` from the
-        triggering user message's metadata; on ``_DAGStepRuntime`` (dag.py)
+        triggering user message's metadata, and again whenever a live user
+        message is admitted at the loop's safe point; on ``_DAGStepRuntime`` (dag.py)
         it's a property resolving the same value from the DAG's root
         context. Either way this lets ``PatternRuntime.on_tool_start`` /
         ``on_tool_end`` / ``on_tool_error`` attribute the resulting trace

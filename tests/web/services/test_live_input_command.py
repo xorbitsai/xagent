@@ -22,6 +22,7 @@ from xagent.web.models.database import Base, get_db, get_engine, init_db
 from xagent.web.models.task import Task, TaskStatus
 from xagent.web.models.user import User
 from xagent.web.services import live_input_command as lic
+from xagent.web.services import task_command_execution
 from xagent.web.services.chat_history_service import (
     DELIVERY_DISPATCHED,
     DELIVERY_PENDING,
@@ -29,7 +30,9 @@ from xagent.web.services.chat_history_service import (
 from xagent.web.services.task_command_execution import _execute_durable_task_command
 from xagent.web.services.task_command_transport import (
     ClaimedTaskCommand,
+    TaskCommandDeferred,
     TaskCommandKind,
+    stage_task_command,
 )
 
 TURN = "turn-1"
@@ -374,3 +377,48 @@ def test_live_input_command_id_is_stable_and_valid() -> None:
     assert first == lic.live_input_command_id("run", "turn", 0)
     assert first != lic.live_input_command_id("run", "turn", 1)
     assert first.startswith("live:") and len(first) == 53
+
+
+@pytest.mark.parametrize("reserved_live", [False, True])
+def test_live_prefix_reserved(db: Any, task: Any, reserved_live: bool) -> None:
+    def stage() -> Any:
+        return stage_task_command(
+            db,
+            task_id=task.id,
+            actor_user_id=None,
+            command_id=lic.live_input_command_id(RUN, TURN, 0),
+            kind=TaskCommandKind.MESSAGE,
+            payload={"scope": lic.LIVE_INPUT_COMMAND_SCOPE},
+            reserved_live=reserved_live,
+        )
+
+    if reserved_live:
+        assert stage().created
+    else:
+        with pytest.raises(ValueError, match="reserved"):
+            stage()
+
+
+@pytest.mark.parametrize(
+    "error",
+    [RuntimeError("executor bug"), TaskCommandDeferred("coordinator unhealthy")],
+    ids=["executor-error", "deferrals-exhausted"],
+)
+async def test_live_input_command_terminal_failure_broadcasts_returned(
+    monkeypatch: pytest.MonkeyPatch, task: Any, error: BaseException
+) -> None:
+    frames: list[dict[str, Any]] = []
+
+    async def publish(frame: dict[str, Any], task_id: int) -> None:
+        frames.append(frame)
+
+    monkeypatch.setattr(task_command_execution, "publish_task_event", publish)
+    await task_command_execution._broadcast_terminal_command_error(command(task), error)
+    assert frames == [
+        {
+            "type": "live_input_returned",
+            "task_id": task.id,
+            "turn_id": TURN,
+            "reason": "unavailable",
+        }
+    ]

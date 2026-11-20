@@ -315,14 +315,15 @@ def _mark_cancelled_turn_delivery_dispatched(
     ``task_id`` filter in ``mark_user_message_delivery`` and lands nothing,
     the same way ``end_user_id`` is audit data only.
 
-    Without one the target is the newest pending user row on the task. That
-    fallback is only sound because a task cannot take a new turn while it is
-    running: ``_claim_turn_no_commit`` in ``task_orchestrator`` filters an
-    APPEND on ``_APPENDABLE_STATUSES`` - COMPLETED, FAILED, PAUSED - which
-    excludes RUNNING, so a cancel target that is still running has at most
-    one pending user row and "newest" and "the running turn's" name the same
-    row. If that filter ever admits RUNNING, this fallback starts closing
-    another turn's row and every caller must pass ``turn_id``.
+    Without one the target is the newest pending user row on the task. A task
+    cannot take a new turn while it is running (``_claim_turn_no_commit`` in
+    ``task_orchestrator`` filters an APPEND on ``_APPENDABLE_STATUSES`` -
+    COMPLETED, FAILED, PAUSED - which excludes RUNNING), but a running run can
+    still receive a live input message, which writes a second pending row
+    while the run executes. The running turn's own row is normally already
+    dispatched by then, so "newest pending" usually names a live input row.
+    Closing that row as dispatched downgrades its outcome to "not confirmed"
+    for the sender; callers that know the turn must pass ``turn_id``.
     """
 
     if turn_id is None:

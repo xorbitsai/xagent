@@ -147,6 +147,7 @@ from .file_turn import (
 from .live_input_command import (
     LIVE_INPUT_COMMAND_SCOPE,
     execute_live_input_command,
+    live_input_returned_frame,
 )
 from .managed_file_ref import (
     DurableObjectIntegrityError,
@@ -5115,6 +5116,17 @@ async def _broadcast_terminal_command_error(
     error: BaseException,
 ) -> None:
     scope = _command_scope(command)
+    if scope == LIVE_INPUT_COMMAND_SCOPE:
+        # The browser holds this message as "sending now"; tell it the
+        # command did not run so it can stop waiting, instead of showing an
+        # error for a message it can still send as the next turn.
+        await publish_task_event(
+            live_input_returned_frame(
+                command.task_id, str(command.payload.get("turn_id")), "unavailable"
+            ),
+            command.task_id,
+        )
+        return
     # Two things separate an external-scope cancel from every other command
     # that exhausts its budget, and both come from who reads the frame. The
     # wording has to be true about the turn, which takes reading the task.

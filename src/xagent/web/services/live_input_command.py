@@ -40,13 +40,12 @@ from .chat_history_service import (
     withdraw_pending_user_message_delivery_sync,
 )
 from .db_runtime import run_db_io_cancellation_safe
-from .task_command_transport import ClaimedTaskCommand
+from .task_command_transport import LIVE_INPUT_COMMAND_PREFIX, ClaimedTaskCommand
 from .task_events import publish_task_event
 
 logger = logging.getLogger(__name__)
 
 LIVE_INPUT_COMMAND_SCOPE = "live_input"
-LIVE_INPUT_COMMAND_PREFIX = "live:"
 
 
 def live_input_command_id(run_id: str, turn_id: str, attempt: int) -> str:

@@ -938,10 +938,13 @@ def _close_cancelled_turn_no_commit(
     closed as ``dispatched``: its message may have been consumed, so it must
     not be offered for a resend.
 
-    The running turn is the newest pending user row, which is sound only
-    because a RUNNING task accepts no new turn. A waiting or paused run has
-    no such guarantee -- a paused task accepts an append -- and its turn's
-    delivery was settled when the run stopped, so only the line is written.
+    The running turn is taken to be the newest pending user row. That holds
+    here because this cancel only acts on tasks with ``source == "sdk"``, and
+    live input messages are written only for first-party and embedded
+    sessions, never for these tasks, so a RUNNING sdk task has one pending
+    row. A waiting or paused run has no such guarantee -- a paused task
+    accepts an append -- and its turn's delivery was settled when the run
+    stopped, so only the line is written.
     Returns the closed turn's id.
     """
 

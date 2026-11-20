@@ -4,6 +4,7 @@ import asyncio
 import base64
 import json
 import logging
+import math
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, List, Optional, Self
@@ -187,22 +188,39 @@ def _saas_duration(value: Any) -> int | float | None:
 
 
 def _saas_dimensions(size: Optional[str]) -> tuple[int, int] | None:
+    """Return an allowed pair; other well-formed sizes snap to the closest ratio.
+
+    Callers (and the video tool prompt) commonly ask for sizes like 1280x720 or
+    1920x1080 that the SaaS API does not list. Rejecting them would just make
+    the model retry blind, so they snap to the allowed size whose aspect ratio
+    is nearest (ties go to the larger area). Text that is not ``WxH`` is
+    rejected with the allowed values.
+    """
     if not size:
         return None
     text = str(size).lower().strip()
     try:
         width_text, height_text = text.split("x", 1)
-        pair = (int(width_text), int(height_text))
+        width, height = int(width_text), int(height_text)
+        if width <= 0 or height <= 0:
+            raise ValueError
     except ValueError:
-        pair = None
-    if pair not in SAAS_VIDEO_SIZES:
         raise MediaParameterError(
             f"Unsupported video size {size!r}; use one of "
             + ", ".join(_saas_allowed_sizes()),
             field="size",
             allowed_values={"size": _saas_allowed_sizes()},
-        )
-    return pair
+        ) from None
+    if (width, height) in SAAS_VIDEO_SIZES:
+        return (width, height)
+    target = math.log(width / height)
+    return min(
+        SAAS_VIDEO_SIZES,
+        key=lambda pair: (
+            abs(math.log(pair[0] / pair[1]) - target),
+            -pair[0] * pair[1],
+        ),
+    )
 
 
 def _saas_seed(value: Any) -> int | None:
@@ -598,7 +616,12 @@ class XinferenceVideoModel(BaseVideoModel):
             "seed": video_item.get("seed", seed_value),
             "resolution": video_item.get("resolution") or resolution,
             "ratio": video_item.get("ratio") or ratio,
-            "duration": reported or duration_value,
+            # Same precedence the usage recorder applied, so the returned
+            # duration is the quantity that was billed.
+            "duration": reported
+            or video_item.get("duration")
+            or video_item.get("seconds")
+            or duration_value,
             "frames": video_item.get("frames"),
             "raw_response": data,
         }

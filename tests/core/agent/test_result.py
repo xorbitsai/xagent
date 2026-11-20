@@ -7,6 +7,7 @@ from xagent.core.agent.result import (
     normalize_tool_failure_code,
     tool_result_requires_authentication,
     tool_result_succeeded,
+    unwrap_final_answer_content,
 )
 
 
@@ -124,3 +125,48 @@ def test_authentication_failure_requires_exact_classified_envelope(overrides):
 )
 def test_unclassified_results_do_not_request_authentication(result):
     assert not tool_result_requires_authentication(result)
+
+
+@pytest.mark.parametrize(
+    ("content", "expected"),
+    [
+        (
+            "<final_answer>\nNo, images can't be sent here.\n</final_answer>",
+            "No, images can't be sent here.",
+        ),
+        ("  <FINAL_ANSWER>Done.</Final_Answer>\n", "Done."),
+        ("Resolved the blockers.</final_answer>", "Resolved the blockers."),
+        (
+            "<final_answer>\nStarted without a closing tag.",
+            "Started without a closing tag.",
+        ),
+        (
+            '<final_answer>{"action": "final_answer", "action_input": "Hi"}</final_answer>',
+            "Hi",
+        ),
+    ],
+)
+def test_unwrap_final_answer_content_removes_tags_at_either_end(content, expected):
+    assert unwrap_final_answer_content(content) == expected
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "Wrap the reply in a <final_answer> tag when the tool is unavailable.",
+        "Close it with </final_answer> and nothing after.\nThen stop.",
+        "  A plain answer with surrounding whitespace.\n",
+    ],
+)
+def test_unwrap_final_answer_content_leaves_text_without_edge_tags_unchanged(content):
+    assert unwrap_final_answer_content(content) == content
+
+
+def test_unwrap_final_answer_content_keeps_legacy_json_unwrapping():
+    assert (
+        unwrap_final_answer_content('{"action": "final_answer", "action_input": "Hi"}')
+        == "Hi"
+    )
+    assert unwrap_final_answer_content('{"final_answer": {"rows": 3}}') == (
+        '{\n  "rows": 3\n}'
+    )

@@ -850,6 +850,8 @@ class TestMCPOAuthConfig:
             "https://brand.example.com/#x",
             "https://user:pass@brand.example.com",
             "https://brand.example.com/prefix",
+            "https://brand.example.com?",
+            "https://brand.example.com#",
         ],
     )
     def test_callback_base_url_rejects_invalid_values(self, monkeypatch, value):

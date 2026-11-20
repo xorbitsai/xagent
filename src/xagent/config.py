@@ -1346,7 +1346,7 @@ def get_mcp_oauth_callback_base_url() -> str | None:
         MCP_OAUTH_CALLBACK_BASE_URL,
         _normalized_http_env_url(MCP_OAUTH_CALLBACK_BASE_URL),
     )
-    if value is not None and urlsplit(value).path:
+    if value is not None and (urlsplit(value).path or "?" in value or "#" in value):
         raise ValueError(
             f"Invalid {MCP_OAUTH_CALLBACK_BASE_URL} value: {value!r}. "
             "Expected an origin without a path."

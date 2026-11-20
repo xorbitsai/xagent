@@ -1087,6 +1087,18 @@ async def test_team_member_callback_site_ignores_the_advertised_callback_base(
 
 
 @pytest.mark.asyncio
+async def test_team_member_treats_a_blank_configured_callback_as_unset(env):
+    env.edit_auth(redirect_uri="   ")
+
+    assert mcp_api._team_member_mcp_oauth_definition_refusal(env.server) is None
+    response = await env.connect()
+
+    assert response.status_code == 303
+    query = parse_qs(urlparse(response.headers["location"]).query)
+    assert query["redirect_uri"] == [mcp_api._default_mcp_oauth_redirect_uri()]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("which", ["advertised", "site"])
 async def test_team_member_accepts_either_spelling_of_the_deployment_callback(
     env, monkeypatch, which

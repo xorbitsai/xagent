@@ -1071,7 +1071,9 @@ async def test_repeated_cancel_keeps_the_first_deadline(
     assert adm.events == ["claim", LiveInputResult.UNKNOWN]
 
 
-async def test_deferred_cancel_is_recognised_by_asyncio_timeout() -> None:
+async def test_deferred_cancel_is_recognised_by_asyncio_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     gate = asyncio.Event()
     adm = RecordingAdmission(gate=gate)
 
@@ -1081,10 +1083,22 @@ async def test_deferred_cancel_is_recognised_by_asyncio_timeout() -> None:
         return tool_calls("w1")
 
     rig = make_rig([reply, final_answer()], ("w1",))
+    cancelling_at_hand_back: list[int] = []
+    hand_back = rig.runner._return_live_inputs_in_background
+
+    def spy(items: list[LiveUserInput]) -> None:
+        task = asyncio.current_task()
+        assert task is not None
+        cancelling_at_hand_back.append(task.cancelling())
+        hand_back(items)
+
+    monkeypatch.setattr(rig.runner, "_return_live_inputs_in_background", spy)
     with pytest.raises(TimeoutError):
         async with asyncio.timeout(0.05):
             await rig.runner.run("hello", execution_id=EID)
     assert adm.events == ["claim", LiveInputResult.APPLIED]
+    # The run is still marked as being cancelled while it winds down.
+    assert cancelling_at_hand_back == [1]
 
 
 async def test_cancel_during_first_of_several_live_inputs() -> None:

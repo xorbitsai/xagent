@@ -34,7 +34,7 @@ from typing import (
 from weakref import WeakValueDictionary
 
 import httpx
-from sqlalchemy import text
+from sqlalchemy import func, text
 
 from ...config import (
     get_google_restricted_scopes,
@@ -80,6 +80,7 @@ from ...core.tools.adapters.vibe.signed_upload import (
 )
 from ...core.tools.core.web_content import get_trusted_proxy_url
 from ...core.utils.public_http_transport import create_public_async_client
+from ..services import shopify_store_locks
 from ..services.actor_mcp_runtime import (
     ActorMCPStdioSessionIdentity,
     resolve_actor_mcp_stdio_configs,
@@ -88,6 +89,7 @@ from ..services.mcp_runtime import (
     MCPActorExecutionIdentity,
     MCPBuiltinOAuthActorPolicy,
 )
+from ..services.shopify_store_locks import shopify_store_of
 from ..services.slack_actor_runtime import (
     SLACK_ACTOR_RUNTIME_REFRESH_KEY,
     SLACK_CHANNEL_ACCESS_POLICY_ENV,
@@ -106,6 +108,7 @@ from ..services.tool_credentials import (
     unresolved_tool_policy_allowlist,
 )
 from ..services.user_oauth import is_ordinary_gmail, scoped_user_oauth_query
+from ..shopify_oauth import is_shopify_provider
 
 logger = logging.getLogger(__name__)
 
@@ -145,6 +148,13 @@ UNAVAILABLE_MCP_APP_SCOPED_GRANT_MESSAGE = (
 )
 _ACTOR_OAUTH_REFRESH_LOCKS: WeakValueDictionary[
     tuple[int, int, str, str], asyncio.Lock
+] = WeakValueDictionary()
+# How often an actor resolution rereads a Shopify grant's store when the
+# grant moved to another store between the read and the row lock.
+_ACTOR_SHOPIFY_STORE_ATTEMPTS = 3
+_SHOPIFY_LOCK_EXPIRY_MARGIN = timedelta(minutes=1)
+_SHOPIFY_OAUTH_REFRESH_LOCKS: WeakValueDictionary[
+    tuple[int, int, str], asyncio.Lock
 ] = WeakValueDictionary()
 # This web-runtime allowlist is intentionally narrower than the adapter-layer
 # public summary allowlist. It accepts only credential/config resolution reasons
@@ -774,6 +784,16 @@ def _actor_oauth_refresh_lock(
     return lock
 
 
+def _shopify_oauth_refresh_lock(user_id: int, provider_name: str) -> asyncio.Lock:
+    """The in-process lock a user's own Shopify grant resolves under."""
+    key = (id(asyncio.get_running_loop()), user_id, provider_name.lower())
+    lock = _SHOPIFY_OAUTH_REFRESH_LOCKS.get(key)
+    if lock is None:
+        lock = asyncio.Lock()
+        _SHOPIFY_OAUTH_REFRESH_LOCKS[key] = lock
+    return lock
+
+
 def _oauth_launch_config_mapping(
     launch_config: Any,
 ) -> Mapping[str, Any] | None:
@@ -929,6 +949,10 @@ class _OAuthRefreshClientRejected(Exception):
     def __init__(self, reason: str) -> None:
         super().__init__(reason)
         self.reason = reason
+
+
+class _ShopifyRefreshNeedsLock(Exception):
+    """A Shopify refresh is due but the in-process refresh lock is not held."""
 
 
 class _OAuthRefreshPermanentlyInvalid(Exception):
@@ -1304,6 +1328,113 @@ def send_oauth_refresh_request(
     return client.post(request.url, timeout=10.0, **request.kwargs)
 
 
+def _oauth_token_undecryptable(oauth_account: Any) -> bool:
+    """Whether a stored token cannot be opened with the configured key."""
+    from ..models.user_oauth import is_undecryptable_oauth_token
+
+    return is_undecryptable_oauth_token(
+        getattr(oauth_account, "access_token", None)
+    ) or is_undecryptable_oauth_token(getattr(oauth_account, "refresh_token", None))
+
+
+def _oauth_token_expiring(
+    oauth_account: Any, *, margin: timedelta = timedelta(0)
+) -> bool:
+    """Whether the access token is expired or expires within the refresh skew
+    (plus ``margin``). A token without an expiry never expires."""
+    from ..services.time_utils import coerce_utc
+
+    expires_at = coerce_utc(oauth_account.expires_at)
+    if expires_at is None:
+        return False
+    return bool(
+        expires_at <= datetime.now(timezone.utc) + OAUTH_TOKEN_EXPIRY_SKEW + margin
+    )
+
+
+def _oauth_token_refresh_due(oauth_account: Any) -> bool:
+    """Whether :func:`refresh_oauth_token_if_needed` may call the provider.
+
+    It shares that function's predicates. An undecryptable token needs a
+    reconnect, not a refresh. A minute's margin covers the refresh reading
+    the clock again later: a token due by then must not be refreshed without
+    the store lock.
+    """
+    return not _oauth_token_undecryptable(oauth_account) and _oauth_token_expiring(
+        oauth_account, margin=_SHOPIFY_LOCK_EXPIRY_MARGIN
+    )
+
+
+def _lock_shopify_store_and_reread(
+    db: Any,
+    oauth_account: Any,
+    provider_name: object,
+    *,
+    may_switch_store: bool,
+) -> Any:
+    """Take the grant's Shopify store lock before a refresh, then reread it.
+
+    Shopify retires a token refreshed or granted alongside another one for
+    the same store, so refreshes and callbacks for a store take turns under
+    the lock until this transaction ends. A grant that needs no refresh is
+    returned as it is, without waiting for the lock. Whoever held the lock
+    may have stored a token that needs no refresh, so the grant is read again
+    after the wait.
+
+    The reread goes through the owner's namespace, never the row id alone: a
+    reconnect replaces the row under a new id, and SQLite can hand a deleted
+    row's id to another owner's new grant. If the owner moved to another
+    store while this waited, ``may_switch_store`` (a transaction holding no
+    other lock) releases the old store and locks the new one, once. ``None``
+    means the owner has no grant for the locked store.
+    """
+    from ..models.user_oauth import UserOAuth
+
+    store = shopify_store_of(provider_name, oauth_account.instance_url)
+    if store is None or not _oauth_token_refresh_due(oauth_account):
+        return oauth_account
+    user_id = int(oauth_account.user_id)
+    resource_owner_key = oauth_account.resource_owner_key
+    app_provider = str(oauth_account.provider)
+    grant_id = oauth_account.id
+
+    def owner_grants() -> Any:
+        return scoped_user_oauth_query(
+            db, user_id=user_id, resource_owner_key=resource_owner_key
+        ).filter(UserOAuth.provider == app_provider)
+
+    for attempt in range(2):
+        shopify_store_locks.lock_shopify_store(
+            db, provider=str(provider_name), store=store
+        )
+        # Only a grant for the locked store: one for another store is not
+        # under this lock. The same row is preferred when it is still there.
+        reread = (
+            owner_grants()
+            .filter(func.lower(UserOAuth.instance_url) == store.lower())
+            .order_by((UserOAuth.id == grant_id).desc(), UserOAuth.id.desc())
+            .populate_existing()
+            .first()
+        )
+        if reread is not None or not may_switch_store or attempt:
+            return reread
+        moved = (
+            owner_grants()
+            .with_entities(UserOAuth.instance_url)
+            .order_by(UserOAuth.id.desc())
+            .first()
+        )
+        new_store = shopify_store_of(
+            provider_name, moved.instance_url if moved else None
+        )
+        if new_store is None or new_store.lower() == store.lower():
+            return None
+        # Hold one store lock at a time: release the old store first.
+        db.rollback()
+        store = new_store
+    return None
+
+
 async def refresh_oauth_token_if_needed(
     db: Any,
     oauth_account: Any,
@@ -1312,14 +1443,12 @@ async def refresh_oauth_token_if_needed(
     flush_changes: bool = True,
 ) -> bool:
     """Check if token is expired (or close to expiring) and refresh if needed."""
-    from ..models.user_oauth import is_undecryptable_oauth_token
-
     # A ciphertext that cannot be opened with the configured key is exposed by
     # the ORM as an empty reconnect marker.  Handle it before the expiry check
     # so rows without ``expires_at`` cannot be treated as usable credentials.
-    if is_undecryptable_oauth_token(
-        getattr(oauth_account, "access_token", None)
-    ) or is_undecryptable_oauth_token(getattr(oauth_account, "refresh_token", None)):
+    # The predicates are shared with _oauth_token_refresh_due, which decides
+    # whether a Shopify refresh takes its store lock first.
+    if _oauth_token_undecryptable(oauth_account):
         logger.warning(
             "Cannot refresh %s OAuth credentials for user %s: "
             "stored token was encrypted with a rotated key; reconnect required",
@@ -1328,19 +1457,8 @@ async def refresh_oauth_token_if_needed(
         )
         return False
 
-    if not oauth_account.expires_at:
-        return True  # Assume valid if no expiration is set
-
-    # Check if expired (or expiring within 5 minutes)
-    now = datetime.now(timezone.utc)
-
-    # Handle timezone naive vs aware
-    expires_at = oauth_account.expires_at
-    if expires_at.tzinfo is None:
-        expires_at = expires_at.replace(tzinfo=timezone.utc)
-
-    if expires_at > now + OAUTH_TOKEN_EXPIRY_SKEW:
-        return True  # Token is still valid
+    if not _oauth_token_expiring(oauth_account):
+        return True  # No expiry set, or not expiring within the skew
 
     logger.info(f"Token expired for {provider_name}, attempting to refresh...")
     try:
@@ -4429,10 +4547,6 @@ class WebToolConfig(BaseToolConfig):
             )
         return cast(Callable[[], Any], self.get_session_factory())
 
-    def _new_legacy_oauth_session(self) -> Any:
-        """Open the transaction owner for legacy OAuth token maintenance."""
-        return self._legacy_oauth_session_factory()()
-
     async def _finish_legacy_oauth_access_token_resolution(
         self,
         *,
@@ -4442,9 +4556,13 @@ class WebToolConfig(BaseToolConfig):
         user_id: int,
         resource_owner_key: str | None,
         actor_app_id: object = None,
+        shopify_refresh_lock_held: bool = True,
     ) -> _LegacyOAuthTokenResolution:
         """``actor_app_id`` is the app an actor grant is resolved for; ordinary
-        resolutions leave it unset."""
+        resolutions leave it unset. ``shopify_refresh_lock_held=False`` means
+        the caller has not taken the in-process Shopify refresh lock: a
+        Shopify refresh then backs off with :class:`_ShopifyRefreshNeedsLock`.
+        """
         from ...web.models.user_oauth import UserOAuth
 
         if not oauth_account:
@@ -4464,6 +4582,27 @@ class WebToolConfig(BaseToolConfig):
                 "restricted scopes are disabled; reconnecting through Composio "
                 "replaces it"
             )
+            return _LegacyOAuthTokenResolution(
+                access_token=None, credential_present=True
+            )
+        if (
+            not shopify_refresh_lock_held
+            and shopify_store_of(provider_name, oauth_account.instance_url)
+            and _oauth_token_refresh_due(oauth_account)
+        ):
+            raise _ShopifyRefreshNeedsLock()
+        # A Shopify grant is reread under its store lock (see the helper).
+        oauth_account = _lock_shopify_store_and_reread(
+            oauth_db,
+            oauth_account,
+            provider_name,
+            # An actor resolution holds its grant row: it must not take
+            # another store's lock (see its resolver).
+            may_switch_store=actor_app_id is None,
+        )
+        if not oauth_account:
+            return _LegacyOAuthTokenResolution(access_token=None)
+        if not oauth_account.access_token:
             return _LegacyOAuthTokenResolution(
                 access_token=None, credential_present=True
             )
@@ -4868,6 +5007,43 @@ class WebToolConfig(BaseToolConfig):
             oauth_db.rollback()
             oauth_db.close()
 
+    @staticmethod
+    def _lock_actor_oauth_namespace(
+        oauth_db: Any,
+        actor_query: Any,
+        *,
+        user_id: int,
+        resource_owner_key: str,
+        app_id: str,
+    ) -> Any:
+        """Lock the actor namespace for this app and return its newest grant."""
+        from ...web.models.user_oauth import UserOAuth
+
+        if oauth_db.get_bind().dialect.name == "sqlite":
+            oauth_db.execute(
+                text(
+                    "UPDATE user_oauth SET id = id "
+                    "WHERE user_id = :user_id "
+                    "AND resource_owner_key = :resource_owner_key "
+                    "AND provider = :provider"
+                ),
+                {
+                    "user_id": user_id,
+                    "resource_owner_key": resource_owner_key,
+                    "provider": app_id,
+                },
+            )
+        else:
+            actor_query = actor_query.with_for_update()
+        # See the ordinary-flow branches in _resolve_legacy_oauth_access_
+        # token for why this is ordered rather than left arbitrary: the
+        # lock above prevents a *new* duplicate from forming during this
+        # resolution, but doesn't retroactively fix a namespace that
+        # already has more than one row from before locking existed (or
+        # from a provider whose identity backfill can't always derive a
+        # non-NULL provider_user_id).
+        return actor_query.order_by(UserOAuth.id.desc()).first()
+
     async def _resolve_actor_oauth_access_token_in_worker(
         self,
         *,
@@ -4908,30 +5084,59 @@ class WebToolConfig(BaseToolConfig):
                 user_id=user_id,
                 resource_owner_key=resource_owner_key,
             ).filter(UserOAuth.provider == app_id)
-            if oauth_db.get_bind().dialect.name == "sqlite":
-                oauth_db.execute(
-                    text(
-                        "UPDATE user_oauth SET id = id "
-                        "WHERE user_id = :user_id "
-                        "AND resource_owner_key = :resource_owner_key "
-                        "AND provider = :provider"
-                    ),
-                    {
-                        "user_id": user_id,
-                        "resource_owner_key": resource_owner_key,
-                        "provider": app_id,
-                    },
+            shopify = isinstance(provider_name, str) and is_shopify_provider(
+                provider_name
+            )
+            for _attempt in range(_ACTOR_SHOPIFY_STORE_ATTEMPTS):
+                # A Shopify grant's store is locked before its row, the order
+                # the callback takes them in (store, then the replaced row),
+                # so the two never wait on each other. Only the store column
+                # is read here: a loaded row would not be refreshed by the
+                # locking read.
+                peeked = (
+                    actor_query.with_entities(UserOAuth.instance_url)
+                    .order_by(UserOAuth.id.desc())
+                    .first()
+                    if shopify
+                    else None
                 )
+                peeked_store = shopify_store_of(
+                    provider_name, peeked.instance_url if peeked else None
+                )
+                if peeked_store is not None:
+                    shopify_store_locks.lock_shopify_store(
+                        oauth_db, provider=str(provider_name), store=peeked_store
+                    )
+                oauth_account = self._lock_actor_oauth_namespace(
+                    oauth_db,
+                    actor_query,
+                    user_id=user_id,
+                    resource_owner_key=resource_owner_key,
+                    app_id=app_id,
+                )
+                locked_store = shopify_store_of(
+                    provider_name,
+                    oauth_account.instance_url if oauth_account else None,
+                )
+                if (locked_store or "").lower() == (peeked_store or "").lower():
+                    break
+                # The grant changed after the peek: the actor reconnected to
+                # another store, connected at all, or disconnected. (A
+                # reconnect to the peeked store cannot land here: it holds
+                # that store's lock until it commits.) Locking another store
+                # now, with the row held, would invert the callback's order
+                # and can deadlock: release everything and read the store
+                # again.
+                logger.info(
+                    "OAUTH CONFIG: Actor Shopify grant changed store during "
+                    "resolution for user %s; retrying",
+                    user_id,
+                )
+                oauth_db.rollback()
             else:
-                actor_query = actor_query.with_for_update()
-            # See the ordinary-flow branches in _resolve_legacy_oauth_access_
-            # token for why this is ordered rather than left arbitrary: the
-            # lock above prevents a *new* duplicate from forming during this
-            # resolution, but doesn't retroactively fix a namespace that
-            # already has more than one row from before locking existed (or
-            # from a provider whose identity backfill can't always derive a
-            # non-NULL provider_user_id).
-            oauth_account = actor_query.order_by(UserOAuth.id.desc()).first()
+                raise RuntimeError(
+                    "Shopify actor grant kept changing store during resolution"
+                )
             logger.info(
                 "OAUTH CONFIG: Checked actor app credential for user %s. Found: %s",
                 user_id,
@@ -5006,12 +5211,6 @@ class WebToolConfig(BaseToolConfig):
         resource_owner_key: str | None = None,
     ) -> _LegacyOAuthTokenResolution:
         """Resolve and persist one exact OAuth owner in an isolated transaction."""
-        from ...web.mcp_apps import (
-            oauth_grant_keys_rejected_by_app_scope,
-            restrict_to_app_scoped_oauth_grant,
-        )
-        from ...web.models.user_oauth import UserOAuth
-
         if self._user_id is None:
             return _LegacyOAuthTokenResolution(access_token=None)
         user_id = int(self._user_id)
@@ -5025,8 +5224,82 @@ class WebToolConfig(BaseToolConfig):
                 resource_owner_key=resource_owner_key,
                 user_id=user_id,
             )
+        session_factory = self._legacy_oauth_session_factory()
+        if isinstance(provider_name, str) and is_shopify_provider(provider_name):
+            return await self._resolve_ordinary_shopify_oauth_access_token(
+                session_factory=session_factory,
+                provider_name=provider_name,
+                app_id=app_id,
+                app_info=app_info,
+                user_id=user_id,
+            )
+        return await self._resolve_ordinary_oauth_access_token(
+            session_factory=session_factory,
+            provider_name=provider_name,
+            app_id=app_id,
+            app_info=app_info,
+            user_id=user_id,
+        )
 
-        oauth_db = self._new_legacy_oauth_session()
+    async def _resolve_ordinary_shopify_oauth_access_token(
+        self,
+        *,
+        session_factory: Callable[[], Any],
+        provider_name: str,
+        app_id: object,
+        app_info: Mapping[str, Any] | None,
+        user_id: int,
+    ) -> _LegacyOAuthTokenResolution:
+        """Resolve a user's own Shopify grant off the event loop.
+
+        Its refresh holds the store lock across the provider request, and a
+        second resolution waiting for that lock on the event loop would stop
+        the loop, and with it the refresh it waits for. So, like an actor
+        refresh, it runs on a worker thread behind an in-process lock.
+        """
+        from ..services.db_runtime import run_db_io_cancellation_safe
+
+        def resolve(lock_held: bool) -> Callable[[], _LegacyOAuthTokenResolution]:
+            return lambda: asyncio.run(
+                self._resolve_ordinary_oauth_access_token(
+                    session_factory=session_factory,
+                    provider_name=provider_name,
+                    app_id=app_id,
+                    app_info=app_info,
+                    user_id=user_id,
+                    shopify_refresh_lock_held=lock_held,
+                )
+            )
+
+        # A token that needs no refresh is used without queueing behind
+        # this user's requests that wait for the store.
+        try:
+            return await run_db_io_cancellation_safe(resolve(False))
+        except _ShopifyRefreshNeedsLock:
+            pass
+        # Same-process waiters must not reserve a pooled connection while
+        # waiting.
+        async with _shopify_oauth_refresh_lock(user_id, provider_name):
+            return await run_db_io_cancellation_safe(resolve(True))
+
+    async def _resolve_ordinary_oauth_access_token(
+        self,
+        *,
+        session_factory: Callable[[], Any],
+        provider_name: object,
+        app_id: object,
+        app_info: Mapping[str, Any] | None,
+        user_id: int,
+        shopify_refresh_lock_held: bool = True,
+    ) -> _LegacyOAuthTokenResolution:
+        """Resolve and persist the user's own grant in an isolated transaction."""
+        from ...web.mcp_apps import (
+            oauth_grant_keys_rejected_by_app_scope,
+            restrict_to_app_scoped_oauth_grant,
+        )
+        from ...web.models.user_oauth import UserOAuth
+
+        oauth_db = session_factory()
         try:
             shared_account = self._resolve_shared_google_oauth_account(
                 oauth_db,
@@ -5130,6 +5403,7 @@ class WebToolConfig(BaseToolConfig):
                 provider_name=provider_name,
                 user_id=user_id,
                 resource_owner_key=None,
+                shopify_refresh_lock_held=shopify_refresh_lock_held,
             )
         except Exception:
             oauth_db.rollback()

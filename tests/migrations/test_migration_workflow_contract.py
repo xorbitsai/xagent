@@ -89,6 +89,38 @@ def test_oauth_lifecycle_changes_run_real_postgresql_fence_tests(
 @pytest.mark.parametrize(
     "source_path",
     [
+        "src/xagent/web/models/shopify_store_lock.py",
+        "src/xagent/web/services/shopify_store_locks.py",
+        "src/xagent/web/api/auth.py",
+        "src/xagent/web/tools/config.py",
+        "tests/web/test_shopify_oauth.py",
+        "tests/web/test_shopify_store_locks_postgresql.py",
+    ],
+)
+def test_shopify_store_lock_changes_run_postgresql_lock_tests(
+    source_path: str,
+) -> None:
+    text = _workflow_text()
+    assert source_path in _push_paths(text)
+    assert source_path in _detector_paths(text)
+
+    workflow = yaml.safe_load(text)
+    job = workflow["jobs"]["test-postgresql-migrations"]
+    regression = next(
+        step
+        for step in job["steps"]
+        if step["name"] == "Test Shopify per-store locking (Postgres-only)"
+    )
+    output = "needs.detect-migration-changes.outputs.should-test"
+    assert regression["if"] == f"{output} == 'true'"
+    assert (
+        "pytest tests/web/test_shopify_store_locks_postgresql.py -m postgresql -q"
+    ) in regression["run"]
+
+
+@pytest.mark.parametrize(
+    "source_path",
+    [
         "src/xagent/web/services/uploaded_file_store.py",
         "src/xagent/core/workspace.py",
         "src/xagent/web/models/task_channel_delivery.py",

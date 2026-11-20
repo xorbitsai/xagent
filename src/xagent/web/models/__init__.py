@@ -24,6 +24,7 @@ from .oidc_consumed_token import OidcConsumedToken
 from .public_mcp import PublicMCPApp, PublicMCPAppAudit
 from .sandbox import DurableSandboxLifecycle, SandboxInfo, SandboxSnapshot
 from .serving_generation import ServingGeneration
+from .shopify_store_lock import ShopifyStoreLock
 from .skill import UserSkill, UserSkillFile
 from .system_setting import SystemSetting
 from .task import DAGExecution, Task, TaskConnectorRuntimeContext
@@ -141,6 +142,7 @@ __all__ = [
     "OidcConsumedToken",
     "PublicMCPApp",
     "PublicMCPAppAudit",
+    "ShopifyStoreLock",
     "Workforce",
     "WorkforceAgent",
     "WorkforceRun",

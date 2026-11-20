@@ -621,7 +621,14 @@ class AgentRunner:
             context_checkpoint_gate(context).run_finishing = False
             runtime.live_input = None
             runtime._live_input_injector = None
-            if self._accepts_live_input():
+            # Live input is taken only while every pattern run so far takes it,
+            # so a run whose first pattern does not never gets a mailbox.
+            first_pattern = next(
+                iter(getattr(self.agent, "patterns", None) or []), None
+            )
+            if first_pattern is not None and self._pattern_accepts_live_input(
+                first_pattern
+            ):
                 runtime.live_input = LiveInputMailbox()
                 runtime._live_input_injector = partial(
                     self._admit_live_input_until_finished, execution_id
@@ -723,6 +730,17 @@ class AgentRunner:
             try:
                 await self._setup_tools(tools, task_id=execution_id)
                 for pattern in patterns:
+                    live_mailbox = runtime.live_input
+                    if (
+                        live_mailbox is not None
+                        and not self._pattern_accepts_live_input(pattern)
+                    ):
+                        # This pattern does not take live input, so the run stops
+                        # taking it for good: later offers answer UNSUPPORTED and
+                        # what was waiting is handed back now, in order, before
+                        # the pattern starts.
+                        runtime.live_input = None
+                        await self._return_live_inputs(live_mailbox.close())
                     load_pattern_checkpoint(pattern, checkpoint)
                     self._reconcile_memory_retrieval_cache(
                         context,
@@ -1590,12 +1608,10 @@ class AgentRunner:
             outcome=UserMessageInjectionOutcome.POSTED_FRESH,
         )
 
-    def _accepts_live_input(self) -> bool:
-        for pattern in getattr(self.agent, "patterns", []):
-            accepts = getattr(pattern, "accepts_live_input", None)
-            if callable(accepts) and accepts() is True:
-                return True
-        return False
+    @staticmethod
+    def _pattern_accepts_live_input(pattern: Any) -> bool:
+        accepts = getattr(pattern, "accepts_live_input", None)
+        return callable(accepts) and accepts() is True
 
     def offer_live_user_message(
         self,

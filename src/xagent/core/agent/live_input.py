@@ -4,7 +4,8 @@ An execution owner may offer a user message to a running execution. The
 message waits in a mailbox until the execution reaches a safe point, where the
 owner-supplied admission decides whether the message may enter the context.
 Messages that did not reach a safe point are handed back to their admission
-when the execution ends.
+when the execution ends, or earlier, when the execution moves on to a pattern
+that does not take live input.
 
 The mailbox is deliberately synchronous: callers and the execution loop share
 one event loop, so "check closed, then append" and "close, then take the

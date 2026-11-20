@@ -897,6 +897,100 @@ async def test_live_input_counters(monkeypatch: pytest.MonkeyPatch) -> None:
     assert ("xagent.live_input.finish_errors", None) in counted
 
 
+class StagedPattern:
+    """Waits to be released, then fails or answers; may take live input."""
+
+    def __init__(self, *, accepts: bool, fails: bool) -> None:
+        self.accepts = accepts
+        self.fails = fails
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+        self.on_start: Any = None
+
+    def accepts_live_input(self) -> bool:
+        return self.accepts
+
+    async def run(self, **_: Any) -> dict[str, Any]:
+        if self.on_start is not None:
+            self.on_start()
+        self.started.set()
+        await self.release.wait()
+        if self.fails:
+            raise RuntimeError("pattern failed")
+        return {"success": True, "output": "done"}
+
+
+def offer_to_runner(
+    runner: AgentRunner, admission: RecordingAdmission, turn_id: str
+) -> LiveInputOffer:
+    return runner.offer_live_user_message(
+        EID,
+        execution_message=LIVE_TEXT,
+        display_message=LIVE_TEXT,
+        turn_id=turn_id,
+        admission=admission,
+    )
+
+
+async def test_live_input_stops_at_the_first_pattern_that_does_not_take_it() -> None:
+    first = StagedPattern(accepts=True, fails=True)
+    second = StagedPattern(accepts=False, fails=True)
+    third = StagedPattern(accepts=True, fails=False)
+    runner = AgentRunner(
+        agent=Agent(name="a", patterns=[first, second, third], llm=None)  # type: ignore[list-item]
+    )
+    queued = RecordingAdmission()
+    late = RecordingAdmission()
+    seen_by_second: list[Any] = []
+    second.on_start = lambda: seen_by_second.extend(queued.events)
+    task = asyncio.create_task(runner.run("hello", execution_id=EID))
+    await asyncio.wait_for(first.started.wait(), timeout=5)
+    assert offer_to_runner(runner, queued, "t1") is LiveInputOffer.QUEUED
+    first.release.set()
+    await asyncio.wait_for(second.started.wait(), timeout=5)
+    answer_in_second = offer_to_runner(runner, late, "t2")
+    second.release.set()
+    await asyncio.wait_for(third.started.wait(), timeout=5)
+    answer_in_third = offer_to_runner(runner, late, "t3")
+    third.release.set()
+    result = await task
+    assert result["success"] is True
+    assert answer_in_second is LiveInputOffer.UNSUPPORTED
+    assert answer_in_third is LiveInputOffer.UNSUPPORTED
+    assert seen_by_second == [LiveInputResult.RETURNED]
+    assert queued.events == [LiveInputResult.RETURNED]
+    assert late.events == []
+
+
+async def test_run_whose_first_pattern_does_not_take_live_input_never_queues() -> None:
+    first = StagedPattern(accepts=False, fails=True)
+    second = StagedPattern(accepts=True, fails=False)
+    runner = AgentRunner(
+        agent=Agent(name="a", patterns=[first, second], llm=None)  # type: ignore[list-item]
+    )
+    adm = RecordingAdmission()
+    setup_entered = asyncio.Event()
+    setup_release = asyncio.Event()
+
+    async def gated_setup(tools: list[Any], *, task_id: str) -> None:
+        setup_entered.set()
+        await setup_release.wait()
+
+    runner._setup_tools = gated_setup  # type: ignore[method-assign]
+    task = asyncio.create_task(runner.run("hello", execution_id=EID))
+    await asyncio.wait_for(setup_entered.wait(), timeout=5)
+    assert offer_to_runner(runner, adm, "t1") is LiveInputOffer.UNSUPPORTED
+    setup_release.set()
+    await asyncio.wait_for(first.started.wait(), timeout=5)
+    first.release.set()
+    await asyncio.wait_for(second.started.wait(), timeout=5)
+    assert offer_to_runner(runner, adm, "t2") is LiveInputOffer.UNSUPPORTED
+    second.release.set()
+    result = await task
+    assert result["success"] is True
+    assert adm.events == []
+
+
 # --------------------------------------------------------------------------
 # Cancellation of the run while a taken message is being admitted
 #

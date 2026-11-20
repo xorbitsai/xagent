@@ -273,7 +273,9 @@ STRIP_LOG_MAX_TOOL_NAME_CHARS = 64
 # One best-effort delivery turn after the work budget, never another work loop.
 ITERATION_LIMIT_DELIVERY_TIMEOUT_SECONDS = 30.0
 # Iterations added to the run's bound for each live user message applied to
-# it, so a message that arrives late still gets room to act on it.
+# it, so a message that arrives late still gets room to act on it. The
+# iterations added over a run never exceed max_iterations, so the iteration
+# cap of a run that keeps receiving messages is at most twice max_iterations.
 LIVE_INPUT_ITERATION_GRANT = 10
 # Stored-result reads a forced answer turn may make, counted over the whole
 # run: reads that ran (the budget) and paths that matched no stored result
@@ -829,8 +831,8 @@ class ReActPattern(AgentPattern):
         # FORCED_ANSWER_READ_REJECT_CAP per run). Only forced answer turns may
         # use them; every other turn stops at the iteration cap (_iteration_cap),
         # which is this value plus LIVE_INPUT_ITERATION_GRANT for each live
-        # user message applied during the run, and which does not count the
-        # forced answer reads.
+        # user message applied during the run, with that addition never above
+        # this value, and which does not count the forced answer reads.
         max_iterations: int = 200,
         tool_choice: str | dict[str, Any] | None = "required",
         reasoning_mode: ReActReasoningMode | str = ReActReasoningMode.TOOL_CALLING,
@@ -1159,8 +1161,9 @@ class ReActPattern(AgentPattern):
         )
 
         # The bound is re-read on every pass because a forced-turn read raises
-        # it for forced answer turns, and every applied live user message
-        # raises it by LIVE_INPUT_ITERATION_GRANT; every other turn, and every
+        # it for forced answer turns, and an applied live user message raises
+        # it by LIVE_INPUT_ITERATION_GRANT until the iterations added that way
+        # reach max_iterations; every other turn, and every
         # turn of a run that made neither, stays within
         # range(self.current_iteration, self._iteration_cap()).
         for iteration in itertools.count(self.current_iteration):
@@ -1232,7 +1235,11 @@ class ReActPattern(AgentPattern):
                 applied = await runtime.admit_live_user_messages(
                     context, tools_settled=not self.pending_tool_calls
                 )
-                self.live_input_iteration_grant += LIVE_INPUT_ITERATION_GRANT * applied
+                if applied:
+                    self.live_input_iteration_grant = self._bounded_live_input_grant(
+                        self.live_input_iteration_grant
+                        + LIVE_INPUT_ITERATION_GRANT * applied
+                    )
 
             route_messages = self._messages_for_llm(
                 context,
@@ -2815,12 +2822,17 @@ class ReActPattern(AgentPattern):
         """The iteration bound of an ordinary turn.
 
         max_iterations plus the allowance the live user messages applied to
-        this run have added; the allowance is 0 for a run that applied none.
-        The allowance is saved with the pattern's next checkpoint; a run
-        resumed from the checkpoint the injection itself wrote has the message
-        without its allowance.
+        this run have added; the allowance is 0 for a run that applied none
+        and never exceeds max_iterations. The allowance is saved with the
+        pattern's next checkpoint; a run resumed from the checkpoint the
+        injection itself wrote has the message without its allowance.
         """
         return self.max_iterations + self.live_input_iteration_grant
+
+    def _bounded_live_input_grant(self, grant: int) -> int:
+        """``grant`` brought into the range an allowance may take: 0 to
+        max_iterations, and 0 when max_iterations is not positive."""
+        return max(0, min(grant, self.max_iterations))
 
     def _within_iteration_bound(
         self, iteration: int, *, runtime: PatternRuntime, context: Any
@@ -3110,13 +3122,14 @@ class ReActPattern(AgentPattern):
         )
         self.status = str(state.get("status", "idle"))
         self.current_iteration = int(state.get("current_iteration", 0))
-        self.live_input_iteration_grant = max(
-            0, int(state.get("live_input_iteration_grant", 0) or 0)
-        )
         self.iteration_limit_delivery_attempted = bool(
             state.get("iteration_limit_delivery_attempted", False)
         )
         self.max_iterations = int(state.get("max_iterations", self.max_iterations))
+        # Bounded by the max_iterations restored on the line above.
+        self.live_input_iteration_grant = self._bounded_live_input_grant(
+            int(state.get("live_input_iteration_grant", 0) or 0)
+        )
         self.finalize_after_tool_result = bool(
             state.get("finalize_after_tool_result", self.finalize_after_tool_result)
         )

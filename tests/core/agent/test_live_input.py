@@ -1467,6 +1467,9 @@ async def test_repeat_write_after_live_input_is_not_suppressed(inserted: bool) -
 # --------------------------------------------------------------------------
 
 GRANT = react_module.LIVE_INPUT_ITERATION_GRANT
+# More than the allowance of three messages, so the max_iterations bound on
+# the allowance does not apply to the cases that use it.
+UNCAPPED_MAX_ITERATIONS = 3 * GRANT + 1
 
 
 def offering_first_reply(
@@ -1541,7 +1544,7 @@ def rig_with_offered_messages(
 async def test_live_input_iteration_grant(
     offers: list[int], claim: LiveInputClaim, granted: int
 ) -> None:
-    max_iterations = 3
+    max_iterations = UNCAPPED_MAX_ITERATIONS
     rig = rig_with_offered_messages(
         offers,
         [tool_calls("w1")] * (max_iterations + GRANT * 3 + 5),
@@ -1584,12 +1587,12 @@ async def test_live_input_failed_injection_adds_no_iteration_grant(
 
 
 async def test_forced_answer_extra_iterations_extend_the_raised_cap() -> None:
-    pattern = ReActPattern(max_iterations=3)
+    pattern = ReActPattern(max_iterations=GRANT)
     pattern.live_input_iteration_grant = GRANT
     pattern.force_final_answer_next = True
     pattern.forced_answer_extra_iterations = 1
     runtime = PatternRuntime(execution_id=EID)
-    cap = 3 + GRANT
+    cap = 2 * GRANT
     bound = pattern._within_iteration_bound
     assert bound(cap - 1, runtime=runtime, context=None)
     assert bound(cap, runtime=runtime, context=None)
@@ -1641,6 +1644,14 @@ async def test_unavailable_tool_recovery_stops_at_the_raised_cap(delivery: str) 
         pytest.param({}, 0, id="missing"),
         pytest.param({"live_input_iteration_grant": None}, 0, id="none"),
         pytest.param({"live_input_iteration_grant": -4}, 0, id="negative"),
+        pytest.param(
+            {"live_input_iteration_grant": GRANT + 5}, GRANT, id="above_max_iterations"
+        ),
+        pytest.param(
+            {"live_input_iteration_grant": 5, "max_iterations": 0},
+            0,
+            id="max_iterations_zero",
+        ),
     ],
 )
 def test_live_input_iteration_grant_loads_within_range(
@@ -1649,6 +1660,8 @@ def test_live_input_iteration_grant_loads_within_range(
     state = ReActPattern(max_iterations=GRANT).get_state()
     del state["live_input_iteration_grant"]
     state.update(saved)
+    # Built with the default max_iterations, so only the saved one can bound
+    # the allowance it loads.
     restored = ReActPattern()
     restored.live_input_iteration_grant = 7
     restored.load_state(state)
@@ -1659,7 +1672,7 @@ def test_live_input_iteration_grant_loads_within_range(
 async def test_live_input_iteration_grant_survives_state_round_trip(
     n_applied: int,
 ) -> None:
-    max_iterations = 3
+    max_iterations = UNCAPPED_MAX_ITERATIONS
     rig = rig_with_offered_messages(
         n_applied, [final_answer()], max_iterations=max_iterations
     )
@@ -1670,3 +1683,19 @@ async def test_live_input_iteration_grant_survives_state_round_trip(
     restored.load_state(json.loads(json.dumps(pattern.get_state())))
     assert restored.live_input_iteration_grant == GRANT * n_applied
     assert restored._iteration_cap() == max_iterations + GRANT * n_applied
+
+
+async def test_live_input_iteration_grant_stops_at_max_iterations() -> None:
+    # The second message takes the allowance to max_iterations; the third is
+    # still written into the conversation but adds nothing.
+    max_iterations = 2 * GRANT - 1
+    rig = rig_with_offered_messages(
+        [1, 1, 1],
+        [tool_calls("w1")] * (3 * max_iterations),
+        max_iterations=max_iterations,
+    )
+    result = await rig.start()
+    assert result["live_input_iteration_grant"] == max_iterations
+    assert len(rig.tools["w1"].calls) == 2 * max_iterations
+    last_request = " ".join(str(m.get("content")) for m in rig.llm.requests[-1])
+    assert all(f"{LIVE_TEXT}{index}" in last_request for index in range(3))

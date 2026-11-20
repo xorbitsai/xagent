@@ -163,7 +163,20 @@ def format_tool_result_for_observation(tool_name: str, result: Any) -> str:
 def _observation_metadata(
     sanitized: dict[str, Any], excluded: set[str]
 ) -> dict[str, Any]:
-    return {key: value for key, value in sanitized.items() if key not in excluded}
+    return {
+        key: _redact_inline_media(value)
+        for key, value in sanitized.items()
+        if key not in excluded
+    }
+
+
+def _redact_inline_media(value: Any) -> Any:
+    """Keep inline ``data:`` payloads (a base64 video can be megabytes) out of
+    what the model reads; they are never usable as text."""
+    if isinstance(value, str) and value.startswith("data:"):
+        media_type = value[5:].split(";", 1)[0].split(",", 1)[0] or "media"
+        return f"<inline {media_type} data omitted ({len(value)} chars)>"
+    return value
 
 
 def _format_artifact_lines(artifacts: list[Any]) -> list[str]:

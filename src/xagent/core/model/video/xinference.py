@@ -4,6 +4,7 @@ import asyncio
 import base64
 import json
 import logging
+import math
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, List, Optional, Self
@@ -144,8 +145,108 @@ def _size_from_resolution_ratio(
     return f"{width}x{height}"
 
 
+# The xinference-saas ("Model API") prepaid video endpoint accepts a closed set
+# of top-level fields instead of the open-source server's ``kwargs`` JSON string.
+SAAS_VIDEO_SIZES: tuple[tuple[int, int], ...] = (
+    (1344, 768),
+    (768, 1344),
+    (1024, 768),
+    (768, 1024),
+    (768, 768),
+    (1792, 768),
+    (768, 1792),
+)
+SAAS_VIDEO_MIN_SECONDS = 4
+SAAS_VIDEO_MAX_SECONDS = 15
+SAAS_VIDEO_MAX_SEED = 2**31 - 1
+
+
+def _saas_allowed_sizes() -> list[str]:
+    return [f"{w}x{h}" for w, h in SAAS_VIDEO_SIZES]
+
+
+def _saas_duration(value: Any) -> int | float | None:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        number: float = float("nan")
+    else:
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            number = float("nan")
+    if not (SAAS_VIDEO_MIN_SECONDS <= number <= SAAS_VIDEO_MAX_SECONDS):
+        raise MediaParameterError(
+            "Xinference video duration must be between "
+            f"{SAAS_VIDEO_MIN_SECONDS} and {SAAS_VIDEO_MAX_SECONDS} seconds",
+            field="duration",
+            allowed_values={
+                "duration": [SAAS_VIDEO_MIN_SECONDS, SAAS_VIDEO_MAX_SECONDS]
+            },
+        )
+    return int(number) if number == int(number) else number
+
+
+def _saas_dimensions(size: Optional[str]) -> tuple[int, int] | None:
+    """Return an allowed pair; other well-formed sizes snap to the closest ratio.
+
+    Callers (and the video tool prompt) commonly ask for sizes like 1280x720 or
+    1920x1080 that the SaaS API does not list. Rejecting them would just make
+    the model retry blind, so they snap to the allowed size whose aspect ratio
+    is nearest (ties go to the larger area). Text that is not ``WxH`` is
+    rejected with the allowed values.
+    """
+    if not size:
+        return None
+    text = str(size).lower().strip()
+    try:
+        width_text, height_text = text.split("x", 1)
+        width, height = int(width_text), int(height_text)
+        if width <= 0 or height <= 0:
+            raise ValueError
+    except ValueError:
+        raise MediaParameterError(
+            f"Unsupported video size {size!r}; use one of "
+            + ", ".join(_saas_allowed_sizes()),
+            field="size",
+            allowed_values={"size": _saas_allowed_sizes()},
+        ) from None
+    if (width, height) in SAAS_VIDEO_SIZES:
+        return (width, height)
+    target = math.log(width / height)
+    return min(
+        SAAS_VIDEO_SIZES,
+        key=lambda pair: (
+            abs(math.log(pair[0] / pair[1]) - target),
+            -pair[0] * pair[1],
+        ),
+    )
+
+
+def _saas_seed(value: Any) -> int | None:
+    if value is None:
+        return None
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or not 0 <= value <= SAAS_VIDEO_MAX_SEED
+    ):
+        raise MediaParameterError(
+            f"seed must be an integer between 0 and {SAAS_VIDEO_MAX_SEED}",
+            field="seed",
+            allowed_values={"seed": [0, SAAS_VIDEO_MAX_SEED]},
+        )
+    return int(value)
+
+
 class XinferenceVideoModel(BaseVideoModel):
-    """Xinference video model client using OpenAI-compatible video endpoints."""
+    """Xinference video model client using OpenAI-compatible video endpoints.
+
+    With ``saas_api=True`` it targets the xinference-saas prepaid video API
+    (text-to-video only, top-level fields, ``b64_json`` responses). The default
+    keeps the open-source server contract (``kwargs`` JSON string, image and
+    first/last-frame endpoints).
+    """
 
     @classmethod
     async def discover_generation_capabilities(
@@ -181,7 +282,9 @@ class XinferenceVideoModel(BaseVideoModel):
         timeout: float = 3600.0,
         abilities: Optional[List[str]] = None,
         model_id: str = "",
+        saas_api: bool = False,
     ) -> None:
+        self.saas_api = saas_api
         self.model_name = model_name
         # The configured row id usage is billed under; see media_metering.
         self.model_id = model_id
@@ -415,6 +518,10 @@ class XinferenceVideoModel(BaseVideoModel):
             data = _to_plain_data(result)
             item = _first_video_item(data)
             reported_seconds = item.get("duration") or item.get("seconds")
+            if self.saas_api and isinstance(data, dict):
+                usage = data.get("usage")
+                if isinstance(usage, dict) and usage.get("video_seconds"):
+                    reported_seconds = usage["video_seconds"]
             item_resolution = str(item.get("resolution") or resolution or "")
         except Exception as exc:  # noqa: BLE001 - positional classification
             logger.warning("Xinference video response was malformed: %s", exc)
@@ -427,6 +534,97 @@ class XinferenceVideoModel(BaseVideoModel):
             resolution=item_resolution,
         )
         return data, item
+
+    async def _generate_saas_video(
+        self,
+        *,
+        prompt: str,
+        reference_image: Optional[str],
+        last_frame_image_url: Optional[str],
+        seconds: Any,
+        size: Optional[str],
+        resolution: Optional[str],
+        ratio: Optional[str],
+        seed: Any,
+        timeout: float,
+    ) -> dict[str, Any]:
+        # Every refusal and validation happens before a request is built.
+        if reference_image or last_frame_image_url:
+            raise MediaParameterError(
+                "This Xinference video model supports text-to-video only; "
+                "image-to-video and first/last-frame input are not available",
+                field="input_reference",
+            )
+        duration_value = _saas_duration(seconds)
+        dimensions = _saas_dimensions(size)
+        seed_value = _saas_seed(seed)
+
+        body: dict[str, Any] = {
+            "model": self._model_uid,
+            "prompt": prompt,
+            "n": 1,
+            "response_format": "b64_json",
+        }
+        if duration_value is not None:
+            body["duration"] = duration_value
+        if dimensions is not None:
+            body["width"], body["height"] = dimensions
+        if seed_value is not None:
+            body["seed"] = seed_value
+
+        result: Any = _NOT_RECEIVED
+        try:
+            async with create_public_model_aiohttp_session(
+                timeout=aiohttp.ClientTimeout(total=timeout)
+            ) as session:
+                result = await self._post_video_json(
+                    session, "/v1/video/generations", body
+                )
+        except asyncio.CancelledError:
+            if result is not _NOT_RECEIVED:
+                self._record_response_usage(result, duration_value, resolution)
+            raise
+        except BilledVideoTaskError:
+            record_provider_usage(self, MediaCallType.VIDEO, 0)
+            raise
+        except Exception as exc:
+            logger.error(
+                "Xinference video generation failed: %s",
+                redact_provider_detail(exc),
+            )
+            raise RuntimeError(f"Xinference video generation failed: {exc}") from exc
+
+        data, video_item = self._record_response_usage(
+            result, duration_value, resolution
+        )
+        if video_item is None:
+            raise BilledVideoTaskError("Xinference video response was malformed")
+        video_url = _video_url_from_item(video_item)
+        if not video_url:
+            raise BilledVideoTaskError(
+                "Xinference video generation response did not include "
+                "url, video_url, or b64_json"
+            )
+        usage = data.get("usage") if isinstance(data, dict) else None
+        reported = usage.get("video_seconds") if isinstance(usage, dict) else None
+        return {
+            "task_id": video_item.get("id") or video_item.get("task_id"),
+            "model": self.model_name,
+            "status": "succeeded",
+            "video_url": video_url,
+            "last_frame_url": None,
+            "seed": video_item.get("seed", seed_value),
+            "resolution": video_item.get("resolution") or resolution,
+            "ratio": video_item.get("ratio") or ratio,
+            # Same precedence the usage recorder applied, so the returned
+            # duration is the quantity that was billed.
+            "duration": reported
+            or video_item.get("duration")
+            or video_item.get("seconds")
+            or duration_value,
+            "frames": video_item.get("frames"),
+            "raw_response": data,
+        }
 
     async def generate_video(
         self,
@@ -481,6 +679,22 @@ class XinferenceVideoModel(BaseVideoModel):
             raise ValueError("prompt cannot be empty")
 
         effective_timeout = timeout if timeout is not None else self.timeout
+
+        if self.saas_api:
+            return await self._generate_saas_video(
+                prompt=prompt,
+                reference_image=input_reference
+                or image_url
+                or image
+                or first_frame_image_url,
+                last_frame_image_url=last_frame_image_url,
+                seconds=seconds if seconds is not None else duration,
+                size=size or _size_from_resolution_ratio(resolution, ratio),
+                resolution=resolution,
+                ratio=ratio,
+                seed=kwargs.get("seed"),
+                timeout=effective_timeout,
+            )
 
         effective_seconds = seconds if seconds is not None else duration
         if effective_seconds is not None and "seconds" not in kwargs:

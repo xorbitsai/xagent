@@ -272,6 +272,11 @@ STRIP_LOG_MAX_TOOL_NAMES = 8
 STRIP_LOG_MAX_TOOL_NAME_CHARS = 64
 # One best-effort delivery turn after the work budget, never another work loop.
 ITERATION_LIMIT_DELIVERY_TIMEOUT_SECONDS = 30.0
+# Iterations added to the run's bound for each live user message applied to
+# it, so a message that arrives late still gets room to act on it. The
+# iterations added over a run never exceed max_iterations, so the iteration
+# cap of a run that keeps receiving messages is at most twice max_iterations.
+LIVE_INPUT_ITERATION_GRANT = 10
 # Stored-result reads a forced answer turn may make, counted over the whole
 # run: reads that ran (the budget) and paths that matched no stored result
 # (the reject cap) are counted apart so neither kind uses up the other.
@@ -824,8 +829,10 @@ class ReActPattern(AgentPattern):
         # path is not a stored result, add iterations on top of this bound
         # (forced_answer_extra_iterations, at most FORCED_ANSWER_READ_BUDGET +
         # FORCED_ANSWER_READ_REJECT_CAP per run). Only forced answer turns may
-        # use them; every other turn stops at this value, which itself does
-        # not count them.
+        # use them; every other turn stops at the iteration cap (_iteration_cap),
+        # which is this value plus LIVE_INPUT_ITERATION_GRANT for each live
+        # user message applied during the run, with that addition never above
+        # this value, and which does not count the forced answer reads.
         max_iterations: int = 200,
         tool_choice: str | dict[str, Any] | None = "required",
         reasoning_mode: ReActReasoningMode | str = ReActReasoningMode.TOOL_CALLING,
@@ -883,6 +890,7 @@ class ReActPattern(AgentPattern):
         )
         self.status = "idle"
         self.current_iteration = 0
+        self.live_input_iteration_grant = 0
         self.iteration_limit_delivery_attempted = False
         self.last_response: Any = None
         self.pending_tool_calls: list[dict[str, Any]] = []
@@ -907,7 +915,7 @@ class ReActPattern(AgentPattern):
         # FORCED_ANSWER_READ_REJECT_CAP forced-turn read dispositions.
         # _forced_answer_read_open says whether the current forced turn offers
         # read_tool_result; forced_answer_extra_iterations counts the
-        # iterations those dispositions added on top of max_iterations and is
+        # iterations those dispositions added on top of the iteration cap and is
         # never reset either.
         self.forced_answer_reads_used = 0
         self.forced_answer_reads_rejected = 0
@@ -1153,9 +1161,11 @@ class ReActPattern(AgentPattern):
         )
 
         # The bound is re-read on every pass because a forced-turn read raises
-        # it for forced answer turns; every other turn, and every turn of a
-        # run that made no such read, stays within
-        # range(self.current_iteration, self.max_iterations).
+        # it for forced answer turns, and an applied live user message raises
+        # it by LIVE_INPUT_ITERATION_GRANT until the iterations added that way
+        # reach max_iterations; every other turn, and every
+        # turn of a run that made neither, stays within
+        # range(self.current_iteration, self._iteration_cap()).
         for iteration in itertools.count(self.current_iteration):
             if not self._within_iteration_bound(
                 iteration, runtime=runtime, context=context
@@ -1222,9 +1232,21 @@ class ReActPattern(AgentPattern):
             if live_input_open and not force_final_answer_now:
                 # Pending tool calls were executed at the top of this iteration,
                 # so the batch is settled here.
-                await runtime.admit_live_user_messages(
+                applied = await runtime.admit_live_user_messages(
                     context, tools_settled=not self.pending_tool_calls
                 )
+                if applied:
+                    self.live_input_iteration_grant = self._bounded_live_input_grant(
+                        self.live_input_iteration_grant
+                        + LIVE_INPUT_ITERATION_GRANT * applied
+                    )
+                    # Saved now: the checkpoint each message wrote was built
+                    # from the pattern state before this allowance, and the
+                    # next pattern checkpoint (before_llm) comes only after
+                    # routing and compaction.
+                    await runtime.checkpoint(
+                        "live_input_applied", context=context, pattern=self
+                    )
 
             route_messages = self._messages_for_llm(
                 context,
@@ -1398,9 +1420,9 @@ class ReActPattern(AgentPattern):
                 if (
                     unavailable_tool_call
                     and not settlement_fence
-                    and iteration >= self.max_iterations
+                    and iteration >= self._iteration_cap()
                 ):
-                    # Past max_iterations only a forced answer turn may run;
+                    # Past the iteration cap only a forced answer turn may run;
                     # stop rather than restore the full tool set there.
                     break
                 auto_load_allowed = unavailable_tool_call and not settlement_fence
@@ -1527,8 +1549,8 @@ class ReActPattern(AgentPattern):
                         allowed_tool_names=recovery_allowed_names,
                     )
                 )
-                if recover_full_tool_set and iteration >= self.max_iterations:
-                    # Past max_iterations only a forced answer turn may run.
+                if recover_full_tool_set and iteration >= self._iteration_cap():
+                    # Past the iteration cap only a forced answer turn may run.
                     # Handing this one the full tool set would run ordinary
                     # work there, so stop as the loop does at its bound.
                     break
@@ -1746,6 +1768,7 @@ class ReActPattern(AgentPattern):
             "iterations": self.max_iterations,
             "status": self.status,
             "forced_answer_extra_iterations": self.forced_answer_extra_iterations,
+            "live_input_iteration_grant": self.live_input_iteration_grant,
         }
         if failure_code is not None:
             metadata["failure_code"] = failure_code
@@ -1876,7 +1899,9 @@ class ReActPattern(AgentPattern):
         # success means a final response was delivered, not that the requested
         # work succeeded; use the existing partial/blocked outcome contract.
         result.update(
-            termination_reason="max_iterations", iterations=self.max_iterations
+            termination_reason="max_iterations",
+            iterations=self.max_iterations,
+            live_input_iteration_grant=self.live_input_iteration_grant,
         )
         return result
 
@@ -2785,7 +2810,7 @@ class ReActPattern(AgentPattern):
         The two read counters are per run and are not reset here, so a later
         forced turn in the same run gets no fresh read allowance.
         forced_answer_extra_iterations is never reset: it is part of the
-        loop bound, and the iteration may already be past max_iterations.
+        loop bound, and the iteration may already be past the iteration cap.
         """
         self.force_final_answer_next = False
         self._forced_answer_read_open = False
@@ -2802,19 +2827,43 @@ class ReActPattern(AgentPattern):
             )
         )
 
+    def _iteration_cap(self) -> int:
+        """The iteration bound of an ordinary turn.
+
+        max_iterations plus the allowance the live user messages applied to
+        this run have added; the allowance is 0 for a run that applied none
+        and never exceeds max_iterations. The safe point saves it in a
+        checkpoint right after applying messages. The checkpoint each message
+        writes for itself is built from the pattern state before that, so a
+        run resumed from one has the message without its allowance. A run
+        resumes from such a checkpoint when a message was written and the
+        safe point's checkpoint was not: for example when the run is
+        cancelled during the safe point's admission, since the cancellation
+        is held back only until the message being admitted finishes or
+        LIVE_INPUT_CANCEL_GRACE_SECONDS pass, or when the process exits while
+        a later message of the same safe point is being written.
+        """
+        return self.max_iterations + self.live_input_iteration_grant
+
+    def _bounded_live_input_grant(self, grant: int) -> int:
+        """``grant`` brought into the range an allowance may take: 0 to
+        max_iterations, and 0 when max_iterations is not positive."""
+        return max(0, min(grant, self.max_iterations))
+
     def _within_iteration_bound(
         self, iteration: int, *, runtime: PatternRuntime, context: Any
     ) -> bool:
         """Whether the loop may run this iteration.
 
-        max_iterations bounds every turn, as it always has. The iterations
-        forced-turn reads added extend it only for a forced answer turn, or
-        for the pending calls such a turn left behind, so an ordinary turn
-        never runs past max_iterations.
+        The bound is max_iterations plus the allowance the applied live user
+        messages added. The iterations forced-turn reads added extend it only
+        for a forced answer turn, or for the pending calls such a turn left
+        behind, so an ordinary turn never runs past the iteration cap.
         """
-        if iteration < self.max_iterations:
+        cap = self._iteration_cap()
+        if iteration < cap:
             return True
-        if iteration >= self.max_iterations + self.forced_answer_extra_iterations:
+        if iteration >= cap + self.forced_answer_extra_iterations:
             return False
         if self.pending_tool_calls:
             return self._forced_answer_read_open or self.force_final_answer_next
@@ -3009,6 +3058,7 @@ class ReActPattern(AgentPattern):
             "reasoning_mode": self.reasoning_mode.value,
             "status": self.status,
             "current_iteration": self.current_iteration,
+            "live_input_iteration_grant": self.live_input_iteration_grant,
             "iteration_limit_delivery_attempted": self.iteration_limit_delivery_attempted,
             "max_iterations": self.max_iterations,
             "finalize_after_tool_result": self.finalize_after_tool_result,
@@ -3092,6 +3142,10 @@ class ReActPattern(AgentPattern):
             state.get("iteration_limit_delivery_attempted", False)
         )
         self.max_iterations = int(state.get("max_iterations", self.max_iterations))
+        # Bounded by the max_iterations restored on the line above.
+        self.live_input_iteration_grant = self._bounded_live_input_grant(
+            int(state.get("live_input_iteration_grant", 0) or 0)
+        )
         self.finalize_after_tool_result = bool(
             state.get("finalize_after_tool_result", self.finalize_after_tool_result)
         )

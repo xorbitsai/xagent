@@ -25,6 +25,7 @@ from xagent.core.agent import (
     Agent,
     AgentExecutionAdapter,
     AgentExecutionConfig,
+    ExecutionContext,
     PatternRuntime,
     ReActPattern,
 )
@@ -112,8 +113,11 @@ def tool_calls(*names: str) -> dict[str, Any]:
     }
 
 
-def final_answer() -> dict[str, Any]:
-    arguments = json.dumps({"answer": "done", "response_language": "English"})
+def final_answer(outcome: str | None = None) -> dict[str, Any]:
+    args = {"answer": "done", "response_language": "English"}
+    if outcome is not None:
+        args["outcome"] = outcome
+    arguments = json.dumps(args)
     return {
         "content": "",
         "tool_calls": [
@@ -1460,3 +1464,405 @@ async def test_repeat_write_after_live_input_is_not_suppressed(inserted: bool) -
     result = await rig.start()
     assert result["success"] is True
     assert len(rig.tools["w1"].calls) == (2 if inserted else 1)
+
+
+# --------------------------------------------------------------------------
+# Iteration allowance
+# --------------------------------------------------------------------------
+
+GRANT = react_module.LIVE_INPUT_ITERATION_GRANT
+# More than the allowance of three messages, so the max_iterations bound on
+# the allowance does not apply to the cases that use it.
+UNCAPPED_MAX_ITERATIONS = 3 * GRANT + 1
+
+
+def offering_first_reply(
+    rig_holder: list[Rig],
+    count: int,
+    reply: Any,
+    *,
+    first_index: int = 0,
+    claim: LiveInputClaim = LiveInputClaim.CLAIMED,
+) -> Any:
+    """A script entry that queues ``count`` live messages, then returns ``reply``."""
+
+    async def entry() -> Any:
+        for index in range(first_index, first_index + count):
+            offer = rig_holder[0].offer(
+                RecordingAdmission(claim),
+                turn_id=f"live-{index}",
+                text=f"{LIVE_TEXT}{index}",
+            )
+            assert offer is LiveInputOffer.QUEUED
+        return reply
+
+    return entry
+
+
+def rig_with_offered_messages(
+    count: int | list[int],
+    rest: list[Any],
+    *,
+    max_iterations: int,
+    claim: LiveInputClaim = LiveInputClaim.CLAIMED,
+) -> Rig:
+    """``count`` messages are queued during the first model request; a list
+    queues ``count[i]`` during request ``i``, so each lands at its own safe point."""
+    counts = [count] if isinstance(count, int) else count
+    holder: list[Rig] = []
+    script = [
+        offering_first_reply(
+            holder,
+            queued,
+            tool_calls("w1"),
+            first_index=sum(counts[:position]),
+            claim=claim,
+        )
+        for position, queued in enumerate(counts)
+    ]
+    rig = make_rig(
+        [*script, *rest],
+        ("w1",),
+        pattern=tool_only_pattern(max_iterations),
+    )
+    holder.append(rig)
+    return rig
+
+
+def tool_only_pattern(max_iterations: int) -> ReActPattern:
+    return ReActPattern(
+        max_iterations=max_iterations,
+        repeated_tool_decision_after_consecutive_tool_calls=None,
+        repeated_tool_decision_after_consecutive_work_tool_calls=None,
+    )
+
+
+def live_messages_in(checkpoint: dict[str, Any]) -> int:
+    """How many live messages the context saved in ``checkpoint`` holds."""
+    messages = (checkpoint.get("context") or {}).get("messages") or []
+    return sum(str(message.get("content")).count(LIVE_TEXT) for message in messages)
+
+
+@pytest.mark.parametrize(
+    ("offers", "claim", "granted"),
+    [
+        pytest.param([0], LiveInputClaim.CLAIMED, 0, id="0"),
+        pytest.param([1], LiveInputClaim.CLAIMED, 1, id="1"),
+        pytest.param([3], LiveInputClaim.CLAIMED, 3, id="3"),
+        pytest.param([1, 1], LiveInputClaim.CLAIMED, 2, id="two_safe_points"),
+        pytest.param([1], LiveInputClaim.UNAVAILABLE, 0, id="returned"),
+        pytest.param([1], LiveInputClaim.UNKNOWN, 0, id="unknown"),
+        pytest.param([1], LiveInputClaim.TAKEN, 0, id="taken"),
+    ],
+)
+async def test_live_input_iteration_grant(
+    offers: list[int], claim: LiveInputClaim, granted: int
+) -> None:
+    max_iterations = UNCAPPED_MAX_ITERATIONS
+    rig = rig_with_offered_messages(
+        offers,
+        [tool_calls("w1")] * (max_iterations + GRANT * 3 + 5),
+        max_iterations=max_iterations,
+        claim=claim,
+    )
+    result = await rig.start()
+    # Every iteration of this model asks for the tool once, so the tool call
+    # count is the number of iterations that ran. Only a message that was
+    # written into the context adds to the bound.
+    assert len(rig.tools["w1"].calls) == max_iterations + GRANT * granted
+    # The run ends at the cap and reports the allowance next to the bound.
+    assert result["live_input_iteration_grant"] == GRANT * granted
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        pytest.param(InputReviewRejected("no"), id="refused"),
+        pytest.param(UserMessageInjectionConflictError("c"), id="conflict"),
+    ],
+)
+async def test_live_input_failed_injection_adds_no_iteration_grant(
+    monkeypatch: pytest.MonkeyPatch, error: BaseException
+) -> None:
+    max_iterations = 3
+    rig = rig_with_offered_messages(
+        1,
+        [tool_calls("w1")] * (max_iterations + GRANT + 5),
+        max_iterations=max_iterations,
+    )
+
+    async def inject(*args: Any, **kwargs: Any) -> UserMessageInjectionResult:
+        raise error
+
+    monkeypatch.setattr(rig.runner, "inject_user_message", inject)
+    await rig.start()
+    assert rig.runner.agent.patterns[0].live_input_iteration_grant == 0
+    assert len(rig.tools["w1"].calls) == max_iterations
+
+
+async def test_forced_answer_extra_iterations_extend_the_raised_cap() -> None:
+    pattern = ReActPattern(max_iterations=GRANT)
+    pattern.live_input_iteration_grant = GRANT
+    pattern.force_final_answer_next = True
+    pattern.forced_answer_extra_iterations = 1
+    runtime = PatternRuntime(execution_id=EID)
+    cap = 2 * GRANT
+    bound = pattern._within_iteration_bound
+    assert bound(cap - 1, runtime=runtime, context=None)
+    assert bound(cap, runtime=runtime, context=None)
+    assert not bound(cap + 1, runtime=runtime, context=None)
+
+
+@pytest.mark.parametrize("delivery", ["raised", "returned"])
+async def test_unavailable_tool_recovery_stops_at_the_raised_cap(delivery: str) -> None:
+    from xagent.core.model.chat.exceptions import LLMToolProtocolError
+    from xagent.core.model.chat.tool_protocol import (
+        ToolProtocolViolation,
+        tool_protocol_error_response,
+    )
+
+    max_iterations = 3
+
+    async def refused() -> Any:
+        if delivery == "raised":
+            raise LLMToolProtocolError(
+                provider="test",
+                code="unavailable_tool_call",
+                message="unavailable tool call",
+            )
+        return tool_protocol_error_response(
+            ToolProtocolViolation(
+                provider="test",
+                code="unavailable_tool_call",
+                message="unavailable tool call",
+            )
+        )
+
+    # Requests 0..2 are iterations 0..2; request 3 is the iteration that sits
+    # at max_iterations and is refused. With the allowance in force the
+    # refusal is recovered from and the next request still offers work.
+    rig = rig_with_offered_messages(
+        1,
+        [tool_calls("w1"), tool_calls("w1"), refused, tool_calls("w1"), final_answer()],
+        max_iterations=max_iterations,
+    )
+    result = await rig.start()
+    assert result["success"] is True
+    assert len(rig.tools["w1"].calls) == max_iterations + 1
+
+
+@pytest.mark.parametrize(
+    ("saved", "expected"),
+    [
+        # A checkpoint written before the allowance existed has no such key.
+        pytest.param({}, 0, id="missing"),
+        pytest.param({"live_input_iteration_grant": None}, 0, id="none"),
+        pytest.param({"live_input_iteration_grant": -4}, 0, id="negative"),
+        pytest.param(
+            {"live_input_iteration_grant": GRANT + 5}, GRANT, id="above_max_iterations"
+        ),
+        pytest.param(
+            {"live_input_iteration_grant": 5, "max_iterations": 0},
+            0,
+            id="max_iterations_zero",
+        ),
+    ],
+)
+def test_live_input_iteration_grant_loads_within_range(
+    saved: dict[str, Any], expected: int
+) -> None:
+    state = ReActPattern(max_iterations=GRANT).get_state()
+    del state["live_input_iteration_grant"]
+    state.update(saved)
+    # Built with the default max_iterations, so only the saved one can bound
+    # the allowance it loads.
+    restored = ReActPattern()
+    restored.live_input_iteration_grant = 7
+    restored.load_state(state)
+    assert restored.live_input_iteration_grant == expected
+
+
+@pytest.mark.parametrize("n_applied", [1, 3])
+async def test_live_input_iteration_grant_survives_state_round_trip(
+    n_applied: int,
+) -> None:
+    max_iterations = UNCAPPED_MAX_ITERATIONS
+    rig = rig_with_offered_messages(
+        n_applied, [final_answer()], max_iterations=max_iterations
+    )
+    pattern = rig.runner.agent.patterns[0]
+    await rig.start()
+    assert pattern.live_input_iteration_grant == GRANT * n_applied
+    restored = ReActPattern(max_iterations=max_iterations)
+    restored.load_state(json.loads(json.dumps(pattern.get_state())))
+    assert restored.live_input_iteration_grant == GRANT * n_applied
+    assert restored._iteration_cap() == max_iterations + GRANT * n_applied
+
+
+async def test_live_input_iteration_grant_stops_at_max_iterations() -> None:
+    # The second message takes the allowance to max_iterations; the third is
+    # still written into the conversation but adds nothing.
+    max_iterations = 2 * GRANT - 1
+    rig = rig_with_offered_messages(
+        [1, 1, 1],
+        [tool_calls("w1")] * (3 * max_iterations),
+        max_iterations=max_iterations,
+    )
+    result = await rig.start()
+    assert result["live_input_iteration_grant"] == max_iterations
+    assert len(rig.tools["w1"].calls) == 2 * max_iterations
+    last_request = " ".join(str(m.get("content")) for m in rig.llm.requests[-1])
+    assert all(f"{LIVE_TEXT}{index}" in last_request for index in range(3))
+    # The third safe point applied a message at the cap and still saved.
+    labels = [c["label"] for c in rig.runtimes[0].checkpoints]
+    assert labels.count("live_input_applied") == 3
+
+
+@pytest.mark.parametrize(
+    ("offers", "claim", "saves"),
+    [
+        pytest.param([1], LiveInputClaim.CLAIMED, 1, id="one"),
+        pytest.param([3], LiveInputClaim.CLAIMED, 1, id="three_at_one_safe_point"),
+        pytest.param([1, 1], LiveInputClaim.CLAIMED, 2, id="two_safe_points"),
+        pytest.param([1], LiveInputClaim.UNAVAILABLE, 0, id="returned"),
+    ],
+)
+async def test_live_input_iteration_grant_is_saved_at_the_safe_point(
+    offers: list[int], claim: LiveInputClaim, saves: int
+) -> None:
+    rig = rig_with_offered_messages(
+        offers, [final_answer()], max_iterations=UNCAPPED_MAX_ITERATIONS, claim=claim
+    )
+    await rig.start()
+    checkpoints = rig.runtimes[0].checkpoints
+    # One save for each safe point that applied a message, none otherwise.
+    labels = [checkpoint["label"] for checkpoint in checkpoints]
+    assert labels.count("live_input_applied") == saves
+    # The first pattern checkpoint to hold a new message is that save, and
+    # every pattern checkpoint holds the allowance of the messages it holds.
+    held = [live_messages_in(checkpoint) for checkpoint in checkpoints]
+    first_to_hold_more = [
+        checkpoint["label"]
+        for checkpoint, before, now in zip(checkpoints, [0, *held], held)
+        if now > before
+    ]
+    assert first_to_hold_more == ["live_input_applied"] * saves
+    assert [
+        checkpoint["pattern_state"]["live_input_iteration_grant"]
+        for checkpoint in checkpoints
+    ] == [GRANT * count for count in held]
+
+
+async def test_live_input_iteration_grant_survives_resume() -> None:
+    max_iterations = UNCAPPED_MAX_ITERATIONS
+    rig = rig_with_offered_messages(1, [final_answer()], max_iterations=max_iterations)
+    await rig.start()
+    saved = next(
+        checkpoint
+        for checkpoint in rig.runtimes[0].checkpoints
+        if checkpoint["label"] == "live_input_applied"
+    )
+    resumed = tool_only_pattern(max_iterations)
+    resumed.load_state(json.loads(json.dumps(saved["pattern_state"])))
+    start = resumed.current_iteration
+    assert start >= 1
+    tool = ProbeTool("w1")
+    context = ExecutionContext(execution_id=EID)
+    context.add_user_message("hello")
+    result = await resumed.run(
+        context=context,
+        tools=[tool],
+        llm=ScriptedLLM([tool_calls("w1")] * (max_iterations + GRANT + 5)),
+        runtime=PatternRuntime(execution_id=EID),
+    )
+    # The resumed run keeps working past max_iterations up to the raised cap.
+    assert result["success"] is False
+    assert len(tool.calls) == max_iterations + GRANT - start
+
+
+async def test_iteration_limit_delivery_reports_the_grant() -> None:
+    max_iterations = UNCAPPED_MAX_ITERATIONS
+    rig = rig_with_offered_messages(
+        [1, 1],
+        [tool_calls("w1")] * (max_iterations + 2 * GRANT - 2)
+        + [final_answer(outcome="partial")],
+        max_iterations=max_iterations,
+    )
+    result = await rig.start()
+    # The answer delivered at the cap reports the allowance as the failure
+    # result does.
+    assert result["success"] is True
+    assert result["termination_reason"] == "max_iterations"
+    assert result["iterations"] == max_iterations
+    assert result["live_input_iteration_grant"] == GRANT * 2
+    assert len(rig.tools["w1"].calls) == max_iterations + GRANT * 2
+
+
+async def test_live_input_mixed_batch_grants_only_the_applied_message() -> None:
+    max_iterations = UNCAPPED_MAX_ITERATIONS
+    holder: list[Rig] = []
+
+    async def offer_claimed_then_unavailable() -> Any:
+        for index, claim in enumerate(
+            (LiveInputClaim.CLAIMED, LiveInputClaim.UNAVAILABLE)
+        ):
+            offer = holder[0].offer(
+                RecordingAdmission(claim),
+                turn_id=f"live-{index}",
+                text=f"{LIVE_TEXT}{index}",
+            )
+            assert offer is LiveInputOffer.QUEUED
+        return tool_calls("w1")
+
+    rig = make_rig(
+        [
+            offer_claimed_then_unavailable,
+            *[tool_calls("w1")] * (max_iterations + 2 * GRANT + 5),
+        ],
+        ("w1",),
+        pattern=tool_only_pattern(max_iterations),
+    )
+    holder.append(rig)
+    result = await rig.start()
+    assert result["live_input_iteration_grant"] == GRANT
+    assert len(rig.tools["w1"].calls) == max_iterations + GRANT
+
+
+async def test_live_input_replay_of_a_turn_written_after_queueing_adds_grant() -> None:
+    max_iterations = UNCAPPED_MAX_ITERATIONS
+    holder: list[Rig] = []
+    outcomes: list[UserMessageInjectionOutcome] = []
+
+    async def queue_then_write_directly() -> Any:
+        rig = holder[0]
+        offer = rig.offer(RecordingAdmission(), turn_id="dup", text=LIVE_TEXT)
+        assert offer is LiveInputOffer.QUEUED
+        # The same turn reaches the context through the ordinary injection
+        # path before the loop takes the queued copy at its safe point.
+        written = await rig.runner.inject_user_message(
+            EID,
+            execution_message=LIVE_TEXT,
+            display_message=LIVE_TEXT,
+            turn_id="dup",
+            request_interrupt=False,
+        )
+        outcomes.append(written.outcome)
+        return tool_calls("w1")
+
+    rig = make_rig(
+        [
+            queue_then_write_directly,
+            *[tool_calls("w1")] * (max_iterations + 2 * GRANT + 5),
+        ],
+        ("w1",),
+        pattern=tool_only_pattern(max_iterations),
+    )
+    holder.append(rig)
+    result = await rig.start()
+    assert outcomes == [UserMessageInjectionOutcome.POSTED_FRESH]
+    # The queued copy finds its turn already accepted: it counts as applied
+    # and adds the allowance once, without a second copy of the message.
+    assert result["live_input_iteration_grant"] == GRANT
+    assert len(rig.tools["w1"].calls) == max_iterations + GRANT
+    last_request = " ".join(str(m.get("content")) for m in rig.llm.requests[-1])
+    assert last_request.count(LIVE_TEXT) == 1

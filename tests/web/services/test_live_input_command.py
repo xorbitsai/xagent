@@ -7,6 +7,7 @@ import logging
 import threading
 import time
 from collections.abc import Iterator
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -46,9 +47,11 @@ from xagent.web.services.chat_history_service import (
 )
 from xagent.web.services.task_command_execution import _execute_durable_task_command
 from xagent.web.services.task_command_transport import (
+    MAX_COMMAND_FAILURES,
     ClaimedTaskCommand,
     TaskCommandDeferred,
     TaskCommandKind,
+    max_command_defers,
     stage_task_command,
 )
 from xagent.web.services.task_event_context_service import load_task_event_context
@@ -601,29 +604,75 @@ def test_live_prefix_reserved(db: Any, task: Any, reserved_live: bool) -> None:
             stage()
 
 
-@pytest.mark.parametrize(
-    "error",
-    [RuntimeError("executor bug"), TaskCommandDeferred("coordinator unhealthy")],
-    ids=["executor-error", "deferrals-exhausted"],
-)
-async def test_live_input_command_terminal_failure_broadcasts_returned(
-    monkeypatch: pytest.MonkeyPatch, task: Any, error: BaseException
-) -> None:
+@pytest.fixture
+def terminal_frames(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, Any]]:
     frames: list[dict[str, Any]] = []
 
     async def publish(frame: dict[str, Any], task_id: int) -> None:
         frames.append(frame)
 
     monkeypatch.setattr(task_command_execution, "publish_task_event", publish)
-    await task_command_execution._broadcast_terminal_command_error(command(task), error)
-    assert frames == [
-        {
-            "type": "live_input_returned",
-            "task_id": task.id,
-            "turn_id": TURN,
-            "reason": "unavailable",
-        }
-    ]
+    return frames
+
+
+def returned_frame(task: Any, turn_id: str) -> dict[str, Any]:
+    return {
+        "type": "live_input_returned",
+        "task_id": task.id,
+        "turn_id": turn_id,
+        "reason": "unavailable",
+    }
+
+
+async def test_live_input_executor_failure_is_reported_once_it_is_terminal(
+    monkeypatch: pytest.MonkeyPatch,
+    task: Any,
+    host: FakeHost,
+    terminal_frames: list[dict[str, Any]],
+) -> None:
+    def unavailable() -> Any:
+        raise RuntimeError("agent manager unavailable")
+
+    monkeypatch.setattr(lic, "get_agent_manager", unavailable)
+    with pytest.raises(RuntimeError):
+        await task_command_execution._execute_and_report_task_command(command(task))
+    assert terminal_frames == []
+    last_attempt = replace(command(task), failure_count=MAX_COMMAND_FAILURES - 1)
+    with pytest.raises(RuntimeError):
+        await task_command_execution._execute_and_report_task_command(last_attempt)
+    assert terminal_frames == [returned_frame(task, TURN)]
+
+
+@pytest.mark.parametrize(
+    "turn_id,reported",
+    [(TURN, TURN), (f"  {TURN} ", TURN), (None, None), ("   ", None)],
+    ids=["plain", "padded", "missing", "blank"],
+)
+async def test_live_input_deferral_raised_by_its_executor_is_reported_when_exhausted(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    task: Any,
+    terminal_frames: list[dict[str, Any]],
+    turn_id: str | None,
+    reported: str | None,
+) -> None:
+    # The executor itself never defers; this stands in for a deferral raised at
+    # its call site.
+    async def deferred(command: ClaimedTaskCommand) -> Any:
+        raise TaskCommandDeferred("Task owner is awaiting a healthy renewal")
+
+    monkeypatch.setattr(task_command_execution, "execute_live_input_command", deferred)
+    exhausted = replace(
+        command(task, payload={"turn_id": turn_id}),
+        defer_count=max_command_defers() - 1,
+    )
+    with caplog.at_level(logging.WARNING):
+        with pytest.raises(TaskCommandDeferred):
+            await task_command_execution._execute_and_report_task_command(exhausted)
+    assert terminal_frames == ([returned_frame(task, reported)] if reported else [])
+    assert any("malformed payload" in r.getMessage() for r in caplog.records) is (
+        reported is None
+    )
 
 
 @pytest.mark.parametrize("reuse_old_id", [False, True])

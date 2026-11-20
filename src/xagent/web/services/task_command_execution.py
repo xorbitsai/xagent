@@ -148,6 +148,7 @@ from .live_input_command import (
     LIVE_INPUT_COMMAND_SCOPE,
     execute_live_input_command,
     live_input_returned_frame,
+    parse_live_input_payload,
 )
 from .managed_file_ref import (
     DurableObjectIntegrityError,
@@ -5118,11 +5119,19 @@ async def _broadcast_terminal_command_error(
     scope = _command_scope(command)
     if scope == LIVE_INPUT_COMMAND_SCOPE:
         # The sender is waiting for this message to be admitted; report it as
-        # not delivered rather than as a command error.
+        # not delivered rather than as a command error. The payload is read as
+        # the executor reads it: one it would refuse as malformed names no
+        # usable turn, so no notice is sent for it.
+        payload = parse_live_input_payload(command)
+        if payload is None:
+            logger.warning(
+                "live input command %s failed terminally with a malformed payload;"
+                " no notice was sent",
+                command.command_id,
+            )
+            return
         await publish_task_event(
-            live_input_returned_frame(
-                command.task_id, str(command.payload.get("turn_id")), "unavailable"
-            ),
+            live_input_returned_frame(command.task_id, payload.turn_id, "unavailable"),
             command.task_id,
         )
         return

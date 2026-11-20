@@ -1850,7 +1850,7 @@ class AgentRunner:
         level: int = logging.ERROR,
     ) -> LiveInputResult:
         increment_counter(
-            "xagent.live_input.finishes", attributes={"result": result.value}
+            "xagent.live_input.finishes", attributes={"outcome": result.value}
         )
         try:
             await item.admission.finish(result)

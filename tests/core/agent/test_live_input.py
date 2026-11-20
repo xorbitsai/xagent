@@ -834,7 +834,7 @@ async def test_live_input_counters(monkeypatch: pytest.MonkeyPatch) -> None:
     # A finish that raises is counted and does not end the run.
     assert result["success"] is True
     assert ("xagent.live_input.offers", {"outcome": "queued"}) in counted
-    assert ("xagent.live_input.finishes", {"result": "applied"}) in counted
+    assert ("xagent.live_input.finishes", {"outcome": "applied"}) in counted
     assert ("xagent.live_input.finish_errors", None) in counted
 
 

@@ -1,20 +1,29 @@
 """Monitoring management API route handlers"""
 
+import asyncio
 import logging
+from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Dict, List, cast
+from functools import partial
+from typing import Any, Callable, Dict, List, TypeVar, cast
 
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import Text
 from sqlalchemy import cast as sql_cast
-from sqlalchemy import func
+from sqlalchemy import func, text
 from sqlalchemy.orm import Session, defer
 from sqlalchemy.sql import expression
 
 from ..auth_dependencies import get_current_user
-from ..models.database import get_db
+from ..models.database import (
+    get_db,
+    get_session_local,
+    release_db_connection_if_clean,
+)
 from ..models.task import Task
 from ..models.user import User
+from ..services.db_runtime import is_database_pool_timeout, run_db_io_cancellation_safe
+from ..services.db_write_retry import _QUERY_CANCELED_SQLSTATE, database_sqlstate
 from ..services.task_event_metrics import monitoring_trace_source
 from ..utils.db_timezone import normalize_datetime_from_db, safe_timestamp_to_unix
 
@@ -187,6 +196,95 @@ def safe_get_json_field(column: Any, field_path: str, db_session: Session) -> An
     return get_json_field_expression(column, field_path, db_session)
 
 
+_T = TypeVar("_T")
+
+# Upper bound for each statement a monitoring query runs on PostgreSQL.
+_MONITOR_STATEMENT_BUDGET_MS = 10_000
+
+# Monitoring queries allowed in flight per process. When every slot is taken
+# the next request is refused immediately instead of queueing, so repeated
+# requests cannot pile up behind the scans or exhaust the shared thread pool.
+_MONITOR_QUERY_CONCURRENCY = 3
+_MONITOR_QUERY_SLOTS = asyncio.Semaphore(_MONITOR_QUERY_CONCURRENCY)
+
+_MONITOR_UNAVAILABLE_DETAIL = "Monitoring statistics are temporarily unavailable"
+
+
+@dataclass(frozen=True)
+class _MonitorViewer:
+    """Plain values describing the caller, safe to hand to a worker thread."""
+
+    is_admin: bool
+    user_id: int
+
+
+def _apply_statement_budget(session: Session) -> None:
+    """Cap each statement of ``session``'s transaction on PostgreSQL.
+
+    ``set_config`` overwrites ``statement_timeout`` rather than taking the
+    smaller of the two values: if the instance-level timeout is lower than this
+    budget, monitoring queries are relaxed to the budget. The setting is
+    transaction-local, so it ends with the session.
+    """
+    if session.get_bind().dialect.name != "postgresql":
+        return
+    session.connection().execute(
+        text("SELECT set_config('statement_timeout', :statement, true)"),
+        {"statement": f"{_MONITOR_STATEMENT_BUDGET_MS}ms"},
+    )
+
+
+async def _run_monitor_query(
+    endpoint_name: str,
+    request_db: Session,
+    compute: Callable[[Session], _T],
+) -> _T:
+    """Run ``compute`` on a worker thread with its own session.
+
+    The request session only ran the authentication lookup, so its connection
+    is handed back to the pool before the scan starts. When it cannot be
+    released the request keeps one extra connection until it finishes; the
+    slot limit bounds how many requests can do that.
+
+    ``endpoint_name`` is the human label used in the failure log line
+    ("Get <endpoint_name> failed").
+
+    ``compute`` runs entirely in the worker thread and must return plain data.
+    A statement that exceeds the budget, or a connection pool that cannot lend
+    a connection in time, is reported as 503. Every other failure keeps the
+    500 contract with the original error text.
+    """
+    release_db_connection_if_clean(request_db)
+
+    if _MONITOR_QUERY_SLOTS.locked():
+        raise HTTPException(status_code=503, detail=_MONITOR_UNAVAILABLE_DETAIL)
+
+    def operation() -> _T:
+        with get_session_local()() as session:
+            _apply_statement_budget(session)
+            return compute(session)
+
+    async with _MONITOR_QUERY_SLOTS:
+        try:
+            return await run_db_io_cancellation_safe(operation)
+        except Exception as exc:
+            if database_sqlstate(
+                exc
+            ) == _QUERY_CANCELED_SQLSTATE or is_database_pool_timeout(exc):
+                logger.warning(
+                    "Monitoring query %s unavailable "
+                    "(statement budget %d ms or connection pool timeout): %s",
+                    endpoint_name,
+                    _MONITOR_STATEMENT_BUDGET_MS,
+                    exc,
+                )
+                raise HTTPException(
+                    status_code=503, detail=_MONITOR_UNAVAILABLE_DETAIL
+                ) from exc
+            logger.error(f"Get {endpoint_name} failed: {exc}")
+            raise HTTPException(status_code=500, detail=str(exc))
+
+
 @monitor_router.get("/tools")
 async def get_tools(
     _current_user: User = Depends(get_current_user),
@@ -220,51 +318,277 @@ async def get_tools(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+def _compute_agents(session: Session, viewer: _MonitorViewer) -> List[Dict[str, Any]]:
+    """Get list of agents"""
+    # Build query based on user permissions
+    query = session.query(Task)
+
+    if not viewer.is_admin:
+        # Regular users can only view their own tasks
+        query = query.filter(Task.user_id == viewer.user_id)
+
+    # Get recent tasks
+    # Loaded without structured_output_record: reading the column from these
+    # objects, or from the same rows reached again through Session.get or a
+    # relationship in this session, raises; do not keep using these Task objects
+    # after a commit, because the reload after a commit reads the column back.
+    recent_tasks = (
+        query.options(defer(cast(Any, Task.structured_output_record), raiseload=True))
+        .order_by(Task.created_at.desc())
+        .limit(10)
+        .all()
+    )
+
+    return [
+        {
+            "task_id": task.id,
+            "title": task.title,
+            "status": task.status.value,
+            "created_at": safe_timestamp_to_unix(task.created_at)
+            if task.created_at
+            else None,
+            "updated_at": safe_timestamp_to_unix(task.updated_at)
+            if task.updated_at
+            else None,
+        }
+        for task in recent_tasks
+    ]
+
+
 @monitor_router.get("/agents")
 async def get_agents(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> List[Dict[str, Any]]:
     """Get list of agents"""
-    try:
-        # Build query based on user permissions
-        query = db.query(Task)
+    viewer = _MonitorViewer(
+        is_admin=is_admin_user(current_user), user_id=int(current_user.id)
+    )
+    return await _run_monitor_query(
+        "agents", db, partial(_compute_agents, viewer=viewer)
+    )
 
-        if not is_admin_user(current_user):
-            # Regular users can only view their own tasks
-            query = query.filter(Task.user_id == current_user.id)
 
-        # Get recent tasks
-        # Loaded without structured_output_record: reading the column from these
-        # objects, or from the same rows reached again through Session.get or a
-        # relationship in this session, raises; do not keep using these Task objects
-        # after a commit, because the reload after a commit reads the column back.
-        recent_tasks = (
-            query.options(
-                defer(cast(Any, Task.structured_output_record), raiseload=True)
+def _compute_monitoring_stats(
+    session: Session, viewer: _MonitorViewer
+) -> Dict[str, Any]:
+    """Get monitoring statistics.
+
+    The daily fields (``todayCalls``, ``activeModels``) are counted over the
+    current UTC calendar day, so they reset at 00:00 UTC rather than on the
+    server's or the viewer's local day.
+    """
+    TraceEvent = monitoring_trace_source(
+        user_id=None if viewer.is_admin else viewer.user_id
+    )
+
+    # Build TraceEvent query filter based on user permissions
+    trace_event_filter = []
+    # Only count trace events from VIBE phase (exclude BUILD phase)
+    trace_event_filter.append(TraceEvent.build_id.is_(None))
+
+    if not viewer.is_admin:
+        # Regular users can only view TraceEvents from their own tasks
+        trace_event_filter.append(
+            TraceEvent.task_id.in_(
+                session.query(Task.id).filter(Task.user_id == viewer.user_id)
             )
-            .order_by(Task.created_at.desc())
-            .limit(10)
-            .all()
         )
 
-        return [
-            {
-                "task_id": task.id,
-                "title": task.title,
-                "status": task.status.value,
-                "created_at": safe_timestamp_to_unix(task.created_at)
-                if task.created_at
-                else None,
-                "updated_at": safe_timestamp_to_unix(task.updated_at)
-                if task.updated_at
-                else None,
-            }
-            for task in recent_tasks
-        ]
-    except Exception as e:
-        logger.error(f"Get agents failed: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+    # Get total call count (LLM calls + tool executions)
+    llm_calls_start = (
+        session.query(TraceEvent)
+        .filter(TraceEvent.event_type == "llm_call_start", *trace_event_filter)
+        .count()
+    )
+    llm_calls_end = (
+        session.query(TraceEvent)
+        .filter(TraceEvent.event_type == "llm_call_end", *trace_event_filter)
+        .count()
+    )
+    tool_executions_start = (
+        session.query(TraceEvent)
+        .filter(TraceEvent.event_type == "tool_execution_start", *trace_event_filter)
+        .count()
+    )
+    tool_executions_end = (
+        session.query(TraceEvent)
+        .filter(TraceEvent.event_type == "tool_execution_end", *trace_event_filter)
+        .count()
+    )
+    total_calls = llm_calls_end + tool_executions_end
+
+    # Get today's call count. "Today" is the UTC day: the boundary must be
+    # in the same frame as the aware-UTC timestamps the column stores.
+    today_start = datetime.now(timezone.utc).replace(
+        hour=0, minute=0, second=0, microsecond=0
+    )
+    today_calls = (
+        session.query(TraceEvent)
+        .filter(
+            TraceEvent.event_type.in_(["llm_call_start", "tool_execution_start"]),
+            TraceEvent.timestamp >= today_start,
+            *trace_event_filter,
+        )
+        .count()
+    )
+
+    # Calculate success rate (based on successfully completed tasks)
+    # Count task completion from TraceEvents
+    completed_tasks = (
+        session.query(TraceEvent.task_id)
+        .filter(
+            TraceEvent.event_type.in_(["task_completion", "task_end_react"]),
+            TraceEvent.task_id.isnot(None),
+            *trace_event_filter,
+        )
+        .distinct()
+        .count()
+    )
+
+    total_tasks_with_events = (
+        session.query(TraceEvent.task_id)
+        .filter(
+            TraceEvent.task_id.isnot(None),
+            *trace_event_filter,
+        )
+        .distinct()
+        .count()
+    )
+
+    success_rate = (
+        (completed_tasks / total_tasks_with_events * 100)
+        if total_tasks_with_events > 0
+        else 0
+    )
+
+    # Calculate average processing time (based on actual execution time of LLM calls)
+    # Use more precise matching logic: match start and end events by step_id and attempt
+    llm_starts = (
+        session.query(TraceEvent)
+        .filter(
+            TraceEvent.event_type == "llm_call_start",
+            TraceEvent.data.isnot(None),
+            TraceEvent.task_id.isnot(None),
+            *trace_event_filter,
+        )
+        .all()
+    )
+
+    llm_ends = (
+        session.query(TraceEvent)
+        .filter(
+            TraceEvent.event_type == "llm_call_end",
+            TraceEvent.data.isnot(None),
+            TraceEvent.task_id.isnot(None),
+            *trace_event_filter,
+        )
+        .all()
+    )
+
+    # Build lookup table for end events
+    end_events: dict[tuple[int, str, int], datetime] = {}
+    for end_event in llm_ends:
+        # Try to match by step_id and attempt
+        if end_event.data and isinstance(end_event.data, dict):
+            step_id = end_event.data.get("step_id")
+            attempt = end_event.data.get("attempt")
+            task_id = end_event.task_id
+
+            if step_id and attempt:
+                key = (task_id, step_id, attempt)
+                end_events[key] = end_event.timestamp
+
+    # Match start events with end events
+    valid_durations: list[float] = []
+    for start_event in llm_starts:
+        if start_event.data and isinstance(start_event.data, dict):
+            step_id = start_event.data.get("step_id")
+            attempt = start_event.data.get("attempt")
+            task_id = start_event.task_id
+
+            if step_id and attempt:
+                key = (task_id, step_id, attempt)
+                if key in end_events:
+                    duration = (end_events[key] - start_event.timestamp).total_seconds()
+                    # Exclude outliers: less than 0 or greater than 1 hour
+                    if 0 < duration <= 3600:
+                        valid_durations.append(duration)
+
+    avg_response_time = (
+        round(sum(valid_durations) / len(valid_durations), 2)
+        if valid_durations
+        else None
+    )
+
+    # Reuse all starts, independently of duration matching. Empty names count.
+    active_model_names: set[str] = set()
+    for event in llm_starts:
+        if not isinstance(event.data, dict):
+            continue
+
+        model_name = event.data.get("model_name")
+        if not isinstance(model_name, str):
+            continue
+
+        timestamp = normalize_datetime_from_db(event.timestamp)
+        if timestamp >= today_start:
+            active_model_names.add(model_name)
+
+    active_models = len(active_model_names)
+
+    # Get total token count
+    token_sum = 0
+    tokens_found = False
+    llm_end_events = (
+        session.query(TraceEvent)
+        .filter(
+            TraceEvent.event_type == "llm_call_end",
+            TraceEvent.data.isnot(None),
+            *trace_event_filter,
+        )
+        .all()
+    )
+
+    for event in llm_end_events:
+        if event.data:
+            if "total_tokens" in event.data and isinstance(
+                event.data["total_tokens"], int
+            ):
+                token_sum += event.data["total_tokens"]
+                tokens_found = True
+            elif "usage" in event.data and isinstance(event.data["usage"], dict):
+                usage = event.data["usage"]
+                if "total_tokens" in usage and isinstance(usage["total_tokens"], int):
+                    token_sum += usage["total_tokens"]
+                    tokens_found = True
+                elif (
+                    "prompt_tokens" in usage
+                    and "completion_tokens" in usage
+                    and isinstance(usage["prompt_tokens"], int)
+                    and isinstance(usage["completion_tokens"], int)
+                ):
+                    token_sum += usage["prompt_tokens"] + usage["completion_tokens"]
+                    tokens_found = True
+
+    # If no token information found, set to None
+    total_tokens = token_sum if tokens_found else None
+
+    return {
+        "totalCalls": total_calls,
+        "successRate": round(success_rate, 1),
+        "avgResponseTime": avg_response_time,
+        "activeModels": active_models,
+        "totalTokens": total_tokens,
+        "todayCalls": today_calls,
+        "totalTasks": total_tasks_with_events,
+        "completedTasks": completed_tasks,
+        "failedTasks": total_tasks_with_events - completed_tasks,
+        "runningTasks": None,
+        "totalAgents": None,
+        "llmCalls": llm_calls_start,
+        "toolExecutions": tool_executions_start,
+    }
 
 
 @monitor_router.get("/stats")
@@ -278,227 +602,72 @@ async def get_monitoring_stats(
     current UTC calendar day, so they reset at 00:00 UTC rather than on the
     server's or the viewer's local day.
     """
+    viewer = _MonitorViewer(
+        is_admin=is_admin_user(current_user), user_id=int(current_user.id)
+    )
+    return await _run_monitor_query(
+        "monitoring stats", db, partial(_compute_monitoring_stats, viewer=viewer)
+    )
+
+
+def _compute_popular_tools(
+    session: Session, viewer: _MonitorViewer
+) -> List[Dict[str, Any]]:
+    """Get popular tools statistics"""
+    TraceEvent = monitoring_trace_source(
+        user_id=None if viewer.is_admin else viewer.user_id
+    )
+
+    # Build filter conditions based on user permissions
+    trace_event_filter = []
+    if not viewer.is_admin:
+        # Regular users can only view TraceEvents from their own tasks
+        trace_event_filter.append(
+            TraceEvent.task_id.in_(
+                session.query(Task.id).filter(Task.user_id == viewer.user_id)
+            )
+        )
+
+    # Count tool usage from TraceEvents
     try:
-        TraceEvent = monitoring_trace_source(
-            user_id=None if is_admin_user(current_user) else int(current_user.id)
-        )
-
-        # Build TraceEvent query filter based on user permissions
-        trace_event_filter = []
-        # Only count trace events from VIBE phase (exclude BUILD phase)
-        trace_event_filter.append(TraceEvent.build_id.is_(None))
-
-        if not is_admin_user(current_user):
-            # Regular users can only view TraceEvents from their own tasks
-            trace_event_filter.append(
-                TraceEvent.task_id.in_(
-                    db.query(Task.id).filter(Task.user_id == current_user.id)
-                )
+        # Use safe JSON field extraction
+        tool_name_expr = safe_get_json_field(TraceEvent.data, "tool_name", session)
+        tool_usage_stats = (
+            session.query(
+                tool_name_expr.label("tool_name"),
+                func.count(TraceEvent.event_id).label("usage_count"),
             )
-
-        # Get total call count (LLM calls + tool executions)
-        llm_calls_start = (
-            db.query(TraceEvent)
-            .filter(TraceEvent.event_type == "llm_call_start", *trace_event_filter)
-            .count()
-        )
-        llm_calls_end = (
-            db.query(TraceEvent)
-            .filter(TraceEvent.event_type == "llm_call_end", *trace_event_filter)
-            .count()
-        )
-        tool_executions_start = (
-            db.query(TraceEvent)
             .filter(
-                TraceEvent.event_type == "tool_execution_start", *trace_event_filter
-            )
-            .count()
-        )
-        tool_executions_end = (
-            db.query(TraceEvent)
-            .filter(TraceEvent.event_type == "tool_execution_end", *trace_event_filter)
-            .count()
-        )
-        total_calls = llm_calls_end + tool_executions_end
-
-        # Get today's call count. "Today" is the UTC day: the boundary must be
-        # in the same frame as the aware-UTC timestamps the column stores.
-        today_start = datetime.now(timezone.utc).replace(
-            hour=0, minute=0, second=0, microsecond=0
-        )
-        today_calls = (
-            db.query(TraceEvent)
-            .filter(
-                TraceEvent.event_type.in_(["llm_call_start", "tool_execution_start"]),
-                TraceEvent.timestamp >= today_start,
-                *trace_event_filter,
-            )
-            .count()
-        )
-
-        # Calculate success rate (based on successfully completed tasks)
-        # Count task completion from TraceEvents
-        completed_tasks = (
-            db.query(TraceEvent.task_id)
-            .filter(
-                TraceEvent.event_type.in_(["task_completion", "task_end_react"]),
-                TraceEvent.task_id.isnot(None),
-                *trace_event_filter,
-            )
-            .distinct()
-            .count()
-        )
-
-        total_tasks_with_events = (
-            db.query(TraceEvent.task_id)
-            .filter(
-                TraceEvent.task_id.isnot(None),
-                *trace_event_filter,
-            )
-            .distinct()
-            .count()
-        )
-
-        success_rate = (
-            (completed_tasks / total_tasks_with_events * 100)
-            if total_tasks_with_events > 0
-            else 0
-        )
-
-        # Calculate average processing time (based on actual execution time of LLM calls)
-        # Use more precise matching logic: match start and end events by step_id and attempt
-        llm_starts = (
-            db.query(TraceEvent)
-            .filter(
-                TraceEvent.event_type == "llm_call_start",
+                TraceEvent.event_type == "tool_execution_start",
                 TraceEvent.data.isnot(None),
-                TraceEvent.task_id.isnot(None),
+                tool_name_expr.isnot(None),
                 *trace_event_filter,
             )
+            .group_by(tool_name_expr)
             .all()
         )
-
-        llm_ends = (
-            db.query(TraceEvent)
-            .filter(
-                TraceEvent.event_type == "llm_call_end",
-                TraceEvent.data.isnot(None),
-                TraceEvent.task_id.isnot(None),
-                *trace_event_filter,
-            )
-            .all()
-        )
-
-        # Build lookup table for end events
-        end_events: dict[tuple[int, str, int], datetime] = {}
-        for end_event in llm_ends:
-            # Try to match by step_id and attempt
-            if end_event.data and isinstance(end_event.data, dict):
-                step_id = end_event.data.get("step_id")
-                attempt = end_event.data.get("attempt")
-                task_id = end_event.task_id
-
-                if step_id and attempt:
-                    key = (task_id, step_id, attempt)
-                    end_events[key] = end_event.timestamp
-
-        # Match start events with end events
-        valid_durations: list[float] = []
-        for start_event in llm_starts:
-            if start_event.data and isinstance(start_event.data, dict):
-                step_id = start_event.data.get("step_id")
-                attempt = start_event.data.get("attempt")
-                task_id = start_event.task_id
-
-                if step_id and attempt:
-                    key = (task_id, step_id, attempt)
-                    if key in end_events:
-                        duration = (
-                            end_events[key] - start_event.timestamp
-                        ).total_seconds()
-                        # Exclude outliers: less than 0 or greater than 1 hour
-                        if 0 < duration <= 3600:
-                            valid_durations.append(duration)
-
-        avg_response_time = (
-            round(sum(valid_durations) / len(valid_durations), 2)
-            if valid_durations
-            else None
-        )
-
-        # Reuse all starts, independently of duration matching. Empty names count.
-        active_model_names: set[str] = set()
-        for event in llm_starts:
-            if not isinstance(event.data, dict):
-                continue
-
-            model_name = event.data.get("model_name")
-            if not isinstance(model_name, str):
-                continue
-
-            timestamp = normalize_datetime_from_db(event.timestamp)
-            if timestamp >= today_start:
-                active_model_names.add(model_name)
-
-        active_models = len(active_model_names)
-
-        # Get total token count
-        token_sum = 0
-        tokens_found = False
-        llm_end_events = (
-            db.query(TraceEvent)
-            .filter(
-                TraceEvent.event_type == "llm_call_end",
-                TraceEvent.data.isnot(None),
-                *trace_event_filter,
-            )
-            .all()
-        )
-
-        for event in llm_end_events:
-            if event.data:
-                if "total_tokens" in event.data and isinstance(
-                    event.data["total_tokens"], int
-                ):
-                    token_sum += event.data["total_tokens"]
-                    tokens_found = True
-                elif "usage" in event.data and isinstance(event.data["usage"], dict):
-                    usage = event.data["usage"]
-                    if "total_tokens" in usage and isinstance(
-                        usage["total_tokens"], int
-                    ):
-                        token_sum += usage["total_tokens"]
-                        tokens_found = True
-                    elif (
-                        "prompt_tokens" in usage
-                        and "completion_tokens" in usage
-                        and isinstance(usage["prompt_tokens"], int)
-                        and isinstance(usage["completion_tokens"], int)
-                    ):
-                        token_sum += usage["prompt_tokens"] + usage["completion_tokens"]
-                        tokens_found = True
-
-        # If no token information found, set to None
-        total_tokens = token_sum if tokens_found else None
-
-        return {
-            "totalCalls": total_calls,
-            "successRate": round(success_rate, 1),
-            "avgResponseTime": avg_response_time,
-            "activeModels": active_models,
-            "totalTokens": total_tokens,
-            "todayCalls": today_calls,
-            "totalTasks": total_tasks_with_events,
-            "completedTasks": completed_tasks,
-            "failedTasks": total_tasks_with_events - completed_tasks,
-            "runningTasks": None,
-            "totalAgents": None,
-            "llmCalls": llm_calls_start,
-            "toolExecutions": tool_executions_start,
-        }
     except Exception as e:
-        logger.error(f"Get monitoring stats failed: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"Failed to query tool usage stats: {e}")
+        tool_usage_stats = []
+
+    # Convert to list format
+    result = []
+    for tool_name, usage_count in tool_usage_stats:
+        if tool_name:
+            result.append(
+                {
+                    "name": tool_name,
+                    "description": f"Tool: {tool_name}",
+                    "usage_count": usage_count,
+                    "avg_duration": 0,  # Simplified handling
+                }
+            )
+
+    # Sort by usage count
+    result.sort(key=lambda x: x["usage_count"], reverse=True)
+
+    # If no data, return empty list, do not create any data
+    return result[:10]  # Return top 10
 
 
 @monitor_router.get("/popular-tools")
@@ -507,64 +676,90 @@ async def get_popular_tools(
     current_user: User = Depends(get_current_user),
 ) -> List[Dict[str, Any]]:
     """Get popular tools statistics"""
-    try:
-        TraceEvent = monitoring_trace_source(
-            user_id=None if is_admin_user(current_user) else int(current_user.id)
+    viewer = _MonitorViewer(
+        is_admin=is_admin_user(current_user), user_id=int(current_user.id)
+    )
+    return await _run_monitor_query(
+        "popular tools", db, partial(_compute_popular_tools, viewer=viewer)
+    )
+
+
+def _compute_model_stats(
+    session: Session, viewer: _MonitorViewer
+) -> List[Dict[str, Any]]:
+    """Get model usage statistics"""
+    TraceEvent = monitoring_trace_source(
+        user_id=None if viewer.is_admin else viewer.user_id
+    )
+
+    # Build filter conditions based on user permissions
+    trace_event_filter = []
+    if not viewer.is_admin:
+        # Regular users can only view TraceEvents from their own tasks
+        trace_event_filter.append(
+            TraceEvent.task_id.in_(
+                session.query(Task.id).filter(Task.user_id == viewer.user_id)
+            )
         )
 
-        # Build filter conditions based on user permissions
-        trace_event_filter = []
-        if not is_admin_user(current_user):
-            # Regular users can only view TraceEvents from their own tasks
-            trace_event_filter.append(
-                TraceEvent.task_id.in_(
-                    db.query(Task.id).filter(Task.user_id == current_user.id)
-                )
+    # Get real LLM call statistics from TraceEvents
+    # Count usage for each model (based on llm_call_start events)
+    try:
+        # Use safe JSON field extraction
+        model_name_expr = safe_get_json_field(TraceEvent.data, "model_name", session)
+        model_stats = (
+            session.query(
+                model_name_expr.label("model_name"),
+                func.count(TraceEvent.event_id).label("total_calls"),
             )
-
-        # Count tool usage from TraceEvents
-        try:
-            # Use safe JSON field extraction
-            tool_name_expr = safe_get_json_field(TraceEvent.data, "tool_name", db)
-            tool_usage_stats = (
-                db.query(
-                    tool_name_expr.label("tool_name"),
-                    func.count(TraceEvent.event_id).label("usage_count"),
-                )
-                .filter(
-                    TraceEvent.event_type == "tool_execution_start",
-                    TraceEvent.data.isnot(None),
-                    tool_name_expr.isnot(None),
-                    *trace_event_filter,
-                )
-                .group_by(tool_name_expr)
-                .all()
+            .filter(
+                TraceEvent.event_type == "llm_call_start",
+                TraceEvent.data.isnot(None),
+                model_name_expr.isnot(None),
+                *trace_event_filter,
             )
-        except Exception as e:
-            logger.error(f"Failed to query tool usage stats: {e}")
-            tool_usage_stats = []
-
-        # Convert to list format
-        result = []
-        for tool_name, usage_count in tool_usage_stats:
-            if tool_name:
-                result.append(
-                    {
-                        "name": tool_name,
-                        "description": f"Tool: {tool_name}",
-                        "usage_count": usage_count,
-                        "avg_duration": 0,  # Simplified handling
-                    }
-                )
-
-        # Sort by usage count
-        result.sort(key=lambda x: x["usage_count"], reverse=True)
-
-        # If no data, return empty list, do not create any data
-        return result[:10]  # Return top 10
+            .group_by(model_name_expr)
+            .all()
+        )
     except Exception as e:
-        logger.error(f"Get popular tools failed: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"Failed to query model stats: {e}")
+        model_stats = []
+
+    # Rows the response will carry. Filtered here rather than inside the
+    # loop so a dropped row stays out of the denominator too: the query
+    # rejects a NULL model name but not an empty one, and counting calls
+    # that are never reported would deflate every rate that is.
+    counted_models = [
+        (model_name, model_calls)
+        for model_name, model_calls in model_stats
+        if model_name and model_calls > 0
+    ]
+
+    # Denominator for each model's share of the traffic. Must stay distinct
+    # from the loop's per-model variable: while the two shared a name the
+    # rate divided a model's calls by itself and every model reported 100%
+    # (#1245).
+    all_model_calls = sum(model_calls for _, model_calls in counted_models)
+
+    result = []
+    for model_name, model_calls in counted_models:
+        # No zero-guard needed: the sum runs over these same rows, each of
+        # which the comprehension above established is positive.
+        usage_rate = model_calls / all_model_calls * 100
+
+        result.append(
+            {
+                "name": model_name,
+                "status": "running",
+                "usage_rate": round(usage_rate, 1),
+                "success_rate": None,  # Simplified, do not calculate success rate
+                "total_tasks": model_calls,
+                "successful_tasks": None,
+                "failed_tasks": None,
+            }
+        )
+
+    return result
 
 
 @monitor_router.get("/model-stats")
@@ -573,82 +768,85 @@ async def get_model_stats(
     current_user: User = Depends(get_current_user),
 ) -> List[Dict[str, Any]]:
     """Get model usage statistics"""
-    try:
-        TraceEvent = monitoring_trace_source(
-            user_id=None if is_admin_user(current_user) else int(current_user.id)
+    viewer = _MonitorViewer(
+        is_admin=is_admin_user(current_user), user_id=int(current_user.id)
+    )
+    return await _run_monitor_query(
+        "model stats", db, partial(_compute_model_stats, viewer=viewer)
+    )
+
+
+def _compute_dashboard_stats(
+    session: Session, viewer: _MonitorViewer
+) -> Dict[str, Any]:
+    """Get dashboard statistics.
+
+    The daily fields (``todayCalls``, ``activeAgents``) are counted over the
+    current UTC calendar day, so they reset at 00:00 UTC rather than on the
+    server's or the viewer's local day.
+    """
+    from ..models.task import Task, TaskStatus, task_status_predicate
+
+    TraceEvent = monitoring_trace_source(
+        user_id=None if viewer.is_admin else viewer.user_id
+    )
+
+    # Build filter conditions based on user permissions
+    task_filter = []
+    if not viewer.is_admin:
+        task_filter.append(Task.user_id == viewer.user_id)
+
+    # Get total task count
+    total_tasks = session.query(Task).filter(*task_filter).count()
+
+    # Start of the current UTC day, in the same frame as the aware-UTC
+    # ``Task.updated_at`` and ``TraceEvent.timestamp`` columns. Read the
+    # clock once: two reads either side of midnight would leave a single
+    # response reporting one metric for yesterday and the other for today.
+    today_start = datetime.now(timezone.utc).replace(
+        hour=0, minute=0, second=0, microsecond=0
+    )
+
+    # Get active agent count (based on tasks with recent activity)
+    active_agents = (
+        session.query(Task)
+        .filter(
+            Task.updated_at >= today_start,
+            task_status_predicate.in_([TaskStatus.RUNNING, TaskStatus.PENDING]),
+            *task_filter,
+        )
+        .count()
+    )
+
+    # Get deployed application count (temporarily set to 0, waiting for Deploy feature implementation)
+    deployed_apps = 0
+
+    # Build TraceEvent filter conditions
+    trace_event_filter = []
+    if not viewer.is_admin:
+        trace_event_filter.append(
+            TraceEvent.task_id.in_(
+                session.query(Task.id).filter(Task.user_id == viewer.user_id)
+            )
         )
 
-        # Build filter conditions based on user permissions
-        trace_event_filter = []
-        if not is_admin_user(current_user):
-            # Regular users can only view TraceEvents from their own tasks
-            trace_event_filter.append(
-                TraceEvent.task_id.in_(
-                    db.query(Task.id).filter(Task.user_id == current_user.id)
-                )
-            )
+    # Get today's call count
+    today_calls = (
+        session.query(TraceEvent)
+        .filter(
+            TraceEvent.event_type.in_(["llm_call_start", "tool_execution_start"]),
+            TraceEvent.timestamp >= today_start,
+            *trace_event_filter,
+        )
+        .count()
+    )
 
-        # Get real LLM call statistics from TraceEvents
-        # Count usage for each model (based on llm_call_start events)
-        try:
-            # Use safe JSON field extraction
-            model_name_expr = safe_get_json_field(TraceEvent.data, "model_name", db)
-            model_stats = (
-                db.query(
-                    model_name_expr.label("model_name"),
-                    func.count(TraceEvent.event_id).label("total_calls"),
-                )
-                .filter(
-                    TraceEvent.event_type == "llm_call_start",
-                    TraceEvent.data.isnot(None),
-                    model_name_expr.isnot(None),
-                    *trace_event_filter,
-                )
-                .group_by(model_name_expr)
-                .all()
-            )
-        except Exception as e:
-            logger.error(f"Failed to query model stats: {e}")
-            model_stats = []
-
-        # Rows the response will carry. Filtered here rather than inside the
-        # loop so a dropped row stays out of the denominator too: the query
-        # rejects a NULL model name but not an empty one, and counting calls
-        # that are never reported would deflate every rate that is.
-        counted_models = [
-            (model_name, model_calls)
-            for model_name, model_calls in model_stats
-            if model_name and model_calls > 0
-        ]
-
-        # Denominator for each model's share of the traffic. Must stay distinct
-        # from the loop's per-model variable: while the two shared a name the
-        # rate divided a model's calls by itself and every model reported 100%
-        # (#1245).
-        all_model_calls = sum(model_calls for _, model_calls in counted_models)
-
-        result = []
-        for model_name, model_calls in counted_models:
-            # No zero-guard needed: the sum runs over these same rows, each of
-            # which the comprehension above established is positive.
-            usage_rate = model_calls / all_model_calls * 100
-
-            result.append(
-                {
-                    "name": model_name,
-                    "status": "running",
-                    "usage_rate": round(usage_rate, 1),
-                    "success_rate": None,  # Simplified, do not calculate success rate
-                    "total_tasks": model_calls,
-                    "successful_tasks": None,
-                    "failed_tasks": None,
-                }
-            )
-
-        return result
-    except Exception as e:
-        logger.error(f"Get model stats failed: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+    return {
+        "totalTasks": total_tasks,
+        "activeAgents": active_agents,
+        "deployedApps": deployed_apps,
+        "todayCalls": today_calls,
+    }
 
 
 @monitor_router.get("/dashboard-stats")
@@ -662,69 +860,9 @@ async def get_dashboard_stats(
     current UTC calendar day, so they reset at 00:00 UTC rather than on the
     server's or the viewer's local day.
     """
-    try:
-        from ..models.task import Task, TaskStatus, task_status_predicate
-
-        TraceEvent = monitoring_trace_source(
-            user_id=None if is_admin_user(current_user) else int(current_user.id)
-        )
-
-        # Build filter conditions based on user permissions
-        task_filter = []
-        if not is_admin_user(current_user):
-            task_filter.append(Task.user_id == current_user.id)
-
-        # Get total task count
-        total_tasks = db.query(Task).filter(*task_filter).count()
-
-        # Start of the current UTC day, in the same frame as the aware-UTC
-        # ``Task.updated_at`` and ``TraceEvent.timestamp`` columns. Read the
-        # clock once: two reads either side of midnight would leave a single
-        # response reporting one metric for yesterday and the other for today.
-        today_start = datetime.now(timezone.utc).replace(
-            hour=0, minute=0, second=0, microsecond=0
-        )
-
-        # Get active agent count (based on tasks with recent activity)
-        active_agents = (
-            db.query(Task)
-            .filter(
-                Task.updated_at >= today_start,
-                task_status_predicate.in_([TaskStatus.RUNNING, TaskStatus.PENDING]),
-                *task_filter,
-            )
-            .count()
-        )
-
-        # Get deployed application count (temporarily set to 0, waiting for Deploy feature implementation)
-        deployed_apps = 0
-
-        # Build TraceEvent filter conditions
-        trace_event_filter = []
-        if not is_admin_user(current_user):
-            trace_event_filter.append(
-                TraceEvent.task_id.in_(
-                    db.query(Task.id).filter(Task.user_id == current_user.id)
-                )
-            )
-
-        # Get today's call count
-        today_calls = (
-            db.query(TraceEvent)
-            .filter(
-                TraceEvent.event_type.in_(["llm_call_start", "tool_execution_start"]),
-                TraceEvent.timestamp >= today_start,
-                *trace_event_filter,
-            )
-            .count()
-        )
-
-        return {
-            "totalTasks": total_tasks,
-            "activeAgents": active_agents,
-            "deployedApps": deployed_apps,
-            "todayCalls": today_calls,
-        }
-    except Exception as e:
-        logger.error(f"Get dashboard stats failed: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+    viewer = _MonitorViewer(
+        is_admin=is_admin_user(current_user), user_id=int(current_user.id)
+    )
+    return await _run_monitor_query(
+        "dashboard stats", db, partial(_compute_dashboard_stats, viewer=viewer)
+    )

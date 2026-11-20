@@ -77,9 +77,16 @@ class _HeldSession(Session):
 
 
 @pytest.fixture
-def stream_sessions_held(monkeypatch) -> Iterator[None]:
-    """Make the stream reconciliation's own session outlive its ``with`` block,
-    so the test can inspect the Task objects it returns."""
+def worker_sessions_held(monkeypatch) -> Iterator[None]:
+    """Keep the sessions opened on worker threads alive until the test ends.
+
+    Stream reconciliation (``task_stream_snapshot``) and the monitoring
+    endpoints (``monitor``) each open their own session with
+    ``get_session_local()()`` inside a ``with`` block. The test inspects the
+    Task objects those sessions loaded after the call has returned, so both
+    modules get a factory whose sessions ignore ``close``; teardown closes
+    every one of them explicitly.
+    """
     opened: list[_HeldSession] = []
 
     def factory() -> sessionmaker[Session]:
@@ -93,6 +100,7 @@ def stream_sessions_held(monkeypatch) -> Iterator[None]:
     monkeypatch.setattr(
         "xagent.web.services.task_stream_snapshot.get_session_local", factory
     )
+    monkeypatch.setattr("xagent.web.api.monitor.get_session_local", factory)
     yield
     for db in opened:
         Session.close(db)
@@ -107,7 +115,7 @@ def world(_test_db) -> Iterator[World]:
     held_sessions.clear()
 
 
-@pytest.mark.usefixtures("stream_sessions_held")
+@pytest.mark.usefixtures("worker_sessions_held")
 @pytest.mark.parametrize("name", sorted(CALLERS))
 def test_a_query_that_reads_many_tasks_does_not_select_the_record_column(world, name):
     with recorded_statements() as statements, loaded_tasks() as loaded:

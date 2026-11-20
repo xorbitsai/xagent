@@ -56,12 +56,14 @@ via ``XAGENT_TEST_POSTGRES_URL``; CI provides it in the PostgreSQL job).
 from __future__ import annotations
 
 import json
+import logging
 import os
 from datetime import datetime
 from typing import Any, Iterator
 
 import pytest
-from sqlalchemy import JSON, Column, Integer, MetaData, Table, select
+from fastapi import HTTPException
+from sqlalchemy import JSON, Column, Integer, MetaData, Table, event, select
 from sqlalchemy import text as sa_text
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.orm import Session
@@ -569,6 +571,34 @@ class TestReadGuardAgainstNativeJson:
         }
 
 
+def _shift_new_connections_time_zone(request: pytest.FixtureRequest) -> None:
+    """Give every connection the engine opens from now on a non-UTC time zone.
+
+    Connections already pooled are discarded first so none of them is reused
+    without the setting; the listener and the pooled connections it produced
+    are removed again when the test ends.
+    """
+    engine = get_engine()
+
+    def _set_time_zone(dbapi_connection: Any, _record: Any) -> None:
+        cursor = dbapi_connection.cursor()
+        try:
+            cursor.execute(f"SET TIME ZONE '{PG_SESSION_TIME_ZONE}'")
+        finally:
+            cursor.close()
+        # SET is transactional; commit so a later rollback does not undo it.
+        dbapi_connection.commit()
+
+    engine.dispose()
+    event.listen(engine, "connect", _set_time_zone)
+
+    def _restore() -> None:
+        event.remove(engine, "connect", _set_time_zone)
+        engine.dispose()
+
+    request.addfinalizer(_restore)
+
+
 class TestDailyWindowsUnderNonUtcSessionTimeZone:
     """The "today" boundary must be an instant, not a wall-clock literal.
 
@@ -653,18 +683,24 @@ class TestDailyWindowsUnderNonUtcSessionTimeZone:
         return admin
 
     @staticmethod
-    def _freeze_and_shift_session(db: Session, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Pin the clock, then move the session off UTC.
+    def _freeze_and_shift_session(
+        request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Pin the clock, then move every new connection off UTC.
 
-        The ``SET`` runs after seeding so no commit intervenes between it and
-        the handler's queries.
+        The handlers query on a worker-thread session that checks out its own
+        connection, so the time zone is set on each newly opened connection
+        rather than on the test's session.
         """
         monkeypatch.setattr(monitor_module, "datetime", FrozenDatetime)
-        db.execute(sa_text(f"SET TIME ZONE '{PG_SESSION_TIME_ZONE}'"))
+        _shift_new_connections_time_zone(request)
 
     @pytest.mark.postgresql
     async def test_stats_today_window_ignores_the_session_time_zone(
-        self, pg_session: Session, monkeypatch: pytest.MonkeyPatch
+        self,
+        pg_session: Session,
+        monkeypatch: pytest.MonkeyPatch,
+        request: pytest.FixtureRequest,
     ) -> None:
         """``todayCalls``/``activeModels`` stay on the UTC day.
 
@@ -673,7 +709,7 @@ class TestDailyWindowsUnderNonUtcSessionTimeZone:
         only one naming ``fresh-model``.
         """
         admin = self._seed(pg_session)
-        self._freeze_and_shift_session(pg_session, monkeypatch)
+        self._freeze_and_shift_session(request, monkeypatch)
 
         stats = await get_monitoring_stats(db=pg_session, current_user=admin)
 
@@ -682,7 +718,10 @@ class TestDailyWindowsUnderNonUtcSessionTimeZone:
 
     @pytest.mark.postgresql
     async def test_dashboard_windows_ignore_the_session_time_zone(
-        self, pg_session: Session, monkeypatch: pytest.MonkeyPatch
+        self,
+        pg_session: Session,
+        monkeypatch: pytest.MonkeyPatch,
+        request: pytest.FixtureRequest,
     ) -> None:
         """``todayCalls``/``activeAgents`` stay on the UTC day.
 
@@ -690,9 +729,56 @@ class TestDailyWindowsUnderNonUtcSessionTimeZone:
         boundary having dropped everything before 16:00 UTC.
         """
         admin = self._seed(pg_session)
-        self._freeze_and_shift_session(pg_session, monkeypatch)
+        self._freeze_and_shift_session(request, monkeypatch)
 
         stats = await get_dashboard_stats(db=pg_session, current_user=admin)
 
         assert stats["todayCalls"] == 2
         assert stats["activeAgents"] == 2
+
+
+@pytest.mark.postgresql
+async def test_session_time_zone_reaches_worker_connection(
+    pg_session: Session, request: pytest.FixtureRequest
+) -> None:
+    """The per-connection time zone is visible on the worker-thread session.
+
+    Guards the two window tests above: if the setting never reached the
+    connection the worker uses, they would pass without exercising anything.
+    """
+    _shift_new_connections_time_zone(request)
+
+    shown = await monitor_module._run_monitor_query(
+        "time zone",
+        pg_session,
+        lambda session: session.execute(sa_text("SHOW TIME ZONE")).scalar_one(),
+    )
+
+    assert shown == PG_SESSION_TIME_ZONE
+
+
+@pytest.mark.postgresql
+async def test_statement_budget_turns_slow_query_into_503(
+    pg_session: Session,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A statement running past the budget is cancelled and reported as 503."""
+    monkeypatch.setattr(monitor_module, "_MONITOR_STATEMENT_BUDGET_MS", 100)
+
+    with pytest.raises(HTTPException) as caught:
+        await monitor_module._run_monitor_query(
+            "slow",
+            pg_session,
+            lambda session: session.execute(sa_text("SELECT pg_sleep(1)")).all(),
+        )
+
+    assert caught.value.status_code == 503
+    assert caught.value.detail == "Monitoring statistics are temporarily unavailable"
+    warnings = [
+        record
+        for record in caplog.records
+        if record.levelno == logging.WARNING and record.name == "xagent.web.api.monitor"
+    ]
+    assert len(warnings) == 1
+    assert "canceling statement due to statement timeout" in warnings[0].getMessage()

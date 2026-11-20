@@ -31,7 +31,18 @@ def test_monitor_tools_requires_current_user() -> None:
     )
 
 
-@pytest.mark.parametrize("path", ["/api/tools/usage", "/api/monitor/tools"])
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/api/tools/usage",
+        "/api/monitor/tools",
+        "/api/monitor/agents",
+        "/api/monitor/stats",
+        "/api/monitor/popular-tools",
+        "/api/monitor/model-stats",
+        "/api/monitor/dashboard-stats",
+    ],
+)
 def test_sensitive_tool_endpoints_reject_anonymous_requests(path: str) -> None:
     app = FastAPI()
     app.include_router(tools_router)

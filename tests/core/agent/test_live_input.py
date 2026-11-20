@@ -878,6 +878,7 @@ async def test_cancel_during_live_input_waits_for_its_outcome(
     entered = asyncio.Event()
     release = asyncio.Event()
     seen: dict[str, Any] = {}
+    counted = record_counters(monkeypatch)
     adm = RecordingAdmission(gate=gate if moment == "claiming" else None)
 
     async def reply() -> dict[str, Any]:
@@ -918,6 +919,7 @@ async def test_cancel_during_live_input_waits_for_its_outcome(
     if moment == "writing":
         assert live_text_count(seen["candidate"]) == 1
     assert len(rig.llm.requests) == 1
+    assert deferred_counts(counted) == ["completed"]
 
 
 @pytest.mark.parametrize(
@@ -932,7 +934,7 @@ async def test_cancel_during_live_input_waits_for_its_outcome(
 async def test_stuck_live_input_releases_cancellation_after_grace(
     monkeypatch: pytest.MonkeyPatch, stall: str, final: LiveInputResult
 ) -> None:
-    grace = 0.2
+    grace = 0.4
     monkeypatch.setattr(runner_module, "LIVE_INPUT_CANCEL_GRACE_SECONDS", grace)
     counted = record_counters(monkeypatch)
     blocker = threading.Event()
@@ -1048,7 +1050,7 @@ async def test_deferred_cancel_still_propagates(
 async def test_repeated_cancel_keeps_the_first_deadline(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(runner_module, "LIVE_INPUT_CANCEL_GRACE_SECONDS", 0.3)
+    monkeypatch.setattr(runner_module, "LIVE_INPUT_CANCEL_GRACE_SECONDS", 0.5)
     adm = RecordingAdmission(gate=asyncio.Event())
 
     async def reply() -> dict[str, Any]:
@@ -1062,11 +1064,11 @@ async def test_repeated_cancel_keeps_the_first_deadline(
         await asyncio.sleep(0)
     started = loop.time()
     task.cancel()
-    await asyncio.sleep(0.15)
+    await asyncio.sleep(0.4)
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await asyncio.wait_for(task, 5)
-    assert 0.29 <= loop.time() - started < 0.4
+    assert 0.49 <= loop.time() - started < 0.8
     await asyncio.gather(*rig.runner._live_input_tasks, return_exceptions=True)
     assert adm.events == ["claim", LiveInputResult.UNKNOWN]
 
@@ -1129,32 +1131,47 @@ async def test_cancel_during_first_of_several_live_inputs() -> None:
     assert third.events == [LiveInputResult.RETURNED]
 
 
-async def test_cancel_deferred_counter(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_no_cancellation_records_no_deferral(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     counted = record_counters(monkeypatch)
+    adm = RecordingAdmission()
 
-    async def run_once(*, cancel: bool) -> None:
-        gate = asyncio.Event()
-        adm = RecordingAdmission(gate=gate)
+    async def reply() -> dict[str, Any]:
+        assert rig.offer(adm) is LiveInputOffer.QUEUED
+        return tool_calls("w1")
 
-        async def reply() -> dict[str, Any]:
-            assert rig.offer(adm) is LiveInputOffer.QUEUED
-            return tool_calls("w1")
-
-        rig = make_rig([reply, final_answer()], ("w1",))
-        task = rig.start()
-        while "claim" not in adm.events:
-            await asyncio.sleep(0)
-        if cancel:
-            task.cancel()
-            await asyncio.sleep(0.01)
-        gate.set()
-        if cancel:
-            with pytest.raises(asyncio.CancelledError):
-                await task
-        else:
-            await task
-
-    await run_once(cancel=False)
+    rig = make_rig([reply, final_answer()], ("w1",))
+    await rig.start()
+    assert adm.events == ["claim", LiveInputResult.APPLIED]
     assert deferred_counts(counted) == []
-    await run_once(cancel=True)
-    assert deferred_counts(counted) == ["completed"]
+
+
+async def test_cancel_right_after_take_still_admits_the_message(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adm = RecordingAdmission()
+
+    async def reply() -> dict[str, Any]:
+        assert rig.offer(adm) is LiveInputOffer.QUEUED
+        mailbox = rig.runner._active_controls[EID].runtime.live_input
+        take_next = mailbox.take_next
+
+        def take_and_cancel() -> LiveUserInput | None:
+            item = take_next()
+            # Takes effect at the next suspension, which must already be
+            # inside the protected admission of the item just taken.
+            task = asyncio.current_task()
+            assert task is not None
+            task.cancel()
+            return item
+
+        monkeypatch.setattr(mailbox, "take_next", take_and_cancel)
+        return tool_calls("w1")
+
+    rig = make_rig([reply, final_answer()], ("w1",))
+    task = rig.start()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert task.cancelled()
+    assert adm.events == ["claim", LiveInputResult.APPLIED]

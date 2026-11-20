@@ -27,6 +27,7 @@ from ...core.agent.live_input import (
     LiveInputClaim,
     LiveInputOffer,
     LiveInputResult,
+    result_without_injection,
 )
 from ...core.runtime_performance import increment_counter
 from . import task_execution as task_execution_service
@@ -174,8 +175,33 @@ class DeliveryLedgerAdmission:
         self._claimed = False
         self._withdrawn = False
         self._refused = False
+        # The claim's outcome, recorded by its worker thread before the thread
+        # returns. ``claim()`` can be cancelled after the thread has finished,
+        # and the outcome is then known here although the caller never got it.
+        self._claim_outcome: _ClaimOutcome | None = None
+        # Whether ``claim()`` handed its outcome to the caller. Until it has,
+        # the caller cannot have injected the message.
+        self._claim_returned = False
 
     def _claim_sync(self) -> _ClaimOutcome:
+        try:
+            outcome = self._claim_in_session()
+        except Exception:
+            if self._wrote:
+                raise
+            # Nothing of this admission was written, so the message is not
+            # claimed, whatever failed. The failures a claim expects are
+            # handled where they occur; this one is unexpected, so it is
+            # logged as an error and counted.
+            logger.error(
+                "live input claim failed before anything was written", exc_info=True
+            )
+            increment_counter("xagent.live_input.claim_errors")
+            outcome = _ClaimOutcome(LiveInputClaim.UNAVAILABLE)
+        self._claim_outcome = outcome
+        return outcome
+
+    def _claim_in_session(self) -> _ClaimOutcome:
         from ..models.database import get_session_local
 
         payload = self._payload
@@ -263,10 +289,14 @@ class DeliveryLedgerAdmission:
 
     async def claim(self) -> LiveInputClaim:
         outcome = await run_db_io_cancellation_safe(self._claim_sync)
+        self._adopt(outcome)
+        self._claim_returned = True
+        return outcome.claim
+
+    def _adopt(self, outcome: _ClaimOutcome) -> None:
         self._claimed = outcome.claimed
         self._withdrawn = outcome.withdrawn
         self._refused = outcome.refused
-        return outcome.claim
 
     async def _mark(self, status: str) -> str | None:
         if not self._wrote:
@@ -320,6 +350,8 @@ class DeliveryLedgerAdmission:
         _publish_in_background(self._payload.task_id, self._payload.turn_id, reason)
 
     async def finish(self, result: LiveInputResult) -> None:
+        if result is LiveInputResult.UNKNOWN:
+            result = self._result_for_unreturned_claim()
         if result is LiveInputResult.APPLIED:
             await self._mark(DELIVERY_DISPATCHED)
             await self._record_applied()
@@ -344,6 +376,21 @@ class DeliveryLedgerAdmission:
     async def _finish_unknown(self) -> None:
         await self._mark(DELIVERY_OUTCOME_UNKNOWN)
         self._notify("outcome_unknown")
+
+    def _result_for_unreturned_claim(self) -> LiveInputResult:
+        """``UNKNOWN``, unless the claim finished but its caller never saw it.
+
+        That happens when ``claim()`` is cancelled while its worker thread
+        runs: the thread still finishes and records its outcome, and a caller
+        that never received a claim cannot have injected the message. The
+        message is then finished as one that was not injected after that
+        claim.
+        """
+        outcome = self._claim_outcome
+        if self._claim_returned or outcome is None:
+            return LiveInputResult.UNKNOWN
+        self._adopt(outcome)
+        return result_without_injection(outcome.claim)
 
 
 def _done(result: str) -> dict[str, Any]:

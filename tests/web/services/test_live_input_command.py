@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import logging
+import threading
 import time
 from collections.abc import Iterator
 from pathlib import Path
@@ -20,11 +22,14 @@ from tests.web.services.test_task_execution_event_writer import engine as engine
 from tests.web.services.test_task_execution_event_writer import (
     task_id as task_id_fixture,
 )
+from xagent.core.agent import Agent
 from xagent.core.agent.live_input import (
     LiveInputClaim,
     LiveInputOffer,
     LiveInputResult,
+    LiveUserInput,
 )
+from xagent.core.agent.runner import AgentRunner
 from xagent.web.models.chat_message import TaskChatMessage
 from xagent.web.models.database import Base, get_db, get_engine, init_db
 from xagent.web.models.task import Task, TaskStatus
@@ -265,6 +270,144 @@ async def test_racing_insert_is_reported_as_taken(
     loser = lic.DeliveryLedgerAdmission(payload_for(task), FakeHost(task.user_id))
     assert await loser.claim() is LiveInputClaim.TAKEN
     assert len(rows(db, task)) == 1
+
+
+class BlockingHost(FakeHost):
+    """Host whose ``authorize`` holds its worker thread until released."""
+
+    def __init__(self, owner: int | None, error: BaseException | None = None) -> None:
+        super().__init__(owner, error)
+        self.entered = threading.Event()
+        self.release = threading.Event()
+
+    def authorize(self, db: Any, payload: lic.LiveInputPayload) -> int | None:
+        self.entered.set()
+        assert self.release.wait(5)
+        return super().authorize(db, payload)
+
+
+@pytest.mark.parametrize(
+    "owned,error,withdraw_works,winner,statuses,reason",
+    [
+        (True, None, True, False, [], "not_applied"),
+        (True, None, False, False, [DELIVERY_OUTCOME_UNKNOWN], "outcome_unknown"),
+        (True, None, True, True, [DELIVERY_PENDING], "taken"),
+        (False, None, True, False, [], "unavailable"),
+        (
+            True,
+            OperationalError("select", {}, Exception("down")),
+            True,
+            False,
+            [],
+            "run_ended",
+        ),
+    ],
+    ids=["claimed", "claimed-withdraw-fails", "taken", "refused", "not-claimed"],
+)
+async def test_claim_cancelled_after_its_worker_finished_settles_by_its_outcome(
+    monkeypatch: pytest.MonkeyPatch,
+    db: Any,
+    task: Any,
+    published: list,
+    owned: bool,
+    error: BaseException | None,
+    withdraw_works: bool,
+    winner: bool,
+    statuses: list[str],
+    reason: str,
+) -> None:
+    if winner:
+        first = lic.DeliveryLedgerAdmission(payload_for(task), FakeHost(task.user_id))
+        assert await first.claim() is LiveInputClaim.CLAIMED
+    if not withdraw_works:
+        monkeypatch.setattr(
+            lic, "withdraw_pending_user_message_delivery_sync", lambda *a: False
+        )
+    host = BlockingHost(task.user_id if owned else None, error)
+    admission = lic.DeliveryLedgerAdmission(payload_for(task), host)
+    runner = AgentRunner(agent=Agent(name="a", patterns=[], llm=None))
+    work = asyncio.ensure_future(
+        runner._inject_live_input("e", LiveUserInput(TURN, "m", "m", admission))
+    )
+    assert await asyncio.to_thread(host.entered.wait, 5)
+    # Cancelled while the claim's worker thread runs, as an expired cancel
+    # grace does; the worker then commits its claim.
+    work.cancel()
+    await asyncio.sleep(0)
+    host.release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await work
+    await asyncio.gather(*runner._live_input_tasks)
+    await settle()
+    assert [r.delivery_status for r in rows(db, task)] == statuses
+    assert [f["reason"] for f in published] == [reason]
+
+
+@pytest.mark.parametrize("failing", ["authorize", "lookup"])
+async def test_unexpected_claim_error_before_write_is_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    db: Any,
+    task: Any,
+    published: list,
+    failing: str,
+) -> None:
+    counted: list[str] = []
+    monkeypatch.setattr(
+        lic, "increment_counter", lambda name, *a, **kw: counted.append(name)
+    )
+    if failing == "authorize":
+        host = FakeHost(task.user_id, KeyError("host bug"))
+    else:
+        host = FakeHost(task.user_id)
+
+        def lose_race(*args: Any, **kwargs: Any) -> Any:
+            raise IntegrityError("insert", {}, Exception("unique"))
+
+        def lookup_fails(*args: Any, **kwargs: Any) -> Any:
+            raise RuntimeError("lookup failed")
+
+        monkeypatch.setattr(lic, "claim_user_message_delivery_no_commit", lose_race)
+        monkeypatch.setattr(lic, "inspect_user_message_delivery", lookup_fails)
+    admission = lic.DeliveryLedgerAdmission(payload_for(task), host)
+    with caplog.at_level(logging.ERROR, logger=lic.__name__):
+        assert await admission.claim() is LiveInputClaim.UNAVAILABLE
+    await admission.finish(LiveInputResult.RETURNED)
+    await settle()
+    assert rows(db, task) == []
+    assert [f["reason"] for f in published] == ["run_ended"]
+    assert counted == ["xagent.live_input.claim_errors"]
+    assert [r.levelno for r in caplog.records] == [logging.ERROR]
+    assert caplog.records[0].exc_info
+
+
+async def test_claim_error_after_write_is_raised(
+    monkeypatch: pytest.MonkeyPatch, db: Any, task: Any, published: list
+) -> None:
+    counted: list[str] = []
+    monkeypatch.setattr(
+        lic, "increment_counter", lambda name, *a, **kw: counted.append(name)
+    )
+    real = lic.claim_user_message_delivery_no_commit
+
+    def claim_then_fail(db_: Any, *args: Any, **kwargs: Any) -> Any:
+        claim = real(db_, *args, **kwargs)
+        db_.commit = lambda: (_ for _ in ()).throw(RuntimeError("commit lost"))
+        return claim
+
+    def bookkeeping_fails() -> Any:
+        raise RuntimeError("withdrawal bookkeeping failed")
+
+    monkeypatch.setattr(lic, "claim_user_message_delivery_no_commit", claim_then_fail)
+    admission = lic.DeliveryLedgerAdmission(payload_for(task), FakeHost(task.user_id))
+    # A defensive case: the real ``_after_failed_commit`` handles its own errors.
+    admission._after_failed_commit = bookkeeping_fails  # type: ignore[method-assign]
+    with pytest.raises(RuntimeError, match="withdrawal bookkeeping failed"):
+        await admission.claim()
+    assert counted == []
+    await admission.finish(LiveInputResult.UNKNOWN)
+    await settle()
+    assert [f["reason"] for f in published] == ["outcome_unknown"]
 
 
 @pytest.fixture

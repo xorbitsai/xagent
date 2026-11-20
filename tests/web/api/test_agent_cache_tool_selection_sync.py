@@ -50,6 +50,7 @@ STALE_MCP_CONFIGS = [{"name": "stale"}]
 WAITING = {"is_running": False, "is_resumable": True}
 RUNNING = {"is_running": True, "is_resumable": False}
 LOADER = "xagent.web.services.agent_service_manager.load_task_setup_snapshot_sync"
+NO_ROW = object()  # what a snapshot load reads for a task that is gone
 
 
 class _Model(BaseLLM):
@@ -126,7 +127,7 @@ class _Runtime:
         self,
         snapshot: TaskSetupSnapshot | None,
         *,
-        loaded: TaskSetupSnapshot | Exception | None = None,
+        loaded: TaskSetupSnapshot | Exception | object | None = None,
         policy: MCPBuiltinOAuthActorPolicy | None = None,
     ) -> Any:
         """Look the task up with ``snapshot`` (``None``: without one, as the
@@ -174,6 +175,8 @@ class _Runtime:
             runtime.snapshot_loads += 1
             if isinstance(loaded, Exception):
                 raise loaded
+            if loaded is NO_ROW:
+                return None
             return loaded or snapshot or _snapshot(["basic"])
 
         db = MagicMock()
@@ -479,6 +482,16 @@ async def test_a_snapshot_that_cannot_be_loaded_leaves_the_selection_alone() -> 
     spec_before = tool_config.get_tool_selection_spec()
 
     assert await runtime.lookup(None, loaded=RuntimeError("database gone")) is service
+
+    _assert_left_alone(service, spec_before)
+
+
+@pytest.mark.asyncio
+async def test_a_snapshot_load_that_finds_no_task_leaves_the_selection_alone() -> None:
+    runtime, service, tool_config = await _built(_snapshot(["basic"]))
+    spec_before = tool_config.get_tool_selection_spec()
+
+    assert await runtime.lookup(None, loaded=NO_ROW) is service
 
     _assert_left_alone(service, spec_before)
 

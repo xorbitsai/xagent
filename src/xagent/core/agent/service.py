@@ -43,8 +43,8 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# How often one call builds the tools again because they were invalidated
-# while it was building.
+# The most builds one call makes (the first and up to two repeats) when the
+# tools are invalidated while they are being built.
 _MAX_TOOL_BUILD_PASSES = 3
 
 _UNSET = object()
@@ -939,6 +939,12 @@ class AgentService:
                 return
             self._tools_initialized = False
             self._tool_policy_signature = None
+        logger.warning(
+            "Tools of %s were invalidated during each of %d builds; this turn runs on "
+            "the last build and the next turn builds again",
+            self.id,
+            _MAX_TOOL_BUILD_PASSES,
+        )
 
     async def _initialize_tools_once(self) -> None:
         if self.tool_config:

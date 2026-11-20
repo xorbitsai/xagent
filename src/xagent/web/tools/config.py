@@ -2523,6 +2523,11 @@ class WebToolConfig(BaseToolConfig):
         self._mcp_config_cache_generation += 1
         discard_mcp_load_reuse(self)
 
+    def _discard_runtime_derived_caches(self) -> None:
+        """Drop everything a per-turn change makes stale: the MCP configs and the prepared runtime."""
+        self._discard_cached_mcp_configs()
+        self.discard_prepared_factory_runtime()
+
     async def get_mcp_server_configs(self) -> List[Dict[str, Any]]:
         """Load MCP server configurations from database."""
         if self._user_id is None:
@@ -2692,9 +2697,7 @@ class WebToolConfig(BaseToolConfig):
             return False
         self._connector_runtime_turn_id = normalized_turn_id
         self._connector_runtime_view = None
-        self._discard_cached_mcp_configs()
-        self._factory_runtime_snapshot = None
-        self._pending_runtime_policy = None
+        self._discard_runtime_derived_caches()
         return True
 
     def set_tool_selection_spec(
@@ -2719,9 +2722,7 @@ class WebToolConfig(BaseToolConfig):
             return False
         self._tool_selection_spec = tool_selection_spec
         self._include_mcp_tools = include_mcp_tools
-        self._discard_cached_mcp_configs()
-        self._factory_runtime_snapshot = None
-        self._pending_runtime_policy = None
+        self._discard_runtime_derived_caches()
         return True
 
     def set_mcp_actor_execution_identity(
@@ -2732,9 +2733,7 @@ class WebToolConfig(BaseToolConfig):
         if self._mcp_actor_execution_identity == identity:
             return False
         self._mcp_actor_execution_identity = identity
-        self._discard_cached_mcp_configs()
-        self._factory_runtime_snapshot = None
-        self._pending_runtime_policy = None
+        self._discard_runtime_derived_caches()
         return True
 
     def set_execution_scope(self, scope: Optional[Any]) -> bool:
@@ -2769,9 +2768,7 @@ class WebToolConfig(BaseToolConfig):
         ):
             return False
         self._execution_scope = scope
-        self._discard_cached_mcp_configs()
-        self._factory_runtime_snapshot = None
-        self._pending_runtime_policy = None
+        self._discard_runtime_derived_caches()
         return True
 
     def _parse_numeric_task_id(self) -> Optional[int]:

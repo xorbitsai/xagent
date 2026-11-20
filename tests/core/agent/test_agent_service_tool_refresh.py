@@ -809,7 +809,7 @@ async def test_tools_invalidated_while_they_are_built_are_built_again(
 
 @pytest.mark.asyncio
 async def test_tools_invalidated_in_every_build_stay_marked_for_a_rebuild(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     tool_config = SelectableToolConfig()
     builds: list[int] = []
@@ -837,6 +837,7 @@ async def test_tools_invalidated_in_every_build_stay_marked_for_a_rebuild(
     assert len(builds) == 3
     assert [tool.name for tool in service.tools] == ["pass-3"]
     assert not service._tools_initialized
+    assert "invalidated during each of 3 builds" in caplog.text
 
     await service._ensure_tools_initialized()
     assert len(builds) == 6

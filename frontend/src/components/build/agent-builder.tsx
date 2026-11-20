@@ -563,24 +563,35 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
       .replace(/\n$/, "");
   };
 
-  const handleInstructionsInput = () => {
+  // A fixed id keeps repeated truncations (e.g. typing at the limit)
+  // updating one toast instead of stacking new ones.
+  const warnInstructionsTruncated = (droppedCount: number) => {
+    toast.warning(
+      t("builds.configForm.instructions.truncatedToast", {
+        max: MAX_INSTRUCTIONS_LENGTH.toLocaleString(),
+        dropped: droppedCount.toLocaleString(),
+      }),
+      { id: "instructions-truncated" }
+    );
+  };
+
+  // Publishes the editor content to state. If the content is still over
+  // MAX_INSTRUCTIONS_LENGTH it keeps only the first MAX_INSTRUCTIONS_LENGTH
+  // characters; paste clips its own text before inserting it, so this cut is
+  // the last resort for typing at the limit and for content that was already
+  // over the limit. droppedBeforeInsert is what the caller already removed
+  // before touching the editor; it is added to anything cut here so one user
+  // action shows a single toast with the total.
+  const syncInstructionsFromEditor = (droppedBeforeInsert: number) => {
     const editor = instructionsRef.current;
     if (!editor) return;
 
     let text = serializeInstructionsContent(editor);
+    let droppedCount = droppedBeforeInsert;
 
     if (text.length > MAX_INSTRUCTIONS_LENGTH) {
-      const droppedCount = text.length - MAX_INSTRUCTIONS_LENGTH;
+      droppedCount += text.length - MAX_INSTRUCTIONS_LENGTH;
       text = text.substring(0, MAX_INSTRUCTIONS_LENGTH);
-      // A fixed id keeps repeated truncations (e.g. typing at the limit)
-      // updating one toast instead of stacking new ones.
-      toast.warning(
-        t("builds.configForm.instructions.truncatedToast", {
-          max: MAX_INSTRUCTIONS_LENGTH.toLocaleString(),
-          dropped: droppedCount.toLocaleString(),
-        }),
-        { id: "instructions-truncated" }
-      );
 
       let html = renderFileMentionsHtml(text);
 
@@ -600,50 +611,70 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
       sel?.addRange(range);
     }
 
+    if (droppedCount > 0) {
+      warnInstructionsTruncated(droppedCount);
+    }
+
     lastInstructionsRef.current = text;
     setInstructions(text);
 
     fileMention.checkTrigger();
   };
 
+  // Used as the editor's onInput handler, so it must not take arguments of
+  // its own: React passes the input event as the first argument.
+  const handleInstructionsInput = () => syncInstructionsFromEditor(0);
+
   const fileMention = useFileMention(instructionsRef, containerRef, handleInstructionsInput, t);
 
   const handleInstructionsPaste = (e: React.ClipboardEvent<HTMLDivElement>) => {
     e.preventDefault();
-    // Insert the full clipboard text. handleInstructionsInput (called below)
-    // enforces MAX_INSTRUCTIONS_LENGTH on the resulting content, which already
-    // accounts for any selection the paste replaced.
-    const textToInsert = normalizeLineBreaks(e.clipboardData.getData("text/plain"));
+    const pastedText = normalizeLineBreaks(e.clipboardData.getData("text/plain"));
+    let droppedFromPaste = 0;
 
     const editor = instructionsRef.current;
     if (editor) {
       editor.focus();
       const selection = window.getSelection();
-      if (selection && selection.rangeCount > 0) {
-        const range = selection.getRangeAt(0);
-        range.deleteContents();
-        const fragment = document.createDocumentFragment();
-        const parts = textToInsert.split("\n");
-        parts.forEach((part, index) => {
-          fragment.appendChild(document.createTextNode(part));
-          if (index < parts.length - 1) {
-            fragment.appendChild(document.createElement("br"));
+      const range = selection && selection.rangeCount > 0 ? selection.getRangeAt(0) : null;
+      // Remove the selection the paste replaces before measuring, so replaced
+      // text does not count against the limit.
+      range?.deleteContents();
+      // Clip the pasted text, never the existing content, to the room left.
+      // syncInstructionsFromEditor still enforces the limit on the result as a
+      // last resort.
+      const room = Math.max(
+        0,
+        MAX_INSTRUCTIONS_LENGTH - serializeInstructionsContent(editor).length
+      );
+      const textToInsert = pastedText.substring(0, room);
+      droppedFromPaste = pastedText.length - textToInsert.length;
+
+      if (textToInsert) {
+        if (range && selection) {
+          const fragment = document.createDocumentFragment();
+          const parts = textToInsert.split("\n");
+          parts.forEach((part, index) => {
+            fragment.appendChild(document.createTextNode(part));
+            if (index < parts.length - 1) {
+              fragment.appendChild(document.createElement("br"));
+            }
+          });
+          const lastNode = fragment.lastChild;
+          range.insertNode(fragment);
+          if (lastNode) {
+            const newRange = document.createRange();
+            newRange.setStartAfter(lastNode);
+            newRange.collapse(true);
+            selection.removeAllRanges();
+            selection.addRange(newRange);
           }
-        });
-        const lastNode = fragment.lastChild;
-        range.insertNode(fragment);
-        if (lastNode) {
-          const newRange = document.createRange();
-          newRange.setStartAfter(lastNode);
-          newRange.collapse(true);
-          selection.removeAllRanges();
-          selection.addRange(newRange);
+        } else {
+          editor.innerHTML += escapeHtml(textToInsert).replace(/\n/g, "<br>");
         }
-      } else {
-        editor.innerHTML += escapeHtml(textToInsert).replace(/\n/g, "<br>");
       }
     }
-    handleInstructionsInput();
+    syncInstructionsFromEditor(droppedFromPaste);
   };
 
   // Handle click on delete button for chips
@@ -2344,7 +2375,11 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
             {instructions.length >= MAX_INSTRUCTIONS_LENGTH && (
               <div className="flex items-center gap-2 mt-2 text-destructive bg-destructive/10 px-3 py-2 rounded-md text-sm">
                 <XCircle className="h-4 w-4" />
-                <span>{t("builds.configForm.instructions.maxLengthExceeded")}</span>
+                <span>
+                  {t("builds.configForm.instructions.maxLengthExceeded", {
+                    max: MAX_INSTRUCTIONS_LENGTH.toLocaleString(),
+                  })}
+                </span>
               </div>
             )}
           </div>

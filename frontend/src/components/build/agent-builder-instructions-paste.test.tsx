@@ -2,9 +2,10 @@ import React from "react"
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 
-// Pasting into the instructions editor must enforce the length limit on the
-// resulting content (so text replaced by the paste does not count against it)
-// and must tell the user whenever anything is dropped.
+// Pasting into the instructions editor must clip only the pasted text to the
+// room left after removing the replaced selection, so the user's existing text
+// is never removed, and must tell the user, once per action, how many
+// characters were dropped.
 
 const apiRequestMock = vi.hoisted(() => vi.fn())
 const toastWarningMock = vi.hoisted(() => vi.fn())
@@ -187,11 +188,38 @@ function selectAll(editor: HTMLElement) {
   selection.addRange(range)
 }
 
+// Collapsed caret at `offset` inside the editor's single text node. Focus
+// first for the same reason as selectAll.
+function placeCaret(editor: HTMLElement, offset: number) {
+  editor.focus()
+  const range = document.createRange()
+  range.setStart(editor.firstChild!, offset)
+  range.collapse(true)
+  const selection = window.getSelection()!
+  selection.removeAllRanges()
+  selection.addRange(range)
+}
+
+function expectSingleTruncationToast(dropped: number) {
+  expect(toastWarningMock).toHaveBeenCalledTimes(1)
+  expect(toastWarningMock.mock.calls[0][0]).toBe(
+    `builds.configForm.instructions.truncatedToast:${JSON.stringify({
+      max: MAX.toLocaleString(),
+      dropped: dropped.toLocaleString(),
+    })}`
+  )
+}
+
 function paste(editor: HTMLElement, text: string) {
   fireEvent.paste(editor, { clipboardData: { getData: () => text } })
 }
 
-const banner = () => screen.queryByText("builds.configForm.instructions.maxLengthExceeded")
+const banner = () =>
+  screen.queryByText(
+    `builds.configForm.instructions.maxLengthExceeded:${JSON.stringify({
+      max: MAX.toLocaleString(),
+    })}`
+  )
 
 beforeEach(() => {
   apiRequestMock.mockReset()
@@ -224,13 +252,7 @@ describe("AgentBuilder instructions paste", () => {
 
     expect(editor.textContent).toBe("b".repeat(MAX))
     expect(banner()).toBeInTheDocument()
-    expect(toastWarningMock).toHaveBeenCalledTimes(1)
-    expect(toastWarningMock.mock.calls[0][0]).toBe(
-      `builds.configForm.instructions.truncatedToast:${JSON.stringify({
-        max: MAX.toLocaleString(),
-        dropped: (2000).toLocaleString(),
-      })}`
-    )
+    expectSingleTruncationToast(2000)
   })
 
   it("replaces a full editor when pasting over a selection", async () => {
@@ -242,5 +264,68 @@ describe("AgentBuilder instructions paste", () => {
     expect(editor.textContent).toBe("short prompt")
     expect(banner()).toBeNull()
     expect(toastWarningMock).not.toHaveBeenCalled()
+  })
+
+  it("clips a paste at a mid-document caret and keeps the existing trailing text", async () => {
+    const editor = await renderWithInstructions("x".repeat(1000) + "y".repeat(8000))
+    placeCaret(editor, 1000)
+
+    paste(editor, "b".repeat(3000))
+
+    expect(editor.textContent).toBe("x".repeat(1000) + "b".repeat(1000) + "y".repeat(8000))
+    expect(banner()).toBeInTheDocument()
+    expectSingleTruncationToast(2000)
+  })
+
+  it("clips a paste at the end caret to the room left", async () => {
+    const editor = await renderWithInstructions("x".repeat(9000))
+    placeCaret(editor, 9000)
+
+    paste(editor, "b".repeat(3000))
+
+    expect(editor.textContent).toBe("x".repeat(9000) + "b".repeat(1000))
+    expectSingleTruncationToast(2000)
+  })
+
+  it("clips a paste when the editor has no selection range", async () => {
+    const editor = await renderWithInstructions("x".repeat(9000))
+    editor.focus()
+    window.getSelection()!.removeAllRanges()
+    expect(window.getSelection()!.rangeCount).toBe(0)
+
+    paste(editor, "b".repeat(3000))
+
+    expect(editor.textContent).toBe("x".repeat(9000) + "b".repeat(1000))
+    expectSingleTruncationToast(2000)
+  })
+
+  it("inserts nothing when pasting into a full editor at a mid-document caret", async () => {
+    const editor = await renderWithInstructions("a".repeat(MAX))
+    placeCaret(editor, 5000)
+
+    paste(editor, "bbbbb")
+
+    expect(editor.textContent).toBe("a".repeat(MAX))
+    expectSingleTruncationToast(5)
+  })
+
+  it("shows one toast with the total when a paste lands in content that was already over the limit", async () => {
+    const editor = await renderWithInstructions("a".repeat(MAX + 5))
+    placeCaret(editor, 5000)
+
+    paste(editor, "bbb")
+
+    expect(editor.textContent).toBe("a".repeat(MAX))
+    expectSingleTruncationToast(8)
+  })
+
+  it("truncates typing past the limit and toasts once", async () => {
+    const editor = await renderWithInstructions("a".repeat(MAX))
+    editor.textContent = "a".repeat(MAX) + "z"
+
+    fireEvent.input(editor)
+
+    expect(editor.textContent).toBe("a".repeat(MAX))
+    expectSingleTruncationToast(1)
   })
 })

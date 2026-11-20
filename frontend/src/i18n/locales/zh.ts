@@ -3277,7 +3277,7 @@ const zh = {
         optimizing: "优化中...",
         optimizeError: "优化指令失败",
         optimizeSuccess: "优化指令成功",
-        maxLengthExceeded: "指令长度不能超过 10,000 个字符，超出部分已截断",
+        maxLengthExceeded: "指令长度不能超过 {max} 个字符，超出部分已截断",
         truncatedToast: "指令最多 {max} 个字符，已删除超出的 {dropped} 个字符。",
       },
       executionMode: {

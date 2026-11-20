@@ -295,4 +295,26 @@ describe("translations", () => {
       expect(resolveTranslation(locale, "clientErrors.connectionReconnecting")).not.toMatch(/(…|\.{3})$/)
     }
   })
+
+  it("renders the instructions limit messages from the limit value with correct English for a count of one", () => {
+    expect(
+      resolveTranslation("en", "builds.configForm.instructions.maxLengthExceeded", { max: "12,345" }),
+    ).toBe("Instructions cannot exceed 12,345 characters; any excess has been truncated.")
+    expect(
+      resolveTranslation("zh", "builds.configForm.instructions.maxLengthExceeded", { max: "12,345" }),
+    ).toBe("指令长度不能超过 12,345 个字符，超出部分已截断")
+    expect(
+      resolveTranslation("en", "builds.configForm.instructions.truncatedToast", {
+        max: "10,000",
+        dropped: "1",
+      }),
+    ).toBe("Instructions are limited to 10,000 characters. Characters removed: 1.")
+    expect(
+      resolveTranslation("en", "builds.editor.flow.instructionsPopover.overLimit", {
+        count: "10,001",
+        max: "10,000",
+        excess: "1",
+      }),
+    ).toBe("10,001 / 10,000 characters. Over the limit by 1; shorten to save.")
+  })
 })

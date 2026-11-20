@@ -6869,8 +6869,9 @@ class ReActPattern(AgentPattern):
         The turn equality is what makes the guard strictly per-turn: the
         runner stamps a fresh turn_id on every user message (initial and
         injected), and ``active_turn_id`` is re-resolved from the latest user
-        message at each pattern start — so an explicit repeat requested in a
-        later turn always executes, while an intra-turn resume of the
+        message at each pattern start, and again whenever a live user message
+        is admitted at the loop's safe point — so an explicit repeat requested
+        in a later turn always executes, while an intra-turn resume of the
         checkpointed ledger keeps suppressing the replay.
 
         An ordinary completion is keyed by its original ``turn_id``. A
@@ -7351,7 +7352,8 @@ class ReActPattern(AgentPattern):
 
         ``runtime.active_turn_id`` carries the durable turn_id: on the real
         ``PatternRuntime`` it's set in ``on_pattern_start`` from the
-        triggering user message's metadata; on ``_DAGStepRuntime`` (dag.py)
+        triggering user message's metadata, and again whenever a live user
+        message is admitted at the loop's safe point; on ``_DAGStepRuntime`` (dag.py)
         it's a property resolving the same value from the DAG's root
         context. Either way this lets ``PatternRuntime.on_tool_start`` /
         ``on_tool_end`` / ``on_tool_error`` attribute the resulting trace

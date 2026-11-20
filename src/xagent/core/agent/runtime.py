@@ -548,7 +548,8 @@ class PatternRuntime:
         Only valid where no tool call is pending or running: a user message
         between a tool call and its result would detach the pair from the model
         input. Interruption is checked before each message is taken, so a stop
-        request leaves the rest in the mailbox for the owner to hand back.
+        request leaves the rest in the mailbox for the owner to hand back. Each
+        message that is applied becomes the current turn.
         """
         if not tools_settled or self._active_tool_tasks:
             raise RuntimeError(
@@ -568,6 +569,7 @@ class PatternRuntime:
                 break
             if await injector(item) is LiveInputResult.APPLIED:
                 applied += 1
+                self.active_turn_id = self._dag_turn_id(context)
         return applied
 
     async def _before_work_call(self) -> bool:

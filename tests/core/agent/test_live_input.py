@@ -1175,3 +1175,92 @@ async def test_cancel_right_after_take_still_admits_the_message(
         await task
     assert task.cancelled()
     assert adm.events == ["claim", LiveInputResult.APPLIED]
+
+
+# --------------------------------------------------------------------------
+# Active turn
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("outcome", "expected"),
+    [
+        (LiveInputResult.APPLIED, "live-1"),
+        (LiveInputResult.RETURNED, "original"),
+        (LiveInputResult.REFUSED, "original"),
+        (LiveInputResult.UNKNOWN, "original"),
+    ],
+)
+async def test_applied_live_input_becomes_active_turn(
+    outcome: LiveInputResult, expected: str
+) -> None:
+    from xagent.core.agent import ExecutionContext
+
+    # The context already ends with the message of turn "live-1" while the
+    # runtime still holds the earlier turn, so only an applied outcome may
+    # move the runtime to the context's latest turn.
+    context = ExecutionContext(execution_id=EID)
+    context.add_user_message("first", metadata={"turn_id": "original"})
+    context.add_user_message(LIVE_TEXT, metadata={"turn_id": "live-1"})
+    runtime = PatternRuntime(execution_id=EID)
+    runtime.live_input = LiveInputMailbox()
+
+    async def injector(item: LiveUserInput) -> LiveInputResult:
+        return outcome
+
+    runtime._live_input_injector = injector
+    runtime.active_turn_id = "original"
+    runtime.live_input.offer(make_item("live-1"))
+    await runtime.admit_live_user_messages(context, tools_settled=True)
+    assert runtime.active_turn_id == expected
+
+
+@pytest.mark.parametrize(
+    ("claim", "expected_second"),
+    [(LiveInputClaim.CLAIMED, "live-1"), (LiveInputClaim.UNAVAILABLE, None)],
+)
+async def test_tool_after_live_input_runs_under_inserted_turn(
+    claim: LiveInputClaim, expected_second: str | None
+) -> None:
+    holder: list[Rig] = []
+    seen: dict[str, str | None] = {}
+
+    async def on_start(name: str) -> None:
+        runtime = holder[0].runner._active_controls[EID].runtime
+        seen[name] = runtime.active_turn_id
+        if name == "w1":
+            holder[0].offer(RecordingAdmission(claim), turn_id="live-1")
+
+    rig = make_rig([tool_calls("w1"), tool_calls("w2"), final_answer()])
+    holder.append(rig)
+    for tool in rig.tools.values():
+        tool.on_start = on_start
+    result = await rig.start()
+    assert result["success"] is True
+    assert seen["w1"] and seen["w1"] != "live-1"
+    # An input that was not applied leaves the turn the run started under.
+    assert seen["w2"] == (expected_second or seen["w1"])
+
+
+@pytest.mark.parametrize("inserted", [True, False])
+async def test_repeat_write_after_live_input_is_not_suppressed(inserted: bool) -> None:
+    holder: list[Rig] = []
+
+    async def on_start(name: str) -> None:
+        if inserted and len(rig.tools["w1"].calls) == 1:
+            holder[0].offer(RecordingAdmission(), turn_id="live-1")
+
+    rig = make_rig(
+        [tool_calls("w1"), tool_calls("w1"), final_answer()],
+        ("w1",),
+        pattern=ReActPattern(
+            repeated_tool_decision_after_consecutive_tool_calls=None,
+            repeated_tool_decision_after_consecutive_work_tool_calls=None,
+        ),
+    )
+    holder.append(rig)
+    rig.tools["w1"].metadata.mcp_non_idempotent_write = True
+    rig.tools["w1"].on_start = on_start
+    result = await rig.start()
+    assert result["success"] is True
+    assert len(rig.tools["w1"].calls) == (2 if inserted else 1)

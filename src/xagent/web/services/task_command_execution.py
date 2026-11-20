@@ -5117,9 +5117,8 @@ async def _broadcast_terminal_command_error(
 ) -> None:
     scope = _command_scope(command)
     if scope == LIVE_INPUT_COMMAND_SCOPE:
-        # The browser holds this message as "sending now"; tell it the
-        # command did not run so it can stop waiting, instead of showing an
-        # error for a message it can still send as the next turn.
+        # The sender is waiting for this message to be admitted; report it as
+        # not delivered rather than as a command error.
         await publish_task_event(
             live_input_returned_frame(
                 command.task_id, str(command.payload.get("turn_id")), "unavailable"

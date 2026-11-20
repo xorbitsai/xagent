@@ -328,8 +328,8 @@ def _canonical_payload(payload: dict[str, Any]) -> str:
 # production caller until the sweeper lands, and tests exercise it.
 AUTO_RESUME_COMMAND_PREFIX = "auto-resume:"
 # Command ids of live input commands (a user message offered to a run that is
-# already executing). Defined with the command's executor; reserved here so no
-# other ingress can stage one.
+# already executing). The id builder lives with the executor; the prefix is
+# reserved here so no other ingress can stage one.
 LIVE_INPUT_COMMAND_PREFIX = "live:"
 # Command ids of a planned release's hand-over pauses (``release_handover``).
 # Reserved like the auto-resume namespace, but staged with ``handover=True``,
@@ -804,7 +804,9 @@ def classify_task_command_conflict(
 
     Normalizes command_id the same way stage_task_command does -- strip plus
     full-format validation, not strip alone -- so a lookup here targets the
-    same row a duplicate-command race would have inserted.
+    same row a duplicate-command race would have inserted. It accepts only
+    ids that need no reserved namespace; a ``live:`` or ``auto-resume:`` id is
+    refused here as it is by ``enqueue_task_command``.
 
     Call only after the caller has rolled back the transaction the failed
     stage happened on -- this queries post-rollback state to tell apart a

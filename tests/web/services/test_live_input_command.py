@@ -12,6 +12,14 @@ from typing import Any
 import pytest
 from sqlalchemy.exc import IntegrityError, OperationalError
 
+from tests.web.services.test_task_event_context_service import accept, apply
+from tests.web.services.test_task_execution_event_writer import (
+    canonical as canonical_fixture,
+)
+from tests.web.services.test_task_execution_event_writer import engine as engine_fixture
+from tests.web.services.test_task_execution_event_writer import (
+    task_id as task_id_fixture,
+)
 from xagent.core.agent.live_input import (
     LiveInputClaim,
     LiveInputOffer,
@@ -25,7 +33,11 @@ from xagent.web.services import live_input_command as lic
 from xagent.web.services import task_command_execution
 from xagent.web.services.chat_history_service import (
     DELIVERY_DISPATCHED,
+    DELIVERY_FAILED,
+    DELIVERY_OUTCOME_UNKNOWN,
     DELIVERY_PENDING,
+    claim_user_message_delivery_no_commit,
+    withdraw_pending_user_message_delivery_sync,
 )
 from xagent.web.services.task_command_execution import _execute_durable_task_command
 from xagent.web.services.task_command_transport import (
@@ -34,6 +46,11 @@ from xagent.web.services.task_command_transport import (
     TaskCommandKind,
     stage_task_command,
 )
+from xagent.web.services.task_event_context_service import load_task_event_context
+
+canonical = canonical_fixture
+engine = engine_fixture
+task_id = task_id_fixture
 
 TURN = "turn-1"
 RUN = "run-1"
@@ -151,10 +168,9 @@ async def test_claim_uses_raw_content_and_no_attachments(
     "owner,error,reason",
     [
         (None, None, "unavailable"),
-        (None, None, "unavailable"),
         (1, OperationalError("select", {}, Exception("down")), "run_ended"),
     ],
-    ids=["quota-exhausted", "authorization-revoked", "database-error"],
+    ids=["refused", "database-error"],
 )
 async def test_live_input_reauthorized_at_claim(
     db: Any,
@@ -225,7 +241,7 @@ async def test_failed_claim_commit_is_withdrawn_and_reports_not_applied(
     assert [f["reason"] for f in published] == ["not_applied"]
 
 
-async def test_live_input_and_new_turn_share_one_delivery_row(
+async def test_second_claim_for_one_turn_is_taken(
     db: Any, task: Any, published: list
 ) -> None:
     host = FakeHost(task.user_id)
@@ -257,14 +273,15 @@ def manager(monkeypatch: pytest.MonkeyPatch) -> Any:
 
     def offer(eid: str, **kwargs: Any) -> LiveInputOffer:
         offers.append({"execution_id": eid, **kwargs})
-        return LiveInputOffer.QUEUED
+        return fake.offer_result
 
     service = SimpleNamespace(offer_live_user_message=offer)
-    fake = SimpleNamespace(
+    fake: Any = SimpleNamespace(
         running_agent_for_task=lambda task_id: service,
         _agent_run_ids={},
         offers=offers,
         service=service,
+        offer_result=LiveInputOffer.QUEUED,
     )
     monkeypatch.setattr(lic, "get_agent_manager", lambda: fake)
     return fake
@@ -310,13 +327,15 @@ async def test_live_input_executor_touches_no_database(
     assert manager.offers[0]["turn_id"] == TURN
 
 
-async def test_cancel_claimable_while_publish_blocks(
+async def test_executor_returns_while_publish_blocks(
     monkeypatch: pytest.MonkeyPatch,
     task: Any,
     manager: Any,
     running_tasks: dict,
     host: FakeHost,
 ) -> None:
+    # The executor only reads memory and hands notices to a background task,
+    # so a blocked event bus cannot hold up the commands queued behind it.
     async def slow_publish(frame: dict[str, Any], task_id: int) -> None:
         await asyncio.sleep(5)
 
@@ -330,17 +349,23 @@ async def test_cancel_claimable_while_publish_blocks(
 
 
 async def test_executor_reports_not_started_before_control_registers(
+    monkeypatch: pytest.MonkeyPatch,
     task: Any,
     manager: Any,
     running_tasks: dict,
     host: FakeHost,
     published: list,
 ) -> None:
+    counted: list[str] = []
+    monkeypatch.setattr(
+        lic, "increment_counter", lambda name, **kw: counted.append(name)
+    )
     manager.running_agent_for_task = lambda task_id: None
     running_tasks[task.id] = object()
     result = await lic.execute_live_input_command(command(task))
     await settle()
     assert result == {"result": "not_started"}
+    assert counted == ["xagent.live_input.not_started"]
     assert [f["reason"] for f in published] == ["not_started"]
 
 
@@ -422,3 +447,147 @@ async def test_live_input_command_terminal_failure_broadcasts_returned(
             "reason": "unavailable",
         }
     ]
+
+
+@pytest.mark.parametrize("reuse_old_id", [False, True])
+def test_new_turn_after_withdrawn_live_input_keeps_history(
+    canonical: Any, reuse_old_id: bool
+) -> None:
+    factory, task_id = canonical
+    with factory() as db:
+        task_row = db.get(Task, task_id)
+        task_row.run_id = "ended-run"
+        owner = task_row.user_id
+        claim = claim_user_message_delivery_no_commit(
+            db, task_id, owner, "live", turn_id="live"
+        )
+        assert claim.claimed
+        db.commit()
+        accept(db, task_id, "later", "after the claim")
+        apply(db, task_id, "later")
+        db.commit()
+    assert withdraw_pending_user_message_delivery_sync(task_id, "live")
+    turn_id = "live" if reuse_old_id else "live-2"
+    with factory() as db:
+        db.get(Task, task_id).run_id = "new-run"
+        accept(db, task_id, turn_id, "live", delivery_status="pending")
+        db.commit()
+        history = load_task_event_context(db, task_id, before_turn_id=turn_id)
+    contents = [message["content"] for message in history.messages]
+    # A reused id reuses the early acceptance event, which cuts the history
+    # off before everything written after the claim.
+    assert ("after the claim" in contents) is (not reuse_old_id)
+
+
+async def test_claim_error_before_write_leaves_foreign_row(
+    monkeypatch: pytest.MonkeyPatch, db: Any, task: Any, published: list
+) -> None:
+    winner = lic.DeliveryLedgerAdmission(payload_for(task), FakeHost(task.user_id))
+    assert await winner.claim() is LiveInputClaim.CLAIMED
+
+    def fail_before_write(*args: Any, **kwargs: Any) -> Any:
+        raise OperationalError("lock", {}, Exception("lock timeout"))
+
+    monkeypatch.setattr(lic, "claim_user_message_delivery_no_commit", fail_before_write)
+    loser = lic.DeliveryLedgerAdmission(payload_for(task), FakeHost(task.user_id))
+    assert await loser.claim() is LiveInputClaim.UNAVAILABLE
+    await loser.finish(LiveInputResult.RETURNED)
+    await settle()
+    assert [r.delivery_status for r in rows(db, task)] == [DELIVERY_PENDING]
+    assert [f["reason"] for f in published] == ["run_ended"]
+
+
+@pytest.mark.parametrize(
+    "result",
+    [LiveInputResult.UNKNOWN, LiveInputResult.REFUSED, LiveInputResult.CONFLICT],
+)
+async def test_unwritten_admission_never_touches_a_foreign_row(
+    db: Any, task: Any, published: list, result: LiveInputResult
+) -> None:
+    winner = lic.DeliveryLedgerAdmission(payload_for(task), FakeHost(task.user_id))
+    assert await winner.claim() is LiveInputClaim.CLAIMED
+    other = lic.DeliveryLedgerAdmission(payload_for(task), FakeHost(task.user_id))
+    assert await other.claim() is LiveInputClaim.TAKEN
+    await other.finish(result)
+    await settle()
+    assert [r.delivery_status for r in rows(db, task)] == [DELIVERY_PENDING]
+
+
+@pytest.mark.parametrize(
+    "result,withdraw_works,status,reason",
+    [
+        (LiveInputResult.REFUSED, True, DELIVERY_FAILED, "refused"),
+        (LiveInputResult.CONFLICT, True, DELIVERY_FAILED, "conflict"),
+        (LiveInputResult.UNKNOWN, True, DELIVERY_OUTCOME_UNKNOWN, "outcome_unknown"),
+        (LiveInputResult.RETURNED, False, DELIVERY_OUTCOME_UNKNOWN, "outcome_unknown"),
+    ],
+)
+async def test_finish_after_claim_settles_the_row(
+    monkeypatch: pytest.MonkeyPatch,
+    db: Any,
+    task: Any,
+    published: list,
+    result: LiveInputResult,
+    withdraw_works: bool,
+    status: str,
+    reason: str,
+) -> None:
+    admission = lic.DeliveryLedgerAdmission(payload_for(task), FakeHost(task.user_id))
+    assert await admission.claim() is LiveInputClaim.CLAIMED
+    if not withdraw_works:
+        monkeypatch.setattr(
+            lic, "withdraw_pending_user_message_delivery_sync", lambda *a: False
+        )
+    await admission.finish(result)
+    await settle()
+    assert [r.delivery_status for r in rows(db, task)] == [status]
+    assert [f["reason"] for f in published] == [reason]
+
+
+async def test_taken_is_reported_without_touching_the_row(
+    db: Any, task: Any, published: list
+) -> None:
+    winner = lic.DeliveryLedgerAdmission(payload_for(task), FakeHost(task.user_id))
+    await winner.claim()
+    other = lic.DeliveryLedgerAdmission(payload_for(task), FakeHost(task.user_id))
+    assert await other.claim() is LiveInputClaim.TAKEN
+    await other.finish(LiveInputResult.TAKEN)
+    await settle()
+    assert [r.delivery_status for r in rows(db, task)] == [DELIVERY_PENDING]
+    assert [f["reason"] for f in published] == ["taken"]
+
+
+@pytest.mark.parametrize(
+    "offer,with_host,message,result,reason",
+    [
+        (LiveInputOffer.CONFLICT, True, "hello", "conflict", "conflict"),
+        (LiveInputOffer.UNSUPPORTED, True, "hello", "unsupported", "run_ended"),
+        (LiveInputOffer.ALREADY_ACCEPTED, True, "hello", "already_applied", None),
+        (LiveInputOffer.QUEUED, False, "hello", "no_host", "unavailable"),
+        (LiveInputOffer.QUEUED, True, "   ", "malformed", None),
+    ],
+)
+async def test_executor_branches(
+    task: Any,
+    manager: Any,
+    running_tasks: dict,
+    published: list,
+    offer: LiveInputOffer,
+    with_host: bool,
+    message: str,
+    result: str,
+    reason: str | None,
+) -> None:
+    manager._agent_run_ids[task.id] = RUN
+    manager.offer_result = offer
+    if with_host:
+        lic.register_live_input_host(FakeHost(1))
+    try:
+        outcome = await lic.execute_live_input_command(
+            command(task, payload={"message": message})
+        )
+    finally:
+        lic.unregister_live_input_host()
+    await settle()
+    assert outcome == {"result": result}
+    assert [f["reason"] for f in published] == ([reason] if reason else [])

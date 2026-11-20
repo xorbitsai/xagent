@@ -28,6 +28,7 @@ from ...core.agent.live_input import (
     LiveInputOffer,
     LiveInputResult,
 )
+from ...core.runtime_performance import increment_counter
 from . import task_execution as task_execution_service
 from .agent_service_manager import get_agent_manager
 from .chat_history_service import (
@@ -155,7 +156,6 @@ def _publish_in_background(task_id: int, turn_id: str, reason: str) -> None:
 @dataclass
 class _ClaimOutcome:
     claim: LiveInputClaim
-    owner_user_id: int | None = None
     claimed: bool = False
     withdrawn: bool = False
     refused: bool = False
@@ -167,6 +167,10 @@ class DeliveryLedgerAdmission:
     def __init__(self, payload: LiveInputPayload, host: LiveInputHost) -> None:
         self._payload = payload
         self._host = host
+        # True once this admission has staged a row of its own for the
+        # commit. Only then may it change the state of the row under its turn
+        # id; before that, any row there belongs to another delivery.
+        self._wrote = False
         self._claimed = False
         self._withdrawn = False
         self._refused = False
@@ -192,7 +196,6 @@ class DeliveryLedgerAdmission:
                     attachments=None,
                     turn_id=payload.turn_id,
                 )
-                db.commit()
             except IntegrityError:
                 db.rollback()
                 winner = inspect_user_message_delivery(
@@ -206,17 +209,28 @@ class DeliveryLedgerAdmission:
                     return _ClaimOutcome(LiveInputClaim.UNAVAILABLE)
                 return _ClaimOutcome(LiveInputClaim.TAKEN)
             except Exception:
+                # The lock, the lookup or the insert failed before anything of
+                # ours was committed. A row under this turn id, if any, belongs
+                # to another delivery and must be left alone.
+                logger.warning("live input claim failed before write", exc_info=True)
+                db.rollback()
+                return _ClaimOutcome(LiveInputClaim.UNAVAILABLE)
+            if not claim.claimed:
+                db.rollback()
+                return _ClaimOutcome(LiveInputClaim.TAKEN)
+            self._wrote = True
+            try:
+                db.commit()
+            except Exception:
                 logger.warning("live input claim commit failed", exc_info=True)
                 try:
                     db.rollback()
                 except Exception:
                     logger.warning("live input claim rollback failed", exc_info=True)
-                return self._after_failed_commit(owner)
-        if claim.claimed:
-            return _ClaimOutcome(LiveInputClaim.CLAIMED, owner, claimed=True)
-        return _ClaimOutcome(LiveInputClaim.TAKEN, owner)
+                return self._after_failed_commit()
+        return _ClaimOutcome(LiveInputClaim.CLAIMED, claimed=True)
 
-    def _after_failed_commit(self, owner: int) -> _ClaimOutcome:
+    def _after_failed_commit(self) -> _ClaimOutcome:
         payload = self._payload
         try:
             withdrawn = withdraw_pending_user_message_delivery_sync(
@@ -238,14 +252,14 @@ class DeliveryLedgerAdmission:
                     )
         except Exception:
             logger.warning("live input claim withdrawal failed", exc_info=True)
-            return _ClaimOutcome(LiveInputClaim.UNKNOWN, owner)
+            return _ClaimOutcome(LiveInputClaim.UNKNOWN)
         if withdrawn:
             # The commit may have succeeded before it failed, so the claim is
             # treated as made and then taken back.
             return _ClaimOutcome(
-                LiveInputClaim.UNAVAILABLE, owner, claimed=True, withdrawn=True
+                LiveInputClaim.UNAVAILABLE, claimed=True, withdrawn=True
             )
-        return _ClaimOutcome(LiveInputClaim.UNKNOWN, owner)
+        return _ClaimOutcome(LiveInputClaim.UNKNOWN)
 
     async def claim(self) -> LiveInputClaim:
         outcome = await run_db_io_cancellation_safe(self._claim_sync)
@@ -255,6 +269,8 @@ class DeliveryLedgerAdmission:
         return outcome.claim
 
     async def _mark(self, status: str) -> str | None:
+        if not self._wrote:
+            return None
         payload = self._payload
         try:
             transition = await run_db_io_cancellation_safe(
@@ -377,6 +393,7 @@ async def execute_live_input_command(
             return _done("unsupported")
 
     if payload.task_id in task_execution_service.background_task_manager.running_tasks:
+        increment_counter("xagent.live_input.not_started")
         _publish_in_background(payload.task_id, payload.turn_id, "not_started")
         return _done("not_started")
     _publish_in_background(payload.task_id, payload.turn_id, "run_ended")

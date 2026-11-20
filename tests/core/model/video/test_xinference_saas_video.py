@@ -135,9 +135,7 @@ async def test_saas_rejects_bad_seed(transport):
         },
     ],
 )
-async def test_saas_refuses_image_and_frame_input_before_any_request(
-    transport, extra
-):
+async def test_saas_refuses_image_and_frame_input_before_any_request(transport, extra):
     with pytest.raises(MediaParameterError):
         await _build().generate_video(prompt="a fox", **extra)
     assert transport["json"] == [] and transport["form"] == []
@@ -184,5 +182,7 @@ async def test_legacy_provider_still_sends_kwargs(transport):
 
 async def test_legacy_provider_still_uses_image_endpoint(transport, tmp_path):
     model = _build("xinference")
-    await model.generate_video(prompt="a fox", input_reference="data:image/png;base64,AAAA")
+    await model.generate_video(
+        prompt="a fox", input_reference="data:image/png;base64,AAAA"
+    )
     assert transport["form"] == ["/v1/video/generations/image"]

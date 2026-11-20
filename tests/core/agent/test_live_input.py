@@ -1066,7 +1066,7 @@ async def test_repeated_cancel_keeps_the_first_deadline(
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await asyncio.wait_for(task, 5)
-    assert 0.29 <= loop.time() - started < 0.7
+    assert 0.29 <= loop.time() - started < 0.4
     await asyncio.gather(*rig.runner._live_input_tasks, return_exceptions=True)
     assert adm.events == ["claim", LiveInputResult.UNKNOWN]
 

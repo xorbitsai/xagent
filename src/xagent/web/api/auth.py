@@ -4837,6 +4837,15 @@ def _generic_oauth_login(
         )
     if provider.lower() == "zoom":
         params["prompt"] = "login"
+    if provider.lower() == "microsoft":
+        # Without a prompt, Entra ID signs in the sole account that already
+        # has a session in this browser -- including one just created by
+        # signing in to this product with Microsoft -- so the connector
+        # binds that account with no chance to pick another. select_account
+        # interrupts that single sign-on with the account picker (which
+        # offers "Use another account") without forcing a fresh password/MFA
+        # the way prompt=login would.
+        params["prompt"] = "select_account"
     if code_verifier:
         digest = hashlib.sha256(code_verifier.encode("ascii")).digest()
         params["code_challenge"] = (

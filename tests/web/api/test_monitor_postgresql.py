@@ -56,6 +56,7 @@ via ``XAGENT_TEST_POSTGRES_URL``; CI provides it in the PostgreSQL job).
 from __future__ import annotations
 
 import json
+import logging
 import os
 from datetime import datetime
 from typing import Any, Iterator
@@ -758,7 +759,9 @@ async def test_session_time_zone_reaches_worker_connection(
 
 @pytest.mark.postgresql
 async def test_statement_budget_turns_slow_query_into_503(
-    pg_session: Session, monkeypatch: pytest.MonkeyPatch
+    pg_session: Session,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """A statement running past the budget is cancelled and reported as 503."""
     monkeypatch.setattr(monitor_module, "_MONITOR_STATEMENT_BUDGET_MS", 100)
@@ -772,4 +775,10 @@ async def test_statement_budget_turns_slow_query_into_503(
 
     assert caught.value.status_code == 503
     assert caught.value.detail == "Monitoring statistics are temporarily unavailable"
-    assert "pg_sleep" not in str(caught.value.detail)
+    warnings = [
+        record
+        for record in caplog.records
+        if record.levelno == logging.WARNING and record.name == "xagent.web.api.monitor"
+    ]
+    assert len(warnings) == 1
+    assert "canceling statement due to statement timeout" in warnings[0].getMessage()

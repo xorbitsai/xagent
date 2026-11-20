@@ -10,6 +10,7 @@ maps budget / pool-timeout failures to a fixed 503.
 from __future__ import annotations
 
 import asyncio
+import logging
 import threading
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable
@@ -233,7 +234,9 @@ async def test_budget_and_pool_errors_map_to_503(
         db.close()
 
 
-async def test_other_sqlstate_stays_500() -> None:
+async def test_other_sqlstate_stays_500(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     db = _direct_db_session()
     try:
         raised: list[BaseException] = []
@@ -250,6 +253,15 @@ async def test_other_sqlstate_stays_500() -> None:
 
         assert caught.value.status_code == 500
         assert caught.value.detail == str(raised[0])
+        errors = [
+            record
+            for record in caplog.records
+            if record.levelno == logging.ERROR
+            and record.name == "xagent.web.api.monitor"
+        ]
+        assert [record.getMessage() for record in errors] == [
+            f"Get serialization failed: {raised[0]}"
+        ]
     finally:
         db.close()
 
@@ -323,5 +335,50 @@ async def test_slot_is_released_when_compute_fails(
             await monitor_module._run_monitor_query("failing", db, compute)
 
         assert slots._value == 3
+    finally:
+        db.close()
+
+
+async def test_request_session_connection_is_released_before_the_scan() -> None:
+    db = _direct_db_session()
+    try:
+        user = _seed_admin(db, username="release-admin")
+        db.refresh(user)
+        db.query(User).filter(User.id == user.id).first()
+        assert db.in_transaction()
+
+        await get_agents(db=db, current_user=user)
+
+        assert not db.in_transaction()
+    finally:
+        db.close()
+
+
+@pytest.mark.parametrize(
+    "endpoint",
+    OFFLOADED_ENDPOINTS,
+    ids=["agents", "stats", "popular_tools", "model_stats", "dashboard_stats"],
+)
+async def test_every_endpoint_applies_the_statement_budget_off_the_event_loop(
+    endpoint: Callable[..., Awaitable[Any]], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    original = monitor_module._apply_statement_budget
+    applied_on: list[int] = []
+
+    def recording(session: Session) -> None:
+        applied_on.append(threading.get_ident())
+        original(session)
+
+    monkeypatch.setattr(monitor_module, "_apply_statement_budget", recording)
+    db = _direct_db_session()
+    try:
+        user = _seed_admin(db, username="budget-admin")
+        db.refresh(user)
+        loop_thread = threading.get_ident()
+
+        await endpoint(db=db, current_user=user)
+
+        assert len(applied_on) == 1
+        assert applied_on[0] != loop_thread
     finally:
         db.close()

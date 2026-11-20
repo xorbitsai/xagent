@@ -1466,7 +1466,7 @@ async def test_repeat_write_after_live_input_is_not_suppressed(inserted: bool) -
 # Iteration allowance
 # --------------------------------------------------------------------------
 
-GRANT = 10
+GRANT = react_module.LIVE_INPUT_ITERATION_GRANT
 
 
 def offering_first_reply(
@@ -1635,42 +1635,38 @@ async def test_unavailable_tool_recovery_stops_at_the_raised_cap(delivery: str) 
 
 
 @pytest.mark.parametrize(
-    "n_applied",
+    ("saved", "expected"),
     [
-        1,
-        3,
-        pytest.param(None, id="legacy_state_without_key"),
-        pytest.param("null", id="null_value"),
-        pytest.param("negative", id="negative_value"),
+        # A checkpoint written before the allowance existed has no such key.
+        pytest.param({}, 0, id="missing"),
+        pytest.param({"live_input_iteration_grant": None}, 0, id="none"),
+        pytest.param({"live_input_iteration_grant": -4}, 0, id="negative"),
     ],
 )
-async def test_live_input_iteration_grant_survives_state_round_trip(
-    n_applied: int | str | None,
+def test_live_input_iteration_grant_loads_within_range(
+    saved: dict[str, Any], expected: int
 ) -> None:
-    restored = ReActPattern(max_iterations=3)
-    if n_applied in ("null", "negative"):
-        state = ReActPattern(max_iterations=3).get_state()
-        state["live_input_iteration_grant"] = None if n_applied == "null" else -4
-        restored.live_input_iteration_grant = 7
-        restored.load_state(state)
-        assert restored.live_input_iteration_grant == 0
-        assert restored._iteration_cap() == 3
-        return
-    assert not isinstance(n_applied, str)
-    if n_applied is None:
-        # A checkpoint written before the allowance existed has no such key.
-        state = ReActPattern(max_iterations=3).get_state()
-        assert "live_input_iteration_grant" in state
-        del state["live_input_iteration_grant"]
-        restored.live_input_iteration_grant = 7
-        restored.load_state(state)
-        assert restored.live_input_iteration_grant == 0
-        assert restored._iteration_cap() == 3
-        return
-    rig = rig_with_offered_messages(n_applied, [final_answer()], max_iterations=3)
+    state = ReActPattern(max_iterations=GRANT).get_state()
+    del state["live_input_iteration_grant"]
+    state.update(saved)
+    restored = ReActPattern()
+    restored.live_input_iteration_grant = 7
+    restored.load_state(state)
+    assert restored.live_input_iteration_grant == expected
+
+
+@pytest.mark.parametrize("n_applied", [1, 3])
+async def test_live_input_iteration_grant_survives_state_round_trip(
+    n_applied: int,
+) -> None:
+    max_iterations = 3
+    rig = rig_with_offered_messages(
+        n_applied, [final_answer()], max_iterations=max_iterations
+    )
     pattern = rig.runner.agent.patterns[0]
     await rig.start()
     assert pattern.live_input_iteration_grant == GRANT * n_applied
+    restored = ReActPattern(max_iterations=max_iterations)
     restored.load_state(json.loads(json.dumps(pattern.get_state())))
     assert restored.live_input_iteration_grant == GRANT * n_applied
-    assert restored._iteration_cap() == 3 + GRANT * n_applied
+    assert restored._iteration_cap() == max_iterations + GRANT * n_applied

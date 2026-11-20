@@ -2,10 +2,12 @@ import React from "react"
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 
-// Pasting into the instructions editor must clip only the pasted text to the
-// room left after removing the replaced selection, so the user's existing text
-// is never removed, and must tell the user, once per action, how many
-// characters were dropped.
+// Pasting into the instructions editor must drop only pasted text when the
+// result would exceed the limit: the clipboard text is clipped to the room left
+// after removing the replaced selection, and any overflow the measurement
+// missed is trimmed from the inserted text, so the user's existing text is
+// never removed. It must tell the user, once per action, how many characters
+// were dropped.
 
 const apiRequestMock = vi.hoisted(() => vi.fn())
 const toastWarningMock = vi.hoisted(() => vi.fn())
@@ -169,11 +171,13 @@ function installApi(instructions: string) {
   })
 }
 
-async function renderWithInstructions(existing: string) {
+// shownText is the editor's textContent once loaded; line breaks render as
+// <br> elements, which contribute nothing to textContent.
+async function renderWithInstructions(existing: string, shownText = existing) {
   installApi(existing)
   const { container } = render(<AgentBuilder agentId={AGENT_ID} />)
   const editor = container.querySelector('[role="textbox"][aria-multiline="true"]') as HTMLDivElement
-  await waitFor(() => expect(editor.textContent).toBe(existing))
+  await waitFor(() => expect(editor.textContent).toBe(shownText))
   return editor
 }
 
@@ -317,6 +321,34 @@ describe("AgentBuilder instructions paste", () => {
 
     expect(editor.textContent).toBe("a".repeat(MAX))
     expectSingleTruncationToast(8)
+  })
+
+  it("trims a paste that un-collapses line breaks instead of cutting the existing text", async () => {
+    const existing = "x\n\n\n" + "y".repeat(MAX - 4)
+    const editor = await renderWithInstructions(existing, "x" + "y".repeat(MAX - 4))
+    // Children: "x", <br>, <br>, <br>, "yyy…". The serializer counts the three
+    // breaks as two, so the measured length is MAX - 1 and the room is 1.
+    expect(Array.from(editor.childNodes).map((node) => node.nodeName)).toEqual([
+      "#text",
+      "BR",
+      "BR",
+      "BR",
+      "#text",
+    ])
+    editor.focus()
+    const range = document.createRange()
+    range.setStart(editor, 3) // between the second and third <br>
+    range.collapse(true)
+    const selection = window.getSelection()!
+    selection.removeAllRanges()
+    selection.addRange(range)
+
+    paste(editor, "b")
+
+    expect(editor.textContent).toBe("x" + "y".repeat(MAX - 4))
+    expect(editor.querySelectorAll("br")).toHaveLength(3)
+    expect(banner()).toBeNull()
+    expectSingleTruncationToast(1)
   })
 
   it("truncates typing past the limit and toasts once", async () => {

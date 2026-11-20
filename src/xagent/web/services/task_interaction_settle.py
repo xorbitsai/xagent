@@ -31,9 +31,10 @@ import enum
 import hashlib
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
+from ...core.agent.result_card import RESULT_CARD_MESSAGE_TYPE
 from ..models.chat_message import TaskChatMessage
 from ..models.database import get_session_local
 from ..models.task import Task, TaskStatus, TraceEvent
@@ -87,7 +88,14 @@ def _open_interaction_ids(db: Session, task: Task) -> frozenset[str]:
         return _recorded_interaction_ids(read_event_waiting_data(db, int(task.id)))
     rows = db.scalars(
         select(TraceEvent)
-        .where(TraceEvent.task_id == task.id, TraceEvent.event_type == "agent_message")
+        .where(
+            TraceEvent.task_id == task.id,
+            TraceEvent.event_type == "agent_message",
+            # Result cards are agent messages too; any number of them can sit
+            # between the question and now, so they must not use up the scan.
+            func.coalesce(TraceEvent.data["message_type"].as_string(), "")
+            != RESULT_CARD_MESSAGE_TYPE,
+        )
         .order_by(TraceEvent.id.desc())
         .limit(_RECENT_WAITING_EVENT_SCAN)
     )

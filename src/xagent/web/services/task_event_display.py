@@ -13,6 +13,7 @@ from typing import Any
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from ...core.agent.result_card import RESULT_CARD_MESSAGE_TYPE, result_card_metadata
 from ...core.agent.trace import normalize_llm_trace_payload
 from ..models.task import Task
 from ..models.task_execution_event import TaskExecutionEvent
@@ -51,6 +52,9 @@ _STREAM_KINDS = frozenset(
 # ``publish_task_result``; a cancellation settlement publishes none. Both
 # reach the client through the next replay.
 _CONDITIONAL_LIVE_KINDS = frozenset({"input_accepted", "assistant_message"})
+# Every kind ``project_event_message`` can turn into a message; a reader that
+# only needs messages can filter on these in SQL.
+MESSAGE_EVENT_KINDS = ("input_accepted", "assistant_message", "agent_message")
 
 
 @dataclass(frozen=True)
@@ -210,6 +214,7 @@ def project_event_message(event: TaskExecutionEvent) -> dict[str, Any] | None:
     data = event_data(event)
     if is_audit_only_trace_data(data) or is_agent_checkpoint_data(data):
         return None
+    card_metadata: dict[str, Any] | None = None
     if event.kind in {"input_accepted", "assistant_message"}:
         role = "user" if event.kind == "input_accepted" else "assistant"
         content = data.get("content")
@@ -244,6 +249,15 @@ def project_event_message(event: TaskExecutionEvent) -> dict[str, Any] | None:
             raise _invalid(event, "invalid question")
         interactions = (metadata or {}).get("interactions")
         attachments = data.get("attachments")
+    elif (
+        event.kind == "agent_message"
+        and (card_metadata := result_card_metadata(data)) is not None
+    ):
+        # A display card is a persisted assistant message that asks nothing.
+        role, message_type = "assistant", RESULT_CARD_MESSAGE_TYPE
+        content = str(data["message"])
+        interactions = None
+        attachments = None
     else:
         return None
     return {
@@ -255,7 +269,9 @@ def project_event_message(event: TaskExecutionEvent) -> dict[str, Any] | None:
         "attachments": attachments if isinstance(attachments, list) else [],
         "turn_id": event.turn_id,
         "created_at": event.occurred_at,
-        "message_metadata": (
+        "message_metadata": card_metadata
+        if card_metadata is not None
+        else (
             data.get("message_metadata")
             if isinstance(data.get("message_metadata"), dict)
             else None

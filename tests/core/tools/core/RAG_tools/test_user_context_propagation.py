@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -141,7 +142,7 @@ def _patch_search_pipeline_common(
     monkeypatch.setattr(
         document_search,
         "resolve_embedding_adapter",
-        lambda *args, **kwargs: (object(), object()),
+        lambda *args, **kwargs: (SimpleNamespace(model_name="fake-model"), object()),
     )
     monkeypatch.setattr(
         document_search,

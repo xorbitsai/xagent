@@ -190,6 +190,7 @@ class ToolRegistry:
                 music_tool,
                 pptx_render_tool,
                 pptx_tool,
+                result_card_tool,
                 skill_tools,
                 sound_effect_tool,
                 sql_tool,

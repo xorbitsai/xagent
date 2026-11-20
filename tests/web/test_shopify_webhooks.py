@@ -1,0 +1,566 @@
+"""Shopify's app webhooks (#2810): ``app/uninstalled`` and the three mandatory
+compliance topics, received at ``POST /api/shopify/webhooks``.
+
+Shopify signs each delivery with the app's client secret over the raw body
+(``X-Shopify-Hmac-Sha256``). The topic and shop headers are not signed, so the
+store comes from the signed body and a destructive topic must carry its own
+body shape.
+"""
+
+import base64
+import hashlib
+import hmac
+import json
+import logging
+from datetime import datetime, timedelta, timezone
+
+import pytest
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
+
+from xagent.web.api import shopify_webhooks
+from xagent.web.builtin_mcp_registry import get_builtin_oauth_provider_rows
+from xagent.web.models.database import Base, get_db
+from xagent.web.models.oauth_provider import OAuthProvider
+from xagent.web.models.user import User
+from xagent.web.models.user_oauth import UserOAuth
+from xagent.web.shopify_oauth import verify_shopify_webhook
+
+CLIENT_SECRET = "shpss_test_secret"
+PATH = "/api/shopify/webhooks"
+
+UNINSTALLED = {
+    "id": 548380009,
+    "name": "Acme",
+    "domain": "shop.acme.example",
+    "myshopify_domain": "acme.myshopify.com",
+}
+SHOP_REDACT = {"shop_id": 548380009, "shop_domain": "acme.myshopify.com"}
+CUSTOMERS_REDACT = {
+    "shop_id": 548380009,
+    "shop_domain": "acme.myshopify.com",
+    "customer": {
+        "id": 207119551,
+        "email": "jane@customer.example",
+        "phone": "555-625-1199",
+    },
+    "orders_to_redact": [299938, 280263],
+}
+CUSTOMERS_DATA_REQUEST = {
+    "shop_id": 548380009,
+    "shop_domain": "acme.myshopify.com",
+    "orders_requested": [299938],
+    "customer": {
+        "id": 207119551,
+        "email": "jane@customer.example",
+        "phone": "555-625-1199",
+    },
+    "data_request": {"id": 9999},
+}
+
+
+def _signature(body: bytes, secret: str = CLIENT_SECRET) -> str:
+    digest = hmac.new(secret.encode(), body, hashlib.sha256).digest()
+    return base64.b64encode(digest).decode()
+
+
+@pytest.fixture()
+def shopify_db(tmp_path, monkeypatch):
+    monkeypatch.delenv("SHOPIFY_CLIENT_SECRET", raising=False)
+    engine = create_engine(f"sqlite:///{tmp_path / 'shopify-webhooks.db'}")
+    Base.metadata.create_all(engine)
+    factory = sessionmaker(bind=engine, autoflush=False, autocommit=False)
+    with factory() as db:
+        user = User(username="alice", password_hash="hash")
+        other = User(username="bob", password_hash="hash")
+        db.add_all([user, other])
+        # The registry's own row: client id and secret blank, read from env.
+        db.add(
+            OAuthProvider(
+                **next(
+                    row
+                    for row in get_builtin_oauth_provider_rows()
+                    if row["provider_name"] == "shopify"
+                )
+            )
+        )
+        db.commit()
+        yield factory, db, user, other
+    engine.dispose()
+
+
+@pytest.fixture()
+def client(shopify_db, monkeypatch):
+    factory, *_ = shopify_db
+    monkeypatch.setenv("SHOPIFY_CLIENT_SECRET", CLIENT_SECRET)
+    app = FastAPI()
+    app.include_router(shopify_webhooks.router)
+
+    def _db():
+        with factory() as db:
+            yield db
+
+    app.dependency_overrides[get_db] = _db
+    return TestClient(app)
+
+
+def _grant(
+    user, *, store="acme", oauth_provider="shopify", actor=None, gid="1", app="shopify"
+):
+    return UserOAuth(
+        user_id=user.id,
+        provider=app,
+        oauth_provider=oauth_provider,
+        resource_owner_key=actor,
+        access_token="access",
+        refresh_token="refresh",
+        instance_url=store,
+        provider_user_id=f"gid://shopify/Shop/{gid}",
+    )
+
+
+def _post(
+    client,
+    topic,
+    payload,
+    *,
+    secret=CLIENT_SECRET,
+    body=None,
+    signature=None,
+    triggered_at=None,
+):
+    raw = body if body is not None else json.dumps(payload).encode()
+    headers = {
+        "Content-Type": "application/json",
+        "X-Shopify-Topic": topic,
+        "X-Shopify-Shop-Domain": "acme.myshopify.com",
+        "X-Shopify-Webhook-Id": "b54557e4-bdd9-4b37-8a5f-bf7d70bcd043",
+    }
+    if signature is not False:
+        headers["X-Shopify-Hmac-Sha256"] = signature or _signature(raw, secret)
+    if triggered_at is not None:
+        headers["X-Shopify-Triggered-At"] = triggered_at
+    return client.post(PATH, content=raw, headers=headers)
+
+
+def _stores(db):
+    """The live grants: rows that still hold a token."""
+    db.expire_all()
+    return sorted(
+        (grant.oauth_provider, grant.instance_url, grant.resource_owner_key)
+        for grant in db.query(UserOAuth).all()
+        if grant.access_token
+    )
+
+
+def _tombstones(db):
+    """Rows kept for reconnect with every credential cleared."""
+    db.expire_all()
+    return sorted(
+        (grant.instance_url, grant.resource_owner_key)
+        for grant in db.query(UserOAuth).all()
+        if grant.access_token == ""
+        and grant.refresh_token is None
+        and grant.expires_at is None
+    )
+
+
+# ---------- signature ---------------------------------------------------------
+
+
+def test_known_webhook_signature_vector_verifies():
+    body = b'{"shop_id":1,"shop_domain":"acme.myshopify.com"}'
+    expected = base64.b64encode(
+        hmac.new(b"secret", body, hashlib.sha256).digest()
+    ).decode()
+    assert verify_shopify_webhook(body, expected, client_secret="secret")
+    assert not verify_shopify_webhook(body, expected, client_secret="other")
+    assert not verify_shopify_webhook(body + b" ", expected, client_secret="secret")
+    assert not verify_shopify_webhook(body, None, client_secret="secret")
+    assert not verify_shopify_webhook(body, "", client_secret="secret")
+    assert not verify_shopify_webhook(body, expected, client_secret="")
+    # A signature made with an empty key must not pass for an unset secret.
+    unkeyed = base64.b64encode(hmac.new(b"", body, hashlib.sha256).digest()).decode()
+    assert not verify_shopify_webhook(body, unkeyed, client_secret="")
+
+
+@pytest.mark.parametrize(
+    "case", ["wrong-secret", "missing", "tampered-body", "not-base64"]
+)
+def test_an_unverified_delivery_gets_401_and_changes_nothing(client, shopify_db, case):
+    _, db, user, _ = shopify_db
+    db.add(_grant(user))
+    db.commit()
+    raw = json.dumps(UNINSTALLED).encode()
+    if case == "wrong-secret":
+        response = _post(client, "app/uninstalled", UNINSTALLED, secret="other")
+    elif case == "missing":
+        response = _post(client, "app/uninstalled", UNINSTALLED, signature=False)
+    elif case == "tampered-body":
+        response = _post(
+            client,
+            "app/uninstalled",
+            None,
+            body=raw.replace(b"548380009", b"548380010"),
+            signature=_signature(raw),
+        )
+    else:
+        response = _post(client, "app/uninstalled", UNINSTALLED, signature="%%%")
+    assert response.status_code == 401
+    assert _stores(db) == [("shopify", "acme", None)]
+
+
+def test_an_unconfigured_secret_is_a_server_error_not_a_pass(
+    client, shopify_db, monkeypatch
+):
+    """Without a secret nothing can be verified; 503 makes Shopify retry once
+    the deployment is fixed instead of dropping the delivery."""
+    _, db, user, _ = shopify_db
+    db.add(_grant(user))
+    db.commit()
+    monkeypatch.delenv("SHOPIFY_CLIENT_SECRET")
+    response = _post(client, "app/uninstalled", UNINSTALLED)
+    assert response.status_code == 503
+    assert _stores(db) == [("shopify", "acme", None)]
+
+
+# ---------- app/uninstalled and shop/redact -----------------------------------
+
+
+@pytest.mark.parametrize(
+    "topic,payload", [("app/uninstalled", UNINSTALLED), ("shop/redact", SHOP_REDACT)]
+)
+def test_uninstall_and_shop_redact_delete_every_grant_for_the_store(
+    client, shopify_db, topic, payload
+):
+    _, db, user, other = shopify_db
+    db.add_all(
+        [
+            _grant(user),
+            _grant(user, actor="actor:toby:1"),
+            _grant(other, store="ACME"),
+            _grant(other, store="acme", oauth_provider="SHOPIFY", actor="actor:toby:2"),
+            _grant(user, store="beta", gid="2"),
+            # Another issuer's grant that happens to hold the same label.
+            _grant(other, oauth_provider="deputy", app="deputy"),
+        ]
+    )
+    db.commit()
+
+    response = _post(client, topic, payload)
+
+    assert response.status_code == 200
+    assert _stores(db) == [("deputy", "acme", None), ("shopify", "beta", None)]
+
+
+def test_a_repeated_delivery_is_still_accepted(client, shopify_db):
+    _, db, user, _ = shopify_db
+    db.add(_grant(user))
+    db.commit()
+    assert _post(client, "app/uninstalled", UNINSTALLED).status_code == 200
+    assert _post(client, "app/uninstalled", UNINSTALLED).status_code == 200
+    assert _post(client, "shop/redact", SHOP_REDACT).status_code == 200
+    assert _stores(db) == []
+
+
+@pytest.mark.parametrize(
+    "topic,payload",
+    [
+        # The topic header is not signed: a signed customer body relabelled
+        # as shop/redact must not delete anything.
+        ("shop/redact", CUSTOMERS_REDACT),
+        ("shop/redact", CUSTOMERS_DATA_REQUEST),
+        ("customers/redact", SHOP_REDACT),
+    ],
+)
+def test_a_body_that_does_not_fit_its_topic_is_refused(
+    client, shopify_db, topic, payload
+):
+    _, db, user, _ = shopify_db
+    db.add(_grant(user, gid="548380009"))
+    db.commit()
+    response = _post(client, topic, payload)
+    assert response.status_code == 400
+    assert _stores(db) == [("shopify", "acme", None)]
+
+
+@pytest.mark.parametrize(
+    "topic,payload",
+    [
+        # One topic's body under the other's header names no store there.
+        ("shop/redact", UNINSTALLED),
+        ("app/uninstalled", SHOP_REDACT),
+        ("app/uninstalled", CUSTOMERS_REDACT),
+        # Only a store directly under myshopify.com, or a numeric shop id.
+        ("app/uninstalled", {"id": "x", "myshopify_domain": "acme.example.com"}),
+        ("app/uninstalled", {"id": True, "myshopify_domain": "a.b.myshopify.com"}),
+        # Shopify's sample payloads carry placeholders.
+        ("shop/redact", {"shop_id": None, "shop_domain": "{shop}.myshopify.com"}),
+        ("shop/redact", {"shop_domain": 5}),
+    ],
+)
+def test_a_signed_body_naming_no_store_is_acknowledged_and_deletes_nothing(
+    client, shopify_db, topic, payload
+):
+    """Refusing it would only make Shopify retry the same signed body."""
+    _, db, user, _ = shopify_db
+    db.add(_grant(user, gid="548380009"))
+    db.commit()
+    response = _post(client, topic, payload)
+    assert response.status_code == 200
+    assert _stores(db) == [("shopify", "acme", None)]
+
+
+@pytest.mark.parametrize(
+    "topic,payload",
+    [
+        ("app/uninstalled", {**UNINSTALLED, "myshopify_domain": None}),
+        ("shop/redact", {**SHOP_REDACT, "shop_domain": "{shop}.myshopify.com"}),
+        ("shop/redact", {**SHOP_REDACT, "shop_id": "548380009", "shop_domain": None}),
+    ],
+)
+def test_the_shop_id_finds_the_store_without_a_domain(
+    client, shopify_db, topic, payload
+):
+    _, db, user, other = shopify_db
+    db.add_all(
+        [
+            _grant(user, store="renamed", gid="548380009"),
+            _grant(other, store="beta", gid="2"),
+        ]
+    )
+    db.commit()
+    response = _post(client, topic, payload)
+    assert response.status_code == 200
+    assert _stores(db) == [("shopify", "beta", None)]
+
+
+def test_a_late_event_keeps_a_grant_written_after_it(client, shopify_db):
+    """Shopify retries for hours and does not keep order: an app/uninstalled
+    that arrives after the merchant reconnected must not delete the new grant."""
+    _, db, user, other = shopify_db
+    uninstalled_at = datetime(2026, 11, 19, 7, 0, tzinfo=timezone.utc)
+    reconnected = _grant(user, actor="actor:toby:1")
+    reconnected.created_at = uninstalled_at - timedelta(days=3)
+    reconnected.updated_at = uninstalled_at + timedelta(minutes=2)
+    stale = _grant(other)
+    stale.created_at = uninstalled_at - timedelta(days=3)
+    db.add_all([reconnected, stale])
+    db.commit()
+
+    response = _post(
+        client,
+        "app/uninstalled",
+        UNINSTALLED,
+        triggered_at="2026-11-19T07:00:00.877041743Z",
+    )
+
+    assert response.status_code == 200
+    assert _stores(db) == [("shopify", "acme", "actor:toby:1")]
+
+
+def test_a_reconnect_after_the_uninstall_survives_a_late_uninstall(client, shopify_db):
+    """The callback writes a new row on reconnect: only created_at is set."""
+    _, db, user, _ = shopify_db
+    uninstalled_at = datetime(2026, 11, 19, 7, 0, tzinfo=timezone.utc)
+    reconnected = _grant(user)
+    reconnected.created_at = uninstalled_at + timedelta(minutes=5)
+    db.add(reconnected)
+    db.commit()
+    assert db.query(UserOAuth).one().updated_at is None
+
+    response = _post(
+        client, "app/uninstalled", UNINSTALLED, triggered_at="2026-11-19T07:00:00Z"
+    )
+
+    assert response.status_code == 200
+    assert _stores(db) == [("shopify", "acme", None)]
+
+
+def test_a_grant_written_at_the_event_time_goes(client, shopify_db):
+    _, db, user, _ = shopify_db
+    grant = _grant(user)
+    grant.created_at = datetime(2026, 11, 19, 7, 0, tzinfo=timezone.utc)
+    db.add(grant)
+    db.commit()
+    response = _post(
+        client, "app/uninstalled", UNINSTALLED, triggered_at="2026-11-19T07:00:00Z"
+    )
+    assert response.status_code == 200
+    assert _stores(db) == []
+
+
+def test_shop_redact_keeps_a_reinstall_from_the_48_hours_before_it(client, shopify_db):
+    """shop/redact comes 48 hours after the uninstall; a merchant who
+    reinstalled in between keeps the new grant, and older ones go."""
+    _, db, user, other = shopify_db
+    redact_at = datetime(2026, 11, 21, 7, 0, tzinfo=timezone.utc)
+    reinstalled = _grant(user)
+    reinstalled.created_at = redact_at - timedelta(hours=40)
+    before_uninstall = _grant(other)
+    before_uninstall.created_at = redact_at - timedelta(hours=50)
+    db.add_all([reinstalled, before_uninstall])
+    db.commit()
+
+    response = _post(
+        client, "shop/redact", SHOP_REDACT, triggered_at="2026-11-21T07:00:00Z"
+    )
+
+    assert response.status_code == 200
+    db.expire_all()
+    assert [grant.user_id for grant in db.query(UserOAuth).all()] == [user.id]
+
+
+@pytest.mark.parametrize("triggered_at", [None, "yesterday", "2026-11-19T07:00:00"])
+def test_without_a_usable_event_time_every_grant_for_the_store_goes(
+    client, shopify_db, triggered_at
+):
+    _, db, user, _ = shopify_db
+    grant = _grant(user)
+    grant.updated_at = datetime.now(timezone.utc) + timedelta(days=1)
+    db.add(grant)
+    db.commit()
+    response = _post(client, "app/uninstalled", UNINSTALLED, triggered_at=triggered_at)
+    assert response.status_code == 200
+    assert _stores(db) == []
+
+
+@pytest.mark.parametrize("body", [b"not json", b"[]", b"null"])
+def test_a_signed_body_that_is_not_a_json_object_is_refused(client, body):
+    response = _post(client, "shop/redact", None, body=body)
+    assert response.status_code == 400
+
+
+def test_uninstall_leaves_a_reconnect_tombstone_and_redact_removes_it(
+    client, shopify_db
+):
+    """Like a grant whose refresh failed for good (tools/config.py), the row
+    stays with no credentials, so the connector asks its owner to reconnect;
+    shop/redact then deletes it, even though clearing it moved updated_at past
+    the uninstall."""
+    _, db, user, other = shopify_db
+    uninstalled_at = datetime(2026, 11, 19, 7, 0, tzinfo=timezone.utc)
+    grant = _grant(user, actor="actor:toby:1")
+    grant.created_at = uninstalled_at - timedelta(days=3)
+    grant.expires_at = uninstalled_at + timedelta(hours=1)
+    db.add_all([grant, _grant(other, store="beta", gid="2")])
+    db.commit()
+
+    response = _post(
+        client, "app/uninstalled", UNINSTALLED, triggered_at="2026-11-19T07:00:00Z"
+    )
+
+    assert response.status_code == 200
+    assert _stores(db) == [("shopify", "beta", None)]
+    assert _tombstones(db) == [("acme", "actor:toby:1")]
+    assert db.query(UserOAuth).count() == 2
+
+    response = _post(
+        client, "shop/redact", SHOP_REDACT, triggered_at="2026-11-21T07:00:00Z"
+    )
+
+    assert response.status_code == 200
+    assert _tombstones(db) == []
+    assert _stores(db) == [("shopify", "beta", None)]
+    assert db.query(UserOAuth).count() == 1
+
+
+def test_a_boolean_shop_id_names_no_shop(client, shopify_db):
+    _, db, user, _ = shopify_db
+    grant = _grant(user)
+    grant.provider_user_id = "gid://shopify/Shop/True"
+    db.add(grant)
+    db.commit()
+    response = _post(client, "app/uninstalled", {"id": True, "myshopify_domain": None})
+    assert response.status_code == 200
+    assert _stores(db) == [("shopify", "acme", None)]
+
+
+def test_read_matches_header_names_in_any_case():
+    body = json.dumps(SHOP_REDACT).encode()
+    webhook = shopify_webhooks.read_shopify_webhook(
+        body,
+        {
+            "X-Shopify-Hmac-Sha256": _signature(body),
+            "X-Shopify-Topic": "shop/redact",
+        },
+        client_secret=CLIENT_SECRET,
+    )
+    assert (webhook.topic, webhook.store) == ("shop/redact", "acme")
+
+
+def test_a_delivery_naming_no_store_matches_no_grant(shopify_db):
+    _, db, user, _ = shopify_db
+    db.add(_grant(user))
+    db.commit()
+    webhook = shopify_webhooks.ShopifyWebhook(
+        topic="app/uninstalled",
+        store=None,
+        shop_gid=None,
+        triggered_at=None,
+        webhook_id=None,
+    )
+    assert shopify_webhooks._clear_store_grants(db, webhook) == (0, 0)
+    assert _stores(db) == [("shopify", "acme", None)]
+
+
+# ---------- customer topics ---------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "topic,payload",
+    [
+        ("customers/redact", CUSTOMERS_REDACT),
+        ("customers/data_request", CUSTOMERS_DATA_REQUEST),
+    ],
+)
+def test_customer_topics_are_acknowledged_without_touching_grants(
+    client, shopify_db, caplog, topic, payload
+):
+    """We keep no per-customer records, so these change nothing; the log line
+    names the store and topic but never the customer."""
+    _, db, user, _ = shopify_db
+    db.add(_grant(user))
+    db.commit()
+    with caplog.at_level(logging.INFO):
+        response = _post(client, topic, payload)
+    assert response.status_code == 200
+    assert _stores(db) == [("shopify", "acme", None)]
+    assert any(topic in record.getMessage() for record in caplog.records)
+    logged = "\n".join(record.getMessage() for record in caplog.records)
+    assert "jane@customer.example" not in logged
+    assert "555-625-1199" not in logged
+    assert "207119551" not in logged
+
+
+def test_an_unknown_topic_is_acknowledged_and_ignored(client, shopify_db):
+    _, db, user, _ = shopify_db
+    db.add(_grant(user))
+    db.commit()
+    response = _post(client, "orders/create", {"id": 1})
+    assert response.status_code == 200
+    assert _stores(db) == [("shopify", "acme", None)]
+
+
+# ---------- reuse ------------------------------------------------------------
+
+
+def test_the_provider_row_secret_wins_over_the_environment(shopify_db, monkeypatch):
+    """Resolved like the connector's own OAuth client: row first, then env."""
+    from xagent.core.utils.encryption import encrypt_value
+
+    _, db, _, _ = shopify_db
+    monkeypatch.setenv("SHOPIFY_CLIENT_SECRET", "env-secret")
+    assert shopify_webhooks.shopify_webhook_secret(db) == "env-secret"
+    row = db.query(OAuthProvider).filter_by(provider_name="shopify").one()
+    row.client_secret = encrypt_value("row-secret")
+    db.commit()
+    assert shopify_webhooks.shopify_webhook_secret(db) == "row-secret"
+
+
+def test_the_route_is_registered_on_the_web_app():
+    from xagent.web.app import app
+
+    assert "post" in app.openapi()["paths"][PATH]

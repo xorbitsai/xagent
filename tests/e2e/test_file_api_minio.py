@@ -450,7 +450,9 @@ async def test_create_kb_from_file_tool_restores_durable_only_upload_from_minio(
         fake_run_document_ingestion,
     )
 
-    tool = CreateKnowledgeBaseFromFileTool(user_id=user.id, is_admin=False)
+    tool = CreateKnowledgeBaseFromFileTool(
+        user_id=user.id, is_admin=False, embedding_model_id=None
+    )
     result = await tool.run_json_async(
         {"file_ids": [seeded.file_id], "collection_name": "agent_file_kb"}
     )

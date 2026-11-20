@@ -1,7 +1,7 @@
 import logging
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
-from ...core.RAG_tools.core.schemas import IngestionConfig
+from ...core.RAG_tools.core.schemas import DEFAULT_EMBEDDING_MODEL_ID, IngestionConfig
 
 logger = logging.getLogger(__name__)
 
@@ -18,6 +18,16 @@ def _get_tool_compatibility_facade() -> "KBToolCompatibilityFacade":
     from ...core.RAG_tools.kb import get_kb_coordinator
 
     return get_kb_coordinator().tool_compatibility
+
+
+def requested_embedding_model_id(
+    default_model_id: Optional[str], collection_existed_before: bool
+) -> str:
+    # Existing collections keep the legacy literal (publishing merges it into the
+    # config row); their bound model wins at ingest.
+    if default_model_id and not collection_existed_before:
+        return default_model_id
+    return DEFAULT_EMBEDDING_MODEL_ID
 
 
 class AgentKnowledgeBaseService:

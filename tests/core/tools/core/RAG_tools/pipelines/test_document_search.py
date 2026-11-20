@@ -5,6 +5,7 @@ from __future__ import annotations
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, List
 from unittest.mock import MagicMock, patch
 
@@ -650,3 +651,63 @@ def test_hybrid_partial_success_uses_warning_message(
 
     assert result.status == "partial_success"
     assert result.message == "Hybrid search completed with warnings"
+
+
+@pytest.mark.parametrize(
+    "model_name", ["qwen3-embedding-0.6b", "Qwen/Qwen3-Embedding-0.6B"]
+)
+def test_encode_query_vector_prefixes_qwen3_instruction(model_name: str) -> None:
+    adapter = MagicMock()
+    adapter.encode.return_value = [0.1, 0.2]
+
+    vector = document_search._encode_query_vector(adapter, "what is x", model_name)
+
+    assert vector == [0.1, 0.2]
+    adapter.encode.assert_called_once_with(
+        "Instruct: Given a search query, retrieve relevant passages that answer "
+        "the query\nQuery: what is x"
+    )
+
+
+@pytest.mark.parametrize("model_name", ["text-embedding-v4", None])
+def test_encode_query_vector_keeps_raw_query_for_other_models(
+    model_name: str | None,
+) -> None:
+    adapter = MagicMock()
+    adapter.encode.return_value = [0.1, 0.2]
+
+    document_search._encode_query_vector(adapter, "what is x", model_name)
+
+    adapter.encode.assert_called_once_with("what is x")
+
+
+def test_search_documents_passes_resolved_model_name_to_query_encoding(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter = MagicMock()
+    adapter.encode.side_effect = RuntimeError("stop after encode")
+    monkeypatch.setattr(
+        "xagent.core.tools.core.RAG_tools.management.collection_manager."
+        "resolve_effective_embedding_model_sync",
+        lambda _collection, model_id: model_id,
+    )
+    monkeypatch.setattr(
+        document_search,
+        "resolve_embedding_adapter",
+        lambda *args, **kwargs: (
+            SimpleNamespace(model_name="Qwen/Qwen3-Embedding-0.6B"),
+            adapter,
+        ),
+    )
+
+    document_search.search_documents(
+        collection="qwen3_collection",
+        query_text="what is x",
+        config=SearchConfig(
+            search_type=SearchType.DENSE, embedding_model_id="qwen3-hub-id"
+        ),
+    )
+
+    adapter.encode.assert_called_once_with(
+        document_search.QWEN3_EMBEDDING_QUERY_INSTRUCTION + "what is x"
+    )

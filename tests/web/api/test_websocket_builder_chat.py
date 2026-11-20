@@ -152,6 +152,7 @@ async def test_handle_builder_chat_basic() -> None:
             authorized_file_ids=("owned-file",),
             llm=mock_llm,
             compact_llm=mock_compact_llm,
+            embedding_model_id="user-default-embedding",
         )
     )
 
@@ -222,6 +223,12 @@ async def test_handle_builder_chat_basic() -> None:
             "create_knowledge_base_from_file",
             "create_knowledge_base_from_url",
         } <= mounted_tool_names
+        assert {
+            tool.embedding_model_id
+            for tool in call_kwargs["tools"]
+            if getattr(tool, "name", None)
+            in {"create_knowledge_base_from_file", "create_knowledge_base_from_url"}
+        } == {"user-default-embedding"}
         mock_agent_service.set_allowed_skills.assert_called_once_with(["agent-builder"])
         mock_agent_service.set_recovered_skill_context.assert_called_once()
         mock_agent_service.set_outbound_message_handler.assert_called_once()

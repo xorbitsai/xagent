@@ -349,6 +349,24 @@ describe("AgentBuilder instructions paste", () => {
     expect(editor.querySelectorAll("br")).toHaveLength(3)
     expect(banner()).toBeNull()
     expectSingleTruncationToast(1)
+    expect(window.getSelection()!.anchorNode).toBe(editor)
+    expect(window.getSelection()!.anchorOffset).toBe(3)
+  })
+
+  it("trims only the overflow from a multi-line paste inside a run of line breaks", async () => {
+    const editor = await renderWithInstructions("x\n\n\n" + "y".repeat(MAX - 8), "x" + "y".repeat(MAX - 8))
+    editor.focus()
+    const range = document.createRange()
+    range.setStart(editor, 3) // between the second and third <br>
+    range.collapse(true)
+    const selection = window.getSelection()!
+    selection.removeAllRanges()
+    selection.addRange(range)
+
+    paste(editor, "bb\ncc")
+
+    expect(editor.textContent).toBe("xbbc" + "y".repeat(MAX - 8))
+    expectSingleTruncationToast(1)
   })
 
   it("truncates typing past the limit and toasts once", async () => {

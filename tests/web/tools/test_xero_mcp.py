@@ -974,17 +974,99 @@ def test_overdue_without_a_threshold_has_no_crossing_fields(fake: FakeXero) -> N
     assert "passes_threshold_on" not in result["invoices"][0]
 
 
+def test_overdue_threshold_defaults_to_a_seven_day_window(fake: FakeXero) -> None:
+    fake.responder = _overdue_pages(
+        [
+            [
+                _invoice("INV-23", "2026-10-28", 23),
+                _invoice("INV-24", "2026-10-27", 24),
+                _invoice("INV-30", "2026-10-21", 30),
+            ]
+        ]
+    )
+
+    result = _call_tool(
+        "list_overdue_invoices", asOfDate="2026-11-20", passesDaysOverdue=30
+    )
+
+    assert [inv["invoice_number"] for inv in result["invoices"]] == ["INV-30", "INV-24"]
+    crossing = result["threshold_crossing"]
+    assert crossing["within_days"] == 7
+    assert crossing["days_overdue_from"] == 24
+    assert crossing["window_end"] == "2026-11-27"
+
+
+def test_overdue_threshold_accepts_a_window_as_long_as_the_threshold(
+    fake: FakeXero,
+) -> None:
+    # Within 5 days of 20 Nov, 1 to 5 days overdue go past 5 days overdue.
+    fake.responder = _overdue_pages(
+        [
+            [
+                _invoice("INV-6", "2026-11-14", 6),
+                _invoice("INV-5", "2026-11-15", 5),
+                _invoice("INV-1", "2026-11-19", 1),
+            ]
+        ]
+    )
+
+    result = _call_tool(
+        "list_overdue_invoices",
+        asOfDate="2026-11-20",
+        passesDaysOverdue=5,
+        withinDays=5,
+    )
+
+    invoices = {inv["invoice_number"]: inv for inv in result["invoices"]}
+    assert list(invoices) == ["INV-5", "INV-1"]
+    assert invoices["INV-1"]["passes_threshold_on"] == "2026-11-25"
+    assert result["threshold_crossing"]["days_overdue_from"] == 1
+    assert result["threshold_crossing"]["window_end"] == "2026-11-25"
+
+
+def test_overdue_threshold_rule_follows_a_narrower_min_days(fake: FakeXero) -> None:
+    fake.responder = _overdue_pages(
+        [
+            [
+                _invoice("INV-24", "2026-10-27", 24),
+                _invoice("INV-27", "2026-10-24", 27),
+                _invoice("INV-30", "2026-10-21", 30),
+            ]
+        ]
+    )
+
+    result = _call_tool(
+        "list_overdue_invoices",
+        asOfDate="2026-11-20",
+        passesDaysOverdue=30,
+        withinDays=7,
+        minDaysOverdue=27,
+    )
+
+    assert [inv["invoice_number"] for inv in result["invoices"]] == ["INV-30", "INV-27"]
+    crossing = result["threshold_crossing"]
+    assert crossing["days_overdue_from"] == 27
+    # The 27-day invoice is the last to pass, on 24 Nov.
+    assert crossing["window_end"] == "2026-11-24"
+    assert crossing["rule"].startswith("Invoices 27-30 days overdue on 2026-11-20")
+    assert "2026-11-21 and 2026-11-24" in crossing["rule"]
+
+
 @pytest.mark.parametrize(
-    ("threshold", "within"),
-    [(0, 1), (30, 0), (5, 6)],
+    "arguments",
+    [
+        {"passesDaysOverdue": 0, "withinDays": 1},
+        {"passesDaysOverdue": 30, "withinDays": 0},
+        {"passesDaysOverdue": 5, "withinDays": 6},
+        {"passesDaysOverdue": 30, "minDaysOverdue": 40},
+        {"withinDays": 7},
+    ],
 )
 def test_overdue_rejects_an_impossible_threshold_window(
-    fake: FakeXero, threshold: int, within: int
+    fake: FakeXero, arguments: dict[str, int]
 ) -> None:
     with pytest.raises(ValueError, match="passesDaysOverdue|withinDays"):
-        xero.list_overdue_invoices(
-            asOfDate="2026-11-20", passesDaysOverdue=threshold, withinDays=within
-        )
+        xero.list_overdue_invoices(asOfDate="2026-11-20", **arguments)
 
     assert [call for call in fake.calls if "params" in call] == []
 

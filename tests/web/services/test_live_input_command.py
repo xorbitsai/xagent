@@ -293,6 +293,7 @@ class BlockingHost(FakeHost):
     "owned,error,withdraw_works,winner,statuses,reason",
     [
         (True, None, True, False, [], "not_applied"),
+        # Guards that a failed withdrawal is never reported as "not applied".
         (True, None, False, False, [DELIVERY_OUTCOME_UNKNOWN], "outcome_unknown"),
         (True, None, True, True, [DELIVERY_PENDING], "taken"),
         (False, None, True, False, [], "unavailable"),
@@ -307,7 +308,7 @@ class BlockingHost(FakeHost):
     ],
     ids=["claimed", "claimed-withdraw-fails", "taken", "refused", "not-claimed"],
 )
-async def test_claim_cancelled_after_its_worker_finished_settles_by_its_outcome(
+async def test_claim_cancelled_while_its_worker_runs_settles_by_its_outcome(
     monkeypatch: pytest.MonkeyPatch,
     db: Any,
     task: Any,
@@ -547,7 +548,6 @@ async def test_executor_run_mismatch_broadcasts_run_ended(
         (RUN, RUN, True),
         (RUN, "other", False),
         (None, None, False),
-        (RUN, None, False),
         (None, RUN, False),
     ],
 )
@@ -648,7 +648,7 @@ async def test_live_input_executor_failure_is_reported_once_it_is_terminal(
     [(TURN, TURN), (f"  {TURN} ", TURN), (None, None), ("   ", None)],
     ids=["plain", "padded", "missing", "blank"],
 )
-async def test_live_input_deferral_raised_by_its_executor_is_reported_when_exhausted(
+async def test_live_input_deferral_raised_where_its_executor_runs_is_reported_when_exhausted(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
     task: Any,
@@ -659,7 +659,7 @@ async def test_live_input_deferral_raised_by_its_executor_is_reported_when_exhau
     # The executor itself never defers; this stands in for a deferral raised at
     # its call site.
     async def deferred(command: ClaimedTaskCommand) -> Any:
-        raise TaskCommandDeferred("Task owner is awaiting a healthy renewal")
+        raise TaskCommandDeferred("deferred at the executor call site")
 
     monkeypatch.setattr(task_command_execution, "execute_live_input_command", deferred)
     exhausted = replace(

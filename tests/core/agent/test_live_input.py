@@ -467,6 +467,7 @@ async def test_offer_while_a_taken_message_is_admitted() -> None:
     same = RecordingAdmission()
     other = RecordingAdmission()
     answers: list[LiveInputOffer] = []
+    background: list[asyncio.Future[None]] = []
     rig = make_rig([tool_calls("w1"), final_answer()], ("w1",))
 
     async def repeat_offers() -> None:
@@ -474,16 +475,18 @@ async def test_offer_while_a_taken_message_is_admitted() -> None:
             if "claim" in first.events:
                 break
             await asyncio.sleep(0.005)
+        assert "claim" in first.events
         answers.append(rig.offer(same, turn_id="dup"))
         answers.append(rig.offer(other, turn_id="dup", text=LIVE_TEXT + "-other"))
         gate.set()
 
     async def on_start(_: str) -> None:
         assert rig.offer(first, turn_id="dup") is LiveInputOffer.QUEUED
-        asyncio.ensure_future(repeat_offers())
+        background.append(asyncio.ensure_future(repeat_offers()))
 
     rig.tools["w1"].on_start = on_start
     result = await rig.start()
+    await asyncio.gather(*background)
     assert result["success"] is True
     assert answers == [LiveInputOffer.ALREADY_QUEUED, LiveInputOffer.CONFLICT]
     assert first.events == ["claim", LiveInputResult.APPLIED]

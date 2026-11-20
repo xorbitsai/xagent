@@ -753,7 +753,14 @@ def test_microsoft_bare_login_sets_prompt_select_account(db_session, provider_na
     assert qs.get("prompt") == ["select_account"]
 
 
-@pytest.mark.parametrize("app_id", ["onedrive", "sharepoint", "planner"])
+MICROSOFT_APP_IDS = sorted(
+    row["app_id"]
+    for row in get_builtin_public_mcp_app_rows()
+    if row["provider_name"] == "microsoft"
+)
+
+
+@pytest.mark.parametrize("app_id", MICROSOFT_APP_IDS)
 def test_microsoft_connector_login_sets_prompt_select_account(db_session, app_id):
     """Connector (app-scoped) connects share the bare login's authorize
     request, so every Microsoft Graph connector must show the account
@@ -762,7 +769,6 @@ def test_microsoft_connector_login_sets_prompt_select_account(db_session, app_id
     token = _token_for(user)
     app_row = get_builtin_public_mcp_app(app_id)
     assert app_row is not None
-    assert app_row["provider_name"] == "microsoft"
     db.add(PublicMCPApp(**app_row))
     db.commit()
 
@@ -1135,13 +1141,6 @@ def test_excel_login_requests_refresh_permission(db_session):
     assert resp.status_code == 307
     scopes = parse_qs(urlparse(_location(resp)).query)["scope"][0].split()
     assert set(scopes) == {"User.Read", "Files.ReadWrite", "offline_access"}
-
-
-MICROSOFT_APP_IDS = sorted(
-    row["app_id"]
-    for row in get_builtin_public_mcp_app_rows()
-    if row["provider_name"] == "microsoft"
-)
 
 
 def test_microsoft_app_id_discovery_is_not_empty():

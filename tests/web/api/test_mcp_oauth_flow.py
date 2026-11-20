@@ -1918,6 +1918,105 @@ def test_default_mcp_oauth_redirect_uri_prefers_public_api_base(monkeypatch):
     )
 
 
+def test_mcp_oauth_callback_base_url_moves_only_the_advertised_callback(
+    monkeypatch,
+):
+    monkeypatch.setenv("XAGENT_PUBLIC_API_BASE_URL", "https://api.xagent.test/")
+    site_callback = "https://api.xagent.test/api/mcp/oauth/callback"
+    # Compose passes an unset variable through as an empty string.
+    monkeypatch.setenv("XAGENT_MCP_OAUTH_CALLBACK_BASE_URL", "")
+    assert mcp_api._default_mcp_oauth_redirect_uri() == site_callback
+
+    monkeypatch.setenv("XAGENT_MCP_OAUTH_CALLBACK_BASE_URL", " https://brand.test/ ")
+
+    assert mcp_api._default_mcp_oauth_redirect_uri() == (
+        "https://brand.test/api/mcp/oauth/callback"
+    )
+    assert mcp_api._mcp_oauth_callback_site_redirect_uri() == site_callback
+
+
+@pytest.mark.asyncio
+async def test_dynamic_registration_advertises_the_configured_callback_base(
+    db_session, monkeypatch
+):
+    db, user, _ = db_session
+    monkeypatch.setenv("XAGENT_PUBLIC_API_BASE_URL", "https://api.xagent.test")
+    monkeypatch.setenv("XAGENT_MCP_OAUTH_CALLBACK_BASE_URL", "https://brand.test")
+    server = _add_mcp_oauth_server(
+        db,
+        user,
+        client_id="",
+        client_secret=None,
+        redirect_uri=None,
+        token_endpoint_auth_method="none",
+    )
+    registration_calls: list[str] = []
+
+    async def fake_discover(*args, **kwargs):
+        return _discovery()
+
+    async def fake_register(_server, *, redirect_uri, client_name):
+        registration_calls.append(redirect_uri)
+        return SimpleNamespace(
+            client_id="brand-client", token_endpoint_auth_method="none"
+        )
+
+    monkeypatch.setattr(mcp_api, "discover_mcp_oauth_metadata", fake_discover)
+    monkeypatch.setattr(mcp_api, "register_mcp_oauth_public_client", fake_register)
+
+    response = await connect_mcp_oauth(
+        server.id,
+        MCPOAuthConnectRequest(redirect_after="/settings/mcp"),
+        user,
+        db,
+    )
+
+    advertised = "https://brand.test/api/mcp/oauth/callback"
+    assert registration_calls == [advertised]
+    query = parse_qs(urlparse(response.headers["location"]).query)
+    assert query["redirect_uri"] == [advertised]
+    client = db.query(MCPOAuthClient).one()
+    assert client.redirect_uri == advertised
+    assert client.registration_lookup_hash == mcp_oauth_client_registration_lookup_hash(
+        server.id,
+        "https://auth.example.com",
+        advertised,
+        client_name=None,
+    )
+
+
+@pytest.mark.asyncio
+async def test_preregistered_client_keeps_the_deployment_callback(
+    db_session, monkeypatch
+):
+    db, user, _ = db_session
+    monkeypatch.setenv("XAGENT_PUBLIC_API_BASE_URL", "https://api.xagent.test")
+    monkeypatch.setenv("XAGENT_MCP_OAUTH_CALLBACK_BASE_URL", "https://brand.test")
+    server = _add_mcp_oauth_server(db, user, redirect_uri=None)
+
+    async def fake_discover(*args, **kwargs):
+        return _discovery()
+
+    async def fail_dcr(*args, **kwargs):
+        raise AssertionError("a pre-registered client must not register")
+
+    monkeypatch.setattr(mcp_api, "discover_mcp_oauth_metadata", fake_discover)
+    monkeypatch.setattr(mcp_api, "register_mcp_oauth_public_client", fail_dcr)
+
+    response = await connect_mcp_oauth(
+        server.id,
+        MCPOAuthConnectRequest(redirect_after="/settings/mcp"),
+        user,
+        db,
+    )
+
+    site_callback = "https://api.xagent.test/api/mcp/oauth/callback"
+    query = parse_qs(urlparse(response.headers["location"]).query)
+    assert query["client_id"] == ["client-123"]
+    assert query["redirect_uri"] == [site_callback]
+    assert db.query(MCPOAuthClient).one().redirect_uri == site_callback
+
+
 @pytest.mark.asyncio
 async def test_connect_without_client_id_or_registration_endpoint_requires_preregistration(
     db_session, monkeypatch
@@ -3470,6 +3569,9 @@ async def test_callback_exchanges_code_and_stores_encrypted_grant(
     db_session, monkeypatch
 ):
     monkeypatch.setenv("XAGENT_APP_BASE_URL", "https://app.example.com/")
+    # The token request must repeat the client row's redirect URI, not
+    # whatever this deployment would advertise now.
+    monkeypatch.setenv("XAGENT_MCP_OAUTH_CALLBACK_BASE_URL", "https://brand.test")
     db, user, _ = db_session
     server = _add_mcp_oauth_server(db, user)
     client = _add_oauth_client(
@@ -3512,6 +3614,9 @@ async def test_callback_exchanges_code_and_stores_encrypted_grant(
         assert form["code_verifier"] == "verifier-123"
         assert form["resource"] == "https%3A%2F%2Fmcp.example.com%2Fmcp"
         assert form["client_secret"] == "client-secret"
+        assert form["redirect_uri"] == (
+            "https%3A%2F%2Fxagent.example.com%2Fapi%2Fmcp%2Foauth%2Fcallback"
+        )
         return httpx.Response(
             200,
             json={

@@ -239,7 +239,7 @@ function WebhookSecretsAlert({
 }
 
 export function AgentBuilder({ agentId }: AgentBuilderProps) {
-  const MAX_INSTRUCTIONS_LENGTH = 8192;
+  const MAX_INSTRUCTIONS_LENGTH = 10000;
   const { state, setTaskId, sendMessage, dispatch, closeFilePreview } = useApp()
   const { t, locale } = useI18n()
   const { apps: officialApps, getAppIcon, refresh: refreshMcpApps } = useMcpApps()
@@ -570,7 +570,17 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
     let text = serializeInstructionsContent(editor);
 
     if (text.length > MAX_INSTRUCTIONS_LENGTH) {
+      const droppedCount = text.length - MAX_INSTRUCTIONS_LENGTH;
       text = text.substring(0, MAX_INSTRUCTIONS_LENGTH);
+      // A fixed id keeps repeated truncations (e.g. typing at the limit)
+      // updating one toast instead of stacking new ones.
+      toast.warning(
+        t("builds.configForm.instructions.truncatedToast", {
+          max: MAX_INSTRUCTIONS_LENGTH.toLocaleString(),
+          dropped: droppedCount.toLocaleString(),
+        }),
+        { id: "instructions-truncated" }
+      );
 
       let html = renderFileMentionsHtml(text);
 
@@ -600,19 +610,10 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
 
   const handleInstructionsPaste = (e: React.ClipboardEvent<HTMLDivElement>) => {
     e.preventDefault();
-    const text = normalizeLineBreaks(e.clipboardData.getData("text/plain"));
-
-    const currentLength = lastInstructionsRef.current.length;
-    const availableSpace = MAX_INSTRUCTIONS_LENGTH - currentLength;
-
-    if (availableSpace <= 0) {
-      return;
-    }
-
-    let textToInsert = text;
-    if (text.length > availableSpace) {
-      textToInsert = text.substring(0, availableSpace);
-    }
+    // Insert the full clipboard text. handleInstructionsInput (called below)
+    // enforces MAX_INSTRUCTIONS_LENGTH on the resulting content, which already
+    // accounts for any selection the paste replaced.
+    const textToInsert = normalizeLineBreaks(e.clipboardData.getData("text/plain"));
 
     const editor = instructionsRef.current;
     if (editor) {

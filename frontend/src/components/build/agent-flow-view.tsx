@@ -323,9 +323,14 @@ export function AgentFlowView({
     setInstructionsPopoverOpen(true)
   }
 
+  // Over-limit drafts are blocked from saving (with a visible counter) rather
+  // than truncated, so the user never loses text without seeing it.
+  const instructionsDraftOverLimit =
+    maxInstructionsLength !== undefined && instructionsDraft.length > maxInstructionsLength
+
   const saveInstructionsPopover = () => {
-    const value = maxInstructionsLength ? instructionsDraft.slice(0, maxInstructionsLength) : instructionsDraft
-    onInstructionsChange(value)
+    if (instructionsDraftOverLimit) return
+    onInstructionsChange(instructionsDraft)
     setInstructionsPopoverOpen(false)
   }
 
@@ -466,6 +471,25 @@ export function AgentFlowView({
                       className="min-h-[150px] font-mono text-xs"
                       autoFocus
                     />
+                    {maxInstructionsLength !== undefined && (
+                      <div
+                        className={cn(
+                          "text-right text-[11px]",
+                          instructionsDraftOverLimit ? "font-semibold text-destructive" : "text-muted-foreground"
+                        )}
+                      >
+                        {instructionsDraftOverLimit
+                          ? t("builds.editor.flow.instructionsPopover.overLimit", {
+                              count: instructionsDraft.length.toLocaleString(),
+                              max: maxInstructionsLength.toLocaleString(),
+                              excess: (instructionsDraft.length - maxInstructionsLength).toLocaleString(),
+                            })
+                          : t("builds.editor.flow.instructionsPopover.charCount", {
+                              count: instructionsDraft.length.toLocaleString(),
+                              max: maxInstructionsLength.toLocaleString(),
+                            })}
+                      </div>
+                    )}
                     <div className="text-[11px] text-muted-foreground">
                       {t("builds.editor.flow.instructionsPopover.note")}
                     </div>
@@ -473,7 +497,7 @@ export function AgentFlowView({
                       <Button size="sm" variant="outline" onClick={() => setInstructionsPopoverOpen(false)}>
                         {t("builds.editor.flow.instructionsPopover.cancel")}
                       </Button>
-                      <Button size="sm" onClick={saveInstructionsPopover}>
+                      <Button size="sm" onClick={saveInstructionsPopover} disabled={instructionsDraftOverLimit}>
                         {t("builds.editor.flow.instructionsPopover.save")}
                       </Button>
                     </div>

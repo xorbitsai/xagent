@@ -74,6 +74,7 @@ from ..mcp_apps import (
     get_app_for_mcp_server,
     get_catalog_mcp_oauth_credentials,
     is_user_owned_server,
+    load_catalog_entries,
     normalize_catalog_key,
     oauth_grant_keys_rejected_by_app_scope,
     restrict_to_app_scoped_oauth_grant,
@@ -5228,6 +5229,68 @@ async def connect_mcp_oauth_app_for_owner(
     )
     return await _connect_mcp_oauth_for_owner(
         cast(int, server.id),
+        request_data,
+        current_user,
+        db,
+        resource_owner_key=owner_key,
+        accept=accept,
+        persistence=_OAuthPersistence.CALLER,
+    )
+
+
+async def connect_mcp_oauth_server_for_owner(
+    server_id: int,
+    request_data: MCPOAuthConnectRequest,
+    current_user: User,
+    db: Session,
+    *,
+    resource_owner_key: str,
+    accept: str | None = None,
+) -> RedirectResponse | JSONResponse:
+    """Start MCP OAuth on one actor-private server for its trusted owner.
+
+    The actor-private hook (``services/actor_private_mcp.py``) must map
+    ``server_id`` to exactly this owner key, the executing user must hold an
+    active link to it, and it must not be a catalog server. Any other server
+    is answered with 404. The flow is stored under the owner key, and the
+    caller commits or rolls it back, as with ``connect_mcp_oauth_app_for_owner``.
+
+    The hook runs on the caller's session. If it fails, the session is rolled
+    back and the seam's ``ConnectorRuntimeError`` (503) is raised, as for the
+    team scope hooks. A hook that ends the caller's transaction is refused
+    with ``ConnectorHookSessionBoundaryError``.
+    """
+    from ..services.actor_private_mcp import (
+        actor_private_row_refused,
+        resolve_actor_private_mcp_servers_or_raise,
+    )
+
+    user_id = cast(int, current_user.id)
+    owner_key = _trusted_mcp_oauth_owner_key(resource_owner_key, user_id=user_id)
+    not_found = HTTPException(
+        status_code=status.HTTP_404_NOT_FOUND, detail="MCP server not found"
+    )
+    private_servers = resolve_actor_private_mcp_servers_or_raise(
+        db, user_id=user_id, session_boundary_checked=True
+    )
+    if private_servers.get(server_id) != owner_key:
+        raise not_found
+    _association, server = _get_user_mcp_server_or_404(
+        db, user_id=user_id, server_id=server_id, require_active=True
+    )
+    # The same rule the task builder applies: remote HTTP only, no catalog claim.
+    if actor_private_row_refused(server, load_catalog_entries(db)):
+        raise not_found
+    # Keep nested race-recovery savepoints inside one caller-owned transaction,
+    # as connect_mcp_oauth_app_for_owner does.
+    db.begin_nested()
+    logger.info(
+        "User %s starting trusted OAuth connect for actor-private MCP server %s",
+        user_id,
+        server_id,
+    )
+    return await _connect_mcp_oauth_for_owner(
+        server_id,
         request_data,
         current_user,
         db,

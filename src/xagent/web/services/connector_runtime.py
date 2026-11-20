@@ -1041,6 +1041,12 @@ def _load_visible_runtime_connectors(
     if missing:
         for server in db.query(MCPServer).filter(MCPServer.id.in_(missing)).all():
             mcp_by_id[int(server.id)] = server
+    # Actor-private servers carry no runtime connector views, whoever owns
+    # them (``actor_private_mcp``); a hook failure raises the typed error.
+    from .actor_private_mcp import resolve_actor_private_mcp_servers_or_raise
+
+    for sid in resolve_actor_private_mcp_servers_or_raise(db, user_id=user_id):
+        mcp_by_id.pop(sid, None)
     for sid, server in mcp_by_id.items():
         visible[ConnectorRef(cast(ConnectorType, CONNECTOR_TYPE_MCP), sid)] = server
 

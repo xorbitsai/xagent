@@ -160,6 +160,7 @@ async def list_connector_tools(
         user_id=user_id,
         server_id=server_id,
         connector_team_id=connector_team_id,
+        mcp_runtime_authorization_policy=mcp_runtime_authorization_policy,
     )
     if server is None:
         return ConnectorToolsResult(ConnectorToolsOutcome.NOT_FOUND, server_id)
@@ -272,7 +273,10 @@ async def list_actor_stdio_connector_tools(
     # propagates, as in the task's _load_mcp_server_configs; a scan failure
     # inside it is the task's config_load_failed.
     visible_query = _visible_server_query(
-        db, user_id=user_id, connector_team_id=connector_team_id
+        db,
+        user_id=user_id,
+        connector_team_id=connector_team_id,
+        mcp_runtime_authorization_policy=mcp_runtime_authorization_policy,
     )
     try:
         resolution = resolve_actor_mcp_stdio_configs(
@@ -317,29 +321,44 @@ async def list_actor_stdio_connector_tools(
 
 
 def find_visible_server(
-    db: Any, *, user_id: int, server_id: int, connector_team_id: int | None
+    db: Any,
+    *,
+    user_id: int,
+    server_id: int,
+    connector_team_id: int | None,
+    mcp_runtime_authorization_policy: MCPActorAuthorizationPolicy | None = None,
 ) -> Any | None:
     """The ``MCPServer`` row ``server_id`` if the task's config would see it.
 
     Visibility is the config's own: an active personal link, or ownership by
     the governing team ``connector_team_id``. With no team id this is exactly
-    the personal link check.
+    the personal link check. An actor-private server is found only under a
+    policy naming its owner, as in a task.
     """
     from ..models.mcp import MCPServer
 
     return (
-        _visible_server_query(db, user_id=user_id, connector_team_id=connector_team_id)
+        _visible_server_query(
+            db,
+            user_id=user_id,
+            connector_team_id=connector_team_id,
+            mcp_runtime_authorization_policy=mcp_runtime_authorization_policy,
+        )
         .filter(MCPServer.id == server_id)
         .first()
     )
 
 
 def _visible_server_query(
-    db: Any, *, user_id: int, connector_team_id: int | None
+    db: Any,
+    *,
+    user_id: int,
+    connector_team_id: int | None,
+    mcp_runtime_authorization_policy: MCPActorAuthorizationPolicy | None = None,
 ) -> Any:
     """The config's own ``_visible_mcp_server_query``, run with the team ids
-    resolved by the same function ``_load_mcp_server_configs`` uses, so the
-    two cannot drift."""
+    resolved by the same function ``_load_mcp_server_configs`` uses, and with
+    the caller's actor policy, so the two cannot drift."""
     from ..tools.config import WebToolConfig
     from .connector_team_scope import resolve_team_connector_selection_or_raise
 
@@ -347,7 +366,10 @@ def _visible_server_query(
         db, team_id=connector_team_id, log_subject=user_id
     )
     return WebToolConfig(
-        db=db, request=None, user_id=user_id
+        db=db,
+        request=None,
+        user_id=user_id,
+        mcp_runtime_authorization_policy=mcp_runtime_authorization_policy,
     )._visible_mcp_server_query(team_selection.mcp_ids)
 
 

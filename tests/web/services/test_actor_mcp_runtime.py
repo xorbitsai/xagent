@@ -721,7 +721,9 @@ async def test_reserved_collision_surfaces_distinct_unavailable_reason(
     monkeypatch.setattr(
         config,
         "_visible_mcp_server_query",
-        lambda _team_ids: SimpleNamespace(all=lambda: [collision]),
+        lambda _team_ids, _actor_private_servers=None: SimpleNamespace(
+            all=lambda: [collision]
+        ),
     )
     monkeypatch.setattr(
         "xagent.web.mcp_apps.classify_actor_builtin_oauth_server",
@@ -1123,7 +1125,7 @@ async def test_web_loader_appends_synthetic_config_without_env_source_queries(
     monkeypatch.setattr(
         config,
         "_visible_mcp_server_query",
-        lambda _team_ids: SimpleNamespace(all=lambda: []),
+        lambda _team_ids, _actor_private_servers=None: SimpleNamespace(all=lambda: []),
     )
 
     def forbidden(*_args: object, **_kwargs: object):
@@ -1158,7 +1160,9 @@ async def test_nonempty_ordinary_env_layers_never_leak_into_actor_config(
     monkeypatch.setattr(
         config,
         "_visible_mcp_server_query",
-        lambda _team_ids: SimpleNamespace(all=lambda: [ordinary]),
+        lambda _team_ids, _actor_private_servers=None: SimpleNamespace(
+            all=lambda: [ordinary]
+        ),
     )
     monkeypatch.setattr(
         "xagent.web.mcp_apps.classify_actor_builtin_oauth_server",
@@ -1261,7 +1265,7 @@ async def test_web_loader_keeps_chrome_identity_in_host_only_side_channel(
     monkeypatch.setattr(
         config,
         "_visible_mcp_server_query",
-        lambda _team_ids: SimpleNamespace(all=lambda: []),
+        lambda _team_ids, _actor_private_servers=None: SimpleNamespace(all=lambda: []),
     )
 
     result = await config._load_mcp_server_configs()
@@ -1297,7 +1301,7 @@ async def test_storage_to_tool_factory_uses_host_only_chrome_consumer(
     monkeypatch.setattr(
         config,
         "_visible_mcp_server_query",
-        lambda _team_ids: SimpleNamespace(all=lambda: []),
+        lambda _team_ids, _actor_private_servers=None: SimpleNamespace(all=lambda: []),
     )
     configs = await config._load_mcp_server_configs()
     pool = AsyncMock(spec=ChromeExecutionSessionPool)

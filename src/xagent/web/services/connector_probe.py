@@ -303,6 +303,7 @@ async def _run(
         user_id=int(user.id),
         server_id=server_id,
         connector_team_id=connector_team_id,
+        mcp_runtime_authorization_policy=mcp_runtime_authorization_policy,
     )
     if server is None:
         return ConnectorProbeResult(ConnectorProbeOutcome.NOT_FOUND, server_id)

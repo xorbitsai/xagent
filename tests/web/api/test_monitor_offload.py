@@ -16,6 +16,7 @@ from typing import Any, Awaitable, Callable
 
 import pytest
 from fastapi import HTTPException
+from fastapi.routing import APIRoute
 from sqlalchemy import event
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.exc import TimeoutError as SQLAlchemyTimeoutError
@@ -29,7 +30,7 @@ from xagent.web.api.monitor import (
     get_monitoring_stats,
     get_popular_tools,
 )
-from xagent.web.models.database import get_engine
+from xagent.web.models.database import get_db, get_engine
 from xagent.web.models.task import Task, TraceEvent
 from xagent.web.models.user import User
 
@@ -73,15 +74,33 @@ def _seed_admin(db: Session, *, username: str) -> User:
     return user
 
 
+OFFLOADED_ENDPOINTS = [
+    get_agents,
+    get_monitoring_stats,
+    get_popular_tools,
+    get_model_stats,
+    get_dashboard_stats,
+]
+
+
+def test_offloaded_endpoint_list_matches_router() -> None:
+    """Every database-backed monitoring route is covered by the thread test."""
+    db_routes = {
+        route.endpoint
+        for route in monitor_module.monitor_router.routes
+        if isinstance(route, APIRoute)
+        and any(
+            dependency.call is get_db
+            for dependency in getattr(route, "depend" + "ant").dependencies
+        )
+    }
+
+    assert db_routes == set(OFFLOADED_ENDPOINTS)
+
+
 @pytest.mark.parametrize(
     "endpoint",
-    [
-        get_agents,
-        get_monitoring_stats,
-        get_popular_tools,
-        get_model_stats,
-        get_dashboard_stats,
-    ],
+    OFFLOADED_ENDPOINTS,
     ids=["agents", "stats", "popular_tools", "model_stats", "dashboard_stats"],
 )
 async def test_monitor_queries_run_off_the_event_loop(
@@ -113,7 +132,7 @@ async def test_monitor_queries_run_off_the_event_loop(
         db.close()
 
 
-async def test_fifth_concurrent_request_is_refused_while_slots_are_full(
+async def test_request_is_refused_while_every_slot_is_taken(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """With every slot taken the next request fails at once instead of queueing."""
@@ -217,20 +236,27 @@ async def test_budget_and_pool_errors_map_to_503(
 async def test_other_sqlstate_stays_500() -> None:
     db = _direct_db_session()
     try:
+        raised: list[BaseException] = []
 
         def compute(_session: Session) -> None:
-            _raise_operational(_PgcodeOrig("40001"))
+            try:
+                _raise_operational(_PgcodeOrig("40001"))
+            except OperationalError as exc:
+                raised.append(exc)
+                raise
 
         with pytest.raises(HTTPException) as caught:
             await monitor_module._run_monitor_query("serialization", db, compute)
 
         assert caught.value.status_code == 500
-        assert caught.value.detail != UNAVAILABLE
+        assert caught.value.detail == str(raised[0])
     finally:
         db.close()
 
 
-async def test_non_budget_error_keeps_500_contract() -> None:
+async def test_non_budget_error_keeps_500_contract(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     db = _direct_db_session()
     try:
 
@@ -242,5 +268,60 @@ async def test_non_budget_error_keeps_500_contract() -> None:
 
         assert caught.value.status_code == 500
         assert caught.value.detail == "boom"
+        assert "Get failing failed: boom" in caplog.text
+    finally:
+        db.close()
+
+
+async def test_cancelled_request_keeps_slot_until_worker_finishes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A cancelled request holds its slot while its worker is still running."""
+    slots = asyncio.Semaphore(3)
+    monkeypatch.setattr(monitor_module, "_MONITOR_QUERY_SLOTS", slots)
+    db = _direct_db_session()
+    try:
+        started = threading.Event()
+        release = threading.Event()
+
+        def blocking(_session: Session) -> str:
+            started.set()
+            release.wait(timeout=30)
+            return "done"
+
+        task = asyncio.create_task(
+            monitor_module._run_monitor_query("cancelled", db, blocking)
+        )
+        try:
+            assert await asyncio.to_thread(started.wait, 10)
+            task.cancel()
+            await asyncio.sleep(0.2)
+
+            assert slots._value == 2
+            assert not task.done()
+        finally:
+            release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert slots._value == 3
+    finally:
+        db.close()
+
+
+async def test_slot_is_released_when_compute_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    slots = asyncio.Semaphore(3)
+    monkeypatch.setattr(monitor_module, "_MONITOR_QUERY_SLOTS", slots)
+    db = _direct_db_session()
+    try:
+
+        def compute(_session: Session) -> None:
+            raise ValueError("boom")
+
+        with pytest.raises(HTTPException):
+            await monitor_module._run_monitor_query("failing", db, compute)
+
+        assert slots._value == 3
     finally:
         db.close()

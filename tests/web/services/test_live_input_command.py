@@ -498,11 +498,16 @@ async def test_claim_error_before_write_leaves_foreign_row(
 
 
 @pytest.mark.parametrize(
-    "result",
-    [LiveInputResult.UNKNOWN, LiveInputResult.REFUSED, LiveInputResult.CONFLICT],
+    "result,reason",
+    [
+        (LiveInputResult.TAKEN, "taken"),
+        (LiveInputResult.UNKNOWN, "outcome_unknown"),
+        (LiveInputResult.REFUSED, "refused"),
+        (LiveInputResult.CONFLICT, "conflict"),
+    ],
 )
 async def test_unwritten_admission_never_touches_a_foreign_row(
-    db: Any, task: Any, published: list, result: LiveInputResult
+    db: Any, task: Any, published: list, result: LiveInputResult, reason: str
 ) -> None:
     winner = lic.DeliveryLedgerAdmission(payload_for(task), FakeHost(task.user_id))
     assert await winner.claim() is LiveInputClaim.CLAIMED
@@ -511,6 +516,7 @@ async def test_unwritten_admission_never_touches_a_foreign_row(
     await other.finish(result)
     await settle()
     assert [r.delivery_status for r in rows(db, task)] == [DELIVERY_PENDING]
+    assert [f["reason"] for f in published] == [reason]
 
 
 @pytest.mark.parametrize(
@@ -542,19 +548,6 @@ async def test_finish_after_claim_settles_the_row(
     await settle()
     assert [r.delivery_status for r in rows(db, task)] == [status]
     assert [f["reason"] for f in published] == [reason]
-
-
-async def test_taken_is_reported_without_touching_the_row(
-    db: Any, task: Any, published: list
-) -> None:
-    winner = lic.DeliveryLedgerAdmission(payload_for(task), FakeHost(task.user_id))
-    await winner.claim()
-    other = lic.DeliveryLedgerAdmission(payload_for(task), FakeHost(task.user_id))
-    assert await other.claim() is LiveInputClaim.TAKEN
-    await other.finish(LiveInputResult.TAKEN)
-    await settle()
-    assert [r.delivery_status for r in rows(db, task)] == [DELIVERY_PENDING]
-    assert [f["reason"] for f in published] == ["taken"]
 
 
 @pytest.mark.parametrize(

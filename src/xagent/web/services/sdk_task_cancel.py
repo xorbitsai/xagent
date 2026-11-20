@@ -942,9 +942,8 @@ def _close_cancelled_turn_no_commit(
     this codebase stages live input for sdk tasks; if a host ever does, this
     fallback can close that live input row instead of the running turn's, and
     callers must then pass ``turn_id``. A waiting or paused run has no such
-    guarantee -- a paused task
-    accepts an append -- and its turn's delivery was settled when the run
-    stopped, so only the line is written.
+    guarantee -- a paused task accepts an append -- and its turn's delivery
+    was settled when the run stopped, so only the line is written.
     Returns the closed turn's id.
     """
 

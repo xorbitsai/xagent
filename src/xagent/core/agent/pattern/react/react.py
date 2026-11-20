@@ -2836,12 +2836,12 @@ class ReActPattern(AgentPattern):
         checkpoint right after applying messages. The checkpoint each message
         writes for itself is built from the pattern state before that, so a
         run resumed from one has the message without its allowance. A run
-        resumes from such a checkpoint when it stops after a message was
-        written and before the safe point's checkpoint is written: for
-        example when it is cancelled during the safe point's admission, since
-        the cancellation is re-raised once the message being admitted is
-        finished, or when the process exits while a later message of the same
-        safe point is being written.
+        resumes from such a checkpoint when a message was written and the
+        safe point's checkpoint was not: for example when the run is
+        cancelled during the safe point's admission, since the cancellation
+        is held back only until the message being admitted finishes or
+        LIVE_INPUT_CANCEL_GRACE_SECONDS pass, or when the process exits while
+        a later message of the same safe point is being written.
         """
         return self.max_iterations + self.live_input_iteration_grant
 

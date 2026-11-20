@@ -1713,6 +1713,9 @@ async def test_live_input_iteration_grant_stops_at_max_iterations() -> None:
     assert len(rig.tools["w1"].calls) == 2 * max_iterations
     last_request = " ".join(str(m.get("content")) for m in rig.llm.requests[-1])
     assert all(f"{LIVE_TEXT}{index}" in last_request for index in range(3))
+    # The third safe point applied a message at the cap and still saved.
+    labels = [c["label"] for c in rig.runtimes[0].checkpoints]
+    assert labels.count("live_input_applied") == 3
 
 
 @pytest.mark.parametrize(
@@ -1780,8 +1783,8 @@ async def test_live_input_iteration_grant_survives_resume() -> None:
 async def test_iteration_limit_delivery_reports_the_grant() -> None:
     max_iterations = UNCAPPED_MAX_ITERATIONS
     rig = rig_with_offered_messages(
-        1,
-        [tool_calls("w1")] * (max_iterations + GRANT - 1)
+        [1, 1],
+        [tool_calls("w1")] * (max_iterations + 2 * GRANT - 2)
         + [final_answer(outcome="partial")],
         max_iterations=max_iterations,
     )
@@ -1791,8 +1794,8 @@ async def test_iteration_limit_delivery_reports_the_grant() -> None:
     assert result["success"] is True
     assert result["termination_reason"] == "max_iterations"
     assert result["iterations"] == max_iterations
-    assert result["live_input_iteration_grant"] == GRANT
-    assert len(rig.tools["w1"].calls) == max_iterations + GRANT
+    assert result["live_input_iteration_grant"] == GRANT * 2
+    assert len(rig.tools["w1"].calls) == max_iterations + GRANT * 2
 
 
 async def test_live_input_mixed_batch_grants_only_the_applied_message() -> None:

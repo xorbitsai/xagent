@@ -1438,6 +1438,8 @@ def list_overdue_invoices(
     minDaysOverdue: int = 1,
     skip: int = 0,
     limit: int = OVERDUE_DEFAULT_LIMIT,
+    passesDaysOverdue: int | None = None,
+    withinDays: int | None = None,
 ) -> str:
     """
     List ALL currently open overdue invoices in Xero, oldest due date first.
@@ -1447,10 +1449,13 @@ def list_overdue_invoices(
     returned, and this tool reads every page from Xero itself, so there is no
     need to call list_invoices page by page.
 
-    The result always carries the complete open-invoice picture in total_count,
-    total_amount_due_by_currency, ageing_buckets (1-30, 31-60, 61-90, 90+ days)
-    and by_contact (largest balances first), even when only part of the invoice
-    list fits in one response. When has_more is true, call again with next_skip
+    The result always carries the complete picture of the invoices selected
+    (all overdue invoices unless minDaysOverdue or passesDaysOverdue narrow
+    them) in total_count, total_amount_due_by_currency, ageing_buckets (1-30,
+    31-60, 61-90, 90+ days) and by_contact (largest balances first), even when
+    only part of the invoice list fits in one response. Do not report a
+    narrowed total_count as the overall overdue figure. When has_more is true,
+    call again with next_skip
     to read the remaining invoices. Each window re-scans the open ledger, so
     prefer the largest practical limit (up to 200) to conserve Xero's tenant
     request quota.
@@ -1465,12 +1470,53 @@ def list_overdue_invoices(
     type: ACCREC for customer invoices (default), ACCPAY for bills you owe.
     minDaysOverdue: only invoices at least this many days past due (default 1).
     skip, limit: window into the invoice list (limit 1-200, default 50).
+    passesDaysOverdue, withinDays: only invoices that will go past
+        passesDaysOverdue days overdue within the withinDays days after
+        asOfDate (default 7), i.e. those passesDaysOverdue - withinDays + 1 to
+        passesDaysOverdue days overdue on asOfDate. withinDays is only valid
+        with passesDaysOverdue; minDaysOverdue may narrow the window further
+        but not above passesDaysOverdue. An invoice exactly
+        passesDaysOverdue days overdue goes past it tomorrow and is included;
+        one already past it is not. Each invoice gets passes_threshold_on (the
+        first day it is more than passesDaysOverdue days overdue) and
+        days_until_past_threshold, and threshold_crossing states the rule.
+        Use these for questions such as "which invoices will pass 30 days
+        overdue in the next 7 days" and report the invoices returned instead
+        of working the window out yourself. Totals, ageing_buckets and
+        by_contact then cover only these invoices; call once without
+        passesDaysOverdue for the whole overdue picture.
     """
     as_of = _iso_date(asOfDate, "asOfDate") if asOfDate else _organisation_today()
     min_days = max(1, int(minDaysOverdue))
     skip = max(0, int(skip))
     limit = max(1, min(int(limit), OVERDUE_MAX_LIMIT))
+    threshold: int | None = None
+    within = 0
+    if passesDaysOverdue is None:
+        if withinDays is not None:
+            raise ValueError("withinDays requires passesDaysOverdue")
+    else:
+        threshold = int(passesDaysOverdue)
+        within = 7 if withinDays is None else int(withinDays)
+        if threshold < 1:
+            raise ValueError("passesDaysOverdue must be at least 1")
+        if not 1 <= within <= threshold:
+            raise ValueError("withinDays must be between 1 and passesDaysOverdue")
+        if min_days > threshold:
+            raise ValueError("minDaysOverdue cannot exceed passesDaysOverdue")
+        # An invoice d days overdue today is more than `threshold` days
+        # overdue after threshold + 1 - d days, so the window is
+        # threshold - within + 1 .. threshold days overdue today.
+        min_days = max(min_days, threshold - within + 1)
     overdue = _collect_open_invoices(as_of, type, contactIds, min_days_overdue=min_days)
+    if threshold is not None:
+        overdue = [view for view in overdue if view["days_overdue"] <= threshold]
+        for view in overdue:
+            days_left = threshold + 1 - view["days_overdue"]
+            view["passes_threshold_on"] = (
+                as_of + timedelta(days=days_left)
+            ).isoformat()
+            view["days_until_past_threshold"] = days_left
 
     overdue.sort(key=lambda view: (view["due_date"], view.get("invoice_number", "")))
     totals: dict[str, Decimal] = {}
@@ -1552,6 +1598,24 @@ def list_overdue_invoices(
             "has_more": has_more,
             "invoices": shown,
         }
+        if threshold is not None:
+            # The least overdue invoice selected is the last to pass.
+            window_end = as_of + timedelta(days=threshold + 1 - min_days)
+            payload["threshold_crossing"] = {
+                "passes_days_overdue": threshold,
+                "within_days": within,
+                "days_overdue_from": min_days,
+                "days_overdue_to": threshold,
+                "window_end": window_end.isoformat(),
+                "rule": (
+                    f"Invoices {min_days}-{threshold} days overdue on "
+                    f"{as_of.isoformat()}; each becomes more than {threshold} "
+                    f"days overdue between "
+                    f"{(as_of + timedelta(days=1)).isoformat()} and "
+                    f"{window_end.isoformat()}. Invoices already more than "
+                    f"{threshold} days overdue are not included."
+                ),
+            }
         if has_more:
             payload["next_skip"] = next_skip
         if truncated:

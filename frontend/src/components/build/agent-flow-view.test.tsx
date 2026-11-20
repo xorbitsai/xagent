@@ -178,3 +178,36 @@ describe("AgentFlowView", () => {
     })
   })
 })
+
+describe("AgentFlowView instructions popover limit", () => {
+  function openPopover() {
+    fireEvent.click(screen.getByText("builds.editor.flow.agent.edit"))
+    const textarea = document.querySelector("textarea") as HTMLTextAreaElement
+    expect(textarea.value).toBe("1. First step\n2. Second step")
+    return textarea
+  }
+
+  it("saves a draft within the limit unchanged", () => {
+    const props = makeProps({ maxInstructionsLength: 20 })
+    render(<AgentFlowView {...props} />)
+
+    fireEvent.change(openPopover(), { target: { value: "x".repeat(20) } })
+    expect(screen.getByText("builds.editor.flow.instructionsPopover.charCount")).toBeInTheDocument()
+    fireEvent.click(screen.getByText("builds.editor.flow.instructionsPopover.save"))
+
+    expect(props.onInstructionsChange).toHaveBeenCalledWith("x".repeat(20))
+  })
+
+  it("blocks saving an over-limit draft instead of truncating it", () => {
+    const props = makeProps({ maxInstructionsLength: 20 })
+    render(<AgentFlowView {...props} />)
+
+    fireEvent.change(openPopover(), { target: { value: "x".repeat(21) } })
+
+    expect(screen.getByText("builds.editor.flow.instructionsPopover.overLimit")).toBeInTheDocument()
+    const save = screen.getByText("builds.editor.flow.instructionsPopover.save").closest("button")!
+    expect(save).toBeDisabled()
+    fireEvent.click(save)
+    expect(props.onInstructionsChange).not.toHaveBeenCalled()
+  })
+})

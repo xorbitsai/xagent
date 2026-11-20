@@ -3220,6 +3220,8 @@ const zh = {
         instructionsPopover: {
           title: "指令",
           note: "Agent 节点上的计划步骤是从这段指令中推导出来的。",
+          charCount: "{count} / {max} 个字符",
+          overLimit: "{count} / {max} 个字符，需删除 {excess} 个字符才能保存。",
           cancel: "取消",
           save: "保存",
         },
@@ -3275,7 +3277,8 @@ const zh = {
         optimizing: "优化中...",
         optimizeError: "优化指令失败",
         optimizeSuccess: "优化指令成功",
-        maxLengthExceeded: "指令长度不能超过8kb，超出部分已截断",
+        maxLengthExceeded: "指令长度不能超过 {max} 个字符，超出部分已截断",
+        truncatedToast: "指令最多 {max} 个字符，已删除超出的 {dropped} 个字符。",
       },
       executionMode: {
         label: "执行模式",

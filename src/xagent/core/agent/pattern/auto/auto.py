@@ -261,6 +261,12 @@ class _AutoChildRuntime:
     async def fail_final_answer_stream(self, message_id: str, error: str) -> None:
         await self.parent.fail_final_answer_stream(message_id, error)
 
+    async def interrupt_final_answer_stream(self, message_id: str) -> None:
+        # Not reached: an auto run gets no mailbox, so no model request under
+        # it is given up for live input. Kept so this runtime offers every
+        # public coroutine of PatternRuntime.
+        await self.parent.interrupt_final_answer_stream(message_id)
+
     async def run_streaming_llm_call(
         self,
         llm: Any,

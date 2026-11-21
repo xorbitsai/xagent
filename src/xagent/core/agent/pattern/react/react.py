@@ -1411,7 +1411,7 @@ class ReActPattern(AgentPattern):
                 effective_tool_choice = compatible_tool_choice_for_llm(
                     call_llm, requested_tool_choice
                 )
-                llm_kwargs = {
+                llm_kwargs: dict[str, Any] = {
                     "messages": messages,
                     "tools": tool_schemas or None,
                     "tool_choice": effective_tool_choice,

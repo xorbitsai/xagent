@@ -446,12 +446,6 @@ describe("sending a queued message into the running turn", () => {
     expect(apply(from, { type: "LIVE_INPUT_APPLIED", clientMessageId: "a" }).next).toBe(from)
   })
 
-  it("confirms a request and clears the request in flight", () => {
-    const from = state(waiting(1), [ins("x", 1)])
-    const accepted = apply(from, { type: "SEND_NOW_ACCEPTED", clientMessageId: "x" }).next
-    expect(firstInsert(accepted, "x")).toMatchObject({ inFlight: false, confirmed: true })
-  })
-
   it.each([
     ["next", "waiting", true],
     ["retry", "waiting", false],

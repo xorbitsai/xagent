@@ -14675,12 +14675,24 @@ describe("session message queue", () => {
       expect(statuses()[0]).toBe("A:inserting")
     })
 
-    it("a returned message for another task does not change the queue", async () => {
+    it("a returned message for another task requires a reload and leaves the queue as it was", async () => {
       await startRunning()
       await sendNow("id-A")
       const before = queue()
       await returned("id-A", "run_ended", TASK + 1)
+      expect(getSessionControls().sessionConversationState).toBe("reload_required")
       expect(queue()).toBe(before)
+    })
+
+    it("ignores a returned message that names no task", async () => {
+      await startRunning()
+      await sendNow("id-A")
+      const before = queue()
+      await push({
+        type: "live_input_returned", timestamp: "2026-11-17T00:00:02Z", data: { turn_id: "id-A", reason: "run_ended" },
+      } as TestWebSocketMessage)
+      expect(queue()).toBe(before)
+      expect(statuses()[0]).toBe("A:inserting")
     })
 
     // Both server-side causes (an injection proven unwritten, a claim that failed

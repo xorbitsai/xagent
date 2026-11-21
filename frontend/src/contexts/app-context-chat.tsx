@@ -4544,6 +4544,8 @@ export function AppProvider({
             // it in. Only an echo that arrives after the conversation has
             // finished attaching counts, because the history replay draws the
             // bubble of a message that was withdrawn again too.
+            // Only the live Session socket reaches this with an attached conversation
+            // today; the flag keeps any other caller from marking a message applied.
             if (
               options?.liveSessionFrame
               && typeof eventData.turn_id === "string"
@@ -7784,6 +7786,8 @@ export function AppProvider({
       // The socket layer nests a frame it has no shape for: the server's own
       // fields (turn_id, reason) arrive inside `data`.
       const { turn_id: turnId, reason } = asMessageRecord(message.data)
+      // The checks above already end the session on a task id that is not the
+      // current one; the comparison stays so the frame is ignored if they change.
       if (
         binding.present
         && binding.valid

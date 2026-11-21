@@ -14383,8 +14383,10 @@ describe("session message queue", () => {
       type: "trace_event", task_id: TASK, timestamp: "2026-11-17T00:00:02Z",
       data: { event_id: `echo-${id}`, event_type: "user_message", data: { message: id, turn_id: id } },
     })
-    const returned = (id: string, reason: string) => push({
-      type: "live_input_returned", task_id: TASK, turn_id: id, reason, timestamp: "2026-11-17T00:00:02Z",
+    // The socket layer nests the server's own fields of a frame it has no
+    // shape for inside `data`; the provider is fed what that layer produces.
+    const returned = (id: string, reason: string, taskId = TASK) => push({
+      type: "live_input_returned", task_id: taskId, timestamp: "2026-11-17T00:00:02Z", data: { turn_id: id, reason },
     } as TestWebSocketMessage)
     // In steps, because a retry is scheduled by an effect that runs once the
     // step's updates have been applied.
@@ -14426,15 +14428,24 @@ describe("session message queue", () => {
     afterEach(() => { vi.useRealTimers() })
 
     it.each([
-      ["only a heartbeat", ["heartbeat"]],
-      ["attach completion", ["heartbeat", "conversation_attached"]],
-      ["new turns", CAPABILITIES],
-    ])("hides send-now and never sends it without the capability [%s]", async (_name, capabilities) => {
-      await startRunning(capabilities).catch(() => undefined)
+      ["only a heartbeat", ["heartbeat"], false],
+      ["attach completion", ["heartbeat", "conversation_attached"], false],
+      ["new turns", CAPABILITIES, true],
+    ])("hides send-now and never sends it without the capability [%s]", async (_name, capabilities, holdsMessages) => {
+      const server = makeServer({ status: "running", version: 3 })
+      sendChatMessageMock.mockImplementation(server.chat)
+      render(tree())
+      await connect(capabilities)
+      await push(taskInfoMessage(TASK, { status: "running", state_version: 3 }))
+      if (holdsMessages) {
+        expect(await submit("A")).toBe("queued")
+        expect(queue().items).toHaveLength(1)
+      }
       expect(getSessionControls().sendNowDelivery).toBe("unsupported")
+      const before = queue()
       await sendNow("id-A")
+      expect(queue()).toBe(before)
       expect(liveFrames()).toEqual([])
-      expect(queue().items.every(entry => entry.status !== "inserting")).toBe(true)
     })
 
     it("sends the message first, once, without a bubble of its own", async () => {
@@ -14607,6 +14618,22 @@ describe("session message queue", () => {
         expect(newTurnFrames()[0]).toEqual(["A", "id-A"])
       })
 
+      it("does not send again early when the turn ends while the retry waits", async () => {
+        const { server, live } = await startRunning()
+        live.reply = async (_id, attempt) => {
+          throw refusal(attempt === 1 ? "live_input_not_started" : "live_input_not_running")
+        }
+        await sendNow("id-A")
+        await push(server.end())
+        await push(server.snapshot())
+        expect(liveFrames()).toHaveLength(1)
+        await advance(999)
+        expect(liveFrames()).toHaveLength(1)
+        await advance(1)
+        expect(liveFrames()).toHaveLength(2)
+        expect(live.mostActive).toBe(1)
+      })
+
       it("late ack after not started keeps the retry wait", async () => {
         const { live } = await startRunning()
         const gate = deferred<void>()
@@ -14636,10 +14663,21 @@ describe("session message queue", () => {
       expect(statuses()).toEqual(["B:waiting"])
     })
 
-    it.each([
-      ["the injection was proven unwritten"],
-      ["the claim failed to commit and was withdrawn"],
-    ])("not applied send-now switches to a new id [%s]", async () => {
+    it("ignores a returned message for another task and an unknown reason", async () => {
+      await startRunning()
+      await sendNow("id-A")
+      const before = queue()
+      await returned("id-A", "run_ended", TASK + 1)
+      await returned("id-A", "something_new")
+      await returned("unknown-id", "run_ended")
+      expect(queue()).toBe(before)
+      expect(statuses()[0]).toBe("A:inserting")
+    })
+
+    // Both server-side causes (an injection proven unwritten, a claim that failed
+    // to commit and was withdrawn) arrive as the same frame, so one case covers
+    // what the browser does with either.
+    it("not applied send-now switches to a new id", async () => {
       const { server } = await startRunning()
       await sendNow("id-A")
       await returned("id-A", "not_applied")

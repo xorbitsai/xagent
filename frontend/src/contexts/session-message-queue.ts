@@ -166,8 +166,7 @@ export type MessageQueueEvent =
   | { type: "SEND_NOW_SUPPORT_LOST" }
 
 // What the caller tells the visitor, once, after applying a transition.
-// "send_now": a request into the running turn is due.
-export type MessageQueueEffect = null | "send_failed" | "support_lost" | "send_now" | "send_now_unknown"
+export type MessageQueueEffect = null | "send_failed" | "support_lost" | "send_now_unknown"
 
 const IDLE: MessageQueuePhase = { kind: "idle" }
 const READY: MessageQueuePhase = { kind: "ready" }
@@ -465,7 +464,7 @@ export function transitionMessageQueue(
         retryAt: undefined,
       }
       const marked = items.map(item => (item === target ? { ...item, status: "inserting" as const, insert } : item))
-      return to({ ...state, items: placeFirst(marked, event.clientMessageId) }, "send_now")
+      return to({ ...state, items: placeFirst(marked, event.clientMessageId) })
     }
     case "SEND_NOW_ACCEPTED": {
       const target = inserting(event.clientMessageId)

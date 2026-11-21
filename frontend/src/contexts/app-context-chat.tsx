@@ -7781,7 +7781,9 @@ export function AppProvider({
 
     // The turn handed a message sent into it back: it will not take it in.
     if (message.type === "live_input_returned") {
-      const { turn_id: turnId, reason } = message as unknown as { turn_id?: unknown; reason?: unknown }
+      // The socket layer nests a frame it has no shape for: the server's own
+      // fields (turn_id, reason) arrive inside `data`.
+      const { turn_id: turnId, reason } = asMessageRecord(message.data)
       if (
         binding.present
         && binding.valid

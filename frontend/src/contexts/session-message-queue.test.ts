@@ -298,9 +298,9 @@ describe("sending a queued message into the running turn", () => {
       ["accepted: leaving sending with a failed message holds", state(SENDING, [H, item("f", 1, "failed")]), { type: "DELIVERY_ACCEPTED", clientMessageId: "h", sinceVersion: 2 }, HELD_UNKNOWN, ["f:failed"], "send_now_unknown"],
       ["send failed: leaving sending with a failed message holds", state(SENDING, [H, item("f", 1, "failed")]), { type: "SEND_FAILED", clientMessageId: "h", verdict: "wait" }, HELD_UNKNOWN, ["h:waiting", "f:failed"], "send_now_unknown"],
       // SEND_NOW_REQUESTED
-      ["requested: waiting inserts at the front", state(waiting(1), [A, B]), requested("b"), waiting(1), ["b:inserting", "a:waiting"], "send_now"],
+      ["requested: waiting inserts at the front", state(waiting(1), [A, B]), requested("b"), waiting(1), ["b:inserting", "a:waiting"], null],
       ["requested: ready marks it next, no frame", state(READY, [A, B]), requested("b"), READY, ["b:waiting", "a:waiting"], null],
-      ["requested: sending goes behind the head being sent", state(SENDING, [H, A, B]), requested("b"), SENDING, ["h:sending", "b:inserting", "a:waiting"], "send_now"],
+      ["requested: sending goes behind the head being sent", state(SENDING, [H, A, B]), requested("b"), SENDING, ["h:sending", "b:inserting", "a:waiting"], null],
       ["requested: held marks it next and continues", state(HELD, [item("a", 1, "failed"), B]), requested("b"), READY, ["b:waiting", "a:waiting"], null],
       // SEND_NOW_ACCEPTED
       ["accepted now: waiting", state(waiting(1), [ins("x", 1)]), { type: "SEND_NOW_ACCEPTED", clientMessageId: "x" }, waiting(1), ["x:inserting"]],
@@ -360,6 +360,85 @@ describe("sending a queued message into the running turn", () => {
     const { next } = apply(from, { type: "CLEAR" })
     expect(next.phase).toEqual(waiting(observed.version))
     expect(ids(next)).toEqual(["x:inserting"])
+  })
+
+  describe("every phase column of the send-now cells", () => {
+    const COLUMNS = ["waiting", "ready", "sending", "held"] as const
+    type Column = (typeof COLUMNS)[number]
+    const phaseOf = (column: Column): MessageQueuePhase =>
+      ({ waiting: waiting(1), ready: READY, sending: SENDING, held: HELD })[column]
+    // The message being inserted at the front, with A behind it; a column that
+    // sends has its head in front of both.
+    const fromColumn = (column: Column, over: Partial<InsertState> = {}) =>
+      state(phaseOf(column), [...(column === "sending" ? [H] : []), ins("x", 3, over), A])
+    const lead = (column: Column) => (column === "sending" ? ["h:sending"] : [])
+    // Whether a failed insert stops the queue itself in this column.
+    const stopsAlone = (column: Column) => column === "waiting" || column === "ready"
+
+    it.each(COLUMNS)("a confirmation in the %s column clears the request and confirms unless a retry waits", (column) => {
+      const confirmed = apply(fromColumn(column), { type: "SEND_NOW_ACCEPTED", clientMessageId: "x" }).next
+      expect(firstInsert(confirmed, "x")).toMatchObject({ inFlight: false, confirmed: true })
+      const waitingRetry = fromColumn(column, { inFlight: true, retryAt: NOW })
+      const late = apply(waitingRetry, { type: "SEND_NOW_ACCEPTED", clientMessageId: "x" }).next
+      expect(firstInsert(late, "x")).toMatchObject({ inFlight: false, confirmed: false, retryAt: NOW })
+    })
+
+    it.each(COLUMNS)("sending again in the %s column starts a request and ends any wait", (column) => {
+      const from = fromColumn(column, { inFlight: false, confirmed: true, retryAt: NOW, connection: "c1", resentAt: undefined })
+      const { next } = apply(from, { type: "SEND_NOW_RESENT", clientMessageId: "x", atVersion: 4, connection: "c2" })
+      expect(firstInsert(next, "x")).toMatchObject({
+        inFlight: true, confirmed: false, retryAt: undefined, connection: "c2", resentAt: 4, retries: 0, since: 1,
+      })
+      expect(next.phase).toEqual(from.phase)
+    })
+
+    it.each(["sending", "waiting"] as const)("a request that cannot be taken in is ignored in the %s column", (column) => {
+      const from = state(phaseOf(column), [...(column === "sending" ? [H] : []), A, B])
+      expect(apply(from, { ...requested("b"), canInsert: false } as MessageQueueEvent).next).toBe(from)
+    })
+
+    describe.each(COLUMNS)("the %s column", (column) => {
+      it.each([
+        ["next", ["x:waiting:next", "a:waiting"]],
+        ["retry", ["a:waiting", "x:waiting"]],
+        ["later", ["x:inserting", "a:waiting"]],
+        ["hold", ["x2:failed", "a:waiting"]],
+        ["unknown", ["x:failed", "a:waiting"]],
+      ] as const)("a failed send ending as %s", (verdict, expected) => {
+        const from = fromColumn(column)
+        const result = apply(from, failedWith("x", verdict, verdict === "hold" ? { newClientMessageId: "x2" } : {}))
+        expect([...lead(column), ...expected]).toEqual(
+          result.next.items.map(entry => `${entry.clientMessageId}:${entry.status}${entry.next ? ":next" : ""}`),
+        )
+        const stops = verdict === "hold" || verdict === "unknown"
+        if (stops && stopsAlone(column)) {
+          expect(result.next.phase).toEqual(verdict === "hold" ? HELD_SENT : HELD_UNKNOWN)
+          expect(result.effect).toBe(verdict === "hold" ? "send_failed" : "send_now_unknown")
+        } else {
+          expect(result.next.phase).toEqual(from.phase)
+          expect(result.effect).toBeNull()
+        }
+        if (verdict === "later") expect(firstInsert(result.next, "x")).toMatchObject({ retries: 1, retryAt: NOW + 1000, inFlight: false })
+      })
+
+      it.each([
+        ["run_ended", ["x:waiting:next", "a:waiting"], null],
+        ["not_applied", ["x2:waiting:next", "a:waiting"], null],
+        ["not_started", ["x:inserting", "a:waiting"], null],
+        ["taken", ["a:waiting"], null],
+        ["unavailable", ["x:failed", "a:waiting"], "send_failed"],
+        ["refused", ["x:failed", "a:waiting"], "send_failed"],
+        ["conflict", ["x:failed", "a:waiting"], "send_failed"],
+        ["outcome_unknown", ["x:failed", "a:waiting"], "send_now_unknown"],
+      ] as const)("a returned message with reason %s", (reason, expected, effect) => {
+        const from = fromColumn(column)
+        const result = apply(from, returned("x", reason, reason === "not_applied" ? { newClientMessageId: "x2" } : {}))
+        const shown = result.next.items.map(entry => `${entry.clientMessageId}:${entry.status}${entry.next ? ":next" : ""}`)
+        expect(shown).toEqual([...lead(column), ...expected])
+        expect(result.effect).toBe(stopsAlone(column) ? effect : null)
+        if (reason === "not_started") expect(firstInsert(result.next, "x")).toMatchObject({ inFlight: true, retries: 1, retryAt: NOW + 1000 })
+      })
+    })
   })
 
   it("ignores an applied echo for a message that is not being inserted", () => {

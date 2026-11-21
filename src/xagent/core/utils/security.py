@@ -26,29 +26,21 @@ from yarl import URL
 # string. This is the union of the names the URL redactor and the server
 # request-target filter used to keep apart; the credential-name rule below
 # (``_is_credential_key``) remains the common part every redactor shares, and
-# a URL query additionally reads this list.
+# a URL query additionally reads this list. A name the credential rule
+# already matches (``access_token``, ``api_key``, ``token``, ``secret`` and
+# the other spellings) is not repeated here.
 SENSITIVE_QUERY_KEYS = frozenset(
     {
-        "access_token",
-        "api_key",
-        "apikey",
         "auth",
         "code",
         "connected_account_id",
         "credential",
-        "id_token",
         "jwt",
-        "key",
-        "password",
-        "refresh_token",
-        "secret",
         "session",
         "session_uri",
         "sig",
-        "signature",
         "state",
         "ticket",
-        "token",
     }
 )
 # Query-string suffixes that mark a credential or a one-time proof without
@@ -60,17 +52,9 @@ SENSITIVE_QUERY_KEYS = frozenset(
 # such as ``page_size`` do not end in any of these suffixes and stay readable.
 _REQUEST_TARGET_QUERY_SUFFIXES = (
     "_key",
-    "-key",
     "_token",
-    "-token",
     "_ticket",
     "-ticket",
-    "_secret",
-    "-secret",
-    "_password",
-    "-password",
-    "_signature",
-    "-signature",
 )
 # Names that are credentials wherever they appear, even outside a URL query:
 # signed-URL and raw-header spellings that carry no credential word of their
@@ -79,10 +63,7 @@ _ALWAYS_SENSITIVE_PARAM_NAMES = frozenset(
     {
         "tempauth",
         "sig",
-        "signature",
-        "client_secret",
         "x-amz-credential",
-        "x-amz-security-token",
     }
 )
 
@@ -314,9 +295,13 @@ def _redact_assignments(text: str, mask: Callable[[str], str]) -> str:
 # linear.
 _HEADER_STOP_NAMES = (
     r"[\"']?(?:proxy-)?authorization[\"']?"
-    r"|x-goog-api-key"
-    r"|x-api-key"
-    r"|x-shopify-access-token"
+    r"|[\"']?x-goog-api-key[\"']?"
+    r"|[\"']?x-api-key[\"']?"
+    r"|[\"']?x-shopify-access-token[\"']?"
+    # Any quoted field name: a JSON object or dict repr can put a
+    # non-header credential name (``api_key``) right behind an unquoted
+    # header value, and the value must not swallow that name.
+    r"|[\"'][A-Za-z0-9_-]++[\"']"
 )
 _HEADER_VALUE = rf"(?:(?!&(?:{_HEADER_STOP_NAMES})\s*[:=])[^\s,;])+"
 AUTH_HEADER_PATTERN = re.compile(
@@ -330,10 +315,32 @@ AUTH_HEADER_PATTERN = re.compile(
 # only by whitespace (``x-api-key header``) is ordinary text and still does
 # not match.
 HEADER_KEY_PATTERNS = [
-    re.compile(rf"(?i)(x-goog-api-key\s*[:=]\s*(?:[:=]\s*)*)({_HEADER_VALUE})"),
-    re.compile(rf"(?i)(x-api-key\s*[:=]\s*(?:[:=]\s*)*)({_HEADER_VALUE})"),
-    re.compile(rf"(?i)(x-shopify-access-token\s*[:=]\s*(?:[:=]\s*)*)({_HEADER_VALUE})"),
+    re.compile(
+        rf"(?i)([\"']?x-goog-api-key[\"']?\s*[:=]\s*(?:[:=]\s*)*)({_HEADER_VALUE})"
+    ),
+    re.compile(rf"(?i)([\"']?x-api-key[\"']?\s*[:=]\s*(?:[:=]\s*)*)({_HEADER_VALUE})"),
+    re.compile(
+        rf"(?i)([\"']?x-shopify-access-token[\"']?\s*[:=]\s*(?:[:=]\s*)*)"
+        rf"({_HEADER_VALUE})"
+    ),
 ]
+# A quoted identifier and ``:`` or ``=`` separator, as a JSON object or a
+# Python dict repr writes it (``{"x-api-key": "sk-..."}``, ``{'api_key':
+# 'sk-...'}``, ``"access_token": "..."``). The header rules above only cover
+# the fixed header spellings; this rule hands the name to
+# ``_is_credential_key`` so every credential name gets the same treatment.
+# The name run is possessive and the value cannot open a nested object or
+# list, so a long run of quotes or a nested JSON document is still scanned
+# once (see the linear-time test for quoted-name runs). The value also stops
+# before a following ``&"name":`` field, as the header rule stops before the
+# next known header name: otherwise the first field's value swallows the next
+# field's name and its value is never examined. Each character is tested once
+# by the lookahead, so this stays linear.
+_QUOTED_FIELD_STOP = r"&[\"']?[A-Za-z0-9_-]++[\"']?\s*[:=]"
+_QUOTED_CREDENTIAL_PATTERN = re.compile(
+    r"(?i)(?<![A-Za-z0-9_-])(([\"'])([A-Za-z0-9_-]++)\2\s*[:=]\s*)"
+    rf"((?:(?!{_QUOTED_FIELD_STOP})[^\s,;{{}}\[\]])+)"
+)
 # A coarse ``?name=value`` / ``&name=value`` shape for the pattern-only
 # fallback, which deliberately does not parse a URL. The name still goes
 # through ``is_sensitive_param_name(..., url_query=True)``, so URL-only names
@@ -765,12 +772,12 @@ def _mask_secret(value: str) -> str:
     return "***" + value[-tail_len:]
 
 
-_FULL_REDACTION = "[REDACTED]"
+REDACTED = "[REDACTED]"
 
 
 def _redact_completely(value: str) -> str:
-    """Mask a secret without keeping any part of it (log records only)."""
-    return _FULL_REDACTION
+    """Mask a secret without keeping any part of it (log-only surfaces)."""
+    return REDACTED
 
 
 # Characters that can wrap a value when it is embedded in a JSON object, a
@@ -820,10 +827,7 @@ def _mask_value_keeping_wrappers(value: str, mask: Callable[[str], str]) -> str:
         end -= 1
     if start >= end:
         return value
-    inner = value[start:end]
-    if _is_redaction_placeholder(inner):
-        return value
-    return f"{value[:start]}{mask(inner)}{value[end:]}"
+    return f"{value[:start]}{mask(value[start:end])}{value[end:]}"
 
 
 _USERINFO_PREFIX_PATTERN = re.compile(r"://[^/\s@]*@")
@@ -833,7 +837,7 @@ def _query_item_needs_redaction(
     key: str, value: str, *, redact_all_query_values: bool
 ) -> bool:
     """Whether one query item gives the URL redactor a reason to rebuild."""
-    if value and _is_redaction_placeholder(value):
+    if _is_redaction_placeholder(value):
         # Already masked by an outer layer: nothing left to do for this item.
         return False
     if redact_all_query_values and value:
@@ -859,11 +863,15 @@ def _redact_url_credentials_for_logging(
         parsed = urlsplit(url)
     except ValueError:
         # Malformed enough that urlsplit itself can't parse it (e.g. an
-        # unclosed IPv6 bracket) -- fall back to a structure-agnostic scan
-        # for a "user:pass@" prefix. Returning the input unchanged here
-        # would be worse than not redacting at all: it would silently
-        # leak a credential through the one code path meant to catch it.
-        return _USERINFO_PREFIX_PATTERN.sub("://***@", url)
+        # unclosed IPv6 bracket) -- fall back to structure-agnostic scans:
+        # mask a "user:pass@" prefix and every coarse ``?name=value`` the
+        # shared query rule recognizes. Returning the input unchanged here
+        # would be worse than not redacting at all: it would silently leak a
+        # credential through the one code path meant to catch it. Callers
+        # that share this function (the record factory and the server
+        # request-target filter) get the same failure policy.
+        redacted = _USERINFO_PREFIX_PATTERN.sub("://***@", url)
+        return _redact_url_query_values(redacted, mask) if "?" in redacted else redacted
 
     has_userinfo = parsed.username is not None or parsed.password is not None
     query_items = parse_qsl(parsed.query, keep_blank_values=True)
@@ -902,7 +910,7 @@ def _redact_url_credentials_for_logging(
             masked = mask(value)
             encoded_value = (
                 masked
-                if masked == _FULL_REDACTION
+                if masked == REDACTED
                 else quote_plus(masked, errors="surrogatepass")
             )
         else:
@@ -952,6 +960,20 @@ def redact_url_credentials_for_logging(
     )
 
 
+def redact_url_query_credentials(url: str) -> str:
+    """Redact credential-like query values in a request target or URL.
+
+    Shares the parser, the percent-encoder and the failure policy of
+    :func:`redact_url_credentials_for_logging`, but replaces every masked
+    value with the full ``[REDACTED]`` marker instead of the short
+    ``***suffix`` one: a server access line is a log-only surface and should
+    not keep part of a credential. A target with nothing to redact is
+    returned byte for byte, so the line still matches the request on the
+    wire.
+    """
+    return _redact_url_credentials_for_logging(url, mask=_redact_completely)
+
+
 # A whitespace-delimited token. Relative request targets (``/cb?code=...``)
 # and relative links are not matched by ``URL_PATTERN``, which requires a
 # scheme. Tokenizing once and examining each token keeps this pass linear,
@@ -987,15 +1009,14 @@ def _redact_relative_target_token(token: str, *, mask: Callable[[str], str]) -> 
         # ``=`` in the middle of the marker (``[REDACTED=]``).
         if (
             token[end - 1] == "]"
-            and token[max(start, end - len(_FULL_REDACTION)) : end].upper()
-            == _FULL_REDACTION
+            and token[max(start, end - len(REDACTED)) : end].upper() == REDACTED
         ):
             break
         end -= 1
     target = token[start:end]
     if not target.startswith("/") or "?" not in target:
         return token
-    if _FULL_REDACTION in target and not _target_has_unmasked_sensitive_value(target):
+    if REDACTED in target and not _target_has_unmasked_sensitive_value(target):
         # Everything the URL rule would mask here is already a marker: the
         # header pre-pass ran before this one. Returning the token unchanged
         # keeps the marker readable instead of percent-encoding it as a query
@@ -1070,7 +1091,7 @@ def _redact_jwts(text: str) -> str:
             offset = _jwt_header_offset(first.group(0))
             if offset is not None:
                 parts.append(text[copied : first.start() + offset])
-                parts.append(_FULL_REDACTION)
+                parts.append(REDACTED)
                 copied = third.end()
                 changed = True
                 window = list(islice(segments, 3))
@@ -1104,7 +1125,7 @@ def _redact_url_query_values(text: str, mask: Callable[[str], str]) -> str:
 
 
 def _mask_headers(text: str, mask: Callable[[str], str]) -> str:
-    """Mask the header-shaped values in ``text``."""
+    """Mask the header-shaped and quoted credential values in ``text``."""
     text = AUTH_HEADER_PATTERN.sub(
         lambda match: f"{match.group(1)}"
         f"{_mask_value_keeping_wrappers(match.group(2), mask)}",
@@ -1116,6 +1137,14 @@ def _mask_headers(text: str, mask: Callable[[str], str]) -> str:
             f"{_mask_value_keeping_wrappers(match.group(2), mask)}",
             text,
         )
+    text = _QUOTED_CREDENTIAL_PATTERN.sub(
+        lambda match: (
+            f"{match.group(1)}{_mask_value_keeping_wrappers(match.group(4), mask)}"
+            if _is_credential_key(match.group(3))
+            else match.group(0)
+        ),
+        text,
+    )
     return text
 
 
@@ -1145,11 +1174,19 @@ def redact_sensitive_text(text: str) -> str:
     Recognition is by keyword and shape, so it is not exhaustive: it covers
     HTTP/WebSocket URLs and relative request targets
     (``redact_url_credentials_for_logging``), ``identifier=value``
-    assignments whose identifier ``_is_credential_key`` accepts, and the
-    header shapes in ``AUTH_HEADER_PATTERN`` and ``HEADER_KEY_PATTERNS``.
+    assignments whose identifier ``_is_credential_key`` accepts, quoted
+    ``"name": value`` fields (JSON objects and dict reprs), and the header
+    shapes in ``AUTH_HEADER_PATTERN`` and ``HEADER_KEY_PATTERNS``.
     Shapes it is known to miss are listed in
     #2356, and secrets in URL path segments in #2272; add a pattern here
     when a new one turns up.
+
+    This text also reaches users and models, so the URL rule is part of the
+    contract: a query value whose name is ``code``, ``state``, ``session``,
+    ``auth``, ``page_token`` or ``connected_account_id`` -- or ends in
+    ``_key``, ``_token``, ``_ticket``, ``_secret``, ``_password`` or
+    ``_signature`` -- is masked here too, not only in a log record. The mask
+    keeps a short suffix (``***c123``) so a diagnostic stays readable.
     """
     if not text:
         return text
@@ -1164,6 +1201,11 @@ def redact_log_text(text: str) -> str:
     token inside a tool result, for instance), and replaces every masked
     value outright instead of keeping a short suffix: a log line should not
     carry part of a credential either.
+
+    This is the text half of the record-factory contract. It does not reach
+    ``extra=`` fields (attached after the factory runs), the traceback when a
+    handler renders ``exc_info`` itself instead of using ``exc_text``, or
+    log lines a subprocess configures on its own.
     """
     if not text:
         return text

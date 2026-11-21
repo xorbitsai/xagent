@@ -4,6 +4,7 @@ import io
 import json
 import logging
 import re
+import time
 from collections.abc import Iterator
 from logging.config import dictConfig
 from pathlib import Path
@@ -137,6 +138,17 @@ def test_redact_request_target(target, expected):
     assert redact_request_target(target) == expected
 
 
+def test_redact_request_target_shares_the_url_query_rule() -> None:
+    # The same parser and encoder as the text redactor: a space becomes ``+``
+    # (not ``%20``) and a credential value becomes the full marker.
+    assert redact_request_target("/a?q=hello world&token=SECRET") == (
+        "/a?q=hello+world&token=[REDACTED]"
+    )
+    # A target urlsplit cannot parse still gets its coarse query values
+    # masked by the shared failure policy instead of echoing the credential.
+    assert "SECRET" not in redact_request_target("https://[::1/?token=SECRET")
+
+
 def test_access_log_record_args_are_redacted():
     # uvicorn.access: '%s - "%s %s HTTP/%s" %d' with the raw path+query.
     record = logging.LogRecord(
@@ -224,6 +236,52 @@ def test_record_factory_keeps_uvicorn_access_formatter_working() -> None:
 
 
 @pytest.mark.usefixtures("restore_logging_state")
+def test_record_factory_masks_a_credential_split_across_access_arguments() -> None:
+    # The whole formatted message masks a value the per-argument pass cannot:
+    # the header name ends the request-target argument and its value is the
+    # next argument. That makes the factory take the five-tuple branch, which
+    # keeps the shape uvicorn's AccessFormatter unpacks but must not write the
+    # split value back into the line.
+    import uvicorn.logging
+
+    setup_logging(force=True)
+    access_logger = logging.getLogger("uvicorn.access")
+    access_logger.setLevel(logging.INFO)
+    access_logger.propagate = False
+
+    stream = io.StringIO()
+    handler = logging.StreamHandler(stream)
+    handler.setFormatter(
+        uvicorn.logging.AccessFormatter(
+            '%(client_addr)s - "%(request_line)s" %(status_code)s',
+            use_colors=False,
+        )
+    )
+    access_logger.addHandler(handler)
+    records, capture_handler = _capture(access_logger)
+    try:
+        access_logger.info(
+            '%s - "%s %s HTTP/%s" %d',
+            "127.0.0.1:1",
+            "GET",
+            "/cb?X-Api-Key:",
+            SECRET,
+            200,
+        )
+    finally:
+        access_logger.removeHandler(handler)
+        access_logger.removeHandler(capture_handler)
+
+    record = records[0]
+    assert isinstance(record.args, tuple)
+    assert len(record.args) == 5
+    assert SECRET not in record.getMessage()
+    output = stream.getvalue()
+    assert SECRET not in output
+    assert "200 OK" in output
+    assert output.count("[REDACTED]") == 4
+
+
 def test_record_factory_does_not_trust_the_access_logger_by_name_alone() -> None:
     # Only the five-tuple uvicorn's AccessFormatter unpacks owns the argument
     # shape. An ordinary record on the same logger must be formatted like any
@@ -492,8 +550,9 @@ def test_paging_and_non_secret_query_values_are_preserved(name: str) -> None:
     value = f"{name}-value-123"
     text = f"GET https://api.example.com/cb?{name}={value}&page=2"
 
-    redacted = security.redact_sensitive_text(text)
-    assert value in redacted
+    for redact in (security.redact_sensitive_text, security.redact_log_text):
+        redacted = redact(text)
+        assert value in redacted
 
 
 def test_code_is_only_sensitive_inside_a_url_query() -> None:
@@ -599,8 +658,8 @@ def test_jwt_in_a_url_path_is_masked() -> None:
     assert "/content" in redacted
 
 
-# The prefix characters the R2 review compared against the previous
-# implementation, with the JWT placed directly behind each one.
+# The prefix characters compared against the previous implementation, with
+# the JWT placed directly behind each one.
 _JWT_PREFIX_CHARS = (
     "",
     " ",
@@ -816,10 +875,10 @@ def test_log_text_redaction_is_idempotent(text: str) -> None:
 # - ``security.redact_url_credentials_for_logging``
 # - ``request_log_redaction.redact_request_target`` (the request-log filter's
 #   target masker)
-# To regenerate, extract both files with ``git show ad253647:<path>`` into a
-# temporary directory, load them with ``importlib`` and run the three functions
-# over the recorded inputs; the one-off generator is intentionally not checked
-# in, so never edit ``legacy_output`` by hand.
+# To regenerate, run ``fixtures/generate_legacy_redaction_golden.py`` from the
+# repository root: it extracts both files with ``git show ad253647:<path>``,
+# loads them with ``importlib`` and recomputes every recorded output. Never
+# edit ``legacy_output`` by hand.
 _GOLDEN_PATH = Path(__file__).with_name("fixtures") / "legacy_redaction_golden.json"
 _LEGACY_GOLDEN: dict[str, list[dict[str, str]]] = json.loads(
     _GOLDEN_PATH.read_text(encoding="utf-8")
@@ -1261,6 +1320,61 @@ def test_record_factory_flattens_only_when_the_secret_is_formed_by_interpolation
 
 
 @pytest.mark.usefixtures("restore_logging_state")
+def test_a_clean_five_kilobyte_message_skips_the_full_pass() -> None:
+    # A ConsoleTraceHandler INFO payload can reach 50 kB and usually carries
+    # none of the characters a redaction rule needs. Measure that skip path;
+    # there is no strict threshold, the printed numbers are the benchmark
+    # (run with ``-s``). The full pass is timed on a message of the same size
+    # so the ratio is meaningful.
+    setup_logging(force=True)
+    factory = logging.getLogRecordFactory()
+    clean = "x" * 5000
+    marked_up = clean + " Authorization: Bearer sk-LEAK-0123456789"
+
+    def per_record(message: str, iterations: int = 200) -> float:
+        started = time.perf_counter()
+        for _ in range(iterations):
+            factory(
+                "xagent.tests.benchmark",
+                logging.INFO,
+                __file__,
+                1,
+                message,
+                (),
+                None,
+            )
+        return (time.perf_counter() - started) / iterations
+
+    def base_record(message: str, iterations: int = 200) -> float:
+        started = time.perf_counter()
+        for _ in range(iterations):
+            logging.LogRecord(
+                "xagent.tests.benchmark",
+                logging.INFO,
+                __file__,
+                1,
+                message,
+                (),
+                None,
+            )
+        return (time.perf_counter() - started) / iterations
+
+    record = factory(
+        "xagent.tests.benchmark", logging.INFO, __file__, 1, clean, (), None
+    )
+    assert record.msg == clean
+    base_cost = base_record(clean)
+    skip_cost = per_record(clean)
+    full_cost = per_record(marked_up, iterations=50)
+    print(
+        f"\n5 kB clean message: stock record {base_cost * 1e6:.2f}, "
+        f"factory skip {skip_cost * 1e6:.2f} "
+        f"(+{(skip_cost - base_cost) * 1e6:.2f} us), "
+        f"same message with a credential {full_cost * 1e6:.2f} us/record"
+    )
+
+
+@pytest.mark.usefixtures("restore_logging_state")
 def test_record_factory_keeps_exc_text_unset_when_nothing_needs_redaction() -> None:
     setup_logging(force=True)
     logger = logging.getLogger("xagent.tests.custom_exception")
@@ -1343,6 +1457,69 @@ def test_transport_info_lines_stay_out_of_the_log_after_a_level_change(
     message = records[0].getMessage()
     assert SECRET not in message
     assert "https://oauth.example.com/token" in message
+
+
+@pytest.mark.usefixtures("restore_logging_state")
+def test_a_transport_record_that_the_filter_drops_is_not_redacted() -> None:
+    # The below-WARNING filter drops the record before any handler, so the
+    # factory skips the expensive pass for it. Inspect the record directly
+    # (a handler would never see it) to pin the skip: with the filter
+    # installed the URL is still there, and the toggle test above proves it
+    # is masked once the filter is gone.
+    setup_logging(force=True)
+    factory = logging.getLogRecordFactory()
+    record = factory(
+        "httpx",
+        logging.INFO,
+        __file__,
+        1,
+        "HTTP Request: GET https://e.com/x?token=%s",
+        (SECRET,),
+        None,
+    )
+
+    assert logging_config._TRANSPORT_FILTER in logging.getLogger("httpx").filters
+    assert SECRET in record.getMessage()
+
+
+@pytest.mark.usefixtures("restore_logging_state")
+def test_transport_info_lines_can_be_kept_with_the_toggle(monkeypatch) -> None:
+    # The filter is the default; this switch is the documented opt-out. The
+    # record factory must still mask the request line when it is on.
+    monkeypatch.setenv("XAGENT_LOG_TRANSPORT_REQUEST_LINES", "true")
+    setup_logging(force=True)
+    logger = logging.getLogger("httpx")
+    logger.setLevel(logging.NOTSET)
+    assert logging_config._TRANSPORT_FILTER not in logger.filters
+    records, handler = _capture(logger)
+    try:
+        logger.info(
+            "HTTP Request: POST https://oauth.example.com/token?refresh_token=%s",
+            SECRET,
+        )
+    finally:
+        logger.removeHandler(handler)
+
+    assert len(records) == 1
+    message = records[0].getMessage()
+    assert SECRET not in message
+    assert "[REDACTED]" in message
+    assert "https://oauth.example.com/token" in message
+
+
+@pytest.mark.usefixtures("restore_logging_state")
+def test_the_transport_toggle_takes_effect_on_a_repeated_setup(monkeypatch) -> None:
+    # setup_logging() without force is the app-import path; flipping the
+    # environment and calling it again must remove the filter, not leave the
+    # process in the previous mode until a restart.
+    setup_logging(force=True)
+    logger = logging.getLogger("httpcore")
+    assert logging_config._TRANSPORT_FILTER in logger.filters
+
+    monkeypatch.setenv("XAGENT_LOG_TRANSPORT_REQUEST_LINES", "1")
+    setup_logging()
+
+    assert logging_config._TRANSPORT_FILTER not in logger.filters
 
 
 @pytest.mark.usefixtures("restore_logging_state")
@@ -1497,6 +1674,10 @@ def test_repeated_setup_logging_does_not_stack_redaction_layers() -> None:
 
 @pytest.mark.usefixtures("restore_logging_state")
 def test_record_factory_chains_with_a_preinstalled_factory() -> None:
+    # Start from the stock factory explicitly: if ``base`` were already this
+    # module's redacting factory, the assertion below would pass even if the
+    # newly installed layer redacted nothing.
+    logging.setLogRecordFactory(logging.LogRecord)
     base = logging.getLogRecordFactory()
 
     def outer(*args, **kwargs):

@@ -1979,16 +1979,18 @@ class TestModelAPI:
             async def chat(self, messages, **kwargs):
                 raise Exception(leak)
 
-        # Isolate model.py from the process-wide record factory: with the
-        # factory active every log record is redacted anyway, so caplog
-        # cannot tell whether this endpoint logged the raw exception or its
-        # own safe_error. Restore it before the assertions and in finally.
+        # The endpoint logs the exception itself and the process-wide record
+        # factory writes the full marker; the short ***suffix mask belongs to
+        # the response only. Install the factory explicitly: the test-suite
+        # fixture resets it to logging.LogRecord between tests.
         record_factory = logging.getLogRecordFactory()
+        from xagent.web import logging_config
+
+        logging_config._install_record_redaction()
         model_records: list[logging.LogRecord] = []
         capture = logging.Handler()
         capture.emit = model_records.append  # type: ignore[method-assign]
         model_logger = logging.getLogger("xagent.web.api.model")
-        logging.setLogRecordFactory(logging.LogRecord)
         model_logger.addHandler(capture)
         try:
             with patch(
@@ -2026,9 +2028,53 @@ class TestModelAPI:
         ]
         assert failure_records, "the model endpoint logged no failure"
         for record in failure_records:
-            assert "sk-test" not in record.getMessage()
-            assert "Authorization" in record.getMessage()
+            message = record.getMessage()
+            assert "sk-test" not in message
+            assert "Authorization" in message
+            # The factory's marker, not the response's short mask.
+            assert "[REDACTED]" in message
+            assert "***" not in message
         assert "sk-test" not in caplog.text
+
+    def test_user_default_error_log_is_redacted_by_the_factory(
+        self, test_db, regular_user, regular_headers, monkeypatch
+    ):
+        """The /user-default handler logs the exception, not safe_error."""
+        leak = '{"headers": {"Authorization": "Bearer sk-user-default"}}'
+
+        def fail(self, user):
+            raise RuntimeError(leak)
+
+        monkeypatch.setattr(model_module.ModelStore, "get_user_default_models", fail)
+
+        from xagent.web import logging_config
+
+        record_factory = logging.getLogRecordFactory()
+        logging_config._install_record_redaction()
+        model_records: list[logging.LogRecord] = []
+        capture = logging.Handler()
+        capture.emit = model_records.append  # type: ignore[method-assign]
+        model_logger = logging.getLogger("xagent.web.api.model")
+        model_logger.addHandler(capture)
+        try:
+            response = client.get("/api/models/user-default", headers=regular_headers)
+        finally:
+            model_logger.removeHandler(capture)
+            logging.setLogRecordFactory(record_factory)
+
+        assert response.status_code == 200
+        assert response.json() == []
+        failure_records = [
+            record
+            for record in model_records
+            if "Error getting user default models" in record.getMessage()
+        ]
+        assert failure_records, "the user-default endpoint logged no failure"
+        for record in failure_records:
+            message = record.getMessage()
+            assert "sk-user-default" not in message
+            assert "[REDACTED]" in message
+            assert "***" not in message
 
     def test_create_model_as_admin(
         self, test_db, admin_user, admin_headers, sample_model_data

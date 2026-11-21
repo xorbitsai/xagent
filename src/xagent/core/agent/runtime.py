@@ -467,7 +467,8 @@ class PatternRuntime:
     pattern_error_reported: bool = False
     last_final_answer_stream_message_id: str | None = None
     # When this run emitted its first non-empty final-answer chunk; None when
-    # it streamed no answer text.
+    # it streamed no answer text. The first text of an answer that is later
+    # given up for a live user message counts too.
     first_final_answer_delta_at: datetime | None = None
     inline_file_delivery: InlineFileDelivery | None = None
     _approved_answers: dict[str, OutputDecision] = field(

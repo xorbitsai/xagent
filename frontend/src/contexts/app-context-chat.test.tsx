@@ -14663,15 +14663,24 @@ describe("session message queue", () => {
       expect(statuses()).toEqual(["B:waiting"])
     })
 
-    it("ignores a returned message for another task and an unknown reason", async () => {
+    it.each([
+      ["an unknown reason", "id-A", "something_new"],
+      ["a turn id that is not in the list", "unknown-id", "run_ended"],
+    ])("ignores a returned message with %s", async (_name, id, reason) => {
+      await startRunning()
+      await sendNow("id-A")
+      const before = queue()
+      await returned(id, reason)
+      expect(queue()).toBe(before)
+      expect(statuses()[0]).toBe("A:inserting")
+    })
+
+    it("a returned message for another task does not change the queue", async () => {
       await startRunning()
       await sendNow("id-A")
       const before = queue()
       await returned("id-A", "run_ended", TASK + 1)
-      await returned("id-A", "something_new")
-      await returned("unknown-id", "run_ended")
       expect(queue()).toBe(before)
-      expect(statuses()[0]).toBe("A:inserting")
     })
 
     // Both server-side causes (an injection proven unwritten, a claim that failed

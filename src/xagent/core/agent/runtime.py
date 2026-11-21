@@ -541,17 +541,18 @@ class PatternRuntime:
     def request_llm_preempt(self) -> bool:
         """Cancel the in-flight preemptible model requests, if no tool is running.
 
-        Only requests started with ``preemptible=True`` are cancelled. They
-        raise :class:`LLMCallPreempted` to their caller instead of failing,
-        unless an interrupt was also requested, which always wins, or the
-        caller's own task was cancelled, which then reaches the caller as it
-        is. Returns whether any request was cancelled.
+        Only requests started with ``preemptible=True`` are cancelled, each
+        at most once: a request already being given up is left to finish its
+        cleanup. They raise :class:`LLMCallPreempted` to their caller instead
+        of failing, unless an interrupt was also requested, which always wins,
+        or the caller's own task was cancelled, which then reaches the caller
+        as it is. Returns whether any request was cancelled.
         """
         if self._active_tool_tasks:
             return False
         cancelled = False
         for task in list(self._preemptible_llm_tasks):
-            if not task.done():
+            if not task.done() and task not in self._preempted_llm_tasks:
                 self._preempted_llm_tasks.add(task)
                 task.cancel()
                 cancelled = True

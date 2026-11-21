@@ -4082,3 +4082,42 @@ async def test_stream_final_answer_preempt_before_text_emits_nothing() -> None:
     assert outbound.events == []
     assert runtime.first_final_answer_delta_at is None
     assert runtime.last_final_answer_stream_message_id is None
+
+
+class CleanupGatedLLM:
+    """Streams one token and waits; its cleanup waits for ``release``."""
+
+    def __init__(self) -> None:
+        self.started = asyncio.Event()
+        self.cleanup_started = asyncio.Event()
+        self.release = asyncio.Event()
+        self.cleanup_finished = False
+
+    async def stream_chat(self, **_: Any) -> Any:
+        try:
+            yield StreamChunk(type=ChunkType.TOKEN, delta="partial")
+            self.started.set()
+            await asyncio.Event().wait()
+        finally:
+            self.cleanup_started.set()
+            await self.release.wait()
+            self.cleanup_finished = True
+
+
+async def test_second_preempt_leaves_request_cleanup_running() -> None:
+    runtime = PatternRuntime()
+    llm = CleanupGatedLLM()
+    task = asyncio.create_task(
+        runtime.run_streaming_llm_call(llm, messages=[], preemptible=True)
+    )
+    await llm.started.wait()
+    assert runtime.request_llm_preempt() is True
+    await llm.cleanup_started.wait()
+    assert runtime.request_llm_preempt() is False
+    llm.release.set()
+    with pytest.raises(LLMCallPreempted):
+        await asyncio.wait_for(task, timeout=5)
+    assert llm.cleanup_finished
+    assert not runtime._active_llm_tasks
+    assert not runtime._preemptible_llm_tasks
+    assert not runtime._preempted_llm_tasks

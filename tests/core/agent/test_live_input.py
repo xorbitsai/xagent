@@ -2294,10 +2294,8 @@ async def test_live_input_in_gap_skips_main_call(
     assert LIVE_TEXT in str(rig.llm.requests[-1])
 
 
-@pytest.mark.parametrize("n", [5])
-async def test_preempts_bounded_by_offers(
-    monkeypatch: pytest.MonkeyPatch, n: int
-) -> None:
+async def test_preempts_bounded_by_offers(monkeypatch: pytest.MonkeyPatch) -> None:
+    n = 5
     spy = spy_llm_calls(monkeypatch)
     box: list[Rig] = []
     offered: list[int] = []
@@ -2499,6 +2497,39 @@ async def test_live_input_iteration_grant_under_preempts(
     assert restored._iteration_cap() == max_iterations + granted
 
 
+async def test_preempt_on_last_ordinary_iteration_raises_iteration_cap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spy = spy_llm_calls(monkeypatch)
+    max_iterations = 3
+    adm = RecordingAdmission()
+    box: list[Rig] = []
+
+    async def last_ordinary_request() -> Any:
+        assert box[0].offer(adm) is LiveInputOffer.QUEUED
+        await asyncio.sleep(HOLD_SECONDS)
+        return tool_calls("w1")
+
+    rig = make_rig(
+        [
+            *[tool_calls("w1")] * (max_iterations - 1),
+            last_ordinary_request,
+            *[tool_calls("w1")] * (max_iterations + GRANT + 5),
+        ],
+        ("w1",),
+        pattern=tool_only_pattern(max_iterations),
+    )
+    box.append(rig)
+    pattern = rig.runner.agent.patterns[0]
+    await rig.start()
+    granted = min(GRANT, max_iterations)
+    assert spy.repeats == 1
+    assert rig.llm.cancelled == 1
+    assert adm.events == ["claim", LiveInputResult.APPLIED]
+    assert pattern.live_input_iteration_grant == granted
+    assert len(rig.tools["w1"].calls) == max_iterations + granted
+
+
 async def test_dag_step_calls_never_preemptible() -> None:
     from xagent.core.agent import ExecutionContext
     from xagent.core.agent.pattern.dag.dag import DAGPattern, _DAGStepRuntime
@@ -2610,6 +2641,40 @@ async def test_offer_already_queued_does_not_preempt(
     runtime.live_input = None
     assert offer("n2", "x") is LiveInputOffer.UNSUPPORTED
     assert preempts == [True]
+
+
+async def test_interrupt_wins_over_offer_on_same_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spy = spy_llm_calls(monkeypatch)
+    adm = RecordingAdmission()
+    box: list[Rig] = []
+
+    async def offer_and_stop() -> Any:
+        assert box[0].offer(adm) is LiveInputOffer.QUEUED
+        assert box[0].runner.pause(EID, "stop") is True
+        await asyncio.sleep(HOLD_SECONDS)
+
+    rig = make_rig(
+        [stream_final_answer_parts("PARTIAL answer......", cut=7, hook=offer_and_stop)],
+        ("w1",),
+        llm_class=StreamingScriptedLLM,
+    )
+    box.append(rig)
+    frames = Frames()
+    result = await rig.start(outbound_message_handler=frames)
+    assert result["status"] == "interrupted"
+    assert adm.events == [LiveInputResult.RETURNED]
+    assert spy.repeats == 0
+    assert not spy.preempted("run_streaming_llm_call")
+    assert len(rig.llm.requests) == 1
+    assert rig.llm.cancelled == 1
+    assert [e["type"] for e in frames.events] == [
+        "final_answer_start",
+        "final_answer_delta",
+        "final_answer_error",
+    ]
+    assert not [e for e in frames.events if e.get("status") == "interrupted"]
 
 
 # --------------------------------------------------------------------------

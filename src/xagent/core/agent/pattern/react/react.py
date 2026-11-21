@@ -1275,11 +1275,13 @@ class ReActPattern(AgentPattern):
             # A forced answer turn ends the run: it takes no live message in
             # and its model request is never given up for one, so messages
             # still waiting are handed back with the run's result.
-            preempt_ok = live_input_open and not force_final_answer_now
+            admit_live_input = live_input_open and not force_final_answer_now
             # Past the repeat limit the request is neither skipped nor given
             # up for a message; it is taken in at the next safe point.
-            may_preempt = preempt_ok and counter.repeats < LIVE_INPUT_PREEMPT_LIMIT
-            if preempt_ok:
+            may_preempt = (
+                admit_live_input and counter.repeats < LIVE_INPUT_PREEMPT_LIMIT
+            )
+            if admit_live_input:
                 # Pending tool calls were executed at the top of this iteration,
                 # so the batch is settled here.
                 applied = await runtime.admit_live_user_messages(

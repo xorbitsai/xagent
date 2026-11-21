@@ -295,6 +295,56 @@ def test_redact_url_credentials_for_logging_does_not_leak_on_parse_failure() -> 
     assert "s3cret-pass" not in redacted
 
 
+@pytest.mark.parametrize(
+    "redact", [redact_sensitive_text, redact_log_text], ids=["text", "log"]
+)
+@pytest.mark.parametrize(
+    ("text", "secret"),
+    [
+        ('wss://e.com/ws?X-Api-Key sk-FUZZ-0123456789"}', "sk-FUZZ-0123456789"),
+        (
+            "https://e.com/x?MCP_API_KEY'tok-FUZZ-abcdef123456>",
+            "tok-FUZZ-abcdef123456",
+        ),
+        ('https://e.com/x?access_token"sk-FUZZ-0123456789}', "sk-FUZZ-0123456789"),
+        ("/cb?X-Api-Key: sk-FUZZ-0123456789", "sk-FUZZ-0123456789"),
+        ("/cb?X-Api-Key = sk-FUZZ-0123456789", "sk-FUZZ-0123456789"),
+    ],
+    ids=["space", "single-quote", "double-quote", "relative-colon", "relative-space"],
+)
+def test_a_malformed_query_without_an_equals_sign_is_still_masked(
+    redact, text: str, secret: str
+) -> None:
+    # The URL redactor accepts a query it cannot parse as ``name=value`` by
+    # rebuilding it with ``=``; the header and assignment rules that run
+    # afterwards then mask the tail (``?X-Api-Key sk-...``,
+    # ``?MCP_API_KEY'tok-...``). A "nothing to mask" return that only looks
+    # at values skips that chain for exactly these shapes.
+    redacted = redact(text)
+
+    assert secret not in redacted
+    assert redacted != text
+
+
+def test_a_value_that_only_starts_with_a_short_mask_is_still_masked() -> None:
+    # ``***`` plus at most four characters is the short marker
+    # ``_mask_secret`` emits. A longer value that happens to begin with the
+    # same characters is a real secret, not an outer layer's marker.
+    secret = "***QWERTYUIOPASDFGZ"
+    for text in (
+        f"password={secret}",
+        f"Authorization: Bearer {secret}",
+        f"GET https://h.example/x?token={secret}",
+        f"GET /cb?token={secret}",
+    ):
+        redacted = redact_sensitive_text(text)
+
+        assert "QWERTYUIOPASDFGZ" not in redacted, text
+
+    # A marker the redactor itself emits is still left alone.
+    assert redact_sensitive_text("MCP_API_KEY=***c123") == "MCP_API_KEY=***c123"
+
+
 def test_redact_sensitive_text_does_not_leak_malformed_proxy_url() -> None:
     text = "Unable to connect to proxy https://alice:s3cret-pass@[::1/"
     redacted = redact_sensitive_text(text)
@@ -625,6 +675,13 @@ _HOSTILE_LOG_PAYLOADS = {
     # class includes the hyphen: the old ``\b`` began a quadratic scan at each
     # one.
     "dense-jwt-prefix": "eyJ-" * 25_000,
+    # The same dense run followed by the two dots a JWT needs: the scanner
+    # must find the one candidate header in the run without rescanning it
+    # from every ``eyJ``.
+    "dense-jwt-prefix-with-dots": "eyJ-" * 20_000 + ".a.b",
+    # Many short dotted runs, each holding a header that is inside a larger
+    # token (so no match): every run is examined once.
+    "dotted-jwt-lookalikes": "aeyJ." * 20_000,
     # Whitespace-free punctuation stresses the assignment, URL and relative
     # target scans without giving any of them a token boundary to stop at.
     "equals-ampersands-quotes": (

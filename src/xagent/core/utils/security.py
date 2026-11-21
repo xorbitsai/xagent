@@ -8,6 +8,7 @@ import socket
 import ssl
 import threading
 from dataclasses import dataclass
+from itertools import islice
 from typing import Callable, Iterable, Mapping, NoReturn
 from urllib.parse import (
     SplitResult,
@@ -86,18 +87,24 @@ _ALWAYS_SENSITIVE_PARAM_NAMES = frozenset(
 )
 
 URL_PATTERN = re.compile(r"(?:https?|wss?)://[^\s\"'>]+")
-WEBSOCKET_CREDENTIAL_PATTERN = re.compile(r"xagent-auth-token\.[A-Za-z0-9._~-]+")
+# The value may already end in an outer layer's marker (or several); consume
+# it so the replacement does not add a second placeholder
+# (``xagent-auth-token.v1.[REDACTED]`` must become
+# ``xagent-auth-token.[REDACTED]``, not ``...[REDACTED][REDACTED]``).
+WEBSOCKET_CREDENTIAL_PATTERN = re.compile(
+    r"xagent-auth-token\."
+    r"(?:[A-Za-z0-9._~-]*+(?:\[REDACTED\])++)"
+    r"|xagent-auth-token\.[A-Za-z0-9._~-]++"
+)
 # A JWT is ``header.payload.signature``, all base64url; the header of a JSON
 # JWT always starts ``eyJ`` (``{"``). It can reach a log line without a URL or
 # an ``identifier=`` around it (a bare token in a tool result, for instance).
-# The boundary is a negative lookbehind on the token character class rather
-# than ``\b``: ``-`` is part of that class, so ``\b`` matched before every
-# ``eyJ`` inside a dense run and each match then scanned to the end of the run
-# again (quadratic on ``"eyJ-" * n``). The possessive quantifiers keep the
-# scan linear even when a run is not followed by a dot.
-JWT_PATTERN = re.compile(
-    r"(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]++\.[A-Za-z0-9_-]++\.[A-Za-z0-9_-]++"
-)
+# The scan below is token-based instead of one regex: a lookbehind that lets
+# ``-`` open a header also lets every ``eyJ`` inside a dense run open one, and
+# each attempt then scans the rest of the run for a dot (quadratic on
+# ``"eyJ-" * n``). A token run is examined once.
+_JWT_TOKEN_PATTERN = re.compile(r"[A-Za-z0-9_-]+")
+_JWT_HEADER_PREFIX = "eyJ"
 # Every ``identifier=`` in the text; ``_is_credential_key`` decides which
 # identifiers name a secret. Only a credential's value is consumed
 # (``_ASSIGNMENT_VALUE_PATTERN``: up to ``&`` or whitespace). After any other
@@ -301,10 +308,16 @@ AUTH_HEADER_PATTERN = re.compile(
     r"(?i)([\"']?(?:proxy-)?authorization[\"']?\s*[:=]\s*[\"']?(?:bearer|basic)\s+)"
     r"([^\s,;]+)"
 )
+# The separator may repeat: rebuilding a query that names a credential without
+# a value appends ``=`` in front of whatever separated the name from the value
+# (``X-Api-Key = value`` becomes ``X-Api-Key= = value``), and the rule must
+# still see the value instead of masking the second separator. A name followed
+# only by whitespace (``x-api-key header``) is ordinary text and still does
+# not match.
 HEADER_KEY_PATTERNS = [
-    re.compile(r"(?i)(x-goog-api-key\s*[:=]\s*)([^\s,;]+)"),
-    re.compile(r"(?i)(x-api-key\s*[:=]\s*)([^\s,;]+)"),
-    re.compile(r"(?i)(x-shopify-access-token\s*[:=]\s*)([^\s,;]+)"),
+    re.compile(r"(?i)(x-goog-api-key\s*[:=]\s*(?:[:=]\s*)*)([^\s,;]+)"),
+    re.compile(r"(?i)(x-api-key\s*[:=]\s*(?:[:=]\s*)*)([^\s,;]+)"),
+    re.compile(r"(?i)(x-shopify-access-token\s*[:=]\s*(?:[:=]\s*)*)([^\s,;]+)"),
 ]
 
 
@@ -721,11 +734,14 @@ async def fetch_public_http_bytes(
     raise ValueError(f"{display_name} exceeded redirect limit")
 
 
+_MASK_SUFFIX_MAX_LENGTH = 4
+
+
 def _mask_secret(value: str) -> str:
     """Mask a secret while preserving a short suffix for troubleshooting."""
     if not value:
         return "***"
-    tail_len = 4 if len(value) > 8 else 2
+    tail_len = _MASK_SUFFIX_MAX_LENGTH if len(value) > 8 else 2
     return "***" + value[-tail_len:]
 
 
@@ -759,10 +775,17 @@ def _is_redaction_placeholder(value: str) -> bool:
     if lowered.startswith("%5b") and lowered.endswith("%5d"):
         candidate = candidate[3:-3]
         lowered = candidate.lower()
-    if lowered in {"redacted", "<redacted>"}:
+    if lowered == "redacted":
         return True
-    # ``***suffix`` / ``******``: the short mask ``_mask_secret`` emits.
-    return candidate.startswith("***")
+    # ``***suffix`` / ``******``: the short mask ``_mask_secret`` emits. It is
+    # ``***`` plus at most the four trailing characters kept for
+    # troubleshooting, so a longer value that merely starts with ``***`` is a
+    # real secret and must still be masked (a value such as
+    # ``***QWERTYUIOPASDFGZ`` is not a marker this redactor produced).
+    return (
+        candidate.startswith("***")
+        and len(candidate) <= len("***") + _MASK_SUFFIX_MAX_LENGTH
+    )
 
 
 def _mask_value_keeping_wrappers(value: str, mask: Callable[[str], str]) -> str:
@@ -784,6 +807,18 @@ def _mask_value_keeping_wrappers(value: str, mask: Callable[[str], str]) -> str:
 
 
 _USERINFO_PREFIX_PATTERN = re.compile(r"://[^/\s@]*@")
+
+
+def _query_item_needs_redaction(
+    key: str, value: str, *, redact_all_query_values: bool
+) -> bool:
+    """Whether one query item gives the URL redactor a reason to rebuild."""
+    if value and _is_redaction_placeholder(value):
+        # Already masked by an outer layer: nothing left to do for this item.
+        return False
+    if redact_all_query_values and value:
+        return True
+    return is_sensitive_param_name(key, url_query=True)
 
 
 def host_matches_suffix(hostname: str, suffix: str) -> bool:
@@ -819,10 +854,15 @@ def _redact_url_credentials_for_logging(
     # any re-encoding, so an untouched query keeps ``?flag`` (not ``?flag=``),
     # ``%20`` and a trailing ``)``, and a value that cannot be percent-encoded
     # (an unpaired surrogate, for instance) never reaches ``quote_plus``.
+    # A credential *name* with no value still needs the rebuild: the previous
+    # implementation rewrote ``?X-Api-Key`` as ``?X-Api-Key=``, and the header
+    # and assignment rules that run after this one then masked a value the
+    # query parser could not see -- the ``'token`` tail of a malformed
+    # ``?MCP_API_KEY'token`` URL, for instance.
     if not has_userinfo and not any(
-        value
-        and (redact_all_query_values or is_sensitive_param_name(key, url_query=True))
-        and not _is_redaction_placeholder(value)
+        _query_item_needs_redaction(
+            key, value, redact_all_query_values=redact_all_query_values
+        )
         for key, value in query_items
     ):
         return url
@@ -903,6 +943,14 @@ def _redact_relative_target_token(token: str, *, mask: Callable[[str], str]) -> 
     redacted = _redact_url_credentials_for_logging(target, mask=mask)
     if redacted == target:
         return token
+    if redacted == f"{target}=" and token[end:] == ":":
+        # A trailing colon is the header separator in
+        # ``/cb?X-Api-Key: value``, not part of the target. The rebuild only
+        # added the ``=`` for a credential name without a value; inserting it
+        # in front of the colon would hide the real separator and the
+        # assignment rule would mask the colon instead. Leave the shape for
+        # the header-key rule that runs next.
+        return token
     return f"{token[:start]}{redacted}{token[end:]}"
 
 
@@ -913,6 +961,67 @@ def _redact_relative_targets(text: str, mask: Callable[[str], str]) -> str:
         lambda match: _redact_relative_target_token(match.group(0), mask=mask),
         text,
     )
+
+
+def _jwt_header_offset(segment: str) -> int | None:
+    """Return where a JWT header starts inside one token run, if anywhere.
+
+    A header either starts the run or follows a hyphen: ``\\b`` treated a
+    hyphen as a boundary, so ``prefix-eyJ...`` was masked, and a header inside
+    a longer base64url run was not. At least one character must follow
+    ``eyJ`` before the first dot, because the header segment of a JWT is never
+    just those three characters.
+    """
+    offset = segment.find(_JWT_HEADER_PREFIX)
+    while offset != -1:
+        if offset == 0 or segment[offset - 1] == "-":
+            if offset + len(_JWT_HEADER_PREFIX) < len(segment):
+                return offset
+            return None
+        offset = segment.find(_JWT_HEADER_PREFIX, offset + 1)
+    return None
+
+
+def _redact_jwts(text: str) -> str:
+    """Replace JWT-shaped ``header.payload.signature`` runs in ``text``.
+
+    The text is split once into base64url token runs; a match is three runs
+    joined by single dots whose first run opens with a JWT header. Scanning
+    runs instead of every ``eyJ`` occurrence is what keeps this linear: a
+    dense ``"eyJ-" * n`` run has one candidate header (the run start) or none,
+    never one candidate per ``eyJ``.
+    """
+    if _JWT_HEADER_PREFIX not in text or "." not in text:
+        return text
+    segments = iter(_JWT_TOKEN_PATTERN.finditer(text))
+    window = list(islice(segments, 3))
+    parts: list[str] = []
+    copied = 0
+    changed = False
+    while len(window) == 3:
+        first, second, third = window
+        if (
+            second.start() - first.end() == 1
+            and text[first.end()] == "."
+            and third.start() - second.end() == 1
+            and text[second.end()] == "."
+        ):
+            offset = _jwt_header_offset(first.group(0))
+            if offset is not None:
+                parts.append(text[copied : first.start() + offset])
+                parts.append(_FULL_REDACTION)
+                copied = third.end()
+                changed = True
+                window = list(islice(segments, 3))
+                continue
+        window.pop(0)
+        following = next(segments, None)
+        if following is not None:
+            window.append(following)
+    if not changed:
+        return text
+    parts.append(text[copied:])
+    return "".join(parts)
 
 
 def _redact_text(text: str, mask: Callable[[str], str]) -> str:
@@ -966,4 +1075,4 @@ def redact_log_text(text: str) -> str:
     if not text:
         return text
     redacted = _redact_text(text, _redact_completely)
-    return JWT_PATTERN.sub(_FULL_REDACTION, redacted)
+    return _redact_jwts(redacted)

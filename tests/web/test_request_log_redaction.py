@@ -1,9 +1,13 @@
 """Request URLs are logged without credential-bearing query values."""
 
+import importlib.util
 import io
 import logging
+import sys
 from collections.abc import Iterator
 from logging.config import dictConfig
+from pathlib import Path
+from types import ModuleType, SimpleNamespace
 
 import pytest
 from fastapi import FastAPI
@@ -21,6 +25,7 @@ from xagent.web.request_log_redaction import (
 )
 
 SECRET = "guest.jwt.SECRET-VALUE"
+_JWT_SAMPLE = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ1c2VyIn0.c2lnbmF0dXJl"
 
 
 @pytest.fixture
@@ -175,7 +180,7 @@ def test_access_log_record_redacts_an_encoded_composio_session_uri():
 
 
 @pytest.mark.usefixtures("restore_logging_state")
-def test_record_factory_keeps_uvicorns_access_formatter_working() -> None:
+def test_record_factory_keeps_uvicorn_access_formatter_working() -> None:
     # uvicorn's AccessFormatter unpacks record.args into five fields and
     # ignores record.msg. A factory that rewrites the message and clears the
     # arguments makes every access line fail with "not enough values to
@@ -217,6 +222,34 @@ def test_record_factory_keeps_uvicorns_access_formatter_working() -> None:
         f'127.0.0.1:1 - "GET /api/files/public/preview/abc'
         f'?ticket={REDACTED}&code={REDACTED}&token={REDACTED} HTTP/1.1" 200 OK'
     ) in output
+
+
+@pytest.mark.usefixtures("restore_logging_state")
+def test_record_factory_does_not_trust_the_access_logger_by_name_alone() -> None:
+    # Only the five-tuple uvicorn's AccessFormatter unpacks owns the argument
+    # shape. An ordinary record on the same logger must be formatted like any
+    # other, or a plain ``%(message)s`` handler prints the credential.
+    setup_logging(force=True)
+    access_logger = logging.getLogger("uvicorn.access")
+    access_logger.setLevel(logging.INFO)
+    access_logger.propagate = False
+
+    stream = io.StringIO()
+    handler = logging.StreamHandler(stream)
+    handler.setFormatter(logging.Formatter("%(message)s"))
+    access_logger.addHandler(handler)
+    records, capture_handler = _capture(access_logger)
+    try:
+        access_logger.info("Authorization: Bearer %s", SECRET)
+        access_logger.info(f"Authorization: Bearer {SECRET}")
+    finally:
+        access_logger.removeHandler(handler)
+        access_logger.removeHandler(capture_handler)
+
+    output = stream.getvalue()
+    assert SECRET not in output
+    assert all(record.args == () for record in records)
+    assert all(SECRET not in record.getMessage() for record in records)
 
 
 @pytest.mark.usefixtures("restore_logging_state")
@@ -546,6 +579,84 @@ def test_jwt_in_a_url_path_is_masked() -> None:
     assert "/content" in redacted
 
 
+# The prefix characters the R2 review compared against the previous
+# implementation, with the JWT placed directly behind each one.
+_JWT_PREFIX_CHARS = (
+    "",
+    " ",
+    "=",
+    "-",
+    "_",
+    ".",
+    "/",
+    ":",
+    ",",
+    ";",
+    "(",
+    "[",
+    "{",
+    "<",
+    '"',
+    "'",
+    "\\",
+    "|",
+    "+",
+    "*",
+    "~",
+    "!",
+    "?",
+    "&",
+    "%",
+    "#",
+    "@",
+    "\n",
+    "\t",
+    "0",
+    "a",
+    "A",
+    "$",
+    "^",
+)
+
+
+@pytest.mark.parametrize(
+    "prefix", _JWT_PREFIX_CHARS, ids=[repr(char) for char in _JWT_PREFIX_CHARS]
+)
+def test_a_jwt_is_recognized_after_each_prefix_character(prefix: str) -> None:
+    text = f"x{prefix}{_JWT_SAMPLE}"
+
+    redacted = security.redact_log_text(text)
+
+    # A header opens a JWT when it starts a token run or follows a hyphen (the
+    # boundary ``\b`` gave the previous implementation). A digit, letter or
+    # underscore keeps the header inside the surrounding run, exactly as it
+    # did before; the c6336485 comparison below checks that dynamically.
+    inside_the_run = not prefix or (
+        prefix.isascii() and (prefix.isalnum() or prefix == "_")
+    )
+    if inside_the_run:
+        assert redacted == text
+    else:
+        assert _JWT_SAMPLE not in redacted
+        assert redacted == f"x{prefix}{REDACTED}"
+
+
+def test_an_already_masked_websocket_credential_is_not_masked_twice() -> None:
+    # An outer layer can mask the secret but leave the version in front of it
+    # (``v1.[REDACTED]``). Replacing the whole tail must not append a second
+    # placeholder, which would break exact log assertions.
+    already_masked = "xagent-auth-token.v1.[REDACTED]"
+    for text in (
+        already_masked,
+        "xagent-auth-token.v1.[REDACTED][REDACTED]",
+        "xagent-auth-token.[REDACTED]",
+    ):
+        once = security.redact_log_text(text)
+
+        assert once == "xagent-auth-token.[REDACTED]"
+        assert security.redact_log_text(once) == once
+
+
 def test_xagent_auth_token_values_are_masked() -> None:
     text = "Sec-WebSocket-Protocol: xagent-auth-v1, xagent-auth-token.s3cr3t.va1ue"
 
@@ -636,8 +747,49 @@ def test_log_text_redaction_is_idempotent(text: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# The previous implementation (ad253647) must remain a subset of this one
+# Earlier implementations must remain a subset of the current one
 # ---------------------------------------------------------------------------
+
+# The redaction sources from the two earlier commits, copied verbatim. They
+# are checked in rather than read with ``git show`` because a test checkout is
+# shallow and does not carry those commits; the header of each file records
+# where it came from and how to regenerate it. Loading and running the old
+# code, instead of comparing against a hand-written list of expected masks, is
+# what catches a boundary change nobody wrote a sample for.
+_LEGACY_SOURCE_DIR = Path(__file__).with_name("legacy_sources")
+_LEGACY_SOURCES = {
+    "ad253647_security": "security_ad253647.py.txt",
+    "ad253647_request_log": "request_log_redaction_ad253647.py.txt",
+    "c6336485_security": "security_c6336485.py.txt",
+}
+
+
+@pytest.fixture(scope="session")
+def legacy_redactors(tmp_path_factory: pytest.TempPathFactory) -> SimpleNamespace:
+    """Load the earlier redactors as separate modules."""
+    modules: dict[str, ModuleType] = {}
+    for name, filename in _LEGACY_SOURCES.items():
+        module_path = tmp_path_factory.mktemp(name) / filename.removesuffix(".txt")
+        module_path.write_text((_LEGACY_SOURCE_DIR / filename).read_text())
+        spec = importlib.util.spec_from_file_location(f"_legacy_{name}", module_path)
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = module
+        spec.loader.exec_module(module)
+        modules[name] = module
+    return SimpleNamespace(**modules)
+
+
+def _assert_never_weaker(
+    old_output: str, new_output: str, secrets: tuple[str, ...], text: str
+) -> None:
+    # Only compare what the old implementation actually masked: masking more
+    # than it did is fine (a log may over-mask), masking less is the bug.
+    masked_before = [secret for secret in secrets if secret not in old_output]
+    assert masked_before, f"sample does not exercise the old redactor: {text!r}"
+    still_visible = [secret for secret in masked_before if secret in new_output]
+    assert not still_visible, (text, old_output, new_output, still_visible)
+
 
 # Names and suffixes the previous request-target filter masked. The new name
 # rule is a union of that list and the new one, so none of these may regress.
@@ -682,82 +834,218 @@ _OLD_REQUEST_TARGET_SUFFIX_NAMES = (
     "s3_key",
     "idempotency_key",
 )
-_OLD_REDACTOR_TEXT_SAMPLES = (
-    ('Authorization: Bearer "sk-LEAK-0123456789"', "sk-LEAK-0123456789"),
-    ("Authorization: Bearer 'sk-LEAK-0123456789'", "sk-LEAK-0123456789"),
-    ('Authorization: Basic "sk-LEAK-0123456789"', "sk-LEAK-0123456789"),
-    ('Authorization: bearer "sk-LEAK-0123456789"', "sk-LEAK-0123456789"),
-    ("Authorization: Bearer abc]def", "abc]def"),
-    ("Authorization: Bearer sk-LEAK-0123456789}", "sk-LEAK-0123456789"),
-    ("MCP_API_KEY=SECRET-abc123", "SECRET-abc123"),
-    ("api_key=SK-OLD-SECRET", "SK-OLD-SECRET"),
-    ("https://example.com/x?api_key=AIzaSyOldKey&v=1", "AIzaSyOldKey"),
-    ("https://example.com/x?key=OLDKEY&v=1", "OLDKEY"),
-    ("https://example.com/x?token=OLDTOKEN", "OLDTOKEN"),
-    ("https://example.com/x?ticket=OLDTICKET", "OLDTICKET"),
-    ("https://example.com/x?password=OLDPASSWORD", "OLDPASSWORD"),
-    ("https://example.com/x?secret=OLDSECRET", "OLDSECRET"),
-    ("https://example.com/x?access_token=OLDACCESS", "OLDACCESS"),
-    ("https://example.com/x?apikey=OLDAPIKEY", "OLDAPIKEY"),
+# Text shapes the ad253647 redactor masked, plus malformed-query shapes whose
+# credential name is not followed by ``=``: the old code rebuilt the URL with
+# ``=`` and let the header/assignment rules mask the tail.
+_OLD_TEXT_SAMPLES = (
+    pytest.param(
+        'Authorization: Bearer "sk-LEAK-0123456789"',
+        ("sk-LEAK-0123456789",),
+        id="old-text-quoted-bearer",
+    ),
+    pytest.param(
+        "Authorization: Bearer 'sk-LEAK-0123456789'",
+        ("sk-LEAK-0123456789",),
+        id="old-text-single-quoted-bearer",
+    ),
+    pytest.param(
+        'Authorization: Basic "sk-LEAK-0123456789"',
+        ("sk-LEAK-0123456789",),
+        id="old-text-quoted-basic",
+    ),
+    pytest.param(
+        'Authorization: bearer "sk-LEAK-0123456789"',
+        ("sk-LEAK-0123456789",),
+        id="old-text-lowercase-bearer",
+    ),
+    pytest.param(
+        "Authorization: Bearer abc]def",
+        ("abc]def",),
+        id="old-text-bracketed-bearer",
+    ),
+    pytest.param(
+        "Authorization: Bearer sk-LEAK-0123456789}",
+        ("sk-LEAK-0123456789",),
+        id="old-text-braced-bearer",
+    ),
+    pytest.param(
+        "MCP_API_KEY=SECRET-abc123", ("SECRET-abc123",), id="old-text-assignment"
+    ),
+    pytest.param("api_key=SK-OLD-SECRET", ("SK-OLD-SECRET",), id="old-text-api-key"),
+    pytest.param(
+        "https://example.com/x?api_key=AIzaSyOldKey&v=1",
+        ("AIzaSyOldKey",),
+        id="old-text-url-api-key",
+    ),
+    pytest.param(
+        "https://example.com/x?key=OLDKEY&v=1", ("OLDKEY",), id="old-text-url-key"
+    ),
+    pytest.param(
+        "https://example.com/x?token=OLDTOKEN",
+        ("OLDTOKEN",),
+        id="old-text-url-token",
+    ),
+    pytest.param(
+        "https://example.com/x?ticket=OLDTICKET",
+        ("OLDTICKET",),
+        id="old-text-url-ticket",
+    ),
+    pytest.param(
+        "https://example.com/x?password=OLDPASSWORD",
+        ("OLDPASSWORD",),
+        id="old-text-url-password",
+    ),
+    pytest.param(
+        "https://example.com/x?secret=OLDSECRET",
+        ("OLDSECRET",),
+        id="old-text-url-secret",
+    ),
+    pytest.param(
+        "https://example.com/x?access_token=OLDACCESS",
+        ("OLDACCESS",),
+        id="old-text-url-access-token",
+    ),
+    pytest.param(
+        "https://example.com/x?apikey=OLDAPIKEY",
+        ("OLDAPIKEY",),
+        id="old-text-url-apikey",
+    ),
+    pytest.param(
+        'wss://e.com/ws?X-Api-Key sk-FUZZ-0123456789"}',
+        ("sk-FUZZ-0123456789",),
+        id="old-text-malformed-space",
+    ),
+    pytest.param(
+        "https://e.com/x?MCP_API_KEY'tok-FUZZ-abcdef123456>",
+        ("tok-FUZZ-abcdef123456",),
+        id="old-text-malformed-quote",
+    ),
+    pytest.param(
+        'https://e.com/x?access_token"sk-FUZZ-0123456789}',
+        ("sk-FUZZ-0123456789",),
+        id="old-text-malformed-double-quote",
+    ),
+    pytest.param(
+        "/cb?X-Api-Key: sk-FUZZ-0123456789",
+        ("sk-FUZZ-0123456789",),
+        id="old-text-relative-colon-separator",
+    ),
+    pytest.param(
+        "/cb?X-Api-Key = sk-FUZZ-0123456789",
+        ("sk-FUZZ-0123456789",),
+        id="old-text-relative-equals-separator",
+    ),
 )
-# (redactor, input, values the old implementation masked). Each value must
-# still be absent from the new output.
-_OLD_REDACTOR_SAMPLES = (
-    [
-        pytest.param(
-            security.redact_sensitive_text,
-            header,
-            (secret,),
-            id=f"old-redact-sensitive-text-{index}",
-        )
-        for index, (header, secret) in enumerate(_OLD_REDACTOR_TEXT_SAMPLES)
-    ]
-    + [
-        pytest.param(
-            security.redact_url_credentials_for_logging,
-            f"https://example.com/x?{name}=OLD-{name}-VALUE&v=1",
-            (f"OLD-{name}-VALUE",),
-            id=f"old-url-redactor-{name}",
-        )
-        for name in (
-            "api_key",
-            "apikey",
-            "key",
-            "access_token",
-            "token",
-            "ticket",
-            "password",
-            "secret",
-        )
-    ]
-    + [
-        pytest.param(
-            security.redact_url_credentials_for_logging,
-            "https://alice:s3cret-pass@proxy.internal:8080/",
-            ("s3cret-pass",),
-            id="old-url-redactor-userinfo",
-        ),
-    ]
-    + [
-        pytest.param(
-            redact_request_target,
-            f"/api/list?{name}=OLD-{name}-VALUE&page=2",
-            (f"OLD-{name}-VALUE",),
-            id=f"old-request-target-{name}",
-        )
-        for name in _OLD_REQUEST_TARGET_NAMES + _OLD_REQUEST_TARGET_SUFFIX_NAMES
-    ]
+_OLD_URL_NAMES = (
+    "api_key",
+    "apikey",
+    "key",
+    "access_token",
+    "token",
+    "ticket",
+    "password",
+    "secret",
+)
+_OLD_URL_USERINFO_SAMPLE = "https://alice:s3cret-pass@proxy.internal:8080/"
+# JWT shapes the c6336485 log redactor masked. The header boundary there was
+# ``\b``, which starts a match after a hyphen, so every sample with a
+# hyphenated prefix must stay masked.
+_JWT_NEVER_WEAKER_SAMPLES = (
+    pytest.param(
+        f"tool output: {_JWT_SAMPLE} (end)", (_JWT_SAMPLE,), id="old-jwt-bare"
+    ),
+    pytest.param(
+        f"GET https://api.example.com/files/{_JWT_SAMPLE}/content",
+        (_JWT_SAMPLE,),
+        id="old-jwt-url-path",
+    ),
+    pytest.param(f"prefix-{_JWT_SAMPLE}", (_JWT_SAMPLE,), id="old-jwt-after-hyphen"),
+    pytest.param(
+        f"GET /files/upload-{_JWT_SAMPLE} failed",
+        (_JWT_SAMPLE,),
+        id="old-jwt-hyphenated-upload-segment",
+    ),
+    pytest.param(
+        f"/files/slug-{_JWT_SAMPLE}", (_JWT_SAMPLE,), id="old-jwt-hyphenated-path"
+    ),
+    pytest.param(f"{_JWT_SAMPLE}-trailing", (_JWT_SAMPLE,), id="old-jwt-before-hyphen"),
+    pytest.param(
+        f"first {_JWT_SAMPLE} then {_JWT_SAMPLE}",
+        (_JWT_SAMPLE,),
+        id="old-jwt-two-values",
+    ),
 )
 
 
-@pytest.mark.parametrize("redact, text, secrets", _OLD_REDACTOR_SAMPLES)
-def test_redaction_is_never_weaker_than_the_previous_implementation(
-    redact, text, secrets
-):
-    redacted = redact(text)
+@pytest.mark.parametrize(("text", "secrets"), _OLD_TEXT_SAMPLES)
+def test_text_redaction_is_never_weaker_than_ad253647(
+    legacy_redactors: SimpleNamespace, text: str, secrets: tuple[str, ...]
+) -> None:
+    old_output = legacy_redactors.ad253647_security.redact_sensitive_text(text)
+    new_output = security.redact_sensitive_text(text)
 
-    for secret in secrets:
-        assert secret not in redacted, text
+    _assert_never_weaker(old_output, new_output, secrets, text)
+
+
+@pytest.mark.parametrize(("text", "secrets"), _OLD_TEXT_SAMPLES)
+def test_log_text_redaction_is_never_weaker_than_ad253647(
+    legacy_redactors: SimpleNamespace, text: str, secrets: tuple[str, ...]
+) -> None:
+    # ``redact_log_text`` replaces values outright, but must still mask every
+    # value the older text redactor masked (with a short suffix or not).
+    old_output = legacy_redactors.ad253647_security.redact_sensitive_text(text)
+    new_output = security.redact_log_text(text)
+
+    _assert_never_weaker(old_output, new_output, secrets, text)
+
+
+@pytest.mark.parametrize("name", _OLD_URL_NAMES)
+def test_url_redaction_is_never_weaker_than_ad253647(
+    legacy_redactors: SimpleNamespace, name: str
+) -> None:
+    text = f"https://example.com/x?{name}=OLD-{name}-VALUE&v=1"
+    old_output = legacy_redactors.ad253647_security.redact_url_credentials_for_logging(
+        text
+    )
+    new_output = security.redact_url_credentials_for_logging(text)
+
+    _assert_never_weaker(old_output, new_output, (f"OLD-{name}-VALUE",), text)
+
+
+def test_url_userinfo_redaction_is_never_weaker_than_ad253647(
+    legacy_redactors: SimpleNamespace,
+) -> None:
+    old_output = legacy_redactors.ad253647_security.redact_url_credentials_for_logging(
+        _OLD_URL_USERINFO_SAMPLE
+    )
+    new_output = security.redact_url_credentials_for_logging(_OLD_URL_USERINFO_SAMPLE)
+
+    _assert_never_weaker(
+        old_output, new_output, ("s3cret-pass",), _OLD_URL_USERINFO_SAMPLE
+    )
+
+
+@pytest.mark.parametrize(
+    "name", _OLD_REQUEST_TARGET_NAMES + _OLD_REQUEST_TARGET_SUFFIX_NAMES
+)
+def test_request_target_redaction_is_never_weaker_than_ad253647(
+    legacy_redactors: SimpleNamespace, name: str
+) -> None:
+    text = f"/api/list?{name}=OLD-{name}-VALUE&page=2"
+    old_output = legacy_redactors.ad253647_request_log.redact_request_target(text)
+    new_output = redact_request_target(text)
+
+    _assert_never_weaker(old_output, new_output, (f"OLD-{name}-VALUE",), text)
+
+
+@pytest.mark.parametrize(("text", "secrets"), _JWT_NEVER_WEAKER_SAMPLES)
+def test_jwt_redaction_is_never_weaker_than_c6336485(
+    legacy_redactors: SimpleNamespace, text: str, secrets: tuple[str, ...]
+) -> None:
+    old_output = legacy_redactors.c6336485_security.redact_log_text(text)
+    new_output = security.redact_log_text(text)
+
+    _assert_never_weaker(old_output, new_output, secrets, text)
 
 
 # ---------------------------------------------------------------------------

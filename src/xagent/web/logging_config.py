@@ -96,9 +96,16 @@ def _redact_record(record: logging.LogRecord) -> None:
             # argument structure: filters and formatters (uvicorn's access
             # formatter in particular) still read it.
             new_args = redacted_args
-        elif record.name in _ARG_PRESERVING_LOGGERS:
-            # This formatter owns the argument shape; never flatten it. The
-            # URL-bearing argument was redacted by _redact_args.
+        elif (
+            record.name in _ARG_PRESERVING_LOGGERS
+            and isinstance(record.args, tuple)
+            and len(record.args) == 5
+        ):
+            # The access formatter unpacks exactly this five-tuple and
+            # ignores record.msg, so flattening would drop the line. Any
+            # other shape on that logger is an ordinary record and is
+            # formatted like one; keeping the raw msg there would leak a
+            # credential to a plain ``%(message)s`` handler.
             new_args = redacted_args
         else:
             # The credential only appears after interpolation. The formatted

@@ -1630,6 +1630,12 @@ class AgentRunner:
         cancelled, the message is taken in at the next safe point, or handed
         back unapplied if that request gives the final answer. Tool calls and
         the execution itself are never cancelled by an offer.
+
+        The request is cancelled as soon as the message is queued, before the
+        host authorizes it and before its input review; both run only when
+        the safe point claims the message. A message that is not applied
+        there has still cost the cancelled request and one of the
+        iteration's ``LIVE_INPUT_PREEMPT_LIMIT`` repeats.
         """
         offer = self._offer_live_user_message(
             execution_id,

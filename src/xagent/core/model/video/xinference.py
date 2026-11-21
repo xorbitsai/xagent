@@ -188,6 +188,7 @@ SAAS_VIDEO_SUBMIT_ATTEMPTS = 3
 SAAS_VIDEO_SUBMIT_PAUSE_SECONDS = 2.0
 SAAS_VIDEO_REQUEST_TIMEOUT_SECONDS = 60.0
 SAAS_VIDEO_CONTENT_TIMEOUT_SECONDS = 600.0
+_SAAS_ACCEPTED_STATUSES = (200, 201, 202)
 # Failure codes the server documents as not charged.
 _SAAS_UNBILLED_FAILURE_CODES = frozenset(
     {"video_expired", "video_cancelled", "upstream_failure"}
@@ -314,6 +315,16 @@ def _saas_seed(value: Any) -> int | None:
             allowed_values={"seed": [0, SAAS_VIDEO_MAX_SEED]},
         )
     return int(value)
+
+
+@dataclass
+class _SubmitState:
+    """What the submit attempts have left uncertain."""
+
+    # An attempt may have created a job whose id we never saw.
+    ambiguous: bool = False
+    # The server accepted a job but its id could not be read.
+    accepted_unreadable: bool = False
 
 
 class _JobDeadline(Exception):
@@ -741,7 +752,13 @@ class XinferenceVideoModel(BaseVideoModel):
         headers: Optional[dict[str, str]] = None,
         read_bytes: bool = False,
         timeout: float = SAAS_VIDEO_REQUEST_TIMEOUT_SECONDS,
+        trace: Optional[dict[str, Any]] = None,
     ) -> _JobResponse:
+        """One request; ``trace["status"]`` is set as soon as headers arrive.
+
+        The trace lets a caller that is cancelled while the body is still being
+        read know the server had already answered.
+        """
         kwargs: dict[str, Any] = {
             "headers": {**self._headers(), **(headers or {})},
             "timeout": aiohttp.ClientTimeout(total=timeout),
@@ -751,6 +768,8 @@ class XinferenceVideoModel(BaseVideoModel):
         async with session.request(
             method, f"{self._job_host()}{path}", **kwargs
         ) as response:
+            if trace is not None:
+                trace["status"] = response.status
             if read_bytes and response.status == 200:
                 return _JobResponse(
                     response.status, response.headers, content=await response.read()
@@ -793,19 +812,44 @@ class XinferenceVideoModel(BaseVideoModel):
         body: dict[str, Any],
         deadline: float,
     ) -> str:
-        """POST the job; return its id. Nothing here has billed yet.
+        """POST the job; return its id.
 
         One ``Idempotency-Key`` covers every attempt, so a POST whose answer
-        was lost cannot start a second render. A full queue (429) is retried
-        after the server's ``Retry-After``; once the attempts run out it is
-        raised as a plain 429, which the retry wrapper may try again because
-        no job exists. Any other failure that could still hide a created job
-        is raised without a retryable cause.
+        was lost cannot start a second render, and an accepted answer whose
+        body is unreadable is recovered by replaying the POST with that key.
+
+        A full queue (429) is retried after the server's ``Retry-After``; once
+        the attempts run out it is raised as a plain 429, which the retry
+        wrapper may try again with a *new* key. That is only safe while no
+        earlier attempt could have created a job, so once one might have
+        (``ambiguous``) a 429 is raised as a non-retryable error instead.
+
+        A call that is accepted but never yields an id is recorded as one
+        unmeasured call before the error leaves, because the job may run on
+        and be billed.
         """
         key = uuid.uuid4().hex
-        last_error: Exception | None = None
+        sub = _SubmitState()
+        try:
+            return await self._submit_attempts(session, body, deadline, key, sub)
+        except BaseException:
+            if sub.accepted_unreadable:
+                self._record_job_usage(
+                    0, None, "unknown", "accepted job id could not be read"
+                )
+            raise
+
+    async def _submit_attempts(
+        self,
+        session: aiohttp.ClientSession,
+        body: dict[str, Any],
+        deadline: float,
+        key: str,
+        sub: "_SubmitState",
+    ) -> str:
         for attempt in range(SAAS_VIDEO_SUBMIT_ATTEMPTS):
             last = attempt == SAAS_VIDEO_SUBMIT_ATTEMPTS - 1
+            trace: dict[str, Any] = {}
             try:
                 response = await self._job_call(
                     session,
@@ -813,10 +857,15 @@ class XinferenceVideoModel(BaseVideoModel):
                     "/v1/videos",
                     json_body=body,
                     headers={"Idempotency-Key": key},
+                    trace=trace,
                 )
+            except asyncio.CancelledError:
+                if trace.get("status") in _SAAS_ACCEPTED_STATUSES:
+                    sub.accepted_unreadable = True
+                raise
             except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
                 # The request may have reached the server and created the job.
-                last_error = exc
+                sub.ambiguous = True
                 if last:
                     raise RuntimeError(
                         "Xinference video job submission failed and may have "
@@ -824,20 +873,30 @@ class XinferenceVideoModel(BaseVideoModel):
                     ) from None
                 await asyncio.sleep(SAAS_VIDEO_SUBMIT_PAUSE_SECONDS)
                 continue
-            if response.status in (200, 201, 202):
+            if response.status in _SAAS_ACCEPTED_STATUSES:
                 job_id = (
                     response.body.get("id") if isinstance(response.body, dict) else None
                 )
-                if not job_id:
+                if job_id:
+                    return str(job_id)
+                sub.ambiguous = True
+                sub.accepted_unreadable = True
+                if last:
                     raise BilledVideoTaskError(
-                        "Xinference accepted the video job but returned no id"
+                        "Xinference accepted the video job but its id could not be read"
                     )
-                return str(job_id)
+                await asyncio.sleep(SAAS_VIDEO_SUBMIT_PAUSE_SECONDS)
+                continue
             if response.status == 429:
                 wait = _retry_after_seconds(
                     response.headers, SAAS_VIDEO_QUEUE_FULL_RETRY_SECONDS
                 )
                 if last or time.monotonic() + wait >= deadline:
+                    if sub.ambiguous:
+                        raise RuntimeError(
+                            "Xinference video queue is full after an earlier "
+                            "submission that may have created a job"
+                        )
                     raise self._job_http_error(
                         "/v1/videos",
                         response,
@@ -850,7 +909,7 @@ class XinferenceVideoModel(BaseVideoModel):
                 await asyncio.sleep(wait)
                 continue
             if response.status >= 500:
-                last_error = RuntimeError(f"HTTP {response.status}")
+                sub.ambiguous = True
                 if last:
                     raise RuntimeError(
                         "Xinference video job submission failed with HTTP "
@@ -864,51 +923,75 @@ class XinferenceVideoModel(BaseVideoModel):
                 f"Xinference video request failed: "
                 f"{response.error_code or response.body}",
             )
-        raise RuntimeError(  # pragma: no cover - the loop always returns or raises
-            f"Xinference video job submission failed: {last_error}"
-        )
+        raise AssertionError("unreachable: the last attempt always returns or raises")
 
     async def _abandon_video_job(
         self,
         session: aiohttp.ClientSession,
         job_id: str,
-        last_status: Optional[str],
         requested_seconds: Any,
         resolution: Optional[str],
     ) -> str:
-        """DELETE a job nobody is waiting for and record what it may cost.
+        """DELETE a job nobody is waiting for, then record what it may cost.
 
-        Returns ``"free"`` (cancelled while queued), ``"charged"`` (the render
-        runs or ran) or ``"unknown"`` (the DELETE could not tell). A queued job
-        is not charged; a rendering one is, so the requested seconds stand in
-        for the bill the poll never delivered. An unknown outcome is recorded
-        as an unmeasured call so a possible charge is not invisible.
+        The DELETE answer alone cannot say what was billed: the same 200
+        covers a queued job cancelled for free, a failed job (no-op) and a
+        completed job whose file was deleted without a refund. So the job is
+        read again afterwards and classified by that final server state:
+
+        - ``failed`` with a documented unbilled code: ``"free"``, no row;
+        - ``completed``: ``"charged"``, its ``usage.video_seconds`` (the
+          requested seconds if absent);
+        - anything else, or a job that cannot be read: ``"unknown"``, one
+          unmeasured row, unless the DELETE itself said ``409
+          video_in_progress`` (documented as charged), which records the
+          requested seconds.
         """
-        outcome = "unknown"
+        render_running = False
         try:
             response = await asyncio.wait_for(
                 self._job_call(session, "DELETE", f"/v1/videos/{job_id}", timeout=15.0),
                 timeout=20.0,
             )
-            if response.status == 409 and response.error_code == "video_in_progress":
-                outcome = "charged"
-            elif response.status == 200:
-                # A 200 on a job last seen rendering means it finished first
-                # and its file was deleted without a refund.
-                outcome = "free" if last_status in (None, "queued") else "charged"
+            render_running = (
+                response.status == 409 and response.error_code == "video_in_progress"
+            )
         except Exception as exc:  # noqa: BLE001 - best effort
             logger.warning(
                 "Could not cancel xinference-saas video job %s: %s",
                 job_id,
                 redact_provider_detail(exc),
             )
-        finally:
-            if outcome == "charged":
-                self._record_job_usage(
-                    requested_seconds or 0, resolution, job_id, "render not cancellable"
-                )
-            elif outcome == "unknown":
-                self._record_job_usage(0, resolution, job_id, "cancel outcome unknown")
+
+        outcome = "unknown"
+        billed: Any = 0
+        try:
+            final = await asyncio.wait_for(
+                self._job_call(session, "GET", f"/v1/videos/{job_id}", timeout=15.0),
+                timeout=20.0,
+            )
+            job = final.body if isinstance(final.body, dict) else {}
+            status = job.get("status") if final.status == 200 else None
+            if status == "completed":
+                outcome = "charged"
+                billed = self._job_billed_seconds(job, requested_seconds)
+            elif status == "failed" and _saas_error_code(job) in (
+                _SAAS_UNBILLED_FAILURE_CODES
+            ):
+                outcome = "free"
+        except Exception as exc:  # noqa: BLE001 - best effort
+            logger.warning(
+                "Could not read xinference-saas video job %s after cancelling: %s",
+                job_id,
+                redact_provider_detail(exc),
+            )
+        if outcome == "unknown" and render_running:
+            outcome = "charged"
+            billed = requested_seconds or 0
+        if outcome == "charged":
+            self._record_job_usage(billed or 0, resolution, job_id, "job charged")
+        elif outcome == "unknown":
+            self._record_job_usage(0, resolution, job_id, "final state unknown")
         return outcome
 
     async def _run_saas_video_job(
@@ -949,23 +1032,16 @@ class XinferenceVideoModel(BaseVideoModel):
                     f"Xinference video generation failed: {exc}"
                 ) from exc
 
-            state: dict[str, Any] = {"status": None, "recorded": False}
+            state: dict[str, Any] = {"status": None}
             try:
                 completed = await self._wait_for_video_job(
                     session, job_id, deadline, state
                 )
             except asyncio.CancelledError:
-                if not state["recorded"]:
-                    state["recorded"] = True
-                    await self._abandon_video_job(
-                        session, job_id, state["status"], seconds, size
-                    )
+                await self._abandon_video_job(session, job_id, seconds, size)
                 raise
             except _JobDeadline as exc:
-                state["recorded"] = True
-                outcome = await self._abandon_video_job(
-                    session, job_id, state["status"], seconds, size
-                )
+                outcome = await self._abandon_video_job(session, job_id, seconds, size)
                 message = (
                     f"Timed out waiting for video job {job_id}; "
                     f"last status: {state['status']}"
@@ -974,14 +1050,10 @@ class XinferenceVideoModel(BaseVideoModel):
                     raise TimeoutError(message) from exc
                 raise BilledVideoTaskTimeout(message) from exc
             except _JobFatal as exc:
-                state["recorded"] = True
-                await self._abandon_video_job(
-                    session, job_id, state["status"], seconds, size
-                )
+                await self._abandon_video_job(session, job_id, seconds, size)
                 raise BilledVideoTaskError(str(exc)) from None
 
             billed = self._job_billed_seconds(completed, seconds)
-            state["recorded"] = True
             self._record_job_usage(billed, size or resolution, job_id, "completed")
             try:
                 content = await self._job_call(
@@ -1047,7 +1119,6 @@ class XinferenceVideoModel(BaseVideoModel):
                 if status == "completed":
                     return job
                 if status == "failed":
-                    state["recorded"] = True
                     code = _saas_error_code(job)
                     detail = _saas_error_message(job)
                     if code in _SAAS_UNBILLED_FAILURE_CODES:
@@ -1068,7 +1139,6 @@ class XinferenceVideoModel(BaseVideoModel):
             ):
                 # The job id stopped resolving or the key stopped working; the
                 # job may still run, so stop waiting without a second submit.
-                state["recorded"] = False
                 raise _JobFatal(
                     f"Video job {job_id} could not be polled: HTTP {response.status} "
                     f"{response.error_code or ''}".strip()

@@ -65,6 +65,9 @@ class FakeServer:
             200, {"id": "vid_1", "object": "video.deleted", "deleted": True}
         )
         self.content_reply: Any = FakeResponse(200, MP4)
+        # What GET /v1/videos/{id} answers once a DELETE has been seen.
+        self.get_after_delete: Any = None
+        self.deleted = False
 
     def urls(self, method: str) -> list[str]:
         return [u for m, u, _, _ in self.calls if m == method]
@@ -75,8 +78,11 @@ class FakeServer:
             reply = self.post_replies.pop(0)
         elif method == "DELETE":
             reply = self.delete_reply
+            self.deleted = True
         elif url.endswith("/content"):
             reply = self.content_reply
+        elif self.deleted and self.get_after_delete is not None:
+            reply = self.get_after_delete
         else:
             reply = (
                 self.get_replies.pop(0)
@@ -145,6 +151,31 @@ def _build(provider: str = XINFERENCE_SAAS_PROVIDER, base_url: str = HOST) -> An
 
 def _rows(manager):
     return [d for d in manager.get_usage().details if d.get("type") == "media"]
+
+
+async def _cancel_after_first_poll(server, **kwargs):
+    """Start a generation, cancel it while it sleeps between polls."""
+    gate = asyncio.Event()
+    real_sleep = asyncio.sleep
+
+    async def stall(delay):
+        gate.set()
+        await real_sleep(3600)
+
+    xinference_module.asyncio.sleep = stall
+    try:
+        task = asyncio.ensure_future(_build().generate_video(prompt="a fox", **kwargs))
+        await gate.wait()
+        task.cancel()
+        xinference_module.asyncio.sleep = real_sleep
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    finally:
+        xinference_module.asyncio.sleep = real_sleep
+
+
+def cancelled_job():
+    return job("failed", error={"code": "video_cancelled", "message": "cancelled"})
 
 
 async def test_happy_path_polls_then_downloads_the_mp4(server):
@@ -243,6 +274,92 @@ async def test_queue_full_exhausted_is_retryable_and_bills_nothing(server):
     assert server.urls("DELETE") == []
 
 
+async def test_ambiguous_submit_then_queue_full_is_not_retryable(server):
+    full = FakeResponse(429, {"error": {"code": "video_queue_full"}})
+    server.post_replies = [aiohttp.ClientConnectionError("lost"), full, full]
+    with TokenContextManager() as manager:
+        with pytest.raises(RuntimeError, match="may have created a job") as info:
+            await _build().generate_video(prompt="a fox")
+    assert retry_on(info.value) is False
+    assert _rows(manager) == []
+    keys = {h["Idempotency-Key"] for m, _, h, _ in server.calls if m == "POST"}
+    assert len(keys) == 1
+
+
+async def test_ambiguous_submit_replays_the_same_key_and_recovers_the_job(server):
+    server.post_replies = [aiohttp.ClientConnectionError("lost"), accepted()]
+    server.get_replies = [completed()]
+    result = await _build().generate_video(prompt="a fox", seconds=4)
+    posts = [h for m, _, h, _ in server.calls if m == "POST"]
+    assert (
+        len(posts) == 2 and posts[0]["Idempotency-Key"] == posts[1]["Idempotency-Key"]
+    )
+    assert result["task_id"] == "vid_1"
+
+
+async def test_accepted_with_unreadable_body_recovers_the_id_by_replay(server):
+    server.post_replies = [FakeResponse(202, None), accepted()]
+    server.get_replies = [completed()]
+    with TokenContextManager() as manager:
+        result = await _build().generate_video(prompt="a fox", seconds=4)
+    posts = [h for m, _, h, _ in server.calls if m == "POST"]
+    assert (
+        len(posts) == 2 and posts[0]["Idempotency-Key"] == posts[1]["Idempotency-Key"]
+    )
+    assert result["task_id"] == "vid_1"
+    assert len(_rows(manager)) == 1  # the completed job only
+
+
+async def test_accepted_with_unreadable_body_every_time_records_one_unmeasured_call(
+    server,
+):
+    server.post_replies = [FakeResponse(202, None)] * 3
+    with TokenContextManager() as manager:
+        with pytest.raises(BilledVideoTaskError) as info:
+            await _build().generate_video(prompt="a fox", seconds=4)
+    assert retry_on(info.value) is False
+    [row] = _rows(manager)
+    assert row["quantity"] == 0.0
+
+
+async def test_accepted_then_replay_queue_full_records_one_unmeasured_call(server):
+    full = FakeResponse(429, {"error": {"code": "video_queue_full"}})
+    server.post_replies = [FakeResponse(202, None), full, full]
+    with TokenContextManager() as manager:
+        with pytest.raises(RuntimeError) as info:
+            await _build().generate_video(prompt="a fox", seconds=4)
+    assert retry_on(info.value) is False
+    [row] = _rows(manager)
+    assert row["quantity"] == 0.0
+
+
+async def test_cancel_while_reading_an_accepted_body_records_one_unmeasured_call(
+    server,
+):
+    class CancelledBody(FakeResponse):
+        async def json(self, content_type=None):
+            raise asyncio.CancelledError
+
+    server.post_replies = [CancelledBody(202, None)]
+    with TokenContextManager() as manager:
+        with pytest.raises(asyncio.CancelledError):
+            await _build().generate_video(prompt="a fox", seconds=4)
+    [row] = _rows(manager)
+    assert row["quantity"] == 0.0
+    assert server.urls("DELETE") == []
+
+
+async def test_cancel_before_the_post_is_answered_records_nothing(server):
+    class CancelledPost(FakeResponse):
+        pass
+
+    server.post_replies = [asyncio.CancelledError()]
+    with TokenContextManager() as manager:
+        with pytest.raises(asyncio.CancelledError):
+            await _build().generate_video(prompt="a fox", seconds=4)
+    assert _rows(manager) == []
+
+
 async def test_server_error_on_submit_is_not_retried_into_a_second_job(server):
     boom = FakeResponse(503, {"error": {"code": "unavailable"}})
     server.post_replies = [boom, boom, boom]
@@ -294,27 +411,9 @@ async def test_unknown_failure_code_is_recorded_unmeasured_and_not_retried(serve
 
 async def test_cancel_while_queued_deletes_the_job_and_records_nothing(server):
     server.post_replies = [accepted()]
-    server.get_replies = [job("queued")]
-    gate = asyncio.Event()
-    real_sleep = asyncio.sleep
-
-    async def stall(delay):
-        gate.set()
-        await real_sleep(3600)
-
-    xinference_module.asyncio.sleep = stall
-    try:
-        with TokenContextManager() as manager:
-            task = asyncio.ensure_future(
-                _build().generate_video(prompt="a fox", seconds=4)
-            )
-            await gate.wait()
-            task.cancel()
-            xinference_module.asyncio.sleep = real_sleep
-            with pytest.raises(asyncio.CancelledError):
-                await task
-    finally:
-        xinference_module.asyncio.sleep = real_sleep
+    server.get_replies = [job("queued"), cancelled_job()]
+    with TokenContextManager() as manager:
+        await _cancel_after_first_poll(server, seconds=4)
     assert server.urls("DELETE") == [f"{HOST}/v1/videos/vid_1"]
     assert _rows(manager) == []
 
@@ -325,58 +424,63 @@ async def test_cancel_while_in_progress_records_the_charged_render(server):
     server.delete_reply = FakeResponse(
         409, {"error": {"code": "video_in_progress", "message": "rendering"}}
     )
-    gate = asyncio.Event()
-    real_sleep = asyncio.sleep
-
-    async def stall(delay):
-        gate.set()
-        await real_sleep(3600)
-
-    xinference_module.asyncio.sleep = stall
-    try:
-        with TokenContextManager() as manager:
-            task = asyncio.ensure_future(
-                _build().generate_video(prompt="a fox", seconds=7)
-            )
-            await gate.wait()
-            task.cancel()
-            xinference_module.asyncio.sleep = real_sleep
-            with pytest.raises(asyncio.CancelledError):
-                await task
-    finally:
-        xinference_module.asyncio.sleep = real_sleep
+    with TokenContextManager() as manager:
+        await _cancel_after_first_poll(server, seconds=7)
     assert server.urls("DELETE") == [f"{HOST}/v1/videos/vid_1"]
     [row] = _rows(manager)
     assert row["quantity"] == 7.0
 
 
-async def test_delete_200_on_a_job_last_seen_rendering_is_still_charged(server):
-    # It finished between the last poll and the DELETE; the file is deleted
-    # without a refund.
+async def test_delete_200_is_classified_by_the_job_read_afterwards_free(server):
+    # Last poll said in_progress, but the job failed before the DELETE: free.
     server.post_replies = [accepted()]
-    server.get_replies = [job("in_progress")]
-    gate = asyncio.Event()
-    real_sleep = asyncio.sleep
+    server.get_replies = [
+        job("in_progress"),
+        job("failed", error={"code": "upstream_failure", "message": "x"}),
+    ]
+    with TokenContextManager() as manager:
+        await _cancel_after_first_poll(server, seconds=6)
+    assert [m for m, _, _, _ in server.calls][-2:] == ["DELETE", "GET"]
+    assert _rows(manager) == []
 
-    async def stall(delay):
-        gate.set()
-        await real_sleep(3600)
 
-    xinference_module.asyncio.sleep = stall
-    try:
-        with TokenContextManager() as manager:
-            task = asyncio.ensure_future(
-                _build().generate_video(prompt="a fox", seconds=6)
-            )
-            await gate.wait()
-            task.cancel()
-            xinference_module.asyncio.sleep = real_sleep
-            with pytest.raises(asyncio.CancelledError):
-                await task
-    finally:
-        xinference_module.asyncio.sleep = real_sleep
+async def test_delete_200_is_classified_by_the_job_read_afterwards_charged(server):
+    # Last poll said queued, but the job completed before the DELETE: charged
+    # for the seconds the server reports.
+    server.post_replies = [accepted()]
+    server.get_replies = [job("queued"), completed(5)]
+    with TokenContextManager() as manager:
+        await _cancel_after_first_poll(server, seconds=4)
     [row] = _rows(manager)
-    assert row["quantity"] == 6.0
+    assert row["quantity"] == 5.0
+
+
+async def test_delete_200_with_an_unreadable_final_state_records_unmeasured(server):
+    server.post_replies = [accepted()]
+    server.get_replies = [job("queued"), FakeResponse(404, {"error": {"code": "gone"}})]
+    with TokenContextManager() as manager:
+        await _cancel_after_first_poll(server, seconds=4)
+    [row] = _rows(manager)
+    assert row["quantity"] == 0.0
+
+
+async def test_cancel_with_unreachable_delete_still_reads_the_final_state(server):
+    server.post_replies = [accepted()]
+    server.get_replies = [job("queued"), cancelled_job()]
+    server.delete_reply = aiohttp.ClientConnectionError("down")
+    with TokenContextManager() as manager:
+        await _cancel_after_first_poll(server, seconds=4)
+    assert _rows(manager) == []
+
+
+async def test_cancel_with_nothing_readable_records_an_unmeasured_call(server):
+    server.post_replies = [accepted()]
+    server.get_replies = [job("queued"), aiohttp.ClientConnectionError("down")]
+    server.delete_reply = aiohttp.ClientConnectionError("down")
+    with TokenContextManager() as manager:
+        await _cancel_after_first_poll(server, seconds=4)
+    [row] = _rows(manager)
+    assert row["quantity"] == 0.0
 
 
 async def test_deadline_while_in_progress_records_and_raises_a_billed_timeout(
@@ -400,6 +504,7 @@ async def test_deadline_while_in_progress_records_and_raises_a_billed_timeout(
 async def test_deadline_while_queued_cancels_for_free(server, monkeypatch):
     server.post_replies = [accepted()]
     server.get_replies = [job("queued")]
+    server.get_after_delete = cancelled_job()
     monkeypatch.setattr(xinference_module, "SAAS_VIDEO_MIN_JOB_DEADLINE_SECONDS", 0.0)
     monkeypatch.setattr(xinference_module, "SAAS_VIDEO_JOB_POLL_SECONDS", 0.01)
     with TokenContextManager() as manager:
@@ -412,34 +517,6 @@ async def test_deadline_while_queued_cancels_for_free(server, monkeypatch):
 
 async def test_deadline_floor_covers_queue_expiry_plus_render():
     assert xinference_module.SAAS_VIDEO_MIN_JOB_DEADLINE_SECONDS >= 1800 + 600
-
-
-async def test_cancel_with_unreachable_delete_records_an_unmeasured_call(server):
-    server.post_replies = [accepted()]
-    server.get_replies = [job("queued")]
-    server.delete_reply = aiohttp.ClientConnectionError("down")
-    gate = asyncio.Event()
-    real_sleep = asyncio.sleep
-
-    async def stall(delay):
-        gate.set()
-        await real_sleep(3600)
-
-    xinference_module.asyncio.sleep = stall
-    try:
-        with TokenContextManager() as manager:
-            task = asyncio.ensure_future(
-                _build().generate_video(prompt="a fox", seconds=4)
-            )
-            await gate.wait()
-            task.cancel()
-            xinference_module.asyncio.sleep = real_sleep
-            with pytest.raises(asyncio.CancelledError):
-                await task
-    finally:
-        xinference_module.asyncio.sleep = real_sleep
-    [row] = _rows(manager)
-    assert row["quantity"] == 0.0
 
 
 async def test_content_gone_after_completion_is_billed_and_not_retried(server):

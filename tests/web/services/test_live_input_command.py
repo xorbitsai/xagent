@@ -38,6 +38,7 @@ from xagent.web.models.user import User
 from xagent.web.services import live_input_command as lic
 from xagent.web.services import task_command_execution
 from xagent.web.services.chat_history_service import (
+    DELIVERY_COMPLETED,
     DELIVERY_DISPATCHED,
     DELIVERY_FAILED,
     DELIVERY_OUTCOME_UNKNOWN,
@@ -207,7 +208,7 @@ async def test_authorize_called_per_claim(task: Any, published: list) -> None:
     assert len(host.authorized) == 3
 
 
-async def test_applied_marks_dispatched_and_meters(
+async def test_applied_marks_completed_and_meters(
     db: Any, task: Any, published: list
 ) -> None:
     host = FakeHost(task.user_id)
@@ -215,8 +216,70 @@ async def test_applied_marks_dispatched_and_meters(
     await admission.claim()
     assert [r.delivery_status for r in rows(db, task)] == [DELIVERY_PENDING]
     await admission.finish(LiveInputResult.APPLIED)
-    assert [r.delivery_status for r in rows(db, task)] == [DELIVERY_DISPATCHED]
+    assert [r.delivery_status for r in rows(db, task)] == [DELIVERY_COMPLETED]
     assert len(host.applied) == 1 and published == []
+
+
+async def test_applied_after_the_stop_fallback_closed_the_row_marks_completed(
+    db: Any, task: Any, published: list
+) -> None:
+    from xagent.web.services.external_task_cancel import (
+        _mark_cancelled_turn_delivery_dispatched,
+    )
+
+    host = FakeHost(task.user_id)
+    admission = lic.DeliveryLedgerAdmission(payload_for(task), host)
+    assert await admission.claim() is LiveInputClaim.CLAIMED
+    _mark_cancelled_turn_delivery_dispatched(db, task.id, turn_id=None)
+    db.commit()
+    assert [r.delivery_status for r in rows(db, task)] == [DELIVERY_DISPATCHED]
+    await admission.finish(LiveInputResult.APPLIED)
+    assert [r.delivery_status for r in rows(db, task)] == [DELIVERY_COMPLETED]
+    assert len(host.applied) == 1 and published == []
+
+
+async def test_applied_mark_failure_leaves_the_row_pending_and_still_meters(
+    monkeypatch: pytest.MonkeyPatch,
+    db: Any,
+    task: Any,
+    published: list,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    host = FakeHost(task.user_id)
+    admission = lic.DeliveryLedgerAdmission(payload_for(task), host)
+    assert await admission.claim() is LiveInputClaim.CLAIMED
+
+    def boom(*args: Any) -> Any:
+        raise OperationalError("update", {}, Exception("db down"))
+
+    monkeypatch.setattr(lic, "mark_user_message_delivery_sync", boom)
+    with caplog.at_level(logging.WARNING, logger=lic.logger.name):
+        await admission.finish(LiveInputResult.APPLIED)
+    await settle()
+    assert [r.delivery_status for r in rows(db, task)] == [DELIVERY_PENDING]
+    assert len(host.applied) == 1 and published == []
+    assert "live input delivery marker completed failed" in caplog.text
+
+
+async def test_applied_records_one_completed_delivery_fact(canonical: Any) -> None:
+    from xagent.web.models.task_execution_event import TaskExecutionEvent
+
+    factory, task_id = canonical
+    with factory() as db:
+        owner = db.get(Task, task_id).user_id
+    host = FakeHost(owner)
+    payload = lic.LiveInputPayload(task_id=task_id, turn_id=TURN, message="hi")
+    admission = lic.DeliveryLedgerAdmission(payload, host)
+    assert await admission.claim() is LiveInputClaim.CLAIMED
+    await admission.finish(LiveInputResult.APPLIED)
+    with factory() as db:
+        keys = [
+            e.idempotency_key
+            for e in db.query(TaskExecutionEvent)
+            .filter_by(task_id=task_id, kind="input_delivery_changed")
+            .all()
+        ]
+    assert keys == [f"delivery:{TURN}:completed"]
 
 
 async def test_returned_after_claim_withdraws_row_and_reports_not_applied(

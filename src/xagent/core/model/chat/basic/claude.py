@@ -234,7 +234,7 @@ class ClaudeLLM(BaseLLM):
 
     def __init__(
         self,
-        model_name: str = "claude-3-5-sonnet-20241022",
+        model_name: str = "claude-sonnet-5-5",
         api_key: Optional[str] = None,
         base_url: Optional[str] = None,
         default_temperature: Optional[float] = None,

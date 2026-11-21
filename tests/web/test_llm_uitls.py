@@ -737,3 +737,43 @@ class TestCreateLLMFromEnv:
         # model is reachable through the proxy.
         assert result is not None
         assert result._inner is mock_llm
+
+
+class TestCreateLLMFromEnvDefaults:
+    @pytest.mark.parametrize(
+        ("key_env", "llm_cls", "retired"),
+        [
+            ("OPENAI_API_KEY", "OpenAILLM", "gpt-4"),
+            ("GEMINI_API_KEY", "GeminiLLM", "gemini-2.0"),
+        ],
+    )
+    def test_default_model_is_not_retired(
+        self, monkeypatch, key_env, llm_cls, retired
+    ):
+        for name in (
+            "OPENAI_API_KEY",
+            "ZHIPU_API_KEY",
+            "DEEPSEEK_API_KEY",
+            "GEMINI_API_KEY",
+            "GOOGLE_API_KEY",
+            "ANTHROPIC_API_KEY",
+            "CLAUDE_API_KEY",
+            "OPENAI_MODEL_NAME",
+            "GEMINI_MODEL_NAME",
+        ):
+            monkeypatch.delenv(name, raising=False)
+        monkeypatch.setenv(key_env, "sk-real-looking-key-123456")
+        captured = {}
+
+        def fake_llm(**kwargs):
+            captured.update(kwargs)
+            return Mock()
+
+        monkeypatch.setattr(f"xagent.web.services.llm_utils.{llm_cls}", fake_llm)
+        monkeypatch.setattr(
+            "xagent.web.services.llm_utils.attach_chat_retry_wrapper", lambda x: x
+        )
+
+        assert create_llm_from_env() is not None
+        assert captured["model_name"] != retired
+        assert not captured["model_name"].startswith(retired + "-")

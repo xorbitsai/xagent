@@ -782,9 +782,11 @@ class PatternRuntime:
     ) -> Any:
         """Stream only the final user-facing answer through the outbound boundary.
 
-        When a ``preemptible`` request is dropped for a live user message, the
+        A ``preemptible`` request opens the answer stream only once it has
+        answer text to send. When it is dropped for a live user message, a
         partial answer is closed with an interrupted start frame, not a
-        failure, and :class:`LLMCallPreempted` propagates.
+        failure, and :class:`LLMCallPreempted` propagates; a request dropped
+        before any text sends no frame.
         """
 
         if self.outbound_message_handler is None or not self._has_native_stream_chat(
@@ -795,7 +797,9 @@ class PatternRuntime:
         from .pattern.final_answer_stream import FinalAnswerStreamSession
 
         stream = FinalAnswerStreamSession(self)
-        if await stream.start() is None:
+        # A request that may be given up opens the stream only once it has
+        # answer text to send, so one dropped before that sends no frame.
+        if not preemptible and await stream.start() is None:
             return await self.run_llm_call(llm, preemptible=preemptible, **kwargs)
 
         async def emit_text_delta(chunk: Any) -> None:

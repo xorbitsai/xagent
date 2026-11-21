@@ -853,7 +853,9 @@ def _redact_url_credentials_for_logging(
     # Nothing to mask: return the URL byte for byte. This check comes before
     # any re-encoding, so an untouched query keeps ``?flag`` (not ``?flag=``),
     # ``%20`` and a trailing ``)``, and a value that cannot be percent-encoded
-    # (an unpaired surrogate, for instance) never reaches ``quote_plus``.
+    # (an unpaired surrogate, for instance) is never re-encoded. When a
+    # rebuild is needed, ``quote_plus`` below runs with ``surrogatepass``
+    # rather than raising and losing the whole record's redaction.
     # A credential *name* with no value still needs the rebuild: the previous
     # implementation rewrote ``?X-Api-Key`` as ``?X-Api-Key=``, and the header
     # and assignment rules that run after this one then masked a value the
@@ -878,10 +880,20 @@ def _redact_url_credentials_for_logging(
             encoded_value = value
         elif is_sensitive:
             masked = mask(value)
-            encoded_value = masked if masked == _FULL_REDACTION else quote_plus(masked)
+            encoded_value = (
+                masked
+                if masked == _FULL_REDACTION
+                else quote_plus(masked, errors="surrogatepass")
+            )
         else:
-            encoded_value = quote_plus(value)
-        encoded_items.append(f"{quote_plus(key)}={encoded_value}")
+            # ``surrogatepass`` keeps a request target that arrived through
+            # ``surrogateescape`` from raising here. A raise would reach the
+            # record factory, which would have to return the whole record
+            # unredacted; encoding the lone surrogate is harmless in a log.
+            encoded_value = quote_plus(value, errors="surrogatepass")
+        encoded_items.append(
+            f"{quote_plus(key, errors='surrogatepass')}={encoded_value}"
+        )
 
     redacted_query = "&".join(encoded_items)
 
@@ -1024,26 +1036,40 @@ def _redact_jwts(text: str) -> str:
     return "".join(parts)
 
 
+def _mask_headers(text: str, mask: Callable[[str], str]) -> str:
+    """Mask the header-shaped values in ``text``."""
+    text = AUTH_HEADER_PATTERN.sub(
+        lambda match: f"{match.group(1)}"
+        f"{_mask_value_keeping_wrappers(match.group(2), mask)}",
+        text,
+    )
+    for pattern in HEADER_KEY_PATTERNS:
+        text = pattern.sub(
+            lambda match: f"{match.group(1)}"
+            f"{_mask_value_keeping_wrappers(match.group(2), mask)}",
+            text,
+        )
+    return text
+
+
 def _redact_text(text: str, mask: Callable[[str], str]) -> str:
     redacted = WEBSOCKET_CREDENTIAL_PATTERN.sub("xagent-auth-token.[REDACTED]", text)
+    # Mask header shapes before any URL or relative-target rebuild. A rebuild
+    # percent-encodes the query key (``X-Api-Key%3A...``), after which the
+    # header rules no longer recognize the value; it also appends ``=`` to a
+    # credential name that has none, which can move the value away from the
+    # separator the header rule reads. Masking here keeps both shapes covered.
+    redacted = _mask_headers(redacted, mask)
     redacted = URL_PATTERN.sub(
         lambda match: _redact_url_credentials_for_logging(match.group(0), mask=mask),
         redacted,
     )
     redacted = _redact_relative_targets(redacted, mask)
     redacted = _redact_assignments(redacted, mask)
-    redacted = AUTH_HEADER_PATTERN.sub(
-        lambda match: f"{match.group(1)}"
-        f"{_mask_value_keeping_wrappers(match.group(2), mask)}",
-        redacted,
-    )
-    for pattern in HEADER_KEY_PATTERNS:
-        redacted = pattern.sub(
-            lambda match: f"{match.group(1)}"
-            f"{_mask_value_keeping_wrappers(match.group(2), mask)}",
-            redacted,
-        )
-    return redacted
+    # The rebuild can also create a header shape that was not there before
+    # (``?X-Api-Key sk-...`` becomes ``?X-Api-Key= sk-...``), so the same rule
+    # runs once more over the rebuilt text.
+    return _mask_headers(redacted, mask)
 
 
 def redact_sensitive_text(text: str) -> str:
@@ -1075,4 +1101,22 @@ def redact_log_text(text: str) -> str:
     if not text:
         return text
     redacted = _redact_text(text, _redact_completely)
+    return _redact_jwts(redacted)
+
+
+def redact_log_text_pattern_only(text: str) -> str:
+    """Redact the header, assignment and JWT shapes without parsing URLs.
+
+    A last-resort pass for the log-record factory: if
+    :func:`redact_log_text` raises for any reason, this function still masks
+    the shapes that need no structural parsing (``Authorization`` and the
+    ``x-api-key``-style headers, ``identifier=value`` assignments, and bare
+    JWTs) so the record is not written out unredacted. It never parses or
+    rebuilds a URL, so it cannot hit the encoding or URL-parser failures that
+    the full pass can.
+    """
+    if not text:
+        return text
+    redacted = _mask_headers(text, _redact_completely)
+    redacted = _redact_assignments(redacted, _redact_completely)
     return _redact_jwts(redacted)

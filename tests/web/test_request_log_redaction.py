@@ -739,6 +739,33 @@ def test_record_factory_tolerates_a_query_value_that_cannot_be_encoded() -> None
     assert "\ud800" in records[0].getMessage()
 
 
+@pytest.mark.usefixtures("restore_logging_state")
+def test_record_factory_redacts_a_line_whose_query_holds_an_unpaired_surrogate() -> (
+    None
+):
+    # A sensitive name without a value forces the URL rebuild even when the
+    # query also holds an unpaired surrogate. The rebuild must encode the
+    # surrogate instead of raising, otherwise the whole record -- including
+    # the Authorization value on the same line -- would be emitted unredacted.
+    setup_logging(force=True)
+    logger = logging.getLogger("xagent.tests.unencodable_sensitive_url")
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+    records, handler = _capture(logger)
+    try:
+        logger.warning(
+            "Authorization: Bearer %s https://e.com/x?token&bad=\ud800",
+            "sk-LEAK-0123456789",
+        )
+    finally:
+        logger.removeHandler(handler)
+
+    message = records[0].getMessage()
+    assert "sk-LEAK-0123456789" not in message
+    assert "Bearer [REDACTED]" in message
+    assert "\ud800" not in message
+
+
 def test_log_text_does_not_rewrite_a_url_without_sensitive_parameters() -> None:
     for text in (
         "GET https://api.example.com/cb?q=a+b&flag&x=%5B1%5D",
@@ -827,6 +854,16 @@ def _assert_never_weaker(text: str, legacy_output: str, new_output: str) -> None
     # than it did is fine (a log may over-mask), masking less is the bug.
     legacy_masked = _masked_fragments(text, legacy_output)
     assert legacy_masked, f"sample does not exercise the legacy redactor: {text!r}"
+    # Assert the same thing directly for every original secret substring the
+    # old implementation masked: the failure then names the retained value
+    # instead of only the fragment-set difference.
+    retained = sorted(fragment for fragment in legacy_masked if fragment in new_output)
+    assert not retained, (
+        text,
+        legacy_output,
+        new_output,
+        retained,
+    )
     new_masked = _masked_fragments(text, new_output)
     assert legacy_masked <= new_masked, (
         text,
@@ -953,7 +990,7 @@ def test_record_factory_leaves_unformattable_records_to_handle_error(
 
 
 @pytest.mark.usefixtures("restore_logging_state")
-def test_record_factory_returns_the_record_when_the_redactor_raises(
+def test_record_factory_falls_back_to_pattern_only_when_the_redactor_raises(
     monkeypatch, capsys
 ) -> None:
     setup_logging(force=True)
@@ -970,8 +1007,37 @@ def test_record_factory_returns_the_record_when_the_redactor_raises(
     finally:
         logger.removeHandler(handler)
 
-    # The record is returned unchanged (and unmarked), so logging behaves as
-    # it would without a factory: the call returns, the line is emitted.
+    # The full pass failed, so the fallback masks the assignment and writes
+    # the message flat; the logging call still returns and emits one line.
+    record = records[0]
+    assert record.getMessage() == f"token={REDACTED}"
+    assert record.msg == f"token={REDACTED}"
+    assert record.args == ()
+    assert getattr(record, "_xagent_log_redacted", False)
+    assert "redactor exploded" not in capsys.readouterr().err
+
+
+@pytest.mark.usefixtures("restore_logging_state")
+def test_record_factory_returns_the_record_when_the_fallback_also_raises(
+    monkeypatch, capsys
+) -> None:
+    setup_logging(force=True)
+
+    def explode(text: str) -> str:
+        raise RuntimeError("redactor exploded")
+
+    monkeypatch.setattr(logging_config, "redact_log_text", explode)
+    monkeypatch.setattr(logging_config, "redact_log_text_pattern_only", explode)
+    logger = logging.getLogger("xagent.tests.fallback_failure")
+    logger.setLevel(logging.INFO)
+    records, handler = _capture(logger)
+    try:
+        logger.warning("token=%s", SECRET)
+    finally:
+        logger.removeHandler(handler)
+
+    # Both passes failed: the record is returned unchanged (and unmarked), so
+    # logging behaves as it would without a factory.
     assert [record.getMessage() for record in records] == [f"token={SECRET}"]
     assert not getattr(records[0], "_xagent_log_redacted", False)
     assert "redactor exploded" not in capsys.readouterr().err

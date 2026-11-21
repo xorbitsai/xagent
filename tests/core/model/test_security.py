@@ -326,6 +326,68 @@ def test_a_malformed_query_without_an_equals_sign_is_still_masked(
     assert redacted != text
 
 
+# The reduced combination matrix from the second review: a rebuilt query holds
+# one sensitive name without a value plus one header-shaped value
+# (``X-Api-Key:sk-...``) in either order. The URL rebuild used to
+# percent-encode the header's ``:`` before the header rule ran, and the ``=``
+# it appended to the valueless name then moved the real value away from the
+# separator. Every combination must still drop the secret.
+_N9_SECRET = "sk-LEAK-0123456789"
+_N9_BASES = ("/cb?", "GET /cb?", "https://e.com/cb?")
+_N9_VALUELESS_NAMES = ("token", "token=", "access_token", "page_token")
+_N9_HEADER_NAMES = (
+    "X-Api-Key:",
+    "X-Api-Key: ",
+    "X-Api-Key:  ",
+    "X-Api-Key = ",
+    "x-goog-api-key:",
+    "x-shopify-access-token:",
+)
+
+
+@pytest.mark.parametrize(
+    "redact", [redact_sensitive_text, redact_log_text], ids=["text", "log"]
+)
+@pytest.mark.parametrize("base", _N9_BASES)
+@pytest.mark.parametrize("valueless", _N9_VALUELESS_NAMES)
+@pytest.mark.parametrize("header_name", _N9_HEADER_NAMES)
+@pytest.mark.parametrize("order", ["header-first", "valueless-first"])
+def test_a_header_shaped_value_beside_a_valueless_credential_is_masked(
+    redact, base: str, valueless: str, header_name: str, order: str
+) -> None:
+    header = f"{header_name}{_N9_SECRET}"
+    query = (
+        f"{header}&{valueless}" if order == "header-first" else f"{valueless}&{header}"
+    )
+    text = f"{base}{query}"
+
+    redacted = redact(text)
+
+    assert _N9_SECRET not in redacted, (text, redacted)
+    assert redacted != text, text
+
+
+@pytest.mark.parametrize(
+    ("redact", "masked"),
+    [(redact_sensitive_text, "***6789"), (redact_log_text, "[REDACTED]")],
+    ids=["text", "log"],
+)
+def test_an_unpaired_surrogate_does_not_skip_the_rest_of_the_redaction(
+    redact, masked: str
+) -> None:
+    # A request target that went through ``surrogateescape`` can hold an
+    # unpaired surrogate. The URL rebuild used to raise from ``quote_plus``,
+    # and the record factory then emitted the whole line -- including the
+    # Authorization value -- unredacted.
+    text = "Authorization: Bearer sk-LEAK-0123456789 https://e.com/x?token&bad=\ud800"
+
+    redacted = redact(text)
+
+    assert "sk-LEAK-0123456789" not in redacted
+    assert f"Bearer {masked}" in redacted
+    assert "\ud800" not in redacted
+
+
 def test_a_value_that_only_starts_with_a_short_mask_is_still_masked() -> None:
     # ``***`` plus at most four characters is the short marker
     # ``_mask_secret`` emits. A longer value that happens to begin with the

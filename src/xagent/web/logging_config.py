@@ -6,7 +6,7 @@ from collections.abc import Callable
 from logging.config import dictConfig
 from typing import Any, Literal, cast
 
-from ..core.utils.security import redact_log_text
+from ..core.utils.security import redact_log_text, redact_log_text_pattern_only
 from .request_log_redaction import install_request_log_redaction
 
 LogLevel = Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]
@@ -71,15 +71,24 @@ def _redact_args(args: object) -> object:
 
 
 def _redact_record(record: logging.LogRecord) -> None:
-    """Redact one record, committing every change only at the end.
+    """Redact one record, falling back to a pattern-only pass on failure.
 
-    The factory around this function must return the record untouched when
-    anything here raises, so assignments happen after all formatting and
-    scanning succeeded.
+    The full pass commits every change only at the end. If it raises anyway,
+    a header/assignment/JWT-only pass still masks the common shapes instead
+    of leaving the whole record unredacted. If that pass fails too, the
+    exception reaches the factory, which returns the record exactly as the
+    previous factory produced it.
     """
     if getattr(record, _RECORD_MARKER, False):
         return
+    try:
+        _redact_record_fully(record)
+    except Exception:
+        _redact_record_pattern_only(record)
 
+
+def _redact_record_fully(record: logging.LogRecord) -> None:
+    """Redact one record with the full structured redactor."""
     message = record.getMessage()
     redacted_message = redact_log_text(message)
 
@@ -136,6 +145,40 @@ def _redact_record(record: logging.LogRecord) -> None:
 
     record.msg = new_msg
     record.args = new_args
+    record.exc_text = exc_text
+    record.stack_info = stack_info
+    setattr(record, _RECORD_MARKER, True)
+
+
+def _redact_record_pattern_only(record: logging.LogRecord) -> None:
+    """Mask a record with the pattern-only fallback when the full pass failed.
+
+    The message is written flat: the fallback does not know which argument a
+    masked value came from, so keeping ``%`` arguments could let a formatter
+    interpolate the raw secret again. Exception and stack text go through the
+    same pass; as in the full pass, a formatted exception is only stored when
+    redaction changed it, so a custom handler formatter still runs otherwise.
+    """
+    message = record.getMessage()
+    redacted_message = redact_log_text_pattern_only(message)
+    changed = redacted_message != message
+
+    exc_text = record.exc_text
+    if exc_text:
+        exc_text = redact_log_text_pattern_only(exc_text)
+    elif record.exc_info:
+        formatted_exc = _EXCEPTION_FORMATTER.formatException(record.exc_info)
+        redacted_exc = redact_log_text_pattern_only(formatted_exc)
+        if redacted_exc != formatted_exc:
+            exc_text = redacted_exc
+
+    stack_info = record.stack_info
+    if stack_info:
+        stack_info = redact_log_text_pattern_only(stack_info)
+
+    if changed:
+        record.msg = redacted_message
+        record.args = ()
     record.exc_text = exc_text
     record.stack_info = stack_info
     setattr(record, _RECORD_MARKER, True)

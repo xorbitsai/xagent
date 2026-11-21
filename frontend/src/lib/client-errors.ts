@@ -25,6 +25,11 @@ export const CLIENT_ERROR_CODES = [
   "task_access_denied",
   "invalid_message",
   "message_outcome_unknown",
+  // Answers to a message sent into the turn in progress.
+  "live_input_not_running",
+  "live_input_not_started",
+  "live_input_unavailable",
+  "live_input_outcome_unknown",
   // Also sent on a terminal task_error frame's code field, by the external
   // cancel core when a turn ends interrupted after an external stop was
   // requested.
@@ -105,6 +110,10 @@ const CLIENT_ERROR_TRANSLATION_KEYS: Record<ClientErrorCode, TranslationKey> = {
   task_access_denied: "clientErrors.taskAccessDenied",
   invalid_message: "clientErrors.invalidMessage",
   message_outcome_unknown: "clientErrors.messageOutcomeUnknown",
+  live_input_not_running: "clientErrors.liveInputNotRunning",
+  live_input_not_started: "clientErrors.liveInputNotStarted",
+  live_input_unavailable: "clientErrors.liveInputUnavailable",
+  live_input_outcome_unknown: "clientErrors.liveInputOutcomeUnknown",
   external_turn_interrupted: "clientErrors.externalTurnInterrupted",
   external_stop_not_applied: "clientErrors.externalStopNotApplied",
   upload_too_large: "clientErrors.uploadTooLarge",
@@ -147,6 +156,10 @@ const CLIENT_ERROR_FALLBACKS: Record<ClientErrorCode, string> = {
   task_access_denied: "You do not have access to this task.",
   invalid_message: "The message format is invalid.",
   message_outcome_unknown: "The message may or may not have been applied. Check the conversation before sending it again.",
+  live_input_not_running: "The message could not be sent now because no response is running.",
+  live_input_not_started: "The message could not be sent now because the response has not started.",
+  live_input_unavailable: "The message could not be sent now.",
+  live_input_outcome_unknown: "A message sent with Send now may not have reached the reply. If it appears in the conversation, it was sent.",
   external_turn_interrupted: "This response was interrupted.",
   external_stop_not_applied: "Stopping this response didn't go through — please try again.",
   upload_too_large: "File is too large. Please reduce the upload size and try again.",

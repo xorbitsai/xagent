@@ -6,10 +6,14 @@ import type { TaskStatus } from "@/lib/task-status"
 import {
   MESSAGE_QUEUE_LIMIT,
   classifyQueuedSendFailure,
+  classifySendNowFailure,
   decideComposerSubmit,
   isAwaitingAnswer,
   isBusyRefusal,
   transitionMessageQueue,
+  type InsertState,
+  type LiveInputReturnReason,
+  type MessageQueueEffect,
   type MessageQueueEvent,
   type MessageQueuePhase,
   type MessageQueueState,
@@ -18,6 +22,13 @@ import {
 
 const item = (id: string, seq: number, status: QueuedMessage["status"] = "waiting"): QueuedMessage =>
   ({ clientMessageId: id, text: id, seq, status })
+const insertOf = (over: Partial<InsertState> = {}): InsertState => ({
+  confirmed: false, inFlight: true, since: 1, connection: "c1", resentAt: undefined, retries: 0, retryAt: undefined, ...over,
+})
+const ins = (id: string, seq: number, over: Partial<InsertState> = {}): QueuedMessage =>
+  ({ clientMessageId: id, text: id, seq, status: "inserting", insert: insertOf(over) })
+const nxt = (id: string, seq: number, status: QueuedMessage["status"] = "waiting"): QueuedMessage =>
+  ({ ...item(id, seq, status), next: true })
 const state = (
   phase: MessageQueuePhase,
   items: QueuedMessage[] = [],
@@ -33,6 +44,8 @@ const apply = (from: MessageQueueState, event: MessageQueueEvent) => transitionM
 const observe = (version: number | undefined, status: TaskStatus | undefined, snapshot = false): MessageQueueEvent =>
   ({ type: "OBSERVE", observed: { version, status }, snapshot })
 const ids = (from: MessageQueueState) => from.items.map(entry => `${entry.clientMessageId}:${entry.status}`)
+const firstInsert = (from: MessageQueueState, id: string) =>
+  from.items.find(entry => entry.clientMessageId === id)?.insert
 
 describe("decideComposerSubmit", () => {
   const A = { active: true, deliveryInFlight: false, hasFiles: false }
@@ -96,6 +109,31 @@ describe("classifyQueuedSendFailure", () => {
     expect(isBusyRefusal(delivery("outcome_unknown", "task_busy"))).toBe(false)
     expect(isBusyRefusal(delivery("rejected", "interaction_response_required"))).toBe(false)
     expect(isBusyRefusal(new Error("busy"))).toBe(false)
+  })
+})
+
+describe("classifySendNowFailure", () => {
+  const delivery = (
+    disposition: "not_sent" | "rejected" | "outcome_unknown",
+    errorCode: ClientErrorCode | null,
+    options: { retryWithNewId?: boolean; connectionLost?: boolean } = {},
+  ) => new MessageDeliveryError("failed", disposition, { errorCode, ...options })
+
+  it.each([
+    ["not sent", delivery("not_sent", null), { verdict: "retry", replaceId: false }],
+    ["no run in progress", delivery("rejected", "live_input_not_running"), { verdict: "next", replaceId: false }],
+    ["a question is pending", delivery("rejected", "interaction_response_required"), { verdict: "next", replaceId: false }],
+    ["run not started yet", delivery("rejected", "live_input_not_started"), { verdict: "later", replaceId: false }],
+    ["unavailable", delivery("rejected", "live_input_unavailable"), { verdict: "hold", replaceId: false }],
+    ["id conflict", delivery("rejected", "message_id_conflict", { retryWithNewId: true }), { verdict: "hold", replaceId: true }],
+    ["quota", delivery("rejected", "message_not_accepted"), { verdict: "hold", replaceId: false }],
+    ["server outcome unknown, rejected", delivery("rejected", "live_input_outcome_unknown"), { verdict: "unknown", replaceId: false }],
+    ["server outcome unknown", delivery("outcome_unknown", "live_input_outcome_unknown"), { verdict: "unknown", replaceId: false }],
+    ["timed out", delivery("outcome_unknown", "message_outcome_unknown"), { verdict: "unknown", replaceId: false }],
+    ["connection lost while waiting", delivery("outcome_unknown", "message_outcome_unknown", { connectionLost: true }), null],
+    ["plain error", new Error("boom"), { verdict: "hold", replaceId: false }],
+  ])("%s", (_name, error, expected) => {
+    expect(classifySendNowFailure(error)).toEqual(expected)
   })
 })
 
@@ -219,5 +257,208 @@ describe("transitionMessageQueue", () => {
     ["a question the server said must be answered", state(waiting(2, true), [A], { version: 2, status: "waiting_for_user" }), true],
   ])("isAwaitingAnswer: %s", (_name, from, expected) => {
     expect(isAwaitingAnswer(from)).toBe(expected)
+  })
+})
+
+describe("sending a queued message into the running turn", () => {
+  const A = item("a", 1)
+  const B = item("b", 2)
+  const H = item("h", 0, "sending")
+  const NOW = 10_000
+  const requested = (id: string, canInsert = true): MessageQueueEvent =>
+    ({ type: "SEND_NOW_REQUESTED", clientMessageId: id, sinceVersion: 1, connection: "c1", canInsert })
+  const failedWith = (id: string, verdict: "next" | "hold" | "unknown" | "retry" | "later", extra: { newClientMessageId?: string } = {}): MessageQueueEvent =>
+    ({ type: "SEND_NOW_FAILED", clientMessageId: id, verdict, now: NOW, ...extra })
+  const returned = (id: string, reason: LiveInputReturnReason, extra: { newClientMessageId?: string } = {}): MessageQueueEvent =>
+    ({ type: "LIVE_INPUT_RETURNED", clientMessageId: id, reason, now: NOW, ...extra })
+  const SENDING = sending("h", 1)
+  const HELD_SENT: MessageQueuePhase = { kind: "held", reason: "send_failed" }
+  const HELD_UNKNOWN: MessageQueuePhase = { kind: "held", reason: "send_now_unknown" }
+
+  it("follows every new cell of the transition table", () => {
+    const rows: Array<[string, MessageQueueState, MessageQueueEvent, MessageQueuePhase, string[], MessageQueueEffect?]> = [
+      // REQUEUE_REFUSED goes behind every message being inserted or going out next.
+      ["requeue: waiting", state(waiting(1), [ins("x", 3), B]), { type: "REQUEUE_REFUSED", item: A, sinceVersion: 9 }, waiting(1), ["x:inserting", "a:waiting", "b:waiting"]],
+      ["requeue: ready", state(READY, [nxt("x", 3), B]), { type: "REQUEUE_REFUSED", item: A, sinceVersion: 9 }, waiting(9), ["x:waiting", "a:waiting", "b:waiting"]],
+      ["requeue: sending", state(SENDING, [H, ins("x", 3), B]), { type: "REQUEUE_REFUSED", item: A, sinceVersion: 9 }, SENDING, ["h:sending", "x:inserting", "a:waiting", "b:waiting"]],
+      ["requeue: held", state(HELD, [ins("x", 3), B]), { type: "REQUEUE_REFUSED", item: A, sinceVersion: 9 }, HELD, ["x:inserting", "a:waiting", "b:waiting"]],
+      // CONTINUE leaves a message being inserted alone.
+      ["continue: held", state(HELD, [ins("x", 3), item("a", 1, "failed"), B]), { type: "CONTINUE" }, READY, ["x:inserting", "a:waiting", "b:waiting"]],
+      // REMOVE: refused while a request is on its way or the server holds the message.
+      ["remove: waiting, request in flight", state(waiting(1), [ins("x", 1), B]), { type: "REMOVE", clientMessageId: "x" }, waiting(1), ["x:inserting", "b:waiting"]],
+      ["remove: ready, retry waiting", state(READY, [ins("x", 1, { inFlight: false, retryAt: NOW }), B]), { type: "REMOVE", clientMessageId: "x" }, READY, ["b:waiting"]],
+      ["remove: sending, confirmed", state(SENDING, [H, ins("x", 1, { inFlight: false, confirmed: true })]), { type: "REMOVE", clientMessageId: "x" }, SENDING, ["h:sending", "x:inserting"]],
+      ["remove: held, retry waiting", state(HELD, [ins("x", 1, { inFlight: false, retryAt: NOW })]), { type: "REMOVE", clientMessageId: "x" }, IDLE, []],
+      // CLEAR keeps what the server holds or a request is on its way for.
+      ["clear: waiting", state(waiting(1), [ins("x", 1, { inFlight: false, confirmed: true }), ins("y", 2, { inFlight: false, retryAt: NOW }), item("c", 3)]), { type: "CLEAR" }, waiting(1), ["x:inserting"]],
+      ["clear: ready, emptied", state(READY, [ins("y", 2, { inFlight: false, retryAt: NOW }), item("c", 3)]), { type: "CLEAR" }, IDLE, []],
+      ["clear: sending", state(SENDING, [H, ins("x", 1), item("c", 3)]), { type: "CLEAR" }, SENDING, ["h:sending", "x:inserting"]],
+      ["clear: held keeps a message being inserted and waits", state(HELD, [ins("x", 1, { confirmed: true }), item("c", 3)], { version: 4, status: "failed" }), { type: "CLEAR" }, waiting(4), ["x:inserting"]],
+      // Leaving the sending phase with a failed message stops the queue.
+      ["accepted: leaving sending with a failed message holds", state(SENDING, [H, item("f", 1, "failed")]), { type: "DELIVERY_ACCEPTED", clientMessageId: "h", sinceVersion: 2 }, HELD_UNKNOWN, ["f:failed"], "send_now_unknown"],
+      ["send failed: leaving sending with a failed message holds", state(SENDING, [H, item("f", 1, "failed")]), { type: "SEND_FAILED", clientMessageId: "h", verdict: "wait" }, HELD_UNKNOWN, ["h:waiting", "f:failed"], "send_now_unknown"],
+      // SEND_NOW_REQUESTED
+      ["requested: waiting inserts at the front", state(waiting(1), [A, B]), requested("b"), waiting(1), ["b:inserting", "a:waiting"], "send_now"],
+      ["requested: ready marks it next, no frame", state(READY, [A, B]), requested("b"), READY, ["b:waiting", "a:waiting"], null],
+      ["requested: sending goes behind the head being sent", state(SENDING, [H, A, B]), requested("b"), SENDING, ["h:sending", "b:inserting", "a:waiting"], "send_now"],
+      ["requested: held marks it next and continues", state(HELD, [item("a", 1, "failed"), B]), requested("b"), READY, ["b:waiting", "a:waiting"], null],
+      // SEND_NOW_ACCEPTED
+      ["accepted now: waiting", state(waiting(1), [ins("x", 1)]), { type: "SEND_NOW_ACCEPTED", clientMessageId: "x" }, waiting(1), ["x:inserting"]],
+      ["accepted now: ready", state(READY, [ins("x", 1)]), { type: "SEND_NOW_ACCEPTED", clientMessageId: "x" }, READY, ["x:inserting"]],
+      ["accepted now: sending", state(SENDING, [H, ins("x", 1)]), { type: "SEND_NOW_ACCEPTED", clientMessageId: "x" }, SENDING, ["h:sending", "x:inserting"]],
+      ["accepted now: held", state(HELD, [ins("x", 1)]), { type: "SEND_NOW_ACCEPTED", clientMessageId: "x" }, HELD, ["x:inserting"]],
+      // SEND_NOW_FAILED
+      ["failed now: waiting, hold stops the queue", state(waiting(1), [ins("x", 1)]), failedWith("x", "hold"), HELD_SENT, ["x:failed"], "send_failed"],
+      ["failed now: ready, unknown stops the queue", state(READY, [ins("x", 1)]), failedWith("x", "unknown"), HELD_UNKNOWN, ["x:failed"], "send_now_unknown"],
+      ["failed now: sending, hold only marks it", state(SENDING, [H, ins("x", 1)]), failedWith("x", "hold"), SENDING, ["h:sending", "x:failed"]],
+      ["failed now: held, unknown only marks it", state(HELD, [ins("x", 1)]), failedWith("x", "unknown"), HELD, ["x:failed"]],
+      // SEND_NOW_RESENT
+      ["resent: waiting", state(waiting(1), [ins("x", 1, { inFlight: false, confirmed: true })]), { type: "SEND_NOW_RESENT", clientMessageId: "x", atVersion: 4, connection: "c2" }, waiting(1), ["x:inserting"]],
+      ["resent: ready", state(READY, [ins("x", 1, { inFlight: false, confirmed: true })]), { type: "SEND_NOW_RESENT", clientMessageId: "x", atVersion: 4, connection: "c2" }, READY, ["x:inserting"]],
+      ["resent: sending", state(SENDING, [H, ins("x", 1, { inFlight: false, retryAt: NOW })]), { type: "SEND_NOW_RESENT", clientMessageId: "x", atVersion: undefined, connection: "c2" }, SENDING, ["h:sending", "x:inserting"]],
+      ["resent: held", state(HELD, [ins("x", 1, { inFlight: false, confirmed: true })]), { type: "SEND_NOW_RESENT", clientMessageId: "x", atVersion: 4, connection: "c2" }, HELD, ["x:inserting"]],
+      // LIVE_INPUT_APPLIED
+      ["applied: waiting keeps waiting when emptied", state(waiting(1), [ins("x", 1, { confirmed: true })]), { type: "LIVE_INPUT_APPLIED", clientMessageId: "x" }, waiting(1), []],
+      ["applied: ready is idle when emptied", state(READY, [ins("x", 1, { confirmed: true })]), { type: "LIVE_INPUT_APPLIED", clientMessageId: "x" }, IDLE, []],
+      ["applied: sending", state(SENDING, [H, ins("x", 1, { confirmed: true })]), { type: "LIVE_INPUT_APPLIED", clientMessageId: "x" }, SENDING, ["h:sending"]],
+      ["applied: held is idle when emptied", state(HELD, [ins("x", 1, { confirmed: true })]), { type: "LIVE_INPUT_APPLIED", clientMessageId: "x" }, IDLE, []],
+      // LIVE_INPUT_RETURNED
+      ["returned: waiting, run ended", state(waiting(1), [ins("x", 1), B]), returned("x", "run_ended"), waiting(1), ["x:waiting", "b:waiting"]],
+      ["returned: ready, taken", state(READY, [ins("x", 1), B]), returned("x", "taken"), READY, ["b:waiting"]],
+      ["returned: sending, refused only marks it", state(SENDING, [H, ins("x", 1)]), returned("x", "refused"), SENDING, ["h:sending", "x:failed"]],
+      ["returned: held, outcome unknown only marks it", state(HELD, [ins("x", 1)]), returned("x", "outcome_unknown"), HELD, ["x:failed"]],
+      // SEND_NOW_SUPPORT_LOST
+      ["support lost: waiting stops the queue", state(waiting(1), [ins("x", 1), B]), { type: "SEND_NOW_SUPPORT_LOST" }, HELD_UNKNOWN, ["x:failed", "b:waiting"], "send_now_unknown"],
+      ["support lost: ready stops the queue", state(READY, [ins("x", 1), B]), { type: "SEND_NOW_SUPPORT_LOST" }, HELD_UNKNOWN, ["x:failed", "b:waiting"], "send_now_unknown"],
+      ["support lost: sending only marks it", state(SENDING, [H, ins("x", 1)]), { type: "SEND_NOW_SUPPORT_LOST" }, SENDING, ["h:sending", "x:failed"]],
+      ["support lost: held only marks it", state(HELD, [ins("x", 1)]), { type: "SEND_NOW_SUPPORT_LOST" }, HELD, ["x:failed"]],
+    ]
+    for (const [name, from, event, phase, expectedIds, effect] of rows) {
+      const { next, effect: actual } = apply(from, event)
+      expect(next.phase, name).toEqual(phase)
+      expect(ids(next), name).toEqual(expectedIds)
+      if (effect !== undefined) expect(actual, name).toBe(effect)
+    }
+    expect(rows).toHaveLength(43)
+  })
+
+  it("ignores every new event while idle", () => {
+    const idle = state(IDLE)
+    const events: MessageQueueEvent[] = [
+      requested("x"), { type: "SEND_NOW_ACCEPTED", clientMessageId: "x" }, failedWith("x", "next"),
+      { type: "SEND_NOW_RESENT", clientMessageId: "x", atVersion: 1, connection: "c1" },
+      { type: "LIVE_INPUT_APPLIED", clientMessageId: "x" }, returned("x", "run_ended"), { type: "SEND_NOW_SUPPORT_LOST" },
+    ]
+    for (const event of events) expect(apply(idle, event).next).toBe(idle)
+  })
+
+  it.each([
+    ["failed", { version: 4, status: "failed" as const }],
+    ["paused", { version: 4, status: "paused" as const }],
+  ])("clearing a held queue that keeps a message being inserted waits from the observed version (%s)", (_name, observed) => {
+    const from = state(HELD, [ins("x", 1, { confirmed: true }), A], observed)
+    const { next } = apply(from, { type: "CLEAR" })
+    expect(next.phase).toEqual(waiting(observed.version))
+    expect(ids(next)).toEqual(["x:inserting"])
+  })
+
+  it("ignores an applied echo for a message that is not being inserted", () => {
+    const from = state(waiting(1), [A])
+    expect(apply(from, { type: "LIVE_INPUT_APPLIED", clientMessageId: "a" }).next).toBe(from)
+  })
+
+  it("confirms a request and clears the request in flight", () => {
+    const from = state(waiting(1), [ins("x", 1)])
+    const accepted = apply(from, { type: "SEND_NOW_ACCEPTED", clientMessageId: "x" }).next
+    expect(firstInsert(accepted, "x")).toMatchObject({ inFlight: false, confirmed: true })
+  })
+
+  it.each([
+    ["next", "waiting", true],
+    ["retry", "waiting", false],
+    ["later", "inserting", false],
+    ["hold", "failed", false],
+    ["unknown", "failed", false],
+  ] as const)("a failed send into the turn ends as %s", (verdict, status, next) => {
+    const from = state(waiting(1), [ins("x", 2), A])
+    const result = apply(from, failedWith("x", verdict, verdict === "hold" ? { newClientMessageId: "x2" } : {})).next
+    const moved = result.items.find(entry => entry.text === "x")
+    expect(moved?.status).toBe(status)
+    expect(moved?.next === true).toBe(next)
+    expect(moved?.clientMessageId).toBe(verdict === "hold" ? "x2" : "x")
+    if (verdict === "retry") expect(ids(result)).toEqual(["a:waiting", "x:waiting"])
+    if (verdict === "later") expect(moved?.insert).toMatchObject({ retries: 1, retryAt: NOW + 1000, confirmed: false, inFlight: false })
+    else expect(moved?.insert).toBeUndefined()
+  })
+
+  it.each([
+    ["run_ended", "waiting", true, undefined],
+    ["not_applied", "waiting", true, "fresh"],
+    ["not_started", "inserting", false, undefined],
+    ["taken", undefined, false, undefined],
+    ["unavailable", "failed", false, undefined],
+    ["refused", "failed", false, undefined],
+    ["conflict", "failed", false, undefined],
+    ["outcome_unknown", "failed", false, undefined],
+  ] as const)("a returned message with reason %s", (reason, status, next, newId) => {
+    const from = state(waiting(1), [ins("x", 2), A])
+    const result = apply(from, returned("x", reason, newId ? { newClientMessageId: newId } : {})).next
+    const moved = result.items.find(entry => entry.text === "x")
+    expect(moved?.status).toBe(status)
+    expect(moved?.next === true).toBe(next)
+    if (moved) {
+      expect(moved.clientMessageId).toBe(newId ?? "x")
+      expect(moved.seq).toBe(2)
+    }
+    if (reason === "not_started") expect(moved?.insert).toMatchObject({ retries: 1, retryAt: NOW + 1000, inFlight: true })
+  })
+
+  it("keeps a request in flight when the turn reports it has not started", () => {
+    const next = apply(state(waiting(1), [ins("x", 1)]), returned("x", "not_started")).next
+    expect(firstInsert(next, "x")).toMatchObject({ inFlight: true, confirmed: false, retries: 1, retryAt: NOW + 1000 })
+  })
+
+  it("gives up retrying after the sixth refusal and sends the message first on the next turn", () => {
+    let current = state(waiting(1), [ins("x", 1), A])
+    for (let attempt = 1; attempt <= 5; attempt += 1) {
+      current = apply(current, failedWith("x", "later")).next
+      expect(firstInsert(current, "x")).toMatchObject({ retries: attempt, inFlight: false })
+      current = apply(current, { type: "SEND_NOW_RESENT", clientMessageId: "x", atVersion: undefined, connection: "c1" }).next
+      expect(firstInsert(current, "x")).toMatchObject({ inFlight: true, retryAt: undefined })
+    }
+    current = apply(current, failedWith("x", "later")).next
+    expect(ids(current)).toEqual(["x:waiting", "a:waiting"])
+    expect(current.items[0].next).toBe(true)
+    expect(current.items[0].insert).toBeUndefined()
+  })
+
+  it("late ack after not started keeps the retry wait", () => {
+    let current = state(waiting(1), [ins("x", 1)])
+    current = apply(current, returned("x", "not_started")).next
+    current = apply(current, { type: "SEND_NOW_ACCEPTED", clientMessageId: "x" }).next
+    expect(firstInsert(current, "x")).toMatchObject({ confirmed: false, inFlight: false, retryAt: NOW + 1000 })
+    // The visitor can still take the message back.
+    expect(ids(apply(current, { type: "REMOVE", clientMessageId: "x" }).next)).toEqual([])
+  })
+
+  it("lets a message be removed only while no request is on its way and nothing is confirmed", () => {
+    const base = (over: Partial<InsertState>) => state(waiting(1), [ins("x", 1, over)])
+    const remove = (from: MessageQueueState) => ids(apply(from, { type: "REMOVE", clientMessageId: "x" }).next)
+    expect(remove(base({}))).toEqual(["x:inserting"])
+    expect(remove(base({ inFlight: false, confirmed: true }))).toEqual(["x:inserting"])
+    expect(remove(base({ inFlight: false, retryAt: NOW }))).toEqual([])
+  })
+
+  it.each([
+    ["run_ended", "waiting"], ["run_ended", "ready"], ["run_ended", "held"],
+    ["not_applied", "waiting"], ["not_applied", "ready"], ["not_applied", "held"],
+  ] as const)("a returned message goes first [%s %s]", (reason, phase) => {
+    const phases = { waiting: waiting(1), ready: READY, held: HELD } as const
+    const from = state(phases[phase], [ins("x", 3), item("a", 1), item("b", 2)])
+    const { next } = apply(from, returned("x", reason, reason === "not_applied" ? { newClientMessageId: "x2" } : {}))
+    const head = next.items[0]
+    expect(head).toMatchObject({ status: "waiting", next: true, seq: 3 })
+    expect(head.clientMessageId).toBe(reason === "not_applied" ? "x2" : "x")
+    expect(next.items.slice(1).map(entry => entry.clientMessageId)).toEqual(["a", "b"])
   })
 })

@@ -13,6 +13,7 @@ const HELD_KEYS = {
   turn_paused: "messageQueue.held.turnInterrupted",
   send_failed: "messageQueue.held.sendFailed",
   earlier_send_failed: "messageQueue.held.earlierSendFailed",
+  send_now_unknown: "messageQueue.held.sendNowUnknown",
 } as const
 
 const NOTICE_CLASS =
@@ -43,7 +44,7 @@ function QueuedRow({ item, onRemove }: { item: QueuedMessage; onRemove: () => vo
         aria-live="polite"
         className={cn("shrink-0 text-xs", item.status === "failed" ? "text-destructive" : "text-muted-foreground")}
       >
-        {t(`messageQueue.status.${item.status}`)}
+        {t(item.status === "waiting" && item.next ? "messageQueue.status.next" : `messageQueue.status.${item.status}`)}
       </span>
       <button
         type="button"

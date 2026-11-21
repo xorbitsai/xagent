@@ -1,8 +1,9 @@
 """Authentication dependency contract tests."""
 
 import ast
+import logging
 from collections import Counter
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -20,7 +21,7 @@ from tests.web.auth_token_cases import (
     RejectedAccessTokenCase,
 )
 from tests.web.auth_token_cases import build_access_token as _access_token
-from xagent.web import auth_dependencies
+from xagent.web import auth_dependencies, browser_idle
 from xagent.web.app import global_exception_handler
 from xagent.web.auth_dependencies import (
     get_current_user,
@@ -66,7 +67,7 @@ def db_session() -> Session:
 def test_access_token_rejection_matrix_preserves_required_http_contract(
     db_session: Session, case: RejectedAccessTokenCase
 ) -> None:
-    """Required HTTP auth exposes its established reason-specific rejection."""
+    """Required HTTP auth returns the generic credential rejection contract."""
     credentials = HTTPAuthorizationCredentials(
         scheme="Bearer", credentials=case.build_token()
     )
@@ -75,8 +76,112 @@ def test_access_token_rejection_matrix_preserves_required_http_contract(
         get_current_user(credentials, db_session)
 
     assert raised.value.status_code == 401
-    assert raised.value.detail == case.expected_detail
+    assert raised.value.detail == "Could not validate credentials"
     assert raised.value.headers == case.expected_headers
+
+
+def test_rejected_access_token_details_do_not_reveal_the_failed_step(
+    db_session: Session,
+) -> None:
+    """Every non-idle rejection reason shares one response body and status."""
+    responses: dict[str, tuple[str, str]] = {}
+    for case in REJECTED_ACCESS_TOKEN_CASES:
+        credentials = HTTPAuthorizationCredentials(
+            scheme="Bearer", credentials=case.build_token()
+        )
+        with pytest.raises(HTTPException) as raised:
+            get_current_user(credentials, db_session)
+        assert raised.value.status_code == 401
+        responses[case.id] = (
+            raised.value.detail,
+            raised.value.headers["Error-Type"],
+        )
+
+    assert {detail for detail, _ in responses.values()} == {
+        "Could not validate credentials"
+    }
+    assert {case_id: error_type for case_id, (_, error_type) in responses.items()} == {
+        "expired": "TokenExpired",
+        "invalid-signature": "InvalidToken",
+        "wrong-type": "InvalidToken",
+        "invalid-claims": "InvalidToken",
+        "user-not-found": "InvalidToken",
+    }
+
+
+def _reject_through_entry_point(entry_point: str, token: str, db: Session) -> None:
+    """Call one access-token entry point and assert its rejection contract."""
+    credentials = HTTPAuthorizationCredentials(scheme="Bearer", credentials=token)
+    if entry_point == "required":
+        with pytest.raises(HTTPException) as raised:
+            get_current_user(credentials, db)
+        assert raised.value.status_code == 401
+    elif entry_point == "optional":
+        assert get_current_user_optional(credentials, db) is None
+    elif entry_point == "token":
+        assert get_user_from_token(token, db) is None
+    else:
+        assert get_user_from_websocket_token(token, db) is None
+
+
+@pytest.mark.parametrize("entry_point", ("required", "optional", "token", "websocket"))
+@pytest.mark.parametrize("case", REJECTED_ACCESS_TOKEN_CASES, ids=lambda case: case.id)
+def test_every_rejection_entry_point_logs_the_reason_without_the_credential(
+    db_session: Session,
+    case: RejectedAccessTokenCase,
+    entry_point: str,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Each entry point logs the reason server-side, but never the token itself."""
+    token = case.build_token()
+    caplog.set_level(logging.INFO, logger=auth_dependencies.__name__)
+
+    _reject_through_entry_point(entry_point, token, db_session)
+
+    messages = [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == auth_dependencies.__name__
+    ]
+    assert messages == [f"Access token rejected: {case.expected_rejection_reason}"]
+    assert token not in caplog.text
+
+
+def test_idle_expired_rejection_keeps_its_response_and_is_logged(
+    db_session: Session,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The idle policy keeps its distinct 401 while logging its own reason."""
+    monkeypatch.setenv("XAGENT_BROWSER_IDLE_TIMEOUT_ENABLED", "true")
+    sid = browser_idle.new_browser_session_id()
+    browser_idle.add_browser_session(
+        db_session,
+        1,
+        sid,
+        now=datetime.now(timezone.utc) - timedelta(minutes=31),
+    )
+    db_session.commit()
+    token = _access_token(sid=sid)
+    credentials = HTTPAuthorizationCredentials(scheme="Bearer", credentials=token)
+    caplog.set_level(logging.INFO, logger=auth_dependencies.__name__)
+
+    with pytest.raises(HTTPException) as raised:
+        get_current_user(credentials, db_session)
+
+    assert raised.value.status_code == 401
+    assert raised.value.detail == "Session expired due to inactivity"
+    assert raised.value.headers == {
+        "WWW-Authenticate": "Bearer",
+        "Error-Type": "SessionIdleExpired",
+    }
+    messages = [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == auth_dependencies.__name__
+    ]
+    assert messages == ["Access token rejected: idle_expired"]
+    assert token not in caplog.text
 
 
 @pytest.mark.parametrize("case", REJECTED_ACCESS_TOKEN_CASES, ids=lambda case: case.id)
@@ -123,8 +228,11 @@ def test_malformed_identity_claim_shapes_are_rejected_before_any_user_query(
         get_current_user(credentials, db_session)
 
     assert raised.value.status_code == 401
-    assert raised.value.detail == "Invalid token payload"
-    assert raised.value.headers == {"WWW-Authenticate": "Bearer"}
+    assert raised.value.detail == "Could not validate credentials"
+    assert raised.value.headers == {
+        "WWW-Authenticate": "Bearer",
+        "Error-Type": "InvalidToken",
+    }
     assert db_session.info["user_query_count"] == 0
 
 
@@ -140,7 +248,7 @@ def test_present_non_string_subject_preserves_invalid_token_http_contract(
         get_current_user(credentials, db_session)
 
     assert raised.value.status_code == 401
-    assert raised.value.detail == "Invalid token"
+    assert raised.value.detail == "Could not validate credentials"
     assert raised.value.headers == {
         "WWW-Authenticate": "Bearer",
         "Error-Type": "InvalidToken",
@@ -165,8 +273,11 @@ def test_malformed_temporal_claims_are_rejected_before_any_user_query(
         get_current_user(credentials, db_session)
 
     assert raised.value.status_code == 401
-    assert raised.value.detail == "Invalid token payload"
-    assert raised.value.headers == {"WWW-Authenticate": "Bearer"}
+    assert raised.value.detail == "Could not validate credentials"
+    assert raised.value.headers == {
+        "WWW-Authenticate": "Bearer",
+        "Error-Type": "InvalidToken",
+    }
     assert db_session.info["user_query_count"] == 0
 
 
@@ -179,7 +290,7 @@ def test_bad_signature_with_malformed_expiry_is_invalid_token(db_session):
     credentials = HTTPAuthorizationCredentials(scheme="Bearer", credentials=token)
     with pytest.raises(HTTPException) as raised:
         get_current_user(credentials, db_session)
-    assert raised.value.detail == "Invalid token"
+    assert raised.value.detail == "Could not validate credentials"
     assert raised.value.headers["Error-Type"] == "InvalidToken"
     assert db_session.info["user_query_count"] == 0
 
@@ -204,7 +315,7 @@ def test_unrelated_jwt_error_context_cannot_change_rejection(db_session, monkeyp
         get_current_user(
             HTTPAuthorizationCredentials(scheme="Bearer", credentials=token), db_session
         )
-    assert raised.value.detail == "Invalid token"
+    assert raised.value.detail == "Could not validate credentials"
     assert raised.value.headers["Error-Type"] == "InvalidToken"
     assert db_session.info["user_query_count"] == 0
 
@@ -228,8 +339,11 @@ def test_mixed_malformed_temporal_claims_are_rejected_before_any_user_query(
         get_current_user(credentials, db_session)
 
     assert raised.value.status_code == 401
-    assert raised.value.detail == "Invalid token payload"
-    assert raised.value.headers == {"WWW-Authenticate": "Bearer"}
+    assert raised.value.detail == "Could not validate credentials"
+    assert raised.value.headers == {
+        "WWW-Authenticate": "Bearer",
+        "Error-Type": "InvalidToken",
+    }
     assert db_session.info["user_query_count"] == 0
 
 
@@ -252,8 +366,11 @@ def test_mixed_temporal_claims_preserve_original_error_proof_after_value_error(
         get_current_user(credentials, db_session)
 
     assert raised.value.status_code == 401
-    assert raised.value.detail == "Invalid token payload"
-    assert raised.value.headers == {"WWW-Authenticate": "Bearer"}
+    assert raised.value.detail == "Could not validate credentials"
+    assert raised.value.headers == {
+        "WWW-Authenticate": "Bearer",
+        "Error-Type": "InvalidToken",
+    }
     assert db_session.info["user_query_count"] == 0
 
 
@@ -327,7 +444,7 @@ def test_sqlite_unbindable_claims_are_rejected_without_a_user_query(
     with pytest.raises(HTTPException) as raised:
         get_current_user(credentials, db_session)
 
-    assert raised.value.detail == "Invalid token payload"
+    assert raised.value.detail == "Could not validate credentials"
     assert db_session.info["user_query_count"] == 0
 
 
@@ -389,7 +506,7 @@ def test_postgresql_unbindable_claims_are_rejected_without_a_user_query(
     with pytest.raises(HTTPException) as raised:
         get_current_user(credentials, db)  # type: ignore[arg-type]
 
-    assert raised.value.detail == "Invalid token payload"
+    assert raised.value.detail == "Could not validate credentials"
     assert db.query_count == 0
 
 
@@ -604,6 +721,35 @@ def test_invalid_session_epoch_is_a_credential_rejection(db_session, epoch):
     assert get_user_from_websocket_token(token, db_session) is None
 
 
+def test_revoked_session_keeps_the_generic_401_and_logs_session_revoked(
+    db_session: Session, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A rotated session epoch is indistinguishable on HTTP, logged apart."""
+    user = db_session.get(User, 1)
+    user.session_epoch = "rotated-session-generation"
+    db_session.commit()
+    token = _access_token(session_epoch="previous-session-generation")
+    credentials = HTTPAuthorizationCredentials(scheme="Bearer", credentials=token)
+    caplog.set_level(logging.INFO, logger=auth_dependencies.__name__)
+
+    with pytest.raises(HTTPException) as raised:
+        get_current_user(credentials, db_session)
+
+    assert raised.value.status_code == 401
+    assert raised.value.detail == "Could not validate credentials"
+    assert raised.value.headers == {
+        "WWW-Authenticate": "Bearer",
+        "Error-Type": "InvalidToken",
+    }
+    messages = [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == auth_dependencies.__name__
+    ]
+    assert messages == ["Access token rejected: session_revoked"]
+    assert token not in caplog.text
+
+
 def test_current_session_epoch_authenticates(db_session):
     user = db_session.get(User, 1)
     user.session_epoch = "current-session-generation"
@@ -637,12 +783,13 @@ def test_invalid_claims_read_the_bound_dialect_without_pool_checkout() -> None:
         held_connection.close()
         engine.dispose()
 
-    assert raised.value.detail == "Invalid token payload"
+    assert raised.value.detail == "Could not validate credentials"
 
 
 def test_auth_consumer_topology_is_closed_across_source_tree() -> None:
     """Authentication consumers stay within the reviewed ownership topology."""
     tracked = {
+        "_authenticate_access_token",
         "_load_websocket_principal_sync",
         "_resolve_access_token_user",
         "get_current_user",
@@ -664,6 +811,12 @@ def test_auth_consumer_topology_is_closed_across_source_tree() -> None:
             rejected,
         ),
         (auth_file, "get_user_from_token", "_resolve_access_token_user", rejected),
+        (
+            auth_file,
+            "_resolve_access_token_user",
+            "_authenticate_access_token",
+            rejected,
+        ),
         (
             auth_file,
             "get_user_from_websocket_token",

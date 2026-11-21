@@ -1,5 +1,6 @@
 """Authentication dependencies for user segregation."""
 
+import logging
 from enum import Enum, auto
 from typing import NoReturn, Optional, assert_never
 
@@ -16,6 +17,8 @@ from .jwt_validation import is_exact_integer_bindable
 from .models.database import get_db
 from .models.user import User
 
+logger = logging.getLogger(__name__)
+
 # JWT Bearer token authentication
 security = HTTPBearer()
 optional_security = HTTPBearer(auto_error=False)
@@ -29,6 +32,7 @@ class _AccessTokenRejectionReason(Enum):
     WRONG_TYPE = auto()
     INVALID_CLAIMS = auto()
     USER_NOT_FOUND = auto()
+    SESSION_REVOKED = auto()
     IDLE_EXPIRED = auto()
 
 
@@ -63,6 +67,17 @@ def _validate_access_token_claim_bindability(
 def _resolve_access_token_user(
     token: str, db: Session, *, verify_exp: bool = True
 ) -> User:
+    """Return the matching user, logging the reason for any rejection."""
+    try:
+        return _authenticate_access_token(token, db, verify_exp=verify_exp)
+    except _AccessTokenRejected as rejected:
+        logger.info("Access token rejected: %s", rejected.reason.name.lower())
+        raise
+
+
+def _authenticate_access_token(
+    token: str, db: Session, *, verify_exp: bool = True
+) -> User:
     """Return the matching user or raise a typed credential rejection."""
     try:
         payload = jwt.decode(
@@ -92,7 +107,7 @@ def _resolve_access_token_user(
     if user is None:
         raise _AccessTokenRejected(_AccessTokenRejectionReason.USER_NOT_FOUND)
     if not matches_user_session(user, payload):
-        raise _AccessTokenRejected(_AccessTokenRejectionReason.INVALID)
+        raise _AccessTokenRejected(_AccessTokenRejectionReason.SESSION_REVOKED)
     # Applies even when verify_exp is off (WebSocket rechecks): a still valid
     # JWT never outlives its login's idle deadline or revocation. With the
     # policy off, a revoked login or one that expired while enforced is rejected.
@@ -105,42 +120,27 @@ def _resolve_access_token_user(
 
 
 def _required_http_rejection(reason: _AccessTokenRejectionReason) -> NoReturn:
-    """Raise the established HTTP response for a typed credential rejection."""
+    """Raise the generic credential 401, keeping idle expiry distinct."""
     match reason:
         case _AccessTokenRejectionReason.EXPIRED:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Token expired",
-                headers={"WWW-Authenticate": "Bearer", "Error-Type": "TokenExpired"},
-            )
-        case _AccessTokenRejectionReason.INVALID:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Invalid token",
-                headers={"WWW-Authenticate": "Bearer", "Error-Type": "InvalidToken"},
-            )
-        case _AccessTokenRejectionReason.WRONG_TYPE:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Invalid token type",
-                headers={"WWW-Authenticate": "Bearer"},
-            )
-        case _AccessTokenRejectionReason.INVALID_CLAIMS:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Invalid token payload",
-                headers={"WWW-Authenticate": "Bearer"},
-            )
-        case _AccessTokenRejectionReason.USER_NOT_FOUND:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="User not found",
-                headers={"WWW-Authenticate": "Bearer"},
-            )
+            headers = {"WWW-Authenticate": "Bearer", "Error-Type": "TokenExpired"}
+        case (
+            _AccessTokenRejectionReason.INVALID
+            | _AccessTokenRejectionReason.SESSION_REVOKED
+            | _AccessTokenRejectionReason.WRONG_TYPE
+            | _AccessTokenRejectionReason.INVALID_CLAIMS
+            | _AccessTokenRejectionReason.USER_NOT_FOUND
+        ):
+            headers = {"WWW-Authenticate": "Bearer", "Error-Type": "InvalidToken"}
         case _AccessTokenRejectionReason.IDLE_EXPIRED:
             raise browser_idle.rejection_http_exception()
         case _:
             assert_never(reason)
+    raise HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Could not validate credentials",
+        headers=headers,
+    )
 
 
 def get_current_user(

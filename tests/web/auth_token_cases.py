@@ -38,8 +38,8 @@ class RejectedAccessTokenCase:
     """One stable credential-rejection reason and its public HTTP contract."""
 
     id: str
-    expected_detail: str
     expected_header_items: tuple[tuple[str, str], ...]
+    expected_rejection_reason: str
     claim_items: tuple[tuple[str, object], ...] = ()
     remove_claims: tuple[str, ...] = ()
     lifetime: timedelta = _DEFAULT_LIFETIME
@@ -64,32 +64,32 @@ _BEARER_HEADERS = (("WWW-Authenticate", "Bearer"),)
 REJECTED_ACCESS_TOKEN_CASES = (
     RejectedAccessTokenCase(
         "expired",
-        "Token expired",
         _BEARER_HEADERS + (("Error-Type", "TokenExpired"),),
+        "expired",
         lifetime=-_DEFAULT_LIFETIME,
     ),
     RejectedAccessTokenCase(
         "invalid-signature",
-        "Invalid token",
         _BEARER_HEADERS + (("Error-Type", "InvalidToken"),),
+        "invalid",
         signing_secret="different-signing-secret",
     ),
     RejectedAccessTokenCase(
         "wrong-type",
-        "Invalid token type",
-        _BEARER_HEADERS,
+        _BEARER_HEADERS + (("Error-Type", "InvalidToken"),),
+        "wrong_type",
         (("type", "refresh"),),
     ),
     RejectedAccessTokenCase(
         "invalid-claims",
-        "Invalid token payload",
-        _BEARER_HEADERS,
+        _BEARER_HEADERS + (("Error-Type", "InvalidToken"),),
+        "invalid_claims",
         (("user_id", "1"),),
     ),
     RejectedAccessTokenCase(
         "user-not-found",
-        "User not found",
-        _BEARER_HEADERS,
+        _BEARER_HEADERS + (("Error-Type", "InvalidToken"),),
+        "user_not_found",
         (("sub", "missing-user"),),
     ),
 )

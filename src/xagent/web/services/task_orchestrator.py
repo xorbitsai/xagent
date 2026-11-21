@@ -952,9 +952,9 @@ def _reconcile_finalized_turn_delivery(
     - ``settlement_error is None`` → ``completed``: the run returned without
       raising. Note this does not certify success — ``execute_task_background``
       may set ``task.status = FAILED`` internally and return normally, leaving
-      ``settlement_error`` unset — but both ``completed`` and ``dispatched``
-      read identically downstream ("delivered, do not retry"), so the
-      distinction has no client-visible effect.
+      ``settlement_error`` unset. Downstream, both ``completed`` and
+      ``dispatched`` mean "delivered, do not retry"; only ``completed`` also
+      says the message is in the conversation.
     - error and ``execution_started`` → ``dispatched``: the run may have
       consumed the message (and produced side effects) before failing, so the
       one certain fact is "no longer in flight". A retry invitation here would

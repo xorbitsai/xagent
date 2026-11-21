@@ -323,7 +323,8 @@ def _mark_cancelled_turn_delivery_dispatched(
     while the run executes. The running turn's own row is normally already
     dispatched by then, so "newest pending" usually names a live input row.
     Closing that row as dispatched downgrades its outcome to "not confirmed"
-    for the sender; callers that know the turn must pass ``turn_id``.
+    for the sender, unless its injection still completes and marks it
+    ``completed``; callers that know the turn must pass ``turn_id``.
     """
 
     if turn_id is None:

@@ -14401,6 +14401,9 @@ describe("session message queue", () => {
       const server = makeServer({ status: "running", version: 3 })
       const live = {
         attempts: 0, active: 0, mostActive: 0,
+        // When set, the acknowledgement says the message is already in the
+        // conversation.
+        applied: false,
         reply: (async () => undefined) as (id: string, attempt: number) => Promise<void>,
       }
       sendChatMessageMock.mockImplementation(async (...args: unknown[]) => {
@@ -14410,7 +14413,7 @@ describe("session message queue", () => {
         live.mostActive = Math.max(live.mostActive, live.active)
         try {
           await live.reply(args[3] as string, live.attempts)
-          return { client_message_id: args[3], turn_id: args[3] }
+          return { client_message_id: args[3], turn_id: args[3], ...(live.applied ? { live_input: "applied" } : {}) }
         } finally {
           live.active -= 1
         }
@@ -14661,6 +14664,109 @@ describe("session message queue", () => {
       await push({ type: "conversation_attached", timestamp: "2026-11-17T00:00:00Z", data: { type: "conversation_attached" } })
       await echo("id-A")
       expect(statuses()).toEqual(["B:waiting"])
+    })
+
+    describe("an acknowledgement saying the message is already in the conversation", () => {
+      const userBubbles = (id: string) =>
+        getSessionControls().state.messages.filter(m => m.role === "user" && m.id === `msg-user-turn-${id}`)
+
+      it("a resend after the replay removes the row and leaves one bubble", async () => {
+        const { live, view } = await startRunning()
+        live.reply = async (_id, attempt) => { if (attempt === 1) throw lost() }
+        await sendNow("id-A")
+        view.rerender(tree("session-two"))
+        act(() => socket()?.onConnect?.())
+        act(() => socket()?.onConnectionCapabilities?.(NOW_CAPABILITIES))
+        await echo("id-A")
+        expect(statuses()[0]).toBe("A:inserting")
+        live.applied = true
+        await push({ type: "conversation_attached", timestamp: "2026-11-17T00:00:00Z", data: { type: "conversation_attached" } })
+        await advance(1000)
+        expect(liveFrames()).toHaveLength(2)
+        expect(statuses()).toEqual(["B:waiting"])
+        expect(userBubbles("id-A")).toHaveLength(1)
+      })
+
+      it("a resend after the turn ended removes the row", async () => {
+        const { server, live } = await startRunning()
+        await sendNow("id-A")
+        expect(insert("id-A")).toMatchObject({ confirmed: true })
+        live.applied = true
+        await push(server.end())
+        await push(server.snapshot())
+        await advance(1000)
+        expect(liveFrames()).toHaveLength(2)
+        expect(statuses()).not.toContain("A:inserting")
+        expect(queue().items.some(entry => entry.clientMessageId === "id-A")).toBe(false)
+      })
+
+      it("draws the bubble that no echo brought, once", async () => {
+        const { server, live } = await startRunning()
+        await sendNow("id-A")
+        expect(userBubbles("id-A")).toHaveLength(0)
+        live.applied = true
+        await push(server.end())
+        await push(server.snapshot())
+        await advance(1000)
+        expect(queue().items.some(entry => entry.clientMessageId === "id-A")).toBe(false)
+        const bubbles = userBubbles("id-A")
+        expect(bubbles).toHaveLength(1)
+        expect(bubbles[0]).toMatchObject({ content: "A", isOptimistic: true })
+        await echo("id-A")
+        expect(userBubbles("id-A")).toHaveLength(1)
+        expect(userBubbles("id-A")[0].isOptimistic).toBeFalsy()
+      })
+
+      it("after the live echo leaves one bubble that is not optimistic", async () => {
+        const { live } = await startRunning()
+        const gate = deferred<void>()
+        live.reply = async () => { await gate.promise }
+        await sendNow("id-A")
+        await echo("id-A")
+        expect(queue().items.some(entry => entry.clientMessageId === "id-A")).toBe(false)
+        expect(userBubbles("id-A")).toHaveLength(1)
+        live.applied = true
+        await act(async () => gate.resolve())
+        const bubbles = userBubbles("id-A")
+        expect(bubbles).toHaveLength(1)
+        expect(bubbles[0].isOptimistic).toBeFalsy()
+      })
+
+      it("for a message no longer listed changes nothing", async () => {
+        const { live } = await startRunning()
+        const gate = deferred<void>()
+        live.reply = async () => { await gate.promise }
+        await sendNow("id-A")
+        await echo("id-A")
+        expect(queue().items.some(entry => entry.clientMessageId === "id-A")).toBe(false)
+        const before = queue()
+        const messagesBefore = getSessionControls().state.messages
+        live.applied = true
+        await act(async () => gate.resolve())
+        expect(queue()).toBe(before)
+        expect(getSessionControls().state.messages).toBe(messagesBefore)
+      })
+
+      it("for a message whose row went away without a bubble draws none", async () => {
+        const { live } = await startRunning()
+        const gate = deferred<void>()
+        live.reply = async () => { await gate.promise }
+        await sendNow("id-A")
+        await returned("id-A", "taken")
+        expect(queue().items.some(entry => entry.clientMessageId === "id-A")).toBe(false)
+        expect(userBubbles("id-A")).toHaveLength(0)
+        live.applied = true
+        await act(async () => gate.resolve())
+        expect(userBubbles("id-A")).toHaveLength(0)
+      })
+
+      it("is not assumed when the acknowledgement has no marker", async () => {
+        await startRunning()
+        await sendNow("id-A")
+        expect(statuses()[0]).toBe("A:inserting")
+        expect(insert("id-A")).toMatchObject({ confirmed: true })
+        expect(userBubbles("id-A")).toHaveLength(0)
+      })
     })
 
     it.each([

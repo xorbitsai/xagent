@@ -139,6 +139,9 @@ interface WebSocketMessage {
 interface MessageDeliveryAck {
   client_message_id: string
   turn_id: string
+  // Present when a server answered a send-now frame by saying the message is
+  // already in the conversation.
+  live_input?: "applied"
 }
 
 // Files that were already uploaded elsewhere and are attached to a chat frame
@@ -1386,6 +1389,7 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
                 pending.resolve({
                   client_message_id: clientMessageId,
                   turn_id: typeof data.turn_id === 'string' ? data.turn_id : clientMessageId,
+                  ...(data.live_input === 'applied' ? { live_input: 'applied' as const } : {}),
                 })
               } else {
                 const hasErrorCode = Object.prototype.hasOwnProperty.call(data, "error_code")

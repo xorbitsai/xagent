@@ -8059,7 +8059,8 @@ export function AppProvider({
         // second time on another connection by this function: the caller
         // decides that from the connection's capabilities. The optimistic
         // bubble is left out as well: the turn's own echo draws it once the
-        // message has been taken in.
+        // message has been taken in, and an acknowledgement saying the message
+        // is already in the conversation draws it when no echo did.
         if (
           sessionConversationRef.current.phase !== "bound"
           || sourceTaskId !== undefined
@@ -8070,7 +8071,10 @@ export function AppProvider({
         }
         beginSessionMessageDelivery()
         try {
-          await sendChatMessage(message, undefined, false, clientMessageId, undefined, undefined, undefined, "send_now")
+          const ack = await sendChatMessage(message, undefined, false, clientMessageId, undefined, undefined, undefined, "send_now")
+          // The executor reads this once the send resolves; sendMessage itself
+          // returns nothing.
+          if (ack?.live_input === "applied") sendNowAppliedRef.current.add(clientMessageId)
         } finally {
           endSessionMessageDelivery()
         }
@@ -9058,6 +9062,9 @@ export function AppProvider({
   // waiting, and a request lost on a connection is not repeated on it.
   const sendNowOnWireRef = useRef(new Set<string>())
   const sendNowLostOnRef = useRef(new Map<string, string | null>())
+  // Messages whose acknowledgement said they are already in the conversation,
+  // until the executor has settled them.
+  const sendNowAppliedRef = useRef(new Set<string>())
   const scanSendNow = () => {
     if (!canSendNowFrom() || !isConnected) return
     const connection = sessionConnectionIdentityRef.current
@@ -9067,7 +9074,27 @@ export function AppProvider({
       sendNowLostOnRef.current.delete(clientMessageId)
       trackedSendMessage(text, { clientMessageId, delivery: "send_now" }).then(() => {
         wire.delete(clientMessageId)
-        if (mountedRef.current) applyMessageQueue({ type: "SEND_NOW_ACCEPTED", clientMessageId })
+        const applied = sendNowAppliedRef.current.delete(clientMessageId)
+        if (!mountedRef.current) return
+        if (applied) {
+          const current = stateRef.current
+          const stillInserting = current.messageQueue.items.some(
+            item => item.clientMessageId === clientMessageId && item.status === "inserting",
+          )
+          const bubbleId = userTurnMessageId(clientMessageId)
+          // The live echo may never have reached this connection; the message
+          // is in the conversation, so it gets a bubble until the transcript's
+          // own copy replaces it. A bubble already there is left as it is.
+          if (stillInserting) {
+            dispatch({
+              type: "ADD_MESSAGE",
+              payload: { id: bubbleId, role: "user", content: text, timestamp: Date.now().toString(), isOptimistic: true },
+            })
+          }
+        }
+        // "Already in the conversation" settles the message the way its live
+        // echo would; any other acceptance means the server holds it.
+        applyMessageQueue({ type: applied ? "LIVE_INPUT_APPLIED" : "SEND_NOW_ACCEPTED", clientMessageId })
       }, (error: unknown) => {
         wire.delete(clientMessageId)
         if (!mountedRef.current) return

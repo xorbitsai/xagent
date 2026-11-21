@@ -3680,6 +3680,46 @@ describe("useWebSocket normalized connections", () => {
       await expect(sent).resolves.toEqual({ client_message_id: "msg-now", turn_id: "msg-now" })
     })
 
+    it("resolves an applied acknowledgement with its marker", async () => {
+      const { result, socket } = await openSocket()
+      const sent = result.current.sendChatMessage(
+        "now", undefined, false, "msg-now", undefined, undefined, undefined, "send_now",
+      )
+      act(() => socket.receive({
+        type: "message_accepted", client_message_id: "msg-now", turn_id: "msg-now", live_input: "applied",
+      }))
+      await expect(sent).resolves.toEqual({
+        client_message_id: "msg-now", turn_id: "msg-now", live_input: "applied",
+      })
+    })
+
+    it.each([
+      ["a different string", "pending"],
+      ["a boolean", true],
+    ])("ignores an acknowledgement marker that is %s", async (_name, marker) => {
+      const { result, socket } = await openSocket()
+      const sent = result.current.sendChatMessage(
+        "now", undefined, false, "msg-now", undefined, undefined, undefined, "send_now",
+      )
+      act(() => socket.receive({
+        type: "message_accepted", client_message_id: "msg-now", turn_id: "msg-now", live_input: marker,
+      }))
+      await expect(sent).resolves.toEqual({ client_message_id: "msg-now", turn_id: "msg-now" })
+    })
+
+    it("does not read the marker on a rejection", async () => {
+      const { result, socket } = await openSocket()
+      const sent = result.current.sendChatMessage(
+        "now", undefined, false, "msg-now", undefined, undefined, undefined, "send_now",
+      )
+      const settled = sent.then(() => "resolved", () => "rejected")
+      act(() => socket.receive({
+        type: "message_rejected", client_message_id: "msg-now", rejection_outcome: "not_accepted",
+        error_code: "live_input_not_running", live_input: "applied",
+      }))
+      await expect(settled).resolves.toBe("rejected")
+    })
+
     it("still refuses an unknown delivery declaration", async () => {
       const { result, socket } = await openSocket()
       const sent = result.current.sendChatMessage(

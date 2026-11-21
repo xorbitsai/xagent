@@ -1,0 +1,264 @@
+{
+  "redact_sensitive_text": [
+    {
+      "input": "Authorization: Bearer \"sk-LEAK-0123456789\"",
+      "legacy_output": "Authorization: Bearer ***789\""
+    },
+    {
+      "input": "Authorization: Bearer 'sk-LEAK-0123456789'",
+      "legacy_output": "Authorization: Bearer ***789'"
+    },
+    {
+      "input": "Authorization: Basic \"sk-LEAK-0123456789\"",
+      "legacy_output": "Authorization: Basic ***789\""
+    },
+    {
+      "input": "Authorization: bearer \"sk-LEAK-0123456789\"",
+      "legacy_output": "Authorization: bearer ***789\""
+    },
+    {
+      "input": "Authorization: Bearer abc]def",
+      "legacy_output": "Authorization: Bearer ***ef"
+    },
+    {
+      "input": "Authorization: Bearer sk-LEAK-0123456789}",
+      "legacy_output": "Authorization: Bearer ***789}"
+    },
+    {
+      "input": "MCP_API_KEY=SECRET-abc123",
+      "legacy_output": "MCP_API_KEY=***c123"
+    },
+    {
+      "input": "api_key=SK-OLD-SECRET",
+      "legacy_output": "api_key=***CRET"
+    },
+    {
+      "input": "https://example.com/x?api_key=AIzaSyOldKey&v=1",
+      "legacy_output": "https://example.com/x?api_key=***dKey&v=1"
+    },
+    {
+      "input": "https://example.com/x?key=OLDKEY&v=1",
+      "legacy_output": "https://example.com/x?key=***2AEY&v=1"
+    },
+    {
+      "input": "https://example.com/x?token=OLDTOKEN",
+      "legacy_output": "https://example.com/x?token=***2AEN"
+    },
+    {
+      "input": "https://example.com/x?ticket=OLDTICKET",
+      "legacy_output": "https://example.com/x?ticket=%2A%2A%2ACKET"
+    },
+    {
+      "input": "https://example.com/x?password=OLDPASSWORD",
+      "legacy_output": "https://example.com/x?password=***WORD"
+    },
+    {
+      "input": "https://example.com/x?secret=OLDSECRET",
+      "legacy_output": "https://example.com/x?secret=***CRET"
+    },
+    {
+      "input": "https://example.com/x?access_token=OLDACCESS",
+      "legacy_output": "https://example.com/x?access_token=***CESS"
+    },
+    {
+      "input": "https://example.com/x?apikey=OLDAPIKEY",
+      "legacy_output": "https://example.com/x?apikey=***IKEY"
+    },
+    {
+      "input": "wss://e.com/ws?X-Api-Key sk-FUZZ-0123456789\"}",
+      "legacy_output": "wss://e.com/ws?X-Api-Key= ***89\"}"
+    },
+    {
+      "input": "https://e.com/x?MCP_API_KEY'tok-FUZZ-abcdef123456>",
+      "legacy_output": "https://e.com/x?MCP_API_KEY=***456>"
+    },
+    {
+      "input": "https://e.com/x?access_token\"sk-FUZZ-0123456789}",
+      "legacy_output": "https://e.com/x?access_token=***789}"
+    },
+    {
+      "input": "/cb?X-Api-Key: sk-FUZZ-0123456789",
+      "legacy_output": "/cb?X-Api-Key: ***6789"
+    },
+    {
+      "input": "/cb?X-Api-Key = sk-FUZZ-0123456789",
+      "legacy_output": "/cb?X-Api-Key = ***6789"
+    }
+  ],
+  "redact_url_credentials_for_logging": [
+    {
+      "input": "https://example.com/x?api_key=OLD-api_key-VALUE&v=1",
+      "legacy_output": "https://example.com/x?api_key=%2A%2A%2AALUE&v=1"
+    },
+    {
+      "input": "https://example.com/x?apikey=OLD-apikey-VALUE&v=1",
+      "legacy_output": "https://example.com/x?apikey=%2A%2A%2AALUE&v=1"
+    },
+    {
+      "input": "https://example.com/x?key=OLD-key-VALUE&v=1",
+      "legacy_output": "https://example.com/x?key=%2A%2A%2AALUE&v=1"
+    },
+    {
+      "input": "https://example.com/x?access_token=OLD-access_token-VALUE&v=1",
+      "legacy_output": "https://example.com/x?access_token=%2A%2A%2AALUE&v=1"
+    },
+    {
+      "input": "https://example.com/x?token=OLD-token-VALUE&v=1",
+      "legacy_output": "https://example.com/x?token=%2A%2A%2AALUE&v=1"
+    },
+    {
+      "input": "https://example.com/x?ticket=OLD-ticket-VALUE&v=1",
+      "legacy_output": "https://example.com/x?ticket=%2A%2A%2AALUE&v=1"
+    },
+    {
+      "input": "https://example.com/x?password=OLD-password-VALUE&v=1",
+      "legacy_output": "https://example.com/x?password=%2A%2A%2AALUE&v=1"
+    },
+    {
+      "input": "https://example.com/x?secret=OLD-secret-VALUE&v=1",
+      "legacy_output": "https://example.com/x?secret=%2A%2A%2AALUE&v=1"
+    },
+    {
+      "input": "https://alice:s3cret-pass@proxy.internal:8080/",
+      "legacy_output": "https://***@proxy.internal:8080/"
+    }
+  ],
+  "redact_request_target": [
+    {
+      "input": "/api/list?access_token=OLD-access_token-VALUE&page=2",
+      "legacy_output": "/api/list?access_token=[REDACTED]&page=2"
+    },
+    {
+      "input": "/api/list?api_key=OLD-api_key-VALUE&page=2",
+      "legacy_output": "/api/list?api_key=[REDACTED]&page=2"
+    },
+    {
+      "input": "/api/list?apikey=OLD-apikey-VALUE&page=2",
+      "legacy_output": "/api/list?apikey=[REDACTED]&page=2"
+    },
+    {
+      "input": "/api/list?auth=OLD-auth-VALUE&page=2",
+      "legacy_output": "/api/list?auth=[REDACTED]&page=2"
+    },
+    {
+      "input": "/api/list?code=OLD-code-VALUE&page=2",
+      "legacy_output": "/api/list?code=[REDACTED]&page=2"
+    },
+    {
+      "input": "/api/list?connected_account_id=OLD-connected_account_id-VALUE&page=2",
+      "legacy_output": "/api/list?connected_account_id=[REDACTED]&page=2"
+    },
+    {
+      "input": "/api/list?credential=OLD-credential-VALUE&page=2",
+      "legacy_output": "/api/list?credential=[REDACTED]&page=2"
+    },
+    {
+      "input": "/api/list?id_token=OLD-id_token-VALUE&page=2",
+      "legacy_output": "/api/list?id_token=[REDACTED]&page=2"
+    },
+    {
+      "input": "/api/list?jwt=OLD-jwt-VALUE&page=2",
+      "legacy_output": "/api/list?jwt=[REDACTED]&page=2"
+    },
+    {
+      "input": "/api/list?key=OLD-key-VALUE&page=2",
+      "legacy_output": "/api/list?key=[REDACTED]&page=2"
+    },
+    {
+      "input": "/api/list?password=OLD-password-VALUE&page=2",
+      "legacy_output": "/api/list?password=[REDACTED]&page=2"
+    },
+    {
+      "input": "/api/list?refresh_token=OLD-refresh_token-VALUE&page=2",
+      "legacy_output": "/api/list?refresh_token=[REDACTED]&page=2"
+    },
+    {
+      "input": "/api/list?secret=OLD-secret-VALUE&page=2",
+      "legacy_output": "/api/list?secret=[REDACTED]&page=2"
+    },
+    {
+      "input": "/api/list?session=OLD-session-VALUE&page=2",
+      "legacy_output": "/api/list?session=[REDACTED]&page=2"
+    },
+    {
+      "input": "/api/list?session_uri=OLD-session_uri-VALUE&page=2",
+      "legacy_output": "/api/list?session_uri=[REDACTED]&page=2"
+    },
+    {
+      "input": "/api/list?sig=OLD-sig-VALUE&page=2",
+      "legacy_output": "/api/list?sig=[REDACTED]&page=2"
+    },
+    {
+      "input": "/api/list?signature=OLD-signature-VALUE&page=2",
+      "legacy_output": "/api/list?signature=[REDACTED]&page=2"
+    },
+    {
+      "input": "/api/list?state=OLD-state-VALUE&page=2",
+      "legacy_output": "/api/list?state=[REDACTED]&page=2"
+    },
+    {
+      "input": "/api/list?ticket=OLD-ticket-VALUE&page=2",
+      "legacy_output": "/api/list?ticket=[REDACTED]&page=2"
+    },
+    {
+      "input": "/api/list?token=OLD-token-VALUE&page=2",
+      "legacy_output": "/api/list?token=[REDACTED]&page=2"
+    },
+    {
+      "input": "/api/list?widget_key=OLD-widget_key-VALUE&page=2",
+      "legacy_output": "/api/list?widget_key=[REDACTED]&page=2"
+    },
+    {
+      "input": "/api/list?share_token=OLD-share_token-VALUE&page=2",
+      "legacy_output": "/api/list?share_token=[REDACTED]&page=2"
+    },
+    {
+      "input": "/api/list?embed_ticket=OLD-embed_ticket-VALUE&page=2",
+      "legacy_output": "/api/list?embed_ticket=[REDACTED]&page=2"
+    },
+    {
+      "input": "/api/list?client_secret=OLD-client_secret-VALUE&page=2",
+      "legacy_output": "/api/list?client_secret=[REDACTED]&page=2"
+    },
+    {
+      "input": "/api/list?x_custom_signature=OLD-x_custom_signature-VALUE&page=2",
+      "legacy_output": "/api/list?x_custom_signature=[REDACTED]&page=2"
+    },
+    {
+      "input": "/api/list?x-api-key=OLD-x-api-key-VALUE&page=2",
+      "legacy_output": "/api/list?x-api-key=[REDACTED]&page=2"
+    },
+    {
+      "input": "/api/list?page_token=OLD-page_token-VALUE&page=2",
+      "legacy_output": "/api/list?page_token=[REDACTED]&page=2"
+    },
+    {
+      "input": "/api/list?next_token=OLD-next_token-VALUE&page=2",
+      "legacy_output": "/api/list?next_token=[REDACTED]&page=2"
+    },
+    {
+      "input": "/api/list?primary_key=OLD-primary_key-VALUE&page=2",
+      "legacy_output": "/api/list?primary_key=[REDACTED]&page=2"
+    },
+    {
+      "input": "/api/list?sort_key=OLD-sort_key-VALUE&page=2",
+      "legacy_output": "/api/list?sort_key=[REDACTED]&page=2"
+    },
+    {
+      "input": "/api/list?cache_key=OLD-cache_key-VALUE&page=2",
+      "legacy_output": "/api/list?cache_key=[REDACTED]&page=2"
+    },
+    {
+      "input": "/api/list?public_key=OLD-public_key-VALUE&page=2",
+      "legacy_output": "/api/list?public_key=[REDACTED]&page=2"
+    },
+    {
+      "input": "/api/list?s3_key=OLD-s3_key-VALUE&page=2",
+      "legacy_output": "/api/list?s3_key=[REDACTED]&page=2"
+    },
+    {
+      "input": "/api/list?idempotency_key=OLD-idempotency_key-VALUE&page=2",
+      "legacy_output": "/api/list?idempotency_key=[REDACTED]&page=2"
+    }
+  ]
+}

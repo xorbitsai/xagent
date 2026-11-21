@@ -341,7 +341,9 @@ export function TaskConversationPanel({
     isConnected,
     messageQueue,
     newTurnDelivery,
+    sendNowDelivery,
     sessionConversationState,
+    sessionConversationAttachment,
   } = useApp()
   const accentAttributes = useAgentAccentAttributes(agent)
   const fileAccess = useFileAccess()
@@ -1247,6 +1249,11 @@ export function TaskConversationPanel({
               <QueuedMessageList
                 queue={messageQueue}
                 canContinue={newTurnDelivery === "supported" && sessionConversationState === "bound"}
+                canSendNow={
+                  sendNowDelivery === "supported"
+                  && sessionConversationState === "bound"
+                  && sessionConversationAttachment !== "pending"
+                }
               />
             )}
             <ChatInput

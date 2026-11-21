@@ -1660,6 +1660,34 @@ describe("SessionAgentChatPage file attachments", () => {
         acceptLast(socket)
         await waitFor(() => expect(queued()).toBeNull())
       })
+
+      it.each([
+        ["the server takes send-now", ["heartbeat", "conversation_attached", "delivery_new_turn", "delivery_send_now"], true],
+        ["the server does not", ["heartbeat", "conversation_attached", "delivery_new_turn"], false],
+      ])("offers send-now on a listed message only when %s", async (_name, announced, offered) => {
+        const socket = await mountActive()
+        receive(socket, { type: "connection_capabilities", capabilities: announced })
+        bindTaskWithStatus(socket, "running")
+        receive(socket, ATTACHED)
+        await waitFor(() => expect(editor()).toBeInTheDocument())
+        submit("A")
+        await waitFor(() => expect(chatFrames(socket)).toHaveLength(1))
+        acceptLast(socket)
+        await waitFor(() => expect(editor().textContent).toBe(""))
+        await act(async () => { await new Promise((resolve) => setTimeout(resolve, 600)) })
+        submit("B")
+        await waitFor(() => expect(queued()).toHaveTextContent("B"))
+
+        const button = () => screen.queryByRole("button", { name: "messageQueue.sendNow" })
+        expect(button() !== null).toBe(offered)
+        if (!offered) return
+        fireEvent.click(button()!)
+        await waitFor(() => expect(chatFrames(socket)).toHaveLength(2))
+        expect(chatFrames(socket)[1]).toMatchObject({ message: "B", delivery: "send_now" })
+        expect(chatFrames(socket)[1]).not.toHaveProperty("request_id")
+        expect(button()).toBeDisabled()
+        expect(queued()).toHaveTextContent("messageQueue.status.inserting")
+      })
     })
   })
 })

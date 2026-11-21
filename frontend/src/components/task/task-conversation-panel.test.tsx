@@ -59,6 +59,8 @@ const appControls = vi.hoisted(() => ({
   connectionNotice: null as "reconnecting" | "lost" | null,
   messageQueue: null as null | SessionMessageQueueControls,
   newTurnDelivery: "supported",
+  sendNowDelivery: "supported",
+  sessionConversationAttachment: "attached",
   sessionConversationState: "bound",
 }))
 const queueControls = (
@@ -125,6 +127,8 @@ vi.mock("@/contexts/app-context-chat", async (importOriginal) => ({
     connectionNotice: appControls.connectionNotice,
     messageQueue: appControls.messageQueue,
     newTurnDelivery: appControls.newTurnDelivery,
+    sendNowDelivery: appControls.sendNowDelivery,
+    sessionConversationAttachment: appControls.sessionConversationAttachment,
     sessionConversationState: appControls.sessionConversationState,
   }),
 }))
@@ -373,6 +377,8 @@ describe("TaskConversationPanel", () => {
     appControls.connectionNotice = null
     appControls.messageQueue = null
     appControls.newTurnDelivery = "supported"
+    appControls.sendNowDelivery = "supported"
+    appControls.sessionConversationAttachment = "attached"
     appControls.sessionConversationState = "bound"
     appControls.filesDisabled = false
     appControls.voiceInputEnabled = true
@@ -441,6 +447,21 @@ describe("TaskConversationPanel", () => {
       const list = screen.getByRole("list", { name: "messageQueue.listLabel" })
       expect(list.compareDocumentPosition(screen.getByTestId("chat-input")) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
       expect(screen.getByRole("button", { name: "messageQueue.continue" })).toHaveProperty("disabled", !enabled)
+    })
+
+    it.each([
+      ["announced", "supported", "bound", "attached", true],
+      ["not announced", "unsupported", "bound", "attached", false],
+      ["not yet known", "unknown", "bound", "attached", false],
+      ["announced, conversation not bound", "supported", "reload_required", "attached", false],
+      ["announced, conversation still attaching", "supported", "bound", "pending", false],
+    ])("passes send-now availability to the queued list [%s]", (_name, delivery, phase, attachment, shown) => {
+      appControls.messageQueue = queueControls({ kind: "waiting", since: 1, answerRequired: false })
+      appControls.sendNowDelivery = delivery
+      appControls.sessionConversationState = phase
+      appControls.sessionConversationAttachment = attachment
+      render(<TaskConversationPanel mode="page" />)
+      expect(screen.queryByRole("button", { name: "messageQueue.sendNow" }) !== null).toBe(shown)
     })
 
     it.each([

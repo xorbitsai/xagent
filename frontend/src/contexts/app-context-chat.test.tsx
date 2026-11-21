@@ -14399,7 +14399,7 @@ describe("session message queue", () => {
       const server = makeServer({ status: "running", version: 3 })
       const live = {
         attempts: 0, active: 0, mostActive: 0,
-        reply: async (_id: string, _attempt: number): Promise<void> => undefined,
+        reply: (async () => undefined) as (id: string, attempt: number) => Promise<void>,
       }
       sendChatMessageMock.mockImplementation(async (...args: unknown[]) => {
         if (args[7] !== "send_now") return server.chat(...args)

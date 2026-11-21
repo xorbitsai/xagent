@@ -27,6 +27,7 @@ const controls = (
   state: { items, phase, observed },
   submit: vi.fn(),
   continueSending: vi.fn(),
+  sendNow: vi.fn(),
   remove: vi.fn(),
   clear: vi.fn(),
 })

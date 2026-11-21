@@ -73,6 +73,7 @@ const queueControls = (
   },
   submit,
   continueSending: vi.fn(),
+  sendNow: vi.fn(),
   remove: vi.fn(),
   clear: vi.fn(),
 })

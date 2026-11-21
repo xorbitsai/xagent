@@ -49,11 +49,14 @@ from xagent.core.agent.runner import (
     UserMessageInjectionResult,
     _record_injection_outcome,
 )
+from xagent.core.agent.runtime import LLMCallPreempted
 from xagent.core.guardrails.input import InputReviewRejected
+from xagent.core.model.chat.types import ChunkType, StreamChunk
 from xagent.web.services.db_runtime import run_db_io_cancellation_safe
 
 EID = "live-exec"
 LIVE_TEXT = "INJECTED"
+RUN_TIMEOUT_SECONDS = 8
 
 
 class _NoArgs(BaseModel):
@@ -136,13 +139,35 @@ class ScriptedLLM:
     def __init__(self, script: list[Any]) -> None:
         self.script = list(script)
         self.requests: list[list[dict[str, Any]]] = []
+        # Requests that were cancelled while they were being answered.
+        self.cancelled = 0
 
     async def chat(self, **kwargs: Any) -> Any:
         self.requests.append(copy.deepcopy(kwargs["messages"]))
         entry = self.script.pop(0)
         if callable(entry):
-            entry = await entry()
+            try:
+                entry = await entry()
+            except asyncio.CancelledError:
+                self.cancelled += 1
+                raise
         return entry
+
+
+class StreamingScriptedLLM(ScriptedLLM):
+    """Native-streaming model: an entry is a list of chunks and async hooks."""
+
+    async def stream_chat(self, **kwargs: Any) -> Any:
+        self.requests.append(copy.deepcopy(kwargs["messages"]))
+        for part in self.script.pop(0):
+            if not callable(part):
+                yield part
+                continue
+            try:
+                await part()
+            except asyncio.CancelledError:
+                self.cancelled += 1
+                raise
 
 
 @dataclass
@@ -171,7 +196,13 @@ class Rig:
         )
 
     def start(self, **kwargs: Any) -> asyncio.Task[dict[str, Any]]:
-        return asyncio.create_task(self.runner.run("hello", execution_id=EID, **kwargs))
+        # A run that cannot finish fails the test instead of hanging it.
+        return asyncio.create_task(
+            asyncio.wait_for(
+                self.runner.run("hello", execution_id=EID, **kwargs),
+                timeout=RUN_TIMEOUT_SECONDS,
+            )
+        )
 
 
 def make_rig(
@@ -180,9 +211,10 @@ def make_rig(
     *,
     safe: tuple[str, ...] = (),
     pattern: Any = None,
+    llm_class: type[ScriptedLLM] = ScriptedLLM,
 ) -> Rig:
     tools = {name: ProbeTool(name, safe=name in safe) for name in tool_names}
-    llm = ScriptedLLM(script)
+    llm = llm_class(script)
     pattern = pattern or ReActPattern(
         tool_parallel_enabled=True, tool_max_concurrency=2
     )
@@ -221,8 +253,6 @@ async def run_scenario(
             assert rig.offer(adm) is LiveInputOffer.QUEUED
 
     async def first_reply() -> dict[str, Any]:
-        if moment == "before-first":
-            fire()
         return tool_calls(*calls)
 
     rig = make_rig(
@@ -253,6 +283,16 @@ async def run_scenario(
         return await original(self, name, *a, **kw)
 
     monkeypatch.setattr(PatternRuntime, "checkpoint", checkpoint)
+    # "before-first": the first model response is complete and no tool has
+    # started. An offer during the request itself would cancel the request.
+    original_llm_end = PatternRuntime.on_llm_end
+
+    async def on_llm_end(self: PatternRuntime, *a: Any, **kw: Any) -> Any:
+        if moment == "before-first":
+            fire()
+        return await original_llm_end(self, *a, **kw)
+
+    monkeypatch.setattr(PatternRuntime, "on_llm_end", on_llm_end)
     result = await rig.start()
     assert fired, "the offer moment was never reached"
     return rig, adm, result
@@ -593,7 +633,7 @@ async def test_admit_requires_settled_tools(call_site: str) -> None:
     assert runtime.live_input.pending() and taken == []
 
 
-@pytest.mark.parametrize("cause", ["fence", "limit"])
+@pytest.mark.parametrize("cause", ["fence", "limit", "flag"])
 async def test_forced_answer_turn_keeps_mailbox(
     monkeypatch: pytest.MonkeyPatch, cause: str
 ) -> None:
@@ -608,6 +648,8 @@ async def test_forced_answer_turn_keeps_mailbox(
 
     async def on_start(_: str) -> None:
         rig.offer(adm)
+        if cause == "flag":
+            pattern.force_final_answer_next = True
 
     rig.tools["w1"].on_start = on_start
     if cause == "fence":
@@ -620,6 +662,10 @@ async def test_forced_answer_turn_keeps_mailbox(
     assert result["success"] is True
     assert adm.events == [LiveInputResult.RETURNED]
     assert LIVE_TEXT not in str(rig.llm.requests[-1])
+    # The forced answer turn is sent as it is: a waiting message neither
+    # cancels it nor makes the loop skip it.
+    assert len(rig.llm.requests) == 2
+    assert rig.llm.cancelled == 0
 
 
 async def test_taken_message_is_settled_when_its_admission_raises() -> None:
@@ -641,7 +687,9 @@ async def test_taken_message_is_settled_when_its_admission_raises() -> None:
 # --------------------------------------------------------------------------
 
 
-async def test_leftover_live_inputs_returned_before_runner_returns() -> None:
+async def test_leftover_live_inputs_returned_before_runner_returns(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     timeline: list[Any] = []
 
     class Timed(RecordingAdmission):
@@ -655,12 +703,16 @@ async def test_leftover_live_inputs_returned_before_runner_returns() -> None:
             await asyncio.sleep(0.01)
             timeline.append((self.name, result))
 
-    async def reply() -> dict[str, Any]:
+    rig = make_rig([final_answer()])
+    original_llm_end = PatternRuntime.on_llm_end
+
+    async def on_llm_end(self: PatternRuntime, *a: Any, **kw: Any) -> Any:
+        # The final answer is complete; the run is about to finish.
         assert rig.offer(Timed("first"), turn_id="a") is LiveInputOffer.QUEUED
         assert rig.offer(Timed("second"), turn_id="b") is LiveInputOffer.QUEUED
-        return final_answer()
+        return await original_llm_end(self, *a, **kw)
 
-    rig = make_rig([reply])
+    monkeypatch.setattr(PatternRuntime, "on_llm_end", on_llm_end)
     await rig.start()
     timeline.append("run-returned")
     assert timeline == [
@@ -676,13 +728,14 @@ async def test_live_input_finished_exactly_once_when_cancelled() -> None:
 
     offered = asyncio.Event()
 
-    async def reply() -> dict[str, Any]:
+    async def on_start(_: str) -> None:
+        # A running tool keeps the message waiting in the mailbox.
         assert rig.offer(adm) is LiveInputOffer.QUEUED
         offered.set()
         await hold.wait()
-        return final_answer()
 
-    rig = make_rig([reply])
+    rig = make_rig([tool_calls("w1"), final_answer()], ("w1",))
+    rig.tools["w1"].on_start = on_start
     task = rig.start()
     await offered.wait()
     task.cancel()
@@ -1477,29 +1530,6 @@ GRANT = react_module.LIVE_INPUT_ITERATION_GRANT
 UNCAPPED_MAX_ITERATIONS = 3 * GRANT + 1
 
 
-def offering_first_reply(
-    rig_holder: list[Rig],
-    count: int,
-    reply: Any,
-    *,
-    first_index: int = 0,
-    claim: LiveInputClaim = LiveInputClaim.CLAIMED,
-) -> Any:
-    """A script entry that queues ``count`` live messages, then returns ``reply``."""
-
-    async def entry() -> Any:
-        for index in range(first_index, first_index + count):
-            offer = rig_holder[0].offer(
-                RecordingAdmission(claim),
-                turn_id=f"live-{index}",
-                text=f"{LIVE_TEXT}{index}",
-            )
-            assert offer is LiveInputOffer.QUEUED
-        return reply
-
-    return entry
-
-
 def rig_with_offered_messages(
     count: int | list[int],
     rest: list[Any],
@@ -1507,26 +1537,32 @@ def rig_with_offered_messages(
     max_iterations: int,
     claim: LiveInputClaim = LiveInputClaim.CLAIMED,
 ) -> Rig:
-    """``count`` messages are queued during the first model request; a list
-    queues ``count[i]`` during request ``i``, so each lands at its own safe point."""
+    """``count`` messages are queued when the first tool starts; a list queues
+    ``count[i]`` when tool call ``i`` starts, so each lands at its own safe
+    point. A running tool never has the model request cancelled."""
     counts = [count] if isinstance(count, int) else count
-    holder: list[Rig] = []
-    script = [
-        offering_first_reply(
-            holder,
-            queued,
-            tool_calls("w1"),
-            first_index=sum(counts[:position]),
-            claim=claim,
-        )
-        for position, queued in enumerate(counts)
-    ]
     rig = make_rig(
-        [*script, *rest],
+        [*[tool_calls("w1")] * len(counts), *rest],
         ("w1",),
         pattern=tool_only_pattern(max_iterations),
     )
-    holder.append(rig)
+    started = 0
+
+    async def on_start(_: str) -> None:
+        nonlocal started
+        position, started = started, started + 1
+        if position >= len(counts):
+            return
+        first_index = sum(counts[:position])
+        for index in range(first_index, first_index + counts[position]):
+            offer = rig.offer(
+                RecordingAdmission(claim),
+                turn_id=f"live-{index}",
+                text=f"{LIVE_TEXT}{index}",
+            )
+            assert offer is LiveInputOffer.QUEUED
+
+    rig.tools["w1"].on_start = on_start
     return rig
 
 
@@ -1801,64 +1837,63 @@ async def test_iteration_limit_delivery_reports_the_grant() -> None:
 
 async def test_live_input_mixed_batch_grants_only_the_applied_message() -> None:
     max_iterations = UNCAPPED_MAX_ITERATIONS
-    holder: list[Rig] = []
+    started: list[bool] = []
 
-    async def offer_claimed_then_unavailable() -> Any:
+    async def offer_claimed_then_unavailable(_: str) -> None:
+        if started:
+            return
+        started.append(True)
         for index, claim in enumerate(
             (LiveInputClaim.CLAIMED, LiveInputClaim.UNAVAILABLE)
         ):
-            offer = holder[0].offer(
+            offer = rig.offer(
                 RecordingAdmission(claim),
                 turn_id=f"live-{index}",
                 text=f"{LIVE_TEXT}{index}",
             )
             assert offer is LiveInputOffer.QUEUED
-        return tool_calls("w1")
 
     rig = make_rig(
-        [
-            offer_claimed_then_unavailable,
-            *[tool_calls("w1")] * (max_iterations + 2 * GRANT + 5),
-        ],
+        [tool_calls("w1")] * (max_iterations + 2 * GRANT + 5),
         ("w1",),
         pattern=tool_only_pattern(max_iterations),
     )
-    holder.append(rig)
+    rig.tools["w1"].on_start = offer_claimed_then_unavailable
     result = await rig.start()
     assert result["live_input_iteration_grant"] == GRANT
     assert len(rig.tools["w1"].calls) == max_iterations + GRANT
 
 
-async def test_live_input_replay_of_a_turn_written_after_queueing_adds_grant() -> None:
+async def test_live_input_replay_of_a_turn_written_after_queueing_adds_grant(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     max_iterations = UNCAPPED_MAX_ITERATIONS
-    holder: list[Rig] = []
     outcomes: list[UserMessageInjectionOutcome] = []
+    original_llm_end = PatternRuntime.on_llm_end
 
-    async def queue_then_write_directly() -> Any:
-        rig = holder[0]
-        offer = rig.offer(RecordingAdmission(), turn_id="dup", text=LIVE_TEXT)
-        assert offer is LiveInputOffer.QUEUED
-        # The same turn reaches the context through the ordinary injection
-        # path before the loop takes the queued copy at its safe point.
-        written = await rig.runner.inject_user_message(
-            EID,
-            execution_message=LIVE_TEXT,
-            display_message=LIVE_TEXT,
-            turn_id="dup",
-            request_interrupt=False,
-        )
-        outcomes.append(written.outcome)
-        return tool_calls("w1")
+    async def on_llm_end(self: PatternRuntime, *a: Any, **kw: Any) -> Any:
+        # The first response is complete; no tool has started.
+        if not outcomes:
+            offer = rig.offer(RecordingAdmission(), turn_id="dup", text=LIVE_TEXT)
+            assert offer is LiveInputOffer.QUEUED
+            # The same turn reaches the context through the ordinary injection
+            # path before the loop takes the queued copy at its safe point.
+            written = await rig.runner.inject_user_message(
+                EID,
+                execution_message=LIVE_TEXT,
+                display_message=LIVE_TEXT,
+                turn_id="dup",
+                request_interrupt=False,
+            )
+            outcomes.append(written.outcome)
+        return await original_llm_end(self, *a, **kw)
 
+    monkeypatch.setattr(PatternRuntime, "on_llm_end", on_llm_end)
     rig = make_rig(
-        [
-            queue_then_write_directly,
-            *[tool_calls("w1")] * (max_iterations + 2 * GRANT + 5),
-        ],
+        [tool_calls("w1")] * (max_iterations + 2 * GRANT + 5),
         ("w1",),
         pattern=tool_only_pattern(max_iterations),
     )
-    holder.append(rig)
     result = await rig.start()
     assert outcomes == [UserMessageInjectionOutcome.POSTED_FRESH]
     # The queued copy finds its turn already accepted: it counts as applied
@@ -1886,3 +1921,783 @@ def test_iteration_counter_matches_count_and_repeats_once() -> None:
     assert counter.repeats == 1
     assert [next(iterator) for _ in range(3)] == [5, 6, 7]
     assert counter.repeats == 0
+
+
+# --------------------------------------------------------------------------
+# Preempting the main model request
+# --------------------------------------------------------------------------
+
+
+class Frames:
+    """Outbound handler that keeps every frame the run emits."""
+
+    def __init__(self) -> None:
+        self.events: list[dict[str, Any]] = []
+
+    async def __call__(self, payload: dict[str, Any]) -> None:
+        self.events.append(payload)
+
+
+def stream_end() -> StreamChunk:
+    return StreamChunk(type=ChunkType.END)
+
+
+def stream_token(text: str) -> StreamChunk:
+    return StreamChunk(type=ChunkType.TOKEN, delta=text)
+
+
+def stream_tool_calls(*names: str) -> list[Any]:
+    chunks = [
+        StreamChunk(
+            type=ChunkType.TOOL_CALL,
+            tool_calls=[
+                {
+                    "index": index,
+                    "id": f"call_{name}",
+                    "function": {"name": name, "arguments": "{}"},
+                }
+            ],
+        )
+        for index, name in enumerate(names)
+    ]
+    return [*chunks, stream_end()]
+
+
+def stream_answer_part(arguments: str) -> StreamChunk:
+    return StreamChunk(
+        type=ChunkType.TOOL_CALL,
+        tool_calls=[
+            {
+                "index": 0,
+                "id": "call_final",
+                "function": {"name": "final_answer", "arguments": arguments},
+            }
+        ],
+    )
+
+
+def stream_final_answer_parts(answer: str, *, cut: int, hook: Any = None) -> list[Any]:
+    """A final_answer call streamed in two parts, ``cut`` characters into the text.
+
+    With a ``hook`` the stream stops after the first part and runs it, and the
+    second part is never produced when the hook does not return.
+    """
+    arguments = json.dumps({"answer": answer, "response_language": "English"})
+    at = arguments.index(answer) + cut
+    parts: list[Any] = [stream_answer_part(arguments[:at])]
+    if hook is not None:
+        return [*parts, hook]
+    return [*parts, stream_answer_part(arguments[at:]), stream_end()]
+
+
+# How long a scripted model request stays open after a message was offered
+# during it. A preempted request is cancelled at once; one that is not simply
+# carries on and returns ``reply`` after this long.
+HOLD_SECONDS = 0.3
+
+
+def offer_then_wait(
+    get_rig: Any,
+    admission: RecordingAdmission,
+    *,
+    turn_id: str = "t1",
+    text: str = LIVE_TEXT,
+    reply: Any = None,
+) -> Any:
+    """A model-request step that offers a message and then keeps the request open."""
+
+    async def hook() -> Any:
+        assert (
+            get_rig().offer(admission, turn_id=turn_id, text=text)
+            is LiveInputOffer.QUEUED
+        )
+        await asyncio.sleep(HOLD_SECONDS)
+        return reply
+
+    return hook
+
+
+class HeldStreamLLM:
+    """Native-streaming model that holds its stream open until released."""
+
+    def __init__(self) -> None:
+        self.started = asyncio.Event()
+        self.gate = asyncio.Event()
+
+    async def stream_chat(self, **_: Any) -> Any:
+        yield stream_token("partial")
+        self.started.set()
+        await self.gate.wait()
+        yield stream_token(" rest")
+        yield stream_end()
+
+
+@dataclass
+class LlmCallSpy:
+    # (runtime method, preemptible argument or None when absent, outcome)
+    calls: list[tuple[str, Any, str]] = field(default_factory=list)
+    main_starts: int = 0
+    repeats: int = 0
+    before_llm_checkpoints: int = 0
+
+    def preempted(self, method: str) -> bool:
+        return (method, True, "LLMCallPreempted") in self.calls
+
+
+def spy_llm_calls(monkeypatch: pytest.MonkeyPatch) -> LlmCallSpy:
+    spy = LlmCallSpy()
+
+    def wrap(method: str) -> None:
+        original = getattr(PatternRuntime, method)
+
+        async def wrapper(self: PatternRuntime, llm: Any, *a: Any, **kw: Any) -> Any:
+            try:
+                result = await original(self, llm, *a, **kw)
+            except BaseException as exc:
+                spy.calls.append((method, kw.get("preemptible"), type(exc).__name__))
+                raise
+            spy.calls.append((method, kw.get("preemptible"), "ok"))
+            return result
+
+        monkeypatch.setattr(PatternRuntime, method, wrapper)
+
+    for method in ("run_llm_call", "run_streaming_llm_call", "stream_final_answer"):
+        wrap(method)
+    original_start = PatternRuntime.on_llm_start
+
+    async def on_llm_start(self: PatternRuntime, *a: Any, **kw: Any) -> Any:
+        if "purpose" not in (kw.get("metadata") or {}):
+            spy.main_starts += 1
+        return await original_start(self, *a, **kw)
+
+    monkeypatch.setattr(PatternRuntime, "on_llm_start", on_llm_start)
+    original_checkpoint = PatternRuntime.checkpoint
+
+    async def checkpoint(self: PatternRuntime, name: str, *a: Any, **kw: Any) -> Any:
+        if name == "before_llm":
+            spy.before_llm_checkpoints += 1
+        return await original_checkpoint(self, name, *a, **kw)
+
+    monkeypatch.setattr(PatternRuntime, "checkpoint", checkpoint)
+    original_repeat = react_module._IterationCounter.repeat
+
+    def repeat(self: Any) -> None:
+        spy.repeats += 1
+        original_repeat(self)
+
+    monkeypatch.setattr(react_module._IterationCounter, "repeat", repeat)
+    return spy
+
+
+def arm_compaction(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make the first compaction check ask the model for a summary."""
+    from xagent.core.agent.context.execution import CompactResult, ExecutionContext
+
+    armed = [True]
+
+    def request(self: Any, *, context_window: int | None = None) -> Any:
+        if not armed:
+            return None
+        armed.clear()
+        return {
+            "messages": [{"role": "user", "content": "summarize"}],
+            "max_tokens": 64,
+            "original_tokens": 10,
+            "metadata": {},
+        }
+
+    def apply(
+        self: Any, response: Any, *, llm: Any, original_tokens: Any = None
+    ) -> Any:
+        return CompactResult(
+            compacted=True,
+            original_count=1,
+            final_count=1,
+            strategy="llm_summary",
+            metadata={},
+        )
+
+    monkeypatch.setattr(
+        ExecutionContext, "build_llm_compact_request_if_needed", request
+    )
+    monkeypatch.setattr(ExecutionContext, "compact_with_llm_response", apply)
+
+
+def live_index(messages: list[dict[str, Any]], text: str = LIVE_TEXT) -> int:
+    return next(i for i, m in enumerate(messages) if text in str(m.get("content")))
+
+
+PREEMPTED_KINDS = {
+    "stream": "run_streaming_llm_call",
+    "no-tools": "stream_final_answer",
+    "chat": "run_streaming_llm_call",
+}
+
+
+def build_preempt_rig(kind: str, adm: RecordingAdmission) -> Rig:
+    """A run whose first main request is open when the message is offered."""
+    box: list[Rig] = []
+    hook = offer_then_wait(lambda: box[0], adm, reply=tool_calls("w1"))
+    if kind == "stream":
+        rig = make_rig(
+            [
+                [stream_tool_calls("w1")[0], hook],
+                stream_final_answer_parts("ok", cut=1),
+            ],
+            ("w1",),
+            llm_class=StreamingScriptedLLM,
+        )
+    elif kind == "no-tools":
+        rig = make_rig(
+            [[stream_token("PARTIAL"), hook], [stream_token("done"), stream_end()]],
+            ("w1",),
+            pattern=ReActPattern(tool_choice="none"),
+            llm_class=StreamingScriptedLLM,
+        )
+    elif kind == "chat":
+        rig = make_rig([hook, final_answer()], ("w1",))
+    elif kind == "protocol-retry":
+        from xagent.core.model.chat.exceptions import LLMToolProtocolError
+
+        async def refused() -> Any:
+            raise LLMToolProtocolError(
+                provider="test",
+                code="unavailable_tool_call",
+                message="unavailable tool call",
+            )
+
+        async def retry_reply() -> Any:
+            assert box[0].offer(adm) is LiveInputOffer.QUEUED
+            await asyncio.sleep(0.01)
+            return tool_calls("w1")
+
+        rig = make_rig([refused, retry_reply, final_answer()], ("w1",))
+    else:
+
+        async def summary() -> str:
+            assert box[0].offer(adm) is LiveInputOffer.QUEUED
+            await asyncio.sleep(0.01)
+            return "summary"
+
+        rig = make_rig([summary, final_answer()], ("w1",))
+    box.append(rig)
+    return rig
+
+
+@pytest.mark.parametrize("kind", ["stream", "no-tools", "chat"])
+async def test_preempt_cancels_the_main_call(
+    monkeypatch: pytest.MonkeyPatch, kind: str
+) -> None:
+    spy = spy_llm_calls(monkeypatch)
+    adm = RecordingAdmission()
+    rig = build_preempt_rig(kind, adm)
+    result = await rig.start(outbound_message_handler=Frames())
+    assert result["success"] is True
+    assert adm.events == ["claim", LiveInputResult.APPLIED]
+    assert all(not runtime._interrupt_requested for runtime in rig.runtimes)
+    assert spy.preempted(PREEMPTED_KINDS[kind])
+    # The cancelled request and its repeat with the message in its input.
+    assert len(rig.llm.requests) == 2
+    assert LIVE_TEXT not in str(rig.llm.requests[0])
+    assert live_index(rig.llm.requests[-1]) > 0
+    assert rig.tools["w1"].calls == []
+
+
+@pytest.mark.parametrize(
+    ("kind", "expected_requests"),
+    [
+        # The refused request, its retry, then the main request that takes
+        # the message in.
+        pytest.param("protocol-retry", 3, id="protocol-retry"),
+        # The summary request, then the main request that takes the message in.
+        pytest.param("compaction", 2, id="compaction"),
+    ],
+)
+async def test_preempt_leaves_non_main_calls_running(
+    monkeypatch: pytest.MonkeyPatch, kind: str, expected_requests: int
+) -> None:
+    spy = spy_llm_calls(monkeypatch)
+    if kind == "compaction":
+        arm_compaction(monkeypatch)
+    adm = RecordingAdmission()
+    rig = build_preempt_rig(kind, adm)
+    result = await rig.start(outbound_message_handler=Frames())
+    assert result["success"] is True
+    assert adm.events == ["claim", LiveInputResult.APPLIED]
+    assert all(not runtime._interrupt_requested for runtime in rig.runtimes)
+    # A retry after a protocol error and the compaction request are not main
+    # requests: they finish, and the message waits for the next main request.
+    assert not any(call[2] == "LLMCallPreempted" for call in spy.calls)
+    assert rig.llm.cancelled == 0
+    assert len(rig.llm.requests) == expected_requests
+    assert live_index(rig.llm.requests[-1]) > 0
+    assert all(LIVE_TEXT not in str(request) for request in rig.llm.requests[:-1])
+
+
+@pytest.mark.parametrize("gap", ["compaction", "before-llm-checkpoint", "prepare-llm"])
+async def test_live_input_in_gap_skips_main_call(
+    monkeypatch: pytest.MonkeyPatch, gap: str
+) -> None:
+    spy = spy_llm_calls(monkeypatch)
+    adm = RecordingAdmission()
+    box: list[Rig] = []
+    fired: list[bool] = []
+
+    def fire() -> None:
+        if not fired:
+            fired.append(True)
+            assert box[0].offer(adm) is LiveInputOffer.QUEUED
+
+    async def summary() -> str:
+        fire()
+        await asyncio.sleep(0.01)
+        return "summary"
+
+    if gap == "compaction":
+        arm_compaction(monkeypatch)
+    rig = make_rig(
+        [summary, final_answer()] if gap == "compaction" else [final_answer()]
+    )
+    box.append(rig)
+    if gap == "before-llm-checkpoint":
+        original = PatternRuntime.checkpoint
+
+        async def checkpoint(
+            self: PatternRuntime, name: str, *a: Any, **kw: Any
+        ) -> Any:
+            if name == "before_llm":
+                fire()
+            return await original(self, name, *a, **kw)
+
+        monkeypatch.setattr(PatternRuntime, "checkpoint", checkpoint)
+    if gap == "prepare-llm":
+        prepare = react_module.prepare_llm_for_context
+
+        async def prepare_and_offer(**kwargs: Any) -> Any:
+            fire()
+            return await prepare(**kwargs)
+
+        monkeypatch.setattr(react_module, "prepare_llm_for_context", prepare_and_offer)
+    result = await rig.start()
+    assert fired and result["success"] is True
+    assert adm.events == ["claim", LiveInputResult.APPLIED]
+    # The skipped attempt sent nothing and traced nothing; only the repeated
+    # one did, and its input carries the message.
+    assert spy.main_starts == 1
+    assert spy.repeats == 1
+    # A skipped attempt writes no before_llm checkpoint, unless the message
+    # arrived while that very checkpoint was being written.
+    assert spy.before_llm_checkpoints == (2 if gap == "before-llm-checkpoint" else 1)
+    assert not any(call[2] == "LLMCallPreempted" for call in spy.calls)
+    assert rig.llm.cancelled == 0
+    assert len(rig.llm.requests) == (2 if gap == "compaction" else 1)
+    assert LIVE_TEXT in str(rig.llm.requests[-1])
+
+
+@pytest.mark.parametrize("n", [5])
+async def test_preempts_bounded_by_offers(
+    monkeypatch: pytest.MonkeyPatch, n: int
+) -> None:
+    spy = spy_llm_calls(monkeypatch)
+    box: list[Rig] = []
+    offered: list[int] = []
+    # Offer k lands at the first opportunity of kind ``order[k % 3]``.
+    order = ["prepare", "checkpoint", "request"]
+
+    def fire(kind: str) -> bool:
+        if len(offered) >= n or order[len(offered) % 3] != kind:
+            return False
+        index = len(offered)
+        offered.append(index)
+        assert (
+            box[0].offer(
+                RecordingAdmission(),
+                turn_id=f"live-{index}",
+                text=f"{LIVE_TEXT}{index}",
+            )
+            is LiveInputOffer.QUEUED
+        )
+        return True
+
+    async def reply() -> Any:
+        if fire("request"):
+            await asyncio.sleep(HOLD_SECONDS)
+        return final_answer()
+
+    prepare = react_module.prepare_llm_for_context
+    checkpoint = PatternRuntime.checkpoint
+
+    async def prepare_and_offer(**kwargs: Any) -> Any:
+        fire("prepare")
+        return await prepare(**kwargs)
+
+    async def checkpoint_and_offer(
+        self: PatternRuntime, name: str, *a: Any, **kw: Any
+    ) -> Any:
+        if name == "before_llm":
+            fire("checkpoint")
+        return await checkpoint(self, name, *a, **kw)
+
+    monkeypatch.setattr(react_module, "prepare_llm_for_context", prepare_and_offer)
+    monkeypatch.setattr(PatternRuntime, "checkpoint", checkpoint_and_offer)
+    rig = make_rig([reply] * (n + 2))
+    box.append(rig)
+    result = await rig.start()
+    assert result["success"] is True
+    assert len(offered) == n
+    assert spy.repeats == n
+    assert all(f"{LIVE_TEXT}{i}" in str(rig.llm.requests[-1]) for i in range(n))
+
+
+LIMIT = react_module.LIVE_INPUT_PREEMPT_LIMIT
+
+
+def offering_requests(count: int, box: list[Rig]) -> list[Any]:
+    """Model requests that each offer a new message, hold, then ask for a tool."""
+    return [
+        offer_then_wait(
+            lambda: box[0],
+            RecordingAdmission(),
+            turn_id=f"live-{index}",
+            text=f"{LIVE_TEXT}{index}",
+            reply=tool_calls("w1"),
+        )
+        for index in range(count)
+    ]
+
+
+async def test_message_past_the_preempt_limit_waits_for_the_next_safe_point(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spy = spy_llm_calls(monkeypatch)
+    box: list[Rig] = []
+    # One message more than the limit arrives while the same iteration's
+    # request is open; the first LIMIT of them preempt it.
+    rig = make_rig([*offering_requests(LIMIT + 1, box), final_answer()], ("w1",))
+    box.append(rig)
+    result = await rig.start()
+    assert result["success"] is True
+    assert spy.repeats == LIMIT
+    assert rig.llm.cancelled == LIMIT
+    # The request the last message arrived in ran to its end, and its tool
+    # call ran once.
+    assert len(rig.llm.requests) == LIMIT + 2
+    assert len(rig.tools["w1"].calls) == 1
+    assert f"{LIVE_TEXT}{LIMIT}" not in str(rig.llm.requests[LIMIT])
+    assert f"{LIVE_TEXT}{LIMIT - 1}" in str(rig.llm.requests[LIMIT])
+    # It was taken in at the next safe point, before the next request.
+    assert all(f"{LIVE_TEXT}{i}" in str(rig.llm.requests[-1]) for i in range(LIMIT + 1))
+
+
+async def test_preempt_count_starts_again_with_the_next_iteration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spy = spy_llm_calls(monkeypatch)
+    box: list[Rig] = []
+    # Iteration 0 uses up the limit; the message that arrives in iteration 1
+    # preempts that iteration's request again.
+    rig = make_rig([*offering_requests(LIMIT + 2, box), final_answer()], ("w1",))
+    box.append(rig)
+    result = await rig.start()
+    assert result["success"] is True
+    assert spy.repeats == LIMIT + 1
+    assert rig.llm.cancelled == LIMIT + 1
+    assert len(rig.llm.requests) == LIMIT + 3
+    assert all(f"{LIVE_TEXT}{i}" in str(rig.llm.requests[-1]) for i in range(LIMIT + 2))
+
+
+@pytest.mark.parametrize("kind", ["stream", "chat"])
+async def test_llm_input_keeps_pairs_after_preempt(kind: str) -> None:
+    adm = RecordingAdmission()
+    box: list[Rig] = []
+    hook = offer_then_wait(lambda: box[0], adm, reply=tool_calls("w2"))
+    if kind == "stream":
+        rig = make_rig(
+            [
+                stream_tool_calls("w1"),
+                [stream_tool_calls("w2")[0], hook],
+                stream_final_answer_parts("ok", cut=1),
+            ],
+            llm_class=StreamingScriptedLLM,
+        )
+    else:
+        rig = make_rig([tool_calls("w1"), hook, final_answer()])
+    box.append(rig)
+    result = await rig.start()
+    assert result["success"] is True
+    messages = rig.llm.requests[-1]
+    assert len(rig.llm.requests) == 3
+    assert pairs_intact(messages)
+    assert live_index(messages) > max(
+        i for i, m in enumerate(messages) if m["role"] == "tool"
+    )
+    # The preempted request left no assistant turn behind.
+    assert [
+        bool(m.get("tool_calls")) for m in messages if m["role"] == "assistant"
+    ] == [True]
+    context = result["context"]
+    assert len(context._sanitize_tool_message_pairs(list(context.messages))) == len(
+        context.messages
+    )
+
+
+@pytest.mark.parametrize(
+    ("n_applied", "n_preempted", "max_iterations"),
+    [
+        *[
+            pytest.param(applied, 5, UNCAPPED_MAX_ITERATIONS, id=f"{applied}-5")
+            for applied in (0, 1, 3)
+        ],
+        # The allowance stays within max_iterations however many messages
+        # preempted a request.
+        pytest.param(3, 5, 3, id="3-5-capped"),
+    ],
+)
+async def test_live_input_iteration_grant_under_preempts(
+    monkeypatch: pytest.MonkeyPatch,
+    n_applied: int,
+    n_preempted: int,
+    max_iterations: int,
+) -> None:
+    spy = spy_llm_calls(monkeypatch)
+    granted = min(GRANT * n_applied, max_iterations)
+    box: list[Rig] = []
+
+    def preempted_request(index: int) -> Any:
+        claim = (
+            LiveInputClaim.CLAIMED if index < n_applied else LiveInputClaim.UNAVAILABLE
+        )
+
+        async def hook() -> Any:
+            offer = box[0].offer(
+                RecordingAdmission(claim), turn_id=f"live-{index}", text=f"m{index}"
+            )
+            assert offer is LiveInputOffer.QUEUED
+            await asyncio.sleep(HOLD_SECONDS)
+            return tool_calls("w1")
+
+        return hook
+
+    rig = make_rig(
+        [
+            *[preempted_request(i) for i in range(n_preempted)],
+            *[tool_calls("w1")] * (max_iterations + GRANT * 3 + 5),
+        ],
+        ("w1",),
+        pattern=tool_only_pattern(max_iterations),
+    )
+    box.append(rig)
+    pattern = rig.runner.agent.patterns[0]
+    await rig.start()
+    # A preempted request never used up an iteration, so the run still gets
+    # exactly the iterations the cap and the applied messages allow.
+    assert spy.repeats == n_preempted
+    assert len(rig.tools["w1"].calls) == max_iterations + granted
+    assert pattern.live_input_iteration_grant == granted
+    restored = ReActPattern(max_iterations=max_iterations)
+    restored.load_state(json.loads(json.dumps(pattern.get_state())))
+    assert restored._iteration_cap() == max_iterations + granted
+
+
+async def test_dag_step_calls_never_preemptible() -> None:
+    from xagent.core.agent import ExecutionContext
+    from xagent.core.agent.pattern.dag.dag import DAGPattern, _DAGStepRuntime
+
+    seen: list[dict[str, Any]] = []
+
+    class RecordingRuntime(PatternRuntime):
+        async def run_streaming_llm_call(self, llm: Any, **kwargs: Any) -> Any:
+            seen.append(kwargs)
+            return final_answer()
+
+        async def run_llm_call(self, llm: Any, **kwargs: Any) -> Any:
+            seen.append(kwargs)
+            return final_answer()
+
+    parent = RecordingRuntime(execution_id=EID)
+    parent.live_input = LiveInputMailbox()
+    runtime = _DAGStepRuntime(
+        parent=parent,
+        dag_pattern=DAGPattern(lambda **_: None),  # type: ignore[arg-type,return-value]
+        root_context=ExecutionContext(execution_id=EID),
+        step_id="step",
+    )
+    context = ExecutionContext(execution_id=f"{EID}:step")
+    context.add_user_message("hello")
+    await ReActPattern().run(
+        context=context, tools=[], llm=ScriptedLLM([]), runtime=runtime
+    )
+    assert seen
+    assert all("preemptible" not in kwargs for kwargs in seen)
+
+
+# --------------------------------------------------------------------------
+# Offering a message preempts the running main request
+# --------------------------------------------------------------------------
+
+
+async def test_offer_does_not_preempt_while_tool_runs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from xagent.core.agent import runner as runner_module
+
+    counted: list[tuple[str, Any]] = []
+    monkeypatch.setattr(
+        runner_module,
+        "increment_counter",
+        lambda name, *, attributes=None, **_: counted.append((name, attributes)),
+    )
+    runner, runtime = manual_runner()
+    llm = HeldStreamLLM()
+    request = asyncio.create_task(
+        runtime.run_streaming_llm_call(llm, messages=[], preemptible=True)
+    )
+    await llm.started.wait()
+    tool: asyncio.Future[Any] = asyncio.get_running_loop().create_future()
+    runtime._active_tool_tasks.add(tool)
+    offer = runner.offer_live_user_message(
+        EID,
+        execution_message="x",
+        display_message="x",
+        turn_id="t1",
+        admission=RecordingAdmission(),
+    )
+    await asyncio.sleep(0)
+    assert offer is LiveInputOffer.QUEUED
+    assert not request.done() and not tool.cancelled()
+    assert ("xagent.live_input.preempts", {"outcome": "nothing_to_cancel"}) in counted
+    # Once no tool is running, the next message does cancel the request.
+    runtime._active_tool_tasks.discard(tool)
+    second = runner.offer_live_user_message(
+        EID,
+        execution_message="y",
+        display_message="y",
+        turn_id="t2",
+        admission=RecordingAdmission(),
+    )
+    assert second is LiveInputOffer.QUEUED
+    with pytest.raises(LLMCallPreempted):
+        await asyncio.wait_for(request, timeout=5)
+    assert ("xagent.live_input.preempts", {"outcome": "cancelled"}) in counted
+
+
+async def test_offer_already_queued_does_not_preempt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner, runtime = manual_runner()
+    context = runner.context_manager.get_context(EID)
+    assert context is not None
+    context.add_user_message("seen", metadata={"turn_id": "old"})
+    preempts: list[bool] = []
+    monkeypatch.setattr(
+        runtime, "request_llm_preempt", lambda: preempts.append(True) or False
+    )
+
+    def offer(turn_id: str, text: str) -> LiveInputOffer:
+        return runner.offer_live_user_message(
+            EID,
+            execution_message=text,
+            display_message=text,
+            turn_id=turn_id,
+            admission=RecordingAdmission(),
+        )
+
+    assert offer("new", "x") is LiveInputOffer.QUEUED
+    assert preempts == [True]
+    assert offer("new", "x") is LiveInputOffer.ALREADY_QUEUED
+    assert offer("new", "y") is LiveInputOffer.CONFLICT
+    assert offer("old", "seen") is LiveInputOffer.ALREADY_ACCEPTED
+    runtime.live_input = None
+    assert offer("n2", "x") is LiveInputOffer.UNSUPPORTED
+    assert preempts == [True]
+
+
+# --------------------------------------------------------------------------
+# A preempted answer is closed as interrupted, not as failed
+# --------------------------------------------------------------------------
+
+
+PARTIAL_ANSWER = "PARTIAL sydney"
+# The stream guard holds back the last six characters of the text it has seen,
+# so only the text before them has been delivered when the answer is cut off.
+HELD_BACK = "......"
+
+
+def interrupted_start_rig(kind: str) -> Rig:
+    adm = RecordingAdmission()
+    box: list[Rig] = []
+    hook = offer_then_wait(lambda: box[0], adm)
+    written = PARTIAL_ANSWER + HELD_BACK
+    if kind == "with-tools":
+        rig = make_rig(
+            [
+                stream_final_answer_parts(written, cut=len(written), hook=hook),
+                stream_final_answer_parts("NEW melbourne answer", cut=7),
+            ],
+            ("w1",),
+            llm_class=StreamingScriptedLLM,
+        )
+    else:
+        rig = make_rig(
+            [
+                [stream_token(written), hook],
+                [stream_token("NEW mel"), stream_token("bourne answer"), stream_end()],
+            ],
+            ("w1",),
+            pattern=ReActPattern(tool_choice="none"),
+            llm_class=StreamingScriptedLLM,
+        )
+    box.append(rig)
+    return rig
+
+
+@pytest.mark.parametrize("kind", ["with-tools", "no-tools"])
+async def test_preempted_stream_emits_interrupted_start(kind: str) -> None:
+    rig = interrupted_start_rig(kind)
+    frames = Frames()
+    result = await rig.start(outbound_message_handler=frames)
+    assert result["success"] is True
+    events = frames.events
+    first_id = events[0]["message_id"]
+    # The frames the web client already handles correctly, in order.
+    assert [{k: v for k, v in e.items() if k != "delta"} for e in events[:3]] == [
+        {"type": "final_answer_start", "message_id": first_id, "task_id": EID},
+        {"type": "final_answer_delta", "message_id": first_id, "task_id": EID},
+        {
+            "type": "final_answer_start",
+            "message_id": first_id,
+            "task_id": EID,
+            "status": "interrupted",
+        },
+    ]
+    assert events[1]["delta"] == PARTIAL_ANSWER
+    assert set(events[2]) == {"type", "message_id", "task_id", "status"}
+    second_id = events[3]["message_id"]
+    assert events[3] == {
+        "type": "final_answer_start",
+        "message_id": second_id,
+        "task_id": EID,
+    }
+    assert second_id != first_id
+    later = [e for e in events[4:] if e["message_id"] == second_id]
+    assert [e["type"] for e in later][-1] == "final_answer_end"
+    assert later[-1]["content"] == "NEW melbourne answer"
+    assert "".join(e["delta"] for e in later if e["type"] == "final_answer_delta") == (
+        "NEW melbourne answer"
+    )
+    assert not [e for e in events if e["type"] == "final_answer_error"]
+
+
+def test_interrupted_start_survives_web_stream_event_builder() -> None:
+    from xagent.web.services.task_execution import create_final_answer_stream_event
+
+    payload = {
+        "type": "final_answer_start",
+        "message_id": "final_answer_1",
+        "task_id": EID,
+        "status": "interrupted",
+    }
+    event = create_final_answer_stream_event("final_answer_start", EID, payload)
+    assert event["type"] == "final_answer_start"
+    assert event["message_id"] == "final_answer_1"
+    assert event["status"] == "interrupted"

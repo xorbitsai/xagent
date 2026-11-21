@@ -181,6 +181,7 @@ from ...runtime import (
     UNAVAILABLE_TOOL_CALL_RESTORING_TOOLS_REASON,
     ExecutionInterrupted,
     LLMCallInterrupted,
+    LLMCallPreempted,
     PatternRuntime,
     ToolCallInterrupted,
     prepare_llm_for_context,
@@ -276,6 +277,12 @@ ITERATION_LIMIT_DELIVERY_TIMEOUT_SECONDS = 30.0
 # iterations added over a run never exceed max_iterations, so the iteration
 # cap of a run that keeps receiving messages is at most twice max_iterations.
 LIVE_INPUT_ITERATION_GRANT = 10
+# Times one iteration number may be repeated because a live user message
+# made its model request be skipped or cancelled. It bounds the re-issued
+# requests per iteration, so a misbehaving caller cannot hold an execution at
+# one iteration indefinitely; past it a message is admitted at the next safe
+# point, or handed back unapplied if that request gives the final answer.
+LIVE_INPUT_PREEMPT_LIMIT = 10
 
 
 class _IterationCounter:
@@ -1265,7 +1272,14 @@ class ReActPattern(AgentPattern):
             if interrupted is not None:
                 return interrupted
 
-            if live_input_open and not force_final_answer_now:
+            # A forced answer turn ends the run: it takes no live message in
+            # and its model request is never given up for one, so messages
+            # still waiting are handed back with the run's result.
+            preempt_ok = live_input_open and not force_final_answer_now
+            # Past the repeat limit the request is neither skipped nor given
+            # up for a message; it is taken in at the next safe point.
+            may_preempt = preempt_ok and counter.repeats < LIVE_INPUT_PREEMPT_LIMIT
+            if preempt_ok:
                 # Pending tool calls were executed at the top of this iteration,
                 # so the batch is settled here.
                 applied = await runtime.admit_live_user_messages(
@@ -1383,7 +1397,21 @@ class ReActPattern(AgentPattern):
                     not supports_forced_tool_choice and not force_final_answer_now
                 ),
             )
+            # A message that arrived while the request was being prepared is
+            # taken in first: nothing is traced or sent for this attempt, and
+            # the retry keeps the same iteration number. A path that goes back
+            # to the top of the loop without sending a request always yields
+            # to the event loop once, so other executions and timeouts keep
+            # running however often it repeats.
+            if may_preempt and self._live_input_pending(runtime):
+                counter.repeat()
+                await asyncio.sleep(0)
+                continue
             await runtime.checkpoint("before_llm", context=context, pattern=self)
+            if may_preempt and self._live_input_pending(runtime):
+                counter.repeat()
+                await asyncio.sleep(0)
+                continue
             llm_metadata[PROMPT_COMPOSITION_KEY] = self._prompt_composition(
                 context,
                 messages,
@@ -1416,6 +1444,8 @@ class ReActPattern(AgentPattern):
                     "tools": tool_schemas or None,
                     "tool_choice": effective_tool_choice,
                 }
+                if may_preempt:
+                    llm_kwargs["preemptible"] = True
                 if tool_schemas:
                     answer_streamer = ReActFinalAnswerStreamer(runtime)
                     response = await runtime.run_streaming_llm_call(
@@ -1425,6 +1455,12 @@ class ReActPattern(AgentPattern):
                     )
                 else:
                     response = await runtime.stream_final_answer(call_llm, **llm_kwargs)
+            except LLMCallPreempted:
+                if answer_streamer is not None:
+                    await answer_streamer.interrupt()
+                counter.repeat()
+                await asyncio.sleep(0)
+                continue
             except LLMCallInterrupted:
                 if answer_streamer is not None:
                     await answer_streamer.fail(INTERRUPTED_DURING_LLM_STREAM_REASON)
@@ -6905,6 +6941,11 @@ class ReActPattern(AgentPattern):
                     "failed or the user explicitly requested a revision."
                 )
         return ""
+
+    @staticmethod
+    def _live_input_pending(runtime: PatternRuntime) -> bool:
+        mailbox = getattr(runtime, "live_input", None)
+        return isinstance(mailbox, LiveInputMailbox) and mailbox.pending()
 
     async def _interrupt_if_requested(
         self,

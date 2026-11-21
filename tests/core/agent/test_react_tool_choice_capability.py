@@ -371,6 +371,32 @@ async def test_auto_only_blank_plain_text_uses_protocol_retry() -> None:
 
 
 @pytest.mark.asyncio
+async def test_auto_only_tag_only_plain_text_uses_protocol_retry() -> None:
+    llm = _ScriptedLLM(
+        [
+            {"content": "<final_answer></final_answer>", "done": True},
+            {"content": "Recovered with text.", "done": True},
+        ],
+        supports_forced_tool_choice=False,
+    )
+    context = ExecutionContext(execution_id="auto-only-tag-only-text")
+    context.add_user_message("Answer without using the calculator.")
+    runtime = PatternRuntime(execution_id=context.execution_id)
+
+    result = await ReActPattern(max_iterations=1).run(
+        context=context, tools=[_Calculator()], llm=llm, runtime=runtime
+    )
+
+    assert result["success"] is True
+    assert result["output"] == "Recovered with text."
+    assert len(llm.calls) == 2
+    assert any(
+        checkpoint["label"] == "empty_plain_text_recovery"
+        for checkpoint in runtime.checkpoints
+    )
+
+
+@pytest.mark.asyncio
 async def test_forced_capable_blank_plain_text_retry_requires_tool_call() -> None:
     llm = _ScriptedLLM(
         [

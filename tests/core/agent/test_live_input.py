@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import gc
+import itertools
 import json
 import logging
 import threading
@@ -1866,3 +1867,22 @@ async def test_live_input_replay_of_a_turn_written_after_queueing_adds_grant() -
     assert len(rig.tools["w1"].calls) == max_iterations + GRANT
     last_request = " ".join(str(m.get("content")) for m in rig.llm.requests[-1])
     assert last_request.count(LIVE_TEXT) == 1
+
+
+# --------------------------------------------------------------------------
+# Iteration counter
+# --------------------------------------------------------------------------
+
+
+def test_iteration_counter_matches_count_and_repeats_once() -> None:
+    plain = react_module._IterationCounter(7)
+    assert list(itertools.islice(plain, 50)) == list(
+        itertools.islice(itertools.count(7), 50)
+    )
+    counter = react_module._IterationCounter(4)
+    iterator = iter(counter)
+    assert [next(iterator), next(iterator)] == [4, 5]
+    counter.repeat()
+    assert counter.repeats == 1
+    assert [next(iterator) for _ in range(3)] == [5, 6, 7]
+    assert counter.repeats == 0

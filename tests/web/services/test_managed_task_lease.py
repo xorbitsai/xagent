@@ -806,9 +806,8 @@ def test_managed_lease_publication_requires_an_execution_result() -> None:
     finalize_managed_task_lease_result must be dominated by an
     `execution_result is not None` guard.
 
-    This PR adds no such call -- publication is wired up separately -- so
-    this pin currently passes on absence. Do not rewrite it to assert the
-    call exists: the smallest way to turn this red is adding the call
+    The finalizer calls it inside such a block. Do not rewrite it to
+    assert the call exists: the smallest way to turn this red is adding the call
     without the guard, which is exactly the mistake it exists to catch.
 
     Two mutations were run against this assertion and both turn it red: a

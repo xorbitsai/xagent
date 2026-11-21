@@ -573,8 +573,9 @@ def evaluate_native_publication(
 
     Never opens a transaction, writes a row, resolves a resume anchor, or
     takes a lock -- it only answers the yes/no question, never acts on the
-    answer. That boundary is what lets this gate exist with zero production
-    callers and full unit coverage.
+    answer. Its three production callers are the finalizers that settle a
+    waiting run; each acts on the answer itself, and this boundary keeps the
+    gate a yes/no question for all of them.
     """
     policy = _require_policy()
 

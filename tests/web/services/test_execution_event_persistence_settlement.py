@@ -12,6 +12,9 @@ from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
 
 from tests.core.agent.test_react import FakeLLM, FakeTool
+from tests.web.services.interaction_rollout_policy_shared import (
+    install_interaction_rollout_policy,
+)
 from tests.web.services.test_execution_event_recovery import tracer_for
 from tests.web.services.test_task_execution_event_writer import (
     canonical as canonical_fixture,
@@ -53,6 +56,16 @@ from xagent.web.services.task_orchestrator import (
     settle_task_lease_isolated,
 )
 from xagent.web.tracing import ExecutionEventTraceAdapter
+
+
+@pytest.fixture(autouse=True)
+def _legacy_rollout_policy(monkeypatch):
+    """Finalizers consult the rollout policy, which only a host process's
+    startup installs."""
+    install_interaction_rollout_policy(
+        monkeypatch, mode="legacy", shared_task_execution=False
+    )
+
 
 canonical = canonical_fixture
 engine = engine_fixture

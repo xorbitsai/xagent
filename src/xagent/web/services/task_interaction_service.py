@@ -85,18 +85,17 @@ same series and has already merged -- the seam now reads through
 ``task_interaction_close.active_interaction_id_sync``, which imports
 ``_active_native_row_criteria`` from this module; ``websocket.py`` itself
 no longer imports it directly -- but is not part of this
-change. ``create()``'s call body is delivered here, but it is still given
-no production caller in this change: no finalizer, HTTP endpoint, or any
-other production code constructs a system principal or calls ``create()``
-with one. Its own zero-production-caller gate
-(``tests/web/services/test_task_interaction_service_create_gate.py``)
-watches both ``create()`` and ``respond()``: zero production code calls
-either name today, and the change that wires a caller is the change that
-takes the corresponding name out of the gated set. The gate gives
-``create()``'s boundary a regression guard against import bindings, not
-an absolute one -- its docstring lists what it cannot see (dynamic
-access, alias/re-export chains, filename-stem exclusion, and code outside
-the scanned package tree).
+change. ``create()``'s production callers are the three finalizers that
+settle a waiting run (``task_execution.py`` and ``managed_task_lease.py``),
+each acting as the system principal; no HTTP endpoint or other production
+code calls it. ``respond()`` has no production caller.
+``tests/web/services/test_task_interaction_service_create_gate.py`` pins
+both facts: ``respond()`` has zero production callers, and ``create()`` is
+called from exactly those two modules. The scan gives both boundaries a
+regression guard against import bindings, not an absolute one -- its
+docstring lists what it cannot see (dynamic access, alias/re-export
+chains, filename-stem exclusion, and code outside the scanned package
+tree).
 """
 
 from __future__ import annotations
@@ -163,6 +162,11 @@ from .task_interaction_staging import (
     _KIND_VOCABULARY,
     InteractionAnchor,
     InteractionAnchorCorrupt,
+)
+from .task_interaction_staging import (
+    InteractionOwnerStateError as InteractionOwnerStateError,
+)
+from .task_interaction_staging import (
     InteractionRequestClosed,
     InteractionRunPartitionMismatch,
     InteractionSlotTaken,
@@ -1477,14 +1481,17 @@ def _assert_write_point_admissible(
 # InteractionOriginUnknown, are not keys here. Both stay unreachable from
 # every wired caller for a caller-side structural reason: the finalizers
 # that call this seam hold their task row's own lock for the span of the
-# call (a SELECT ... FOR UPDATE on PostgreSQL; single-writer serialization
-# on SQLite -- see InteractionHandoff._assert_current_attempt for the same
-# backend-specific distinction stated where the comparison is actually
-# made), which keeps the attempt comparison's window closed before this
-# call is ever reached; and the gating layer in front of native
-# publication (interaction_rollout.evaluate_native_publication) already
-# refuses an out-of-vocabulary task.source before a finalizer would ever
-# call this seam. A caller that cannot provide either property must not
+# call -- the two in task_execution.py through their settlement lock read
+# (a SELECT ... FOR UPDATE on PostgreSQL), the managed-lease finalizer
+# through the lock its fenced lease-release UPDATE took earlier in the same
+# transaction; single-writer serialization on SQLite either way (see
+# InteractionHandoff._assert_current_attempt for the same backend-specific
+# distinction stated where the comparison is actually made) -- which keeps
+# the attempt comparison's window closed before this call is ever reached;
+# and the gating layer in front of native publication
+# (interaction_rollout.evaluate_native_publication) already refuses an
+# out-of-vocabulary task.source before a finalizer would ever call this
+# seam. A caller that cannot provide either property must not
 # use this path. If either exception somehow fires anyway, create() falls
 # back to the single default classification below
 # (handoff_degraded_unclassified).
@@ -1558,13 +1565,11 @@ def create(
     watched by
     ``tests/web/services/test_interaction_handoff_production_surface.py``
     (see ``test_handoff_is_entered_only_from_the_create_seam`` and its two
-    sibling guards). It is not, on its own, the change
-    that gives this seam a production caller: the three finalizers that
-    will call it, the Task-side protocol marker, and the read-surface
-    switch are a separate change (see
-    ``tests/web/services/test_task_interaction_service_create_gate.py``,
-    which continues to watch ``create()`` and ``respond()`` for exactly
-    that -- zero production code calls either name yet).
+    sibling guards). Its production callers are the three finalizers that
+    settle a waiting run, which call it only when the rollout policy allows
+    native publication and then set the task's protocol marker themselves
+    (``tests/web/services/test_task_interaction_service_create_gate.py``
+    pins that call-site set).
 
     Authorization runs first. For a ``user``/``guest`` principal it runs
     against a task this call loads itself, by id, the same way it always
@@ -1773,11 +1778,14 @@ def create(
     two of the staging primitive's six swallowed exceptions this seam does
     not map to a distinct outcome, and stay unreachable from every wired
     caller for a caller-side structural reason: the finalizers that call
-    this seam hold their task row's own lock for the span of the call (a
-    ``SELECT ... FOR UPDATE`` on PostgreSQL; single-writer serialization on
-    SQLite -- see ``InteractionHandoff._assert_current_attempt`` for the
-    same backend-specific distinction stated where the comparison is
-    actually made), which keeps the attempt comparison's window closed
+    this seam hold their task row's own lock for the span of the call (the
+    two in ``task_execution.py`` through their settlement lock read, a
+    ``SELECT ... FOR UPDATE`` on PostgreSQL; the managed-lease finalizer
+    through the lock its fenced lease-release ``UPDATE`` took earlier in the
+    same transaction; single-writer serialization on SQLite either way --
+    see ``InteractionHandoff._assert_current_attempt`` for the same
+    backend-specific distinction stated where the comparison is actually
+    made), which keeps the attempt comparison's window closed
     before this call is ever reached; and the gating layer in front of
     native publication (``interaction_rollout.evaluate_native_publication``)
     already refuses an out-of-vocabulary ``task.source`` before a finalizer

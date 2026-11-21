@@ -9,6 +9,9 @@ import pytest
 
 from tests.web.services.channel_delivery_shared import database_url as database_url
 from tests.web.services.channel_delivery_shared import selected as selected
+from tests.web.services.interaction_rollout_policy_shared import (
+    install_interaction_rollout_policy,
+)
 from xagent.web.models.chat_message import TaskChatMessage
 from xagent.web.models.database import get_session_local
 from xagent.web.models.task import Task, TaskStatus
@@ -19,6 +22,15 @@ from xagent.web.services.channel_runtime import (
     ChannelAuthorizationError,
 )
 from xagent.web.services.task_orchestrator import TaskTurnError, TaskTurnPayload
+
+
+@pytest.fixture(autouse=True)
+def _legacy_rollout_policy(monkeypatch):
+    """Finalizers consult the rollout policy, which only a host process's
+    startup installs."""
+    install_interaction_rollout_policy(
+        monkeypatch, mode="legacy", shared_task_execution=False
+    )
 
 
 def test_acceptance_persists_start_and_single_transcript_without_lease(selected):

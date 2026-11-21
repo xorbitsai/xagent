@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+import sqlalchemy as sa
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
@@ -92,6 +93,19 @@ def _lease(task_id: int, *, run_id: str = "run-a") -> TaskLease:
 
 def _next_key() -> str:
     return f"key-{next(_key_counter)}"
+
+
+def _force_reclaim_to_match_nothing(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Stand in for a concurrent publisher whose uncommitted active row the
+    reclaim's snapshot cannot see: the reclaim matches nothing, so the INSERT
+    collides for real. Publishing retires every other active row, so this
+    collision no longer happens without a concurrent writer."""
+    real = staging._reclaim_stale_slot_stmt
+    monkeypatch.setattr(
+        staging,
+        "_reclaim_stale_slot_stmt",
+        lambda **kwargs: real(**kwargs).where(sa.false()),
+    )
 
 
 def _stage_kwargs(**overrides: Any) -> dict[str, Any]:
@@ -172,7 +186,9 @@ def test_th2_zero_stage_calls_leaves_staged_none(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize("case", ["slot-taken", "run-partition-mismatch"])
-def test_th3_degraded_stage_leaves_staged_none(tmp_path: Path, case: str) -> None:
+def test_th3_degraded_stage_leaves_staged_none(
+    tmp_path: Path, case: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """Two of the six swallowed types, not all six -- test_interaction_staging.py's
     T-CM-1 already parametrizes the full six-plus-replay matrix for
     degrade-vs-signal-vs-caller-write behavior; this only needs enough
@@ -203,6 +219,7 @@ def test_th3_degraded_stage_leaves_staged_none(tmp_path: Path, case: str) -> Non
             **_stage_kwargs(),
         )
         db.commit()
+        _force_reclaim_to_match_nothing(monkeypatch)
     else:
         assert case == "run-partition-mismatch"
         anchor = _anchor(anchor_id, resume_run_partition="some-other-run")

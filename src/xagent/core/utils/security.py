@@ -12,7 +12,7 @@ from typing import Callable, Iterable, Mapping, NoReturn
 from urllib.parse import (
     SplitResult,
     parse_qsl,
-    urlencode,
+    quote_plus,
     urljoin,
     urlsplit,
     urlunsplit,
@@ -23,8 +23,9 @@ from yarl import URL
 
 # Parameter names that name a credential or a one-time proof in a URL query
 # string. This is the union of the names the URL redactor and the server
-# request-target filter used to keep apart; ``is_sensitive_param_name`` is the
-# only rule that reads it.
+# request-target filter used to keep apart; the credential-name rule below
+# (``_is_credential_key``) remains the common part every redactor shares, and
+# a URL query additionally reads this list.
 SENSITIVE_QUERY_KEYS = frozenset(
     {
         "access_token",
@@ -49,11 +50,27 @@ SENSITIVE_QUERY_KEYS = frozenset(
         "token",
     }
 )
-# Query-string names that are one-time proofs without carrying a credential
-# word. The credential-word suffixes (``_key``, ``_token``, ``_secret``,
-# ``_password``, ``_signature``) are decided by ``_is_credential_key``, whose
-# qualifier exemptions keep paging cursors such as ``next_token`` readable.
-_SENSITIVE_QUERY_SUFFIXES = ("_ticket", "-ticket")
+# Query-string suffixes that mark a credential or a one-time proof without
+# the name carrying a credential word of its own. This is the union of the
+# suffix list the server request-target filter applied before the name rule
+# moved here and the ticket spellings the URL redactor added: a name such as
+# ``page_token`` or ``primary_key`` stays masked there, because a log line may
+# keep a paging cursor but must not keep an access token. Non-secret names
+# such as ``page_size`` do not end in any of these suffixes and stay readable.
+_REQUEST_TARGET_QUERY_SUFFIXES = (
+    "_key",
+    "-key",
+    "_token",
+    "-token",
+    "_ticket",
+    "-ticket",
+    "_secret",
+    "-secret",
+    "_password",
+    "-password",
+    "_signature",
+    "-signature",
+)
 # Names that are credentials wherever they appear, even outside a URL query:
 # signed-URL and raw-header spellings that carry no credential word of their
 # own.
@@ -73,7 +90,14 @@ WEBSOCKET_CREDENTIAL_PATTERN = re.compile(r"xagent-auth-token\.[A-Za-z0-9._~-]+"
 # A JWT is ``header.payload.signature``, all base64url; the header of a JSON
 # JWT always starts ``eyJ`` (``{"``). It can reach a log line without a URL or
 # an ``identifier=`` around it (a bare token in a tool result, for instance).
-JWT_PATTERN = re.compile(r"\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+")
+# The boundary is a negative lookbehind on the token character class rather
+# than ``\b``: ``-`` is part of that class, so ``\b`` matched before every
+# ``eyJ`` inside a dense run and each match then scanned to the end of the run
+# again (quadratic on ``"eyJ-" * n``). The possessive quantifiers keep the
+# scan linear even when a run is not followed by a dot.
+JWT_PATTERN = re.compile(
+    r"(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]++\.[A-Za-z0-9_-]++\.[A-Za-z0-9_-]++"
+)
 # Every ``identifier=`` in the text; ``_is_credential_key`` decides which
 # identifiers name a secret. Only a credential's value is consumed
 # (``_ASSIGNMENT_VALUE_PATTERN``: up to ``&`` or whitespace). After any other
@@ -238,7 +262,7 @@ def is_sensitive_param_name(name: str, *, url_query: bool = False) -> bool:
         return False
     lowered = name.lower()
     return lowered in SENSITIVE_QUERY_KEYS or lowered.endswith(
-        _SENSITIVE_QUERY_SUFFIXES
+        _REQUEST_TARGET_QUERY_SUFFIXES
     )
 
 
@@ -254,7 +278,10 @@ def _redact_assignments(text: str, mask: Callable[[str], str]) -> str:
             # text as it is and keep scanning right after this ``=``.
             continue
         value = _ASSIGNMENT_VALUE_PATTERN.match(text, match.end())
-        if value is None:
+        if value is None or _is_redaction_placeholder(value.group(0)):
+            # Already masked by an outer layer or an earlier pass. Masking a
+            # short ``***suffix`` marker again would eat part of the suffix
+            # and break idempotency; leave the marker exactly as it is.
             continue
         parts.append(text[copied : match.end()])
         parts.append(mask(value.group(0)))
@@ -263,9 +290,16 @@ def _redact_assignments(text: str, mask: Callable[[str], str]) -> str:
     return "".join(parts)
 
 
+# One ``\s*`` on each side of the optional quote before the scheme: a second
+# ``\s*`` after the quote made the whitespace between ``:`` and the scheme
+# split at every position (quadratic on ``Authorization:`` followed by a long
+# run of spaces). The value is read as everything up to whitespace, comma or
+# semicolon -- the same span the pre-change pattern consumed -- so a quote or
+# a bracket at the end of the value is masked instead of ending the match
+# early. The wrappers are put back by ``_mask_value_keeping_wrappers``.
 AUTH_HEADER_PATTERN = re.compile(
-    r"(?i)([\"']?(?:proxy-)?authorization[\"']?\s*[:=]\s*[\"']?\s*"
-    r"(?:bearer|basic)\s+)([^\s,;\"'}\]]+)"
+    r"(?i)([\"']?(?:proxy-)?authorization[\"']?\s*[:=]\s*[\"']?(?:bearer|basic)\s+)"
+    r"([^\s,;]+)"
 )
 HEADER_KEY_PATTERNS = [
     re.compile(r"(?i)(x-goog-api-key\s*[:=]\s*)([^\s,;]+)"),
@@ -703,6 +737,52 @@ def _redact_completely(value: str) -> str:
     return _FULL_REDACTION
 
 
+# Characters that can wrap a value when it is embedded in a JSON object, a
+# dict repr, a header line or a parenthesised sentence. They are put back
+# around the mask so the surrounding syntax survives.
+_VALUE_WRAPPERS = "\"'`([{<)]}>"
+
+
+def _is_redaction_placeholder(value: str) -> bool:
+    """Whether ``value`` is already one of the markers a redactor emits.
+
+    A second redaction pass must leave these alone: ``_mask_secret`` keeps a
+    four-character suffix (``***c123``), and replacing the marker with itself
+    is harmless only for the full ``[REDACTED]`` marker. Recognizing the
+    markers also keeps a value an outer layer already masked from being
+    masked a second time.
+    """
+    candidate = value.strip().strip(_VALUE_WRAPPERS).strip()
+    if not candidate:
+        return False
+    lowered = candidate.lower()
+    if lowered.startswith("%5b") and lowered.endswith("%5d"):
+        candidate = candidate[3:-3]
+        lowered = candidate.lower()
+    if lowered in {"redacted", "<redacted>"}:
+        return True
+    # ``***suffix`` / ``******``: the short mask ``_mask_secret`` emits.
+    return candidate.startswith("***")
+
+
+def _mask_value_keeping_wrappers(value: str, mask: Callable[[str], str]) -> str:
+    """Mask ``value`` but keep any quotes/brackets around it."""
+    if _is_redaction_placeholder(value):
+        return value
+    start = 0
+    end = len(value)
+    while start < end and value[start] in _VALUE_WRAPPERS:
+        start += 1
+    while end > start and value[end - 1] in _VALUE_WRAPPERS:
+        end -= 1
+    if start >= end:
+        return value
+    inner = value[start:end]
+    if _is_redaction_placeholder(inner):
+        return value
+    return f"{value[:start]}{mask(inner)}{value[end:]}"
+
+
 _USERINFO_PREFIX_PATTERN = re.compile(r"://[^/\s@]*@")
 
 
@@ -735,15 +815,35 @@ def _redact_url_credentials_for_logging(
     if not query_items and not has_userinfo:
         return url
 
-    redacted_items: list[tuple[str, str]] = []
+    # Nothing to mask: return the URL byte for byte. This check comes before
+    # any re-encoding, so an untouched query keeps ``?flag`` (not ``?flag=``),
+    # ``%20`` and a trailing ``)``, and a value that cannot be percent-encoded
+    # (an unpaired surrogate, for instance) never reaches ``quote_plus``.
+    if not has_userinfo and not any(
+        value
+        and (redact_all_query_values or is_sensitive_param_name(key, url_query=True))
+        and not _is_redaction_placeholder(value)
+        for key, value in query_items
+    ):
+        return url
+
+    encoded_items: list[str] = []
     for key, value in query_items:
-        if value and (
+        is_sensitive = bool(value) and (
             redact_all_query_values or is_sensitive_param_name(key, url_query=True)
-        ):
-            redacted_items.append((key, mask(value)))
+        )
+        if _is_redaction_placeholder(value):
+            # A marker is not query data: keep it readable instead of
+            # percent-encoding it as ``%5BREDACTED%5D``.
+            encoded_value = value
+        elif is_sensitive:
+            masked = mask(value)
+            encoded_value = masked if masked == _FULL_REDACTION else quote_plus(masked)
         else:
-            redacted_items.append((key, value))
-    redacted_query = urlencode(redacted_items, doseq=True)
+            encoded_value = quote_plus(value)
+        encoded_items.append(f"{quote_plus(key)}={encoded_value}")
+
+    redacted_query = "&".join(encoded_items)
 
     netloc = parsed.netloc
     if has_userinfo:
@@ -780,20 +880,58 @@ def redact_url_credentials_for_logging(
     )
 
 
+# A whitespace-delimited token. Relative request targets (``/cb?code=...``)
+# and relative links are not matched by ``URL_PATTERN``, which requires a
+# scheme. Tokenizing once and examining each token keeps this pass linear,
+# unlike a ``/``-anchored pattern that rescans the rest of a long token from
+# every slash when the token has no query string.
+_RELATIVE_TARGET_TOKEN_PATTERN = re.compile(r"[^\s\"'<>]+")
+_RELATIVE_TARGET_LEADING = "([{<"
+_RELATIVE_TARGET_TRAILING = ")]}>.,;:!"
+
+
+def _redact_relative_target_token(token: str, *, mask: Callable[[str], str]) -> str:
+    start = 0
+    end = len(token)
+    while start < end and token[start] in _RELATIVE_TARGET_LEADING:
+        start += 1
+    while end > start and token[end - 1] in _RELATIVE_TARGET_TRAILING:
+        end -= 1
+    target = token[start:end]
+    if not target.startswith("/") or "?" not in target:
+        return token
+    redacted = _redact_url_credentials_for_logging(target, mask=mask)
+    if redacted == target:
+        return token
+    return f"{token[:start]}{redacted}{token[end:]}"
+
+
+def _redact_relative_targets(text: str, mask: Callable[[str], str]) -> str:
+    if "?" not in text or "/" not in text:
+        return text
+    return _RELATIVE_TARGET_TOKEN_PATTERN.sub(
+        lambda match: _redact_relative_target_token(match.group(0), mask=mask),
+        text,
+    )
+
+
 def _redact_text(text: str, mask: Callable[[str], str]) -> str:
     redacted = WEBSOCKET_CREDENTIAL_PATTERN.sub("xagent-auth-token.[REDACTED]", text)
     redacted = URL_PATTERN.sub(
         lambda match: _redact_url_credentials_for_logging(match.group(0), mask=mask),
         redacted,
     )
+    redacted = _redact_relative_targets(redacted, mask)
     redacted = _redact_assignments(redacted, mask)
     redacted = AUTH_HEADER_PATTERN.sub(
-        lambda match: f"{match.group(1)}{mask(match.group(2))}",
+        lambda match: f"{match.group(1)}"
+        f"{_mask_value_keeping_wrappers(match.group(2), mask)}",
         redacted,
     )
     for pattern in HEADER_KEY_PATTERNS:
         redacted = pattern.sub(
-            lambda match: f"{match.group(1)}{mask(match.group(2))}",
+            lambda match: f"{match.group(1)}"
+            f"{_mask_value_keeping_wrappers(match.group(2), mask)}",
             redacted,
         )
     return redacted
@@ -803,10 +941,11 @@ def redact_sensitive_text(text: str) -> str:
     """Redact common key/token patterns from arbitrary text.
 
     Recognition is by keyword and shape, so it is not exhaustive: it covers
-    HTTP/WebSocket URLs (``redact_url_credentials_for_logging``),
-    ``identifier=value`` assignments whose identifier ``_is_credential_key``
-    accepts, and the header shapes in ``AUTH_HEADER_PATTERN`` and
-    ``HEADER_KEY_PATTERNS``. Shapes it is known to miss are listed in
+    HTTP/WebSocket URLs and relative request targets
+    (``redact_url_credentials_for_logging``), ``identifier=value``
+    assignments whose identifier ``_is_credential_key`` accepts, and the
+    header shapes in ``AUTH_HEADER_PATTERN`` and ``HEADER_KEY_PATTERNS``.
+    Shapes it is known to miss are listed in
     #2356, and secrets in URL path segments in #2272; add a pattern here
     when a new one turns up.
     """

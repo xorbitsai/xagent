@@ -1,5 +1,6 @@
 """Request URLs are logged without credential-bearing query values."""
 
+import io
 import logging
 from collections.abc import Iterator
 from logging.config import dictConfig
@@ -105,10 +106,22 @@ def restore_logging_state() -> Iterator[None]:
             f"/download.aspx?tempauth={REDACTED}&sig={REDACTED}"
             f"&X-Amz-Signature={REDACTED}",
         ),
-        # Paging cursors and ordinary parameters stay readable.
+        # Every name the previous request-target filter masked by suffix is
+        # still masked; a paging cursor may be over-masked in a log line, an
+        # access token may not be under-masked.
         (
-            "/a?next_token=cursor-1&guest_id=g1&page_size=10",
-            "/a?next_token=cursor-1&guest_id=g1&page_size=10",
+            f"/a?page_token={SECRET}&next_token={SECRET}&primary_key={SECRET}"
+            f"&sort_key={SECRET}&cache_key={SECRET}&public_key={SECRET}"
+            f"&s3_key={SECRET}&idempotency_key={SECRET}",
+            f"/a?page_token={REDACTED}&next_token={REDACTED}"
+            f"&primary_key={REDACTED}&sort_key={REDACTED}"
+            f"&cache_key={REDACTED}&public_key={REDACTED}&s3_key={REDACTED}"
+            f"&idempotency_key={REDACTED}",
+        ),
+        # Names that are clearly not credentials stay readable.
+        (
+            "/a?next_page=2&guest_id=g1&page_size=10",
+            "/a?next_page=2&guest_id=g1&page_size=10",
         ),
         ("/a?token=", "/a?token="),
         ("/a?validation_only=true", "/a?validation_only=true"),
@@ -159,6 +172,51 @@ def test_access_log_record_redacts_an_encoded_composio_session_uri():
     assert "sess_SECRET" not in message
     assert "backend.composio.dev" not in message
     assert f"?session_uri={REDACTED}" in message
+
+
+@pytest.mark.usefixtures("restore_logging_state")
+def test_record_factory_keeps_uvicorns_access_formatter_working() -> None:
+    # uvicorn's AccessFormatter unpacks record.args into five fields and
+    # ignores record.msg. A factory that rewrites the message and clears the
+    # arguments makes every access line fail with "not enough values to
+    # unpack", so a credential-bearing request disappears from the log.
+    # ``token`` is in the query on purpose: the previous text redactor saw it
+    # in the interpolated message and flattened the record, so this case is a
+    # real regression test for the access formatter, not just for the filter.
+    import uvicorn.logging
+
+    setup_logging(force=True)
+    access_logger = logging.getLogger("uvicorn.access")
+    access_logger.setLevel(logging.INFO)
+
+    stream = io.StringIO()
+    handler = logging.StreamHandler(stream)
+    handler.setFormatter(
+        uvicorn.logging.AccessFormatter(
+            '%(client_addr)s - "%(request_line)s" %(status_code)s',
+            use_colors=False,
+        )
+    )
+    access_logger.addHandler(handler)
+    try:
+        access_logger.info(
+            '%s - "%s %s HTTP/%s" %d',
+            "127.0.0.1:1",
+            "GET",
+            f"/api/files/public/preview/abc"
+            f"?ticket={SECRET}&code={SECRET}&token={SECRET}",
+            "1.1",
+            200,
+        )
+    finally:
+        access_logger.removeHandler(handler)
+
+    output = stream.getvalue()
+    assert SECRET not in output
+    assert (
+        f'127.0.0.1:1 - "GET /api/files/public/preview/abc'
+        f'?ticket={REDACTED}&code={REDACTED}&token={REDACTED} HTTP/1.1" 200 OK'
+    ) in output
 
 
 @pytest.mark.usefixtures("restore_logging_state")
@@ -372,8 +430,18 @@ _MASKED_QUERY_PARAMS = (
     "code",
     "client_secret",
     "ticket",
+    # Suffix rule the previous request-target filter applied: the new name
+    # rule is a union, so none of these may become readable again.
+    "page_token",
+    "next_token",
+    "primary_key",
+    "sort_key",
+    "cache_key",
+    "public_key",
+    "s3_key",
+    "idempotency_key",
 )
-_PRESERVED_QUERY_PARAMS = ("next_token", "guest_id", "page_size")
+_PRESERVED_QUERY_PARAMS = ("guest_id", "page_size", "next_page")
 
 
 @pytest.mark.parametrize("name", _MASKED_QUERY_PARAMS)
@@ -402,11 +470,23 @@ def test_code_is_only_sensitive_inside_a_url_query() -> None:
     assert security.redact_sensitive_text("code=400") == "code=400"
 
 
+def test_url_query_rule_keeps_the_previous_request_target_suffixes() -> None:
+    for name in _OLD_REQUEST_TARGET_SUFFIX_NAMES:
+        assert security.is_sensitive_param_name(name, url_query=True), name
+    assert not security.is_sensitive_param_name("page_size", url_query=True)
+    assert not security.is_sensitive_param_name("guest_id", url_query=True)
+
+
 _AUTHORIZATION_HEADERS = (
     "Authorization: Bearer sk-secret-value",
     '{"Authorization": "Bearer sk-secret-value"}',
     "{'Authorization': 'Bearer sk-secret-value'}",
-    "Authorization: Basic c2VjcmV0OnZhbHVl",
+    # The quote can sit after the scheme rather than before it, and the value
+    # character class must not stop at a bracket the value itself contains.
+    'Authorization: Bearer "sk-secret-value"',
+    "Authorization: Bearer 'sk-secret-value'",
+    'Authorization: Basic "sk-secret-value"',
+    "Authorization: Bearer sk-secret-value]tail",
     "Proxy-Authorization: Basic c2VjcmV0OnZhbHVl",
 )
 
@@ -419,6 +499,28 @@ def test_authorization_header_values_are_masked(header: str) -> None:
         redacted = redact(header)
         assert "sk-secret-value" not in redacted
         assert "c2VjcmV0OnZhbHVl" not in redacted
+
+
+def test_quoted_authorization_value_keeps_its_quotes() -> None:
+    assert (
+        security.redact_log_text('{"Authorization": "Bearer sk-secret-value"}')
+        == '{"Authorization": "Bearer [REDACTED]"}'
+    )
+    assert (
+        security.redact_log_text('Authorization: Bearer "sk-secret-value"')
+        == 'Authorization: Bearer "[REDACTED]"'
+    )
+
+
+def test_an_already_masked_authorization_value_is_not_masked_again() -> None:
+    # An outer redaction layer (or an earlier pass) may already have produced
+    # the marker; appending another ``]`` breaks exact log assertions.
+    for text in (
+        "Authorization: Bearer [REDACTED]",
+        'Authorization: Bearer "[REDACTED]"',
+        "Authorization: Basic ***c123",
+    ):
+        assert security.redact_log_text(text) == text
 
 
 def test_jwt_shaped_values_are_masked_outside_a_url() -> None:
@@ -453,6 +555,211 @@ def test_xagent_auth_token_values_are_masked() -> None:
     assert "xagent-auth-v1" in redacted
 
 
+def test_log_text_redacts_a_relative_request_target_query() -> None:
+    text = f"GET /api/files/public/preview/abc?code={SECRET}&ticket={SECRET} 404"
+
+    redacted = security.redact_log_text(text)
+
+    assert SECRET not in redacted
+    assert (
+        f"/api/files/public/preview/abc?code={REDACTED}&ticket={REDACTED}" in redacted
+    )
+    assert "404" in redacted
+
+
+def test_log_text_keeps_url_placeholders_readable() -> None:
+    text = f"GET https://api.example.com/cb?code={SECRET}&token={SECRET}"
+
+    redacted = security.redact_log_text(text)
+
+    assert "code=[REDACTED]" in redacted
+    assert "token=[REDACTED]" in redacted
+    assert "%5BREDACTED%5D" not in redacted
+
+
+def test_a_rebuilt_url_keeps_an_existing_marker_readable() -> None:
+    # One placeholder plus one still-sensitive value forces a rebuild; the
+    # existing marker must not become percent-encoded on the way through.
+    text = f"GET https://api.example.com/cb?token={REDACTED}&key={SECRET}"
+
+    redacted = security.redact_log_text(text)
+
+    assert "token=[REDACTED]" in redacted
+    assert "key=[REDACTED]" in redacted
+    assert "%5BREDACTED%5D" not in redacted
+
+
+@pytest.mark.usefixtures("restore_logging_state")
+def test_record_factory_tolerates_a_query_value_that_cannot_be_encoded() -> None:
+    # An unpaired surrogate in an ordinary query value used to raise from
+    # urlencode at the logging call site. A URL with nothing to mask is
+    # returned untouched before any percent-encoding happens.
+    setup_logging(force=True)
+    logger = logging.getLogger("xagent.tests.unencodable_url")
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+    records, handler = _capture(logger)
+    try:
+        logger.warning("GET https://api.example.com/y?q=\ud800")
+    finally:
+        logger.removeHandler(handler)
+
+    assert len(records) == 1
+    assert "\ud800" in records[0].getMessage()
+
+
+def test_log_text_does_not_rewrite_a_url_without_sensitive_parameters() -> None:
+    for text in (
+        "GET https://api.example.com/cb?q=a+b&flag&x=%5B1%5D",
+        "GET https://api.example.com/cb?q=a%20b",
+        "see https://api.example.com/x?q=1).",
+    ):
+        assert security.redact_log_text(text) == text
+
+
+_IDEMPOTENT_LOG_TEXTS = (
+    "Authorization: Bearer [REDACTED]",
+    'Authorization: Bearer "[REDACTED]"',
+    "MCP_API_KEY=***c123 rejected",
+    "token=<redacted>",
+    f"GET https://api.example.com/cb?code={SECRET}&token={SECRET}",
+    f"GET /api/files/public/preview/abc?code={SECRET}&ticket={SECRET}",
+    f'{{"headers": {{"Authorization": "Bearer {SECRET}"}}}}',
+)
+
+
+@pytest.mark.parametrize("text", _IDEMPOTENT_LOG_TEXTS)
+def test_log_text_redaction_is_idempotent(text: str) -> None:
+    once = security.redact_log_text(text)
+
+    assert security.redact_log_text(once) == once
+
+
+# ---------------------------------------------------------------------------
+# The previous implementation (ad253647) must remain a subset of this one
+# ---------------------------------------------------------------------------
+
+# Names and suffixes the previous request-target filter masked. The new name
+# rule is a union of that list and the new one, so none of these may regress.
+_OLD_REQUEST_TARGET_NAMES = (
+    "access_token",
+    "api_key",
+    "apikey",
+    "auth",
+    "code",
+    "connected_account_id",
+    "credential",
+    "id_token",
+    "jwt",
+    "key",
+    "password",
+    "refresh_token",
+    "secret",
+    "session",
+    "session_uri",
+    "sig",
+    "signature",
+    "state",
+    "ticket",
+    "token",
+)
+_OLD_REQUEST_TARGET_SUFFIX_NAMES = (
+    "widget_key",
+    "share_token",
+    "embed_ticket",
+    "client_secret",
+    "x_custom_signature",
+    "x-api-key",
+    # Structural names the old suffix rule covered unconditionally. They are
+    # usually not credentials, but a log may over-mask them; it may not
+    # under-mask one that really is an access token.
+    "page_token",
+    "next_token",
+    "primary_key",
+    "sort_key",
+    "cache_key",
+    "public_key",
+    "s3_key",
+    "idempotency_key",
+)
+_OLD_REDACTOR_TEXT_SAMPLES = (
+    ('Authorization: Bearer "sk-LEAK-0123456789"', "sk-LEAK-0123456789"),
+    ("Authorization: Bearer 'sk-LEAK-0123456789'", "sk-LEAK-0123456789"),
+    ('Authorization: Basic "sk-LEAK-0123456789"', "sk-LEAK-0123456789"),
+    ('Authorization: bearer "sk-LEAK-0123456789"', "sk-LEAK-0123456789"),
+    ("Authorization: Bearer abc]def", "abc]def"),
+    ("Authorization: Bearer sk-LEAK-0123456789}", "sk-LEAK-0123456789"),
+    ("MCP_API_KEY=SECRET-abc123", "SECRET-abc123"),
+    ("api_key=SK-OLD-SECRET", "SK-OLD-SECRET"),
+    ("https://example.com/x?api_key=AIzaSyOldKey&v=1", "AIzaSyOldKey"),
+    ("https://example.com/x?key=OLDKEY&v=1", "OLDKEY"),
+    ("https://example.com/x?token=OLDTOKEN", "OLDTOKEN"),
+    ("https://example.com/x?ticket=OLDTICKET", "OLDTICKET"),
+    ("https://example.com/x?password=OLDPASSWORD", "OLDPASSWORD"),
+    ("https://example.com/x?secret=OLDSECRET", "OLDSECRET"),
+    ("https://example.com/x?access_token=OLDACCESS", "OLDACCESS"),
+    ("https://example.com/x?apikey=OLDAPIKEY", "OLDAPIKEY"),
+)
+# (redactor, input, values the old implementation masked). Each value must
+# still be absent from the new output.
+_OLD_REDACTOR_SAMPLES = (
+    [
+        pytest.param(
+            security.redact_sensitive_text,
+            header,
+            (secret,),
+            id=f"old-redact-sensitive-text-{index}",
+        )
+        for index, (header, secret) in enumerate(_OLD_REDACTOR_TEXT_SAMPLES)
+    ]
+    + [
+        pytest.param(
+            security.redact_url_credentials_for_logging,
+            f"https://example.com/x?{name}=OLD-{name}-VALUE&v=1",
+            (f"OLD-{name}-VALUE",),
+            id=f"old-url-redactor-{name}",
+        )
+        for name in (
+            "api_key",
+            "apikey",
+            "key",
+            "access_token",
+            "token",
+            "ticket",
+            "password",
+            "secret",
+        )
+    ]
+    + [
+        pytest.param(
+            security.redact_url_credentials_for_logging,
+            "https://alice:s3cret-pass@proxy.internal:8080/",
+            ("s3cret-pass",),
+            id="old-url-redactor-userinfo",
+        ),
+    ]
+    + [
+        pytest.param(
+            redact_request_target,
+            f"/api/list?{name}=OLD-{name}-VALUE&page=2",
+            (f"OLD-{name}-VALUE",),
+            id=f"old-request-target-{name}",
+        )
+        for name in _OLD_REQUEST_TARGET_NAMES + _OLD_REQUEST_TARGET_SUFFIX_NAMES
+    ]
+)
+
+
+@pytest.mark.parametrize("redact, text, secrets", _OLD_REDACTOR_SAMPLES)
+def test_redaction_is_never_weaker_than_the_previous_implementation(
+    redact, text, secrets
+):
+    redacted = redact(text)
+
+    for secret in secrets:
+        assert secret not in redacted, text
+
+
 # ---------------------------------------------------------------------------
 # Process-level record redaction
 # ---------------------------------------------------------------------------
@@ -466,15 +773,164 @@ def _capture(logger: logging.Logger) -> tuple[list[logging.LogRecord], logging.H
     return records, handler
 
 
+class _ExplodingMessage:
+    def __str__(self) -> str:
+        raise ValueError("message cannot be formatted")
+
+
+_BAD_LOG_CALLS = [
+    pytest.param("%s %s", (1,), id="too-few-arguments"),
+    pytest.param("%(a)s %(b)s", ({"a": 1},), id="missing-mapping-key"),
+    pytest.param(_ExplodingMessage(), (), id="exploding-str"),
+]
+
+
+@pytest.mark.usefixtures("restore_logging_state")
+@pytest.mark.parametrize("message, args", _BAD_LOG_CALLS)
+def test_record_factory_leaves_unformattable_records_to_handle_error(
+    message: object, args: tuple[object, ...], capsys
+) -> None:
+    setup_logging(force=True)
+    logger = logging.getLogger("xagent.tests.unformattable")
+    logger.setLevel(logging.INFO)
+
+    # Exactly what logging does without this factory: the call returns and
+    # the handler reports the bad record on stderr through handleError.
+    logger.info(message, *args)
+
+    assert "--- Logging error ---" in capsys.readouterr().err
+
+
+@pytest.mark.usefixtures("restore_logging_state")
+def test_record_factory_returns_the_record_when_the_redactor_raises(
+    monkeypatch, capsys
+) -> None:
+    setup_logging(force=True)
+
+    def explode(text: str) -> str:
+        raise RuntimeError("redactor exploded")
+
+    monkeypatch.setattr(logging_config, "redact_log_text", explode)
+    logger = logging.getLogger("xagent.tests.redactor_failure")
+    logger.setLevel(logging.INFO)
+    records, handler = _capture(logger)
+    try:
+        logger.warning("token=%s", SECRET)
+    finally:
+        logger.removeHandler(handler)
+
+    # The record is returned unchanged (and unmarked), so logging behaves as
+    # it would without a factory: the call returns, the line is emitted.
+    assert [record.getMessage() for record in records] == [f"token={SECRET}"]
+    assert not getattr(records[0], "_xagent_log_redacted", False)
+    assert "redactor exploded" not in capsys.readouterr().err
+
+
+@pytest.mark.usefixtures("restore_logging_state")
+def test_record_factory_keeps_argument_structure_when_each_secret_is_in_an_argument():
+    setup_logging(force=True)
+    logger = logging.getLogger("xagent.tests.structured_args")
+    logger.setLevel(logging.INFO)
+    records, handler = _capture(logger)
+    try:
+        logger.warning("headers: %s", f"Authorization: Bearer {SECRET}")
+        logger.warning("count=%d event=%s", 3, f"Authorization: Bearer {SECRET}")
+        logger.warning("event=%(event)s", {"event": f"Authorization: Bearer {SECRET}"})
+    finally:
+        logger.removeHandler(handler)
+
+    first, second, third = records
+    assert first.msg == "headers: %s"
+    assert first.args == (f"Authorization: Bearer {REDACTED}",)
+    assert second.msg == "count=%d event=%s"
+    assert second.args == (3, f"Authorization: Bearer {REDACTED}")
+    assert third.msg == "event=%(event)s"
+    assert third.args == {"event": f"Authorization: Bearer {REDACTED}"}
+    assert all(SECRET not in record.getMessage() for record in records)
+
+
+@pytest.mark.usefixtures("restore_logging_state")
+def test_record_factory_flattens_only_when_the_secret_is_formed_by_interpolation():
+    setup_logging(force=True)
+    logger = logging.getLogger("xagent.tests.flattened_args")
+    logger.setLevel(logging.INFO)
+    records, handler = _capture(logger)
+    try:
+        logger.warning("token=%s", SECRET)
+    finally:
+        logger.removeHandler(handler)
+
+    record = records[0]
+    assert record.msg == f"token={REDACTED}"
+    assert record.args == ()
+
+
+@pytest.mark.usefixtures("restore_logging_state")
+def test_record_factory_keeps_exc_text_unset_when_nothing_needs_redaction() -> None:
+    setup_logging(force=True)
+    logger = logging.getLogger("xagent.tests.custom_exception")
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+
+    class CustomFormatter(logging.Formatter):
+        def formatException(self, ei: object) -> str:
+            return "CUSTOM-TRACEBACK"
+
+    stream = io.StringIO()
+    stream_handler = logging.StreamHandler(stream)
+    stream_handler.setFormatter(CustomFormatter("%(message)s"))
+    logger.addHandler(stream_handler)
+    records, capture_handler = _capture(logger)
+    try:
+        try:
+            raise RuntimeError("plain failure")
+        except RuntimeError:
+            logger.exception("request failed")
+    finally:
+        logger.removeHandler(stream_handler)
+        logger.removeHandler(capture_handler)
+
+    # The factory left exc_text unset, so the handler's own formatException
+    # filled it in: the default traceback text (which a pre-formatted
+    # exc_text would have frozen) never appears.
+    assert records[0].exc_text == "CUSTOM-TRACEBACK"
+    assert "Traceback" not in records[0].exc_text
+    assert "CUSTOM-TRACEBACK" in stream.getvalue()
+
+
+@pytest.mark.usefixtures("restore_logging_state")
+def test_record_factory_leaves_an_existing_short_mask_alone() -> None:
+    # An earlier layer may already have applied the text redactor's
+    # ``***suffix`` mask; a second pass must not eat part of the suffix.
+    setup_logging(force=True)
+    logger = logging.getLogger("xagent.tests.prefix_mask")
+    logger.setLevel(logging.INFO)
+    records, handler = _capture(logger)
+    try:
+        logger.warning("MCP_API_KEY=***c123 rejected")
+    finally:
+        logger.removeHandler(handler)
+
+    assert records[0].getMessage() == "MCP_API_KEY=***c123 rejected"
+
+
 @pytest.mark.usefixtures("restore_logging_state")
 @pytest.mark.parametrize("name", ["httpx", "httpcore", "httpcore.connection"])
 def test_transport_info_lines_stay_out_of_the_log_after_a_level_change(
     name: str,
 ) -> None:
+    # Create the child before setup so the setup scan attaches the filter;
+    # the point of the last case is that the filter alone drops the INFO
+    # record, not the inherited WARNING level.
+    logging.getLogger(name)
     setup_logging(force=True)
+    if "." in name:
+        logging.getLogger(name.split(".", 1)[0]).setLevel(logging.NOTSET)
     logger = logging.getLogger(name)
     # A third-party SDK constructing its own httpx client does exactly this.
     logger.setLevel(logging.NOTSET)
+    # Level alone would let the INFO record through; only the filter drops it.
+    assert logger.isEnabledFor(logging.INFO)
     records, handler = _capture(logger)
     try:
         logger.info(
@@ -492,6 +948,41 @@ def test_transport_info_lines_stay_out_of_the_log_after_a_level_change(
     message = records[0].getMessage()
     assert SECRET not in message
     assert "https://oauth.example.com/token" in message
+
+
+@pytest.mark.usefixtures("restore_logging_state")
+def test_a_transport_child_created_after_setup_is_still_text_redacted() -> None:
+    setup_logging(force=True)
+    logging.getLogger("httpcore").setLevel(logging.NOTSET)
+    late_child = logging.getLogger("httpcore.created_after_setup")
+    late_child.setLevel(logging.NOTSET)
+    records, handler = _capture(late_child)
+    try:
+        late_child.info(
+            "HTTP Request: POST https://oauth.example.com/token?refresh_token=%s",
+            SECRET,
+        )
+    finally:
+        late_child.removeHandler(handler)
+
+    # No logger-level filter was installed on this child (it did not exist at
+    # setup), so the INFO line is emitted; the record factory is the fallback
+    # that keeps the credential out of it.
+    assert len(records) == 1
+    assert SECRET not in records[0].getMessage()
+
+
+@pytest.mark.usefixtures("restore_logging_state")
+def test_repeated_setup_logging_attaches_the_filter_to_a_late_child() -> None:
+    setup_logging(force=True)
+    late_child = logging.getLogger("httpcore.late_filter_child")
+    assert logging_config._TRANSPORT_FILTER not in late_child.filters
+
+    # A repeated non-forced setup (the app import path) re-scans the logger
+    # registry, so children created since the first call get the filter.
+    setup_logging()
+
+    assert logging_config._TRANSPORT_FILTER in late_child.filters
 
 
 @pytest.mark.usefixtures("restore_logging_state")

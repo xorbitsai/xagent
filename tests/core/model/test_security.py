@@ -13,6 +13,7 @@ from xagent.core.utils.security import (
     _NON_CREDENTIAL_TOKEN_QUALIFIERS,
     PrivateNetworkHostError,
     fetch_public_http_bytes,
+    redact_log_text,
     redact_sensitive_text,
     redact_url_credentials_for_logging,
     reject_private_network_host,
@@ -614,6 +615,40 @@ def test_redact_sensitive_text_is_linear_on_hostile_assignment_runs(
     started = time.perf_counter()
     redact_sensitive_text(hostile)
     assert time.perf_counter() - started < 1.0
+
+
+_HOSTILE_LOG_PAYLOADS = {
+    "authorization-whitespace": (
+        "Authorization: " + " " * (100_000 - len("Authorization: "))
+    ),
+    # ``eyJ`` is a word start before every hyphen, and the token character
+    # class includes the hyphen: the old ``\b`` began a quadratic scan at each
+    # one.
+    "dense-jwt-prefix": "eyJ-" * 25_000,
+    # Whitespace-free punctuation stresses the assignment, URL and relative
+    # target scans without giving any of them a token boundary to stop at.
+    "equals-ampersands-quotes": (
+        "=" * 25_000 + "&" * 25_000 + '"' * 25_000 + "'" * 25_000
+    ),
+    "nested-json": '{"a":' * 17_000 + "1" + "}" * 17_000,
+}
+
+
+@pytest.mark.parametrize(
+    "label, payload", _HOSTILE_LOG_PAYLOADS.items(), ids=_HOSTILE_LOG_PAYLOADS.keys()
+)
+def test_redact_log_text_is_linear_on_hostile_input(label: str, payload: str) -> None:
+    # Every record is scanned at creation, and a tool result or an LLM
+    # context can carry 100 kB of text a remote service controls. Warm the
+    # caches once, then measure; the 100 ms budget is the task's ceiling and
+    # is ~10x the measured time here, while a quadratic pattern is seconds.
+    redact_log_text(payload)
+    started = time.perf_counter()
+    redact_log_text(payload)
+    elapsed = time.perf_counter() - started
+    print(f"\nredact_log_text[{label}] {len(payload)} bytes: {elapsed * 1000:.2f} ms")
+
+    assert elapsed < 0.1
 
 
 def test_redact_sensitive_text_leaves_a_credential_without_a_value() -> None:

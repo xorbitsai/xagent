@@ -4,7 +4,7 @@ import logging
 import os
 from collections.abc import Callable
 from logging.config import dictConfig
-from typing import Literal, cast
+from typing import Any, Literal, cast
 
 from ..core.utils.security import redact_log_text
 from .request_log_redaction import install_request_log_redaction
@@ -40,6 +40,100 @@ class _BelowWarningFilter(logging.Filter):
 _TRANSPORT_FILTER = _BelowWarningFilter()
 
 
+# Loggers whose record arguments are also read by a formatter of their own.
+# uvicorn's ``AccessFormatter`` unpacks the five-tuple in ``record.args`` and
+# ignores ``record.msg``, so flattening such a record into a string drops the
+# access line entirely. The request target inside ``args[2]`` is redacted
+# here (and again by ``RequestTargetRedactionFilter``).
+_ARG_PRESERVING_LOGGERS = frozenset({"uvicorn.access"})
+
+
+def _format_with_args(msg: object, args: object) -> str:
+    text = str(msg)
+    if args:
+        return text % args
+    return text
+
+
+def _redact_argument(value: object) -> object:
+    if isinstance(value, str):
+        return redact_log_text(value)
+    return value
+
+
+def _redact_args(args: object) -> object:
+    """Redact string elements of a tuple/dict of log arguments in place."""
+    if isinstance(args, tuple):
+        return tuple(_redact_argument(item) for item in args)
+    if isinstance(args, dict):
+        return {key: _redact_argument(value) for key, value in args.items()}
+    return args
+
+
+def _redact_record(record: logging.LogRecord) -> None:
+    """Redact one record, committing every change only at the end.
+
+    The factory around this function must return the record untouched when
+    anything here raises, so assignments happen after all formatting and
+    scanning succeeded.
+    """
+    if getattr(record, _RECORD_MARKER, False):
+        return
+
+    message = record.getMessage()
+    redacted_message = redact_log_text(message)
+
+    new_msg = record.msg
+    new_args: Any = record.args
+    if redacted_message != message:
+        redacted_args = _redact_args(record.args)
+        try:
+            rebuilt = _format_with_args(record.msg, redacted_args)
+        except Exception:
+            rebuilt = None
+        if rebuilt == redacted_message:
+            # Every masked value was visible inside one argument. Keep the
+            # argument structure: filters and formatters (uvicorn's access
+            # formatter in particular) still read it.
+            new_args = redacted_args
+        elif record.name in _ARG_PRESERVING_LOGGERS:
+            # This formatter owns the argument shape; never flatten it. The
+            # URL-bearing argument was redacted by _redact_args.
+            new_args = redacted_args
+        else:
+            # The credential only appears after interpolation. The formatted
+            # text is final; drop the raw arguments so a formatter cannot
+            # interpolate them again.
+            new_msg = redacted_message
+            new_args = ()
+
+    exc_text = record.exc_text
+    if exc_text:
+        redacted_exc = redact_log_text(exc_text)
+        if redacted_exc != exc_text:
+            exc_text = redacted_exc
+    elif record.exc_info:
+        formatted_exc = _EXCEPTION_FORMATTER.formatException(record.exc_info)
+        redacted_exc = redact_log_text(formatted_exc)
+        if redacted_exc != formatted_exc:
+            # Only pre-format when redaction changed something. Otherwise a
+            # handler's own formatException (custom or structured) must still
+            # run, exactly as it did before this factory existed.
+            exc_text = redacted_exc
+
+    stack_info = record.stack_info
+    if stack_info:
+        redacted_stack = redact_log_text(stack_info)
+        if redacted_stack != stack_info:
+            stack_info = redacted_stack
+
+    record.msg = new_msg
+    record.args = new_args
+    record.exc_text = exc_text
+    record.stack_info = stack_info
+    setattr(record, _RECORD_MARKER, True)
+
+
 def _redacting_record_factory(
     previous: Callable[..., logging.LogRecord],
 ) -> Callable[..., logging.LogRecord]:
@@ -53,24 +147,15 @@ def _redacting_record_factory(
 
     def factory(*args: object, **kwargs: object) -> logging.LogRecord:
         record = previous(*args, **kwargs)
-        if getattr(record, _RECORD_MARKER, False):
+        try:
+            _redact_record(record)
+        except Exception:
+            # Redaction must never change the semantics of a logging call.
+            # Return the record exactly as the previous factory produced it;
+            # logging's own error path (handler ``handleError``) then handles
+            # a bad format string, a broken ``__str__`` or a failing
+            # redactor just as it would without this factory.
             return record
-        message = record.getMessage()
-        redacted = redact_log_text(message)
-        if redacted != message:
-            # The formatted text is final; leaving the arguments in place
-            # would let a formatter interpolate the raw values again.
-            record.msg = redacted
-            record.args = ()
-        if record.exc_text:
-            record.exc_text = redact_log_text(record.exc_text)
-        elif record.exc_info:
-            record.exc_text = redact_log_text(
-                _EXCEPTION_FORMATTER.formatException(record.exc_info)
-            )
-        if record.stack_info:
-            record.stack_info = redact_log_text(record.stack_info)
-        setattr(record, _RECORD_MARKER, True)
         return record
 
     setattr(factory, _RECORD_FACTORY_MARKER, True)
@@ -121,6 +206,11 @@ def setup_logging(level: LogLevel | None = None, force: bool = False) -> None:
     """
     global _is_applied
     if _is_applied and not force:
+        # A transport child logger (``httpcore.http11`` and friends) can be
+        # created lazily after the first call. Re-scan on a repeated setup so
+        # a caller that imports the app after configuring logging still gets
+        # the below-WARNING filter onto the children that now exist.
+        _install_transport_log_filters()
         return
     # Read log level from env var if not provided
     if level is None:

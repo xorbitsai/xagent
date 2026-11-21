@@ -1979,22 +1979,37 @@ class TestModelAPI:
             async def chat(self, messages, **kwargs):
                 raise Exception(leak)
 
-        with patch(
-            "xagent.core.model.chat.basic.adapter.create_base_llm",
-            return_value=FailingLLM(),
-        ):
-            with caplog.at_level(logging.ERROR, logger="xagent.web.api.model"):
-                response = client.post(
-                    "/api/models/test-connection",
-                    json={
-                        "model_provider": "openai",
-                        "model_name": "gpt-4o-mini",
-                        "api_key": "test-api-key",
-                        "base_url": "https://api.example.com/v1",
-                        "category": "llm",
-                    },
-                    headers=regular_headers,
-                )
+        # Isolate model.py from the process-wide record factory: with the
+        # factory active every log record is redacted anyway, so caplog
+        # cannot tell whether this endpoint logged the raw exception or its
+        # own safe_error. Restore it before the assertions and in finally.
+        record_factory = logging.getLogRecordFactory()
+        model_records: list[logging.LogRecord] = []
+        capture = logging.Handler()
+        capture.emit = model_records.append  # type: ignore[method-assign]
+        model_logger = logging.getLogger("xagent.web.api.model")
+        logging.setLogRecordFactory(logging.LogRecord)
+        model_logger.addHandler(capture)
+        try:
+            with patch(
+                "xagent.core.model.chat.basic.adapter.create_base_llm",
+                return_value=FailingLLM(),
+            ):
+                with caplog.at_level(logging.ERROR, logger="xagent.web.api.model"):
+                    response = client.post(
+                        "/api/models/test-connection",
+                        json={
+                            "model_provider": "openai",
+                            "model_name": "gpt-4o-mini",
+                            "api_key": "test-api-key",
+                            "base_url": "https://api.example.com/v1",
+                            "category": "llm",
+                        },
+                        headers=regular_headers,
+                    )
+        finally:
+            model_logger.removeHandler(capture)
+            logging.setLogRecordFactory(record_factory)
 
         assert response.status_code == 200
         data = response.json()
@@ -2002,6 +2017,17 @@ class TestModelAPI:
         assert "sk-test" not in data["error"]
         # The diagnostic header name stays readable.
         assert "Authorization" in data["error"]
+        # Only the record this logger emitted matters here; another logger's
+        # output in caplog cannot stand in for the model.py fix.
+        failure_records = [
+            record
+            for record in model_records
+            if "Model connection test failed" in record.getMessage()
+        ]
+        assert failure_records, "the model endpoint logged no failure"
+        for record in failure_records:
+            assert "sk-test" not in record.getMessage()
+            assert "Authorization" in record.getMessage()
         assert "sk-test" not in caplog.text
 
     def test_create_model_as_admin(

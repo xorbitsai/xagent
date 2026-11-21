@@ -118,7 +118,7 @@ def test_loader_rejects_every_credential_reason_inside_worker_session(
     assert websocket_auth._load_websocket_principal_sync(case.build_token()) is None
     assert session.enter_count == 1
     assert session.exit_count == 1
-    assert session.query_count == (1 if case.expected_detail == "User not found" else 0)
+    assert session.query_count == (1 if case.id == "user-not-found" else 0)
 
 
 @pytest.mark.asyncio

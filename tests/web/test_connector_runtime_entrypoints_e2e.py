@@ -2490,7 +2490,7 @@ def test_read_endpoints_reject_anonymous_and_widget_credentials(
 ) -> None:
     """No ``Authorization`` header is a Bearer-challenge 401
     (``HTTPBearer`` itself, ``auto_error=True``), and a well-formed widget
-    guest token is a 401 ``"Invalid token type"`` -- the same two doors
+    guest token is a generic credential 401 -- the same two doors
     every other authenticated-only endpoint in this module is gated by
     (``get_current_user``'s ``type: "access"`` check, ``auth_dependencies.py``).
     """
@@ -2530,7 +2530,7 @@ def test_read_endpoints_reject_anonymous_and_widget_credentials(
         url, headers={"Authorization": f"Bearer {widget_token}"}
     )
     assert widget_response.status_code == 401, widget_response.text
-    assert widget_response.json()["detail"] == "Invalid token type"
+    assert widget_response.json()["detail"] == "Could not validate credentials"
 
 
 # ---------------------------------------------------------------------------

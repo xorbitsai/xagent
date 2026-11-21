@@ -393,7 +393,15 @@ TOOL_MAX_FIELD_COUNT = "XAGENT_TOOL_MAX_FIELD_COUNT"
 MAX_TRACE_PAYLOAD_BYTES = "XAGENT_MAX_TRACE_PAYLOAD_BYTES"
 INLINE_FILE_DELIVERY_MAX_BYTES = "XAGENT_INLINE_FILE_DELIVERY_MAX_BYTES"
 
-WEB_SEARCH_PROVIDERS = {"auto", "google", "tavily", "exa", "zhipu", "brave"}
+WEB_SEARCH_PROVIDERS = {
+    "auto",
+    "google",
+    "tavily",
+    "exa",
+    "zhipu",
+    "brave",
+    "keenable",
+}
 BRAVE_SEARCH_ENDPOINTS = {"web", "llm_context"}
 # Returned by get_web_search_provider() for an unrecognised, non-empty value:
 # no web search tool is registered (fail closed).
@@ -4990,7 +4998,7 @@ def get_web_search_provider() -> str:
         1. XAGENT_WEB_SEARCH_PROVIDER environment variable
         2. "auto"
 
-    Valid values are: auto, google, tavily, exa, zhipu, brave.
+    Valid values are: auto, google, tavily, exa, zhipu, brave, keenable.
 
     An unset or empty value means "auto". An unrecognised value fails closed:
     ``WEB_SEARCH_PROVIDER_INVALID`` is returned and no search tool is

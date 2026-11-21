@@ -168,7 +168,7 @@ def test_replay_keeps_interrupted_start_and_earlier_steps(canonical, running):
     assert by_id["start-2"]["message_id"] == "final_answer_1"
     assert by_id["start-2"]["status"] == "interrupted"
     assert not [e for e in view.events if e["type"] == "final_answer_error"]
-    assert ("status" in by_id["start-1"]) is (not running)
+    assert by_id["start-1"].get("status") == (None if running else "interrupted")
 
 
 def test_stream_boundaries_fixed_horizon_and_settlement_share_one_bubble(canonical):

@@ -144,6 +144,13 @@ def test_unclassified_results_do_not_request_authentication(result):
             '<final_answer>{"action": "final_answer", "action_input": "Hi"}</final_answer>',
             "Hi",
         ),
+        ("<final_answer></final_answer>", ""),
+        ("</final_answer>", ""),
+        (
+            "Here is the answer:\n<final_answer>\nX\n</final_answer>",
+            "Here is the answer:\n\nX",
+        ),
+        ("<final_answer>X</final_answer>\nLet me know", "X\nLet me know"),
     ],
 )
 def test_unwrap_final_answer_content_removes_tags_at_either_end(content, expected):
@@ -156,6 +163,7 @@ def test_unwrap_final_answer_content_removes_tags_at_either_end(content, expecte
         "Wrap the reply in a <final_answer> tag when the tool is unavailable.",
         "Close it with </final_answer> and nothing after.\nThen stop.",
         "  A plain answer with surrounding whitespace.\n",
+        "Use <final_answer>x</final_answer> tags.",
     ],
 )
 def test_unwrap_final_answer_content_leaves_text_without_edge_tags_unchanged(content):

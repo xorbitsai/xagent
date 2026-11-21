@@ -136,20 +136,25 @@ def set_assistant_message(result: dict[str, Any], content: str) -> None:
 
 # A model that answers in plain text sometimes wraps the answer in the
 # final_answer tool's name as markup: an opening tag at the start, a closing
-# tag at the end, or only one of them. Only a tag at either end of the whole
-# text is removed, so an answer that mentions the tag in its body is left as
-# it is.
+# tag at the end, or only one of them, sometimes with a sentence outside the
+# wrapper. Unwrapping starts only from a tag at either end of the whole text,
+# so an answer that mentions the tag in its body is left as it is.
 _LEADING_FINAL_ANSWER_TAG = re.compile(r"\A\s*<final_answer>", re.IGNORECASE)
 _TRAILING_FINAL_ANSWER_TAG = re.compile(r"</final_answer>\s*\Z", re.IGNORECASE)
+_OPENING_FINAL_ANSWER_TAG = re.compile(r"<final_answer>", re.IGNORECASE)
+_CLOSING_FINAL_ANSWER_TAG = re.compile(r"</final_answer>", re.IGNORECASE)
 
 
 def unwrap_final_answer_content(content: str) -> str:
     """Unwrap textual final_answer markup or legacy JSON into display-ready content.
 
     A leading ``<final_answer>`` and a trailing ``</final_answer>`` are removed
-    first, and when either is removed the remaining text is trimmed at both
-    ends; text without either tag is not changed. What remains is then
-    unwrapped when it is legacy final_answer JSON.
+    first. When only one of the two is at an end, its counterpart inside the
+    text is removed as well (the last closing tag after a leading opening
+    tag, the first opening tag before a trailing closing tag), so text outside
+    the wrapper keeps no orphan tag. When any tag is removed the remaining text
+    is trimmed at both ends; text without a tag at either end is not changed.
+    What remains is then unwrapped when it is legacy final_answer JSON.
     """
     content = _strip_final_answer_tags(content)
     parsed = _parse_json_like_text(content)
@@ -171,10 +176,17 @@ def unwrap_final_answer_content(content: str) -> str:
 
 
 def _strip_final_answer_tags(content: str) -> str:
-    stripped = _TRAILING_FINAL_ANSWER_TAG.sub(
-        "", _LEADING_FINAL_ANSWER_TAG.sub("", content, count=1), count=1
-    )
-    return content if stripped == content else stripped.strip()
+    text, leading = _LEADING_FINAL_ANSWER_TAG.subn("", content, count=1)
+    text, trailing = _TRAILING_FINAL_ANSWER_TAG.subn("", text, count=1)
+    if not leading and not trailing:
+        return content
+    if leading and not trailing:
+        closing = list(_CLOSING_FINAL_ANSWER_TAG.finditer(text))
+        if closing:
+            text = text[: closing[-1].start()] + text[closing[-1].end() :]
+    elif trailing and not leading:
+        text = _OPENING_FINAL_ANSWER_TAG.sub("", text, count=1)
+    return text.strip()
 
 
 def _parse_json_like_text(content: str) -> Any | None:

@@ -4725,6 +4725,11 @@ def test_dispatcher_interactive_reserve_env_parsing(
             "XAGENT_DISPATCH_ACCEPT_REQUESTED_CLASS",
             "get_dispatch_accept_requested_class_enabled",
         ),
+        (
+            "LOG_TRANSPORT_REQUEST_LINES",
+            "XAGENT_LOG_TRANSPORT_REQUEST_LINES",
+            "get_log_transport_request_lines",
+        ),
     ],
 )
 @pytest.mark.parametrize(

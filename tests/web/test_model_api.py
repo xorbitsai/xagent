@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import logging
 import os
 import tempfile
 from types import SimpleNamespace
@@ -1963,6 +1964,117 @@ class TestModelAPI:
         assert model_module._CONNECTION_TEST_TIMEOUT_SECONDS == 60.0
         assert "60 seconds" in data["error"]
         assert "network" not in data["error"].lower()
+
+    def test_test_connection_error_never_carries_an_authorization_value(
+        self, test_db, regular_user, regular_headers, caplog
+    ):
+        """An upstream error body can echo the request's Authorization header.
+
+        The log line and the error field returned to the client must both
+        carry the redacted text, not the raw exception.
+        """
+        leak = '{"headers": {"Authorization": "Bearer sk-test"}}'
+
+        class FailingLLM:
+            async def chat(self, messages, **kwargs):
+                raise Exception(leak)
+
+        # The endpoint logs the exception itself and the process-wide record
+        # factory writes the full marker; the short ***suffix mask belongs to
+        # the response only. Install the factory explicitly: the test-suite
+        # fixture resets it to logging.LogRecord between tests.
+        record_factory = logging.getLogRecordFactory()
+        from xagent.web import logging_config
+
+        logging_config._install_record_redaction()
+        model_records: list[logging.LogRecord] = []
+        capture = logging.Handler()
+        capture.emit = model_records.append  # type: ignore[method-assign]
+        model_logger = logging.getLogger("xagent.web.api.model")
+        model_logger.addHandler(capture)
+        try:
+            with patch(
+                "xagent.core.model.chat.basic.adapter.create_base_llm",
+                return_value=FailingLLM(),
+            ):
+                with caplog.at_level(logging.ERROR, logger="xagent.web.api.model"):
+                    response = client.post(
+                        "/api/models/test-connection",
+                        json={
+                            "model_provider": "openai",
+                            "model_name": "gpt-4o-mini",
+                            "api_key": "test-api-key",
+                            "base_url": "https://api.example.com/v1",
+                            "category": "llm",
+                        },
+                        headers=regular_headers,
+                    )
+        finally:
+            model_logger.removeHandler(capture)
+            logging.setLogRecordFactory(record_factory)
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["status"] == "failed"
+        assert "sk-test" not in data["error"]
+        # The diagnostic header name stays readable.
+        assert "Authorization" in data["error"]
+        # Only the record this logger emitted matters here; another logger's
+        # output in caplog cannot stand in for the model.py fix.
+        failure_records = [
+            record
+            for record in model_records
+            if "Model connection test failed" in record.getMessage()
+        ]
+        assert failure_records, "the model endpoint logged no failure"
+        for record in failure_records:
+            message = record.getMessage()
+            assert "sk-test" not in message
+            assert "Authorization" in message
+            # The factory's marker, not the response's short mask.
+            assert "[REDACTED]" in message
+            assert "***" not in message
+        assert "sk-test" not in caplog.text
+
+    def test_user_default_error_log_is_redacted_by_the_factory(
+        self, test_db, regular_user, regular_headers, monkeypatch
+    ):
+        """The /user-default handler logs the exception, not safe_error."""
+        leak = '{"headers": {"Authorization": "Bearer sk-user-default"}}'
+
+        def fail(self, user):
+            raise RuntimeError(leak)
+
+        monkeypatch.setattr(model_module.ModelStore, "get_user_default_models", fail)
+
+        from xagent.web import logging_config
+
+        record_factory = logging.getLogRecordFactory()
+        logging_config._install_record_redaction()
+        model_records: list[logging.LogRecord] = []
+        capture = logging.Handler()
+        capture.emit = model_records.append  # type: ignore[method-assign]
+        model_logger = logging.getLogger("xagent.web.api.model")
+        model_logger.addHandler(capture)
+        try:
+            response = client.get("/api/models/user-default", headers=regular_headers)
+        finally:
+            model_logger.removeHandler(capture)
+            logging.setLogRecordFactory(record_factory)
+
+        assert response.status_code == 200
+        assert response.json() == []
+        failure_records = [
+            record
+            for record in model_records
+            if "Error getting user default models" in record.getMessage()
+        ]
+        assert failure_records, "the user-default endpoint logged no failure"
+        for record in failure_records:
+            message = record.getMessage()
+            assert "sk-user-default" not in message
+            assert "[REDACTED]" in message
+            assert "***" not in message
 
     def test_create_model_as_admin(
         self, test_db, admin_user, admin_headers, sample_model_data

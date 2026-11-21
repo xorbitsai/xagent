@@ -14,51 +14,13 @@ access, handshake and handshake-header lines go through
 from __future__ import annotations
 
 import logging
-from urllib.parse import parse_qsl, quote, urlsplit
 
-REDACTED = "[REDACTED]"
+from ..core.utils.security import (
+    REDACTED,
+    is_sensitive_param_name,
+    redact_url_query_credentials,
+)
 
-# Exact names (lower-cased) whose values are credentials or one-time proofs.
-_SENSITIVE_QUERY_NAMES = frozenset(
-    {
-        "access_token",
-        "api_key",
-        "apikey",
-        "auth",
-        "code",
-        # Composio's hosted-auth redirects (web/composio_auth.py): the
-        # single-use verification session and the connection it activates.
-        "connected_account_id",
-        "credential",
-        "id_token",
-        "jwt",
-        "key",
-        "password",
-        "refresh_token",
-        "secret",
-        "session",
-        "session_uri",
-        "sig",
-        "signature",
-        "state",
-        "ticket",
-        "token",
-    }
-)
-# Any name ending in one of these (``widget_key``, ``share_token``,
-# ``embed_ticket``, ``client_secret``) is treated as a credential too.
-_SENSITIVE_QUERY_SUFFIXES = (
-    "_key",
-    "-key",
-    "_token",
-    "-token",
-    "_ticket",
-    "-ticket",
-    "_secret",
-    "-secret",
-    "_password",
-    "_signature",
-)
 _LOGGER_NAMES = ("uvicorn.access", "uvicorn.error")
 
 # Handshake header lines of both WebSocket implementations uvicorn drives with
@@ -69,49 +31,29 @@ _LOGGER_NAMES = ("uvicorn.access", "uvicorn.error")
 # ``>`` the response.
 _HEADER_LOG_FORMATS = frozenset({"< %s: %s", "> %s: %s"})
 # Headers whose whole value is a credential, besides names that already read
-# as credentials (``X-Api-Key``, ``X-Auth-Token``, see is_sensitive_query_name).
+# as credentials (``X-Api-Key``, ``X-Auth-Token``, see
+# ``is_sensitive_param_name(..., url_query=True)``).
 _SENSITIVE_HEADER_NAMES = frozenset({"cookie", "set-cookie"})
 # ``Sec-WebSocket-Protocol`` items carrying a login credential
 # (``xagent-auth-token.<jwt>``); the protocol names stay readable.
 _CREDENTIAL_SUBPROTOCOL_PREFIXES = ("xagent-auth-token.",)
 
 
-def is_sensitive_query_name(name: str) -> bool:
-    lowered = name.lower()
-    return lowered in _SENSITIVE_QUERY_NAMES or lowered.endswith(
-        _SENSITIVE_QUERY_SUFFIXES
-    )
-
-
 def redact_request_target(target: str) -> str:
     """Return ``target`` with credential-like query values replaced.
 
     Accepts a request target (``/path?query``) or an absolute URL. Parameter
-    names and non-sensitive values are kept so logs stay useful, and a target
-    with nothing to redact is returned unchanged (never re-serialized), so the
-    log still matches the request on the wire.
+    names and non-sensitive values are kept so logs stay useful. The query is
+    parsed, encoded and masked by the same function the text and record
+    redactors use (``redact_url_query_credentials``), so a request target
+    cannot disagree with them about which names are sensitive, how a value is
+    encoded, or what happens to a target that cannot be parsed. A target with
+    nothing to redact is returned unchanged (never re-serialized), so the log
+    still matches the request on the wire.
     """
     if "?" not in target:
         return target
-    try:
-        parsed = urlsplit(target)
-    except ValueError:
-        # Unparsable: never risk echoing the query.
-        return target.split("?", 1)[0] + "?" + REDACTED
-    if not parsed.query:
-        return target
-    parts = []
-    redacted = False
-    for name, value in parse_qsl(parsed.query, keep_blank_values=True):
-        if value and is_sensitive_query_name(name):
-            value = REDACTED
-            redacted = True
-        parts.append(f"{quote(name, safe='')}={quote(value, safe='[]')}")
-    if not redacted:
-        return target
-    prefix = target.split("?", 1)[0]
-    suffix = f"#{parsed.fragment}" if parsed.fragment else ""
-    return f"{prefix}?{'&'.join(parts)}{suffix}"
+    return redact_url_query_credentials(target)
 
 
 def redact_header_value(name: str, value: str) -> str:
@@ -144,7 +86,9 @@ def redact_header_value(name: str, value: str) -> str:
     if lowered.startswith("sec-websocket-"):
         # Key/accept nonces, version and extensions: handshake diagnostics.
         return value
-    if lowered in _SENSITIVE_HEADER_NAMES or is_sensitive_query_name(lowered):
+    if lowered in _SENSITIVE_HEADER_NAMES or is_sensitive_param_name(
+        lowered, url_query=True
+    ):
         return REDACTED if value else value
     return value
 

@@ -861,7 +861,10 @@ async def get_user_default_models(
     try:
         return ModelStore(db).get_user_default_models(user)
     except Exception as e:
-        logger.error(f"Error getting user default models: {e}")
+        # Log the exception itself: the record factory masks its credential
+        # shapes with the full [REDACTED] marker. safe_error is for the
+        # response only.
+        logger.error("Error getting user default models: %s", e)
         # Return an empty list even if an error occurs, instead of 404
         return []
 
@@ -1220,9 +1223,11 @@ async def test_model_connection(
             ),
         )
     except Exception as e:
-        logger.error(f"Model connection test failed: {e}")
-        response_time = time.time() - start_time
+        # The response keeps the short ***suffix mask; the log line goes
+        # through the record factory, which writes [REDACTED].
         safe_error = redact_sensitive_text(str(e))
+        logger.error("Model connection test failed: %s", e)
+        response_time = time.time() - start_time
         return ModelTestResponse(
             model_id=request.model_name,
             status="failed",
@@ -1334,9 +1339,7 @@ async def transcribe_speech_input(
     except Exception as exc:
         safe_error = redact_sensitive_text(str(exc))
         logger.error(
-            "Speech transcription failed for model %s: %s",
-            db_model.model_id,
-            safe_error,
+            "Speech transcription failed for model %s: %s", db_model.model_id, exc
         )
         raise HTTPException(
             status_code=500,
@@ -1445,11 +1448,7 @@ async def test_models(
         except Exception as e:
             response_time = time.time() - start_time
             safe_error = redact_sensitive_text(str(e))
-            logger.error(
-                "Error testing model %s: %s",
-                model.model_id,
-                safe_error,
-            )
+            logger.error("Error testing model %s: %s", model.model_id, e)
             test_results.append(
                 ModelTestResponse(
                     model_id=model.model_id,
@@ -2547,9 +2546,7 @@ async def fetch_provider_models(
             }
         if isinstance(e, AnthropicAuthenticationError):
             safe_error = redact_sensitive_text(str(e))
-            logger.warning(
-                "Provider %s rejected its credentials: %s", provider, safe_error
-            )
+            logger.warning("Provider %s rejected its credentials: %s", provider, e)
             raise HTTPException(
                 status_code=422,
                 detail={
@@ -2559,11 +2556,7 @@ async def fetch_provider_models(
                 },
             ) from e
         safe_error = redact_sensitive_text(str(e))
-        logger.error(
-            "Error fetching models from %s: %s",
-            provider,
-            safe_error,
-        )
+        logger.error("Error fetching models from %s: %s", provider, e)
         raise HTTPException(
             status_code=502,
             detail=f"Failed to fetch models from {provider}: {safe_error}",
@@ -2641,11 +2634,7 @@ async def fetch_multiple_providers_models(
             }
         except Exception as e:
             safe_error = redact_sensitive_text(str(e))
-            logger.error(
-                "Error fetching from %s: %s",
-                provider,
-                safe_error,
-            )
+            logger.error("Error fetching from %s: %s", provider, e)
             results[provider] = {
                 "error": safe_error,
                 "models": [],

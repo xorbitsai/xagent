@@ -720,6 +720,17 @@ def test_a_rebuilt_url_keeps_an_existing_marker_readable() -> None:
     assert "%5BREDACTED%5D" not in redacted
 
 
+def test_a_masked_relative_header_marker_stays_readable() -> None:
+    # The header pre-pass masks ``X-Api-Key:sk-...`` inside a relative target
+    # before the URL rebuild. Stripping the closing ``]`` as trailing
+    # punctuation then made the rebuild insert ``=`` in the middle of the
+    # marker (``[REDACTED=]``); a following pass no longer recognized it.
+    redacted = security.redact_log_text("/cb?token&X-Api-Key:sk-LEAK-0123456789")
+
+    assert redacted == "/cb?token&X-Api-Key:[REDACTED]"
+    assert "[REDACTED=]" not in redacted
+
+
 @pytest.mark.usefixtures("restore_logging_state")
 def test_record_factory_tolerates_a_query_value_that_cannot_be_encoded() -> None:
     # An unpaired surrogate in an ordinary query value used to raise from
@@ -819,6 +830,18 @@ _LEGACY_GOLDEN: dict[str, list[dict[str, str]]] = json.loads(
 # the value (``***6789``): the full value is still gone even though four of its
 # characters remain, and the new output must drop at least the same fragments.
 _FRAGMENT_PATTERN = re.compile(r"[A-Za-z0-9._~%+-]+")
+# The shortest piece of a masked value that must not survive. A fragment can be
+# shorter than this (``alice`` in a URL's userinfo); the whole-fragment check
+# still covers it.
+_NEVER_WEAKER_MIN_FRAGMENT = 6
+# The pre-change header rule could consume the following header *name* as part
+# of a value when two header shapes were adjacent, so the old output dropped
+# that name. A name is not secret material, and the fix deliberately keeps it,
+# so it does not count as masked material in the comparison.
+_HEADER_NAME_FRAGMENT = re.compile(
+    r"(?i)^(?:proxy-)?authorization$|^x-goog-api-key$|^x-api-key$"
+    r"|^x-shopify-access-token$"
+)
 
 
 def _masked_fragments(original: str, redacted: str) -> set[str]:
@@ -828,6 +851,31 @@ def _masked_fragments(original: str, redacted: str) -> set[str]:
         for fragment in _FRAGMENT_PATTERN.findall(original)
         if len(fragment) > 1 and fragment not in redacted
     }
+
+
+def _retained_secret_windows(
+    fragment: str, legacy_output: str, new_output: str
+) -> list[str]:
+    """Return pieces of a masked fragment that survived into ``new_output``.
+
+    Comparing whole fragments alone lets a truncated secret through: the old
+    output dropped ``sk-LEAK-0123456789`` and the new output keeps
+    ``sk-LEAK-01234567``, which is a different fragment, so the set comparison
+    still passes. Every six-character window of the original value must be
+    gone unless the legacy output itself retained that window (a query name
+    can share a window with the value it belongs to, and that name is not a
+    secret). Any surviving window is a shorter prefix or middle slice of the
+    value the old redactor removed.
+    """
+    if len(fragment) < _NEVER_WEAKER_MIN_FRAGMENT:
+        return []
+    return [
+        window
+        for start in range(len(fragment) - _NEVER_WEAKER_MIN_FRAGMENT + 1)
+        if (window := fragment[start : start + _NEVER_WEAKER_MIN_FRAGMENT])
+        in new_output
+        and window not in legacy_output
+    ]
 
 
 def _golden_cases(section: str) -> list[tuple[str, str]]:
@@ -852,7 +900,11 @@ _REQUEST_TARGET_CASES = _golden_cases("redact_request_target")
 def _assert_never_weaker(text: str, legacy_output: str, new_output: str) -> None:
     # Only compare what the old implementation actually masked: masking more
     # than it did is fine (a log may over-mask), masking less is the bug.
-    legacy_masked = _masked_fragments(text, legacy_output)
+    legacy_masked = {
+        fragment
+        for fragment in _masked_fragments(text, legacy_output)
+        if not _HEADER_NAME_FRAGMENT.match(fragment)
+    }
     assert legacy_masked, f"sample does not exercise the legacy redactor: {text!r}"
     # Assert the same thing directly for every original secret substring the
     # old implementation masked: the failure then names the retained value
@@ -863,6 +915,17 @@ def _assert_never_weaker(text: str, legacy_output: str, new_output: str) -> None
         legacy_output,
         new_output,
         retained,
+    )
+    truncated = sorted(
+        window
+        for fragment in legacy_masked
+        for window in _retained_secret_windows(fragment, legacy_output, new_output)
+    )
+    assert not truncated, (
+        text,
+        legacy_output,
+        new_output,
+        truncated,
     )
     new_masked = _masked_fragments(text, new_output)
     assert legacy_masked <= new_masked, (
@@ -921,6 +984,28 @@ def test_request_target_redaction_is_never_weaker_than_ad253647(
     text: str, legacy_output: str
 ) -> None:
     _assert_never_weaker(text, legacy_output, redact_request_target(text))
+
+
+@pytest.mark.parametrize(
+    "truncated",
+    [
+        'Authorization: Bearer "sk-LEAK-01234567"',
+        'Authorization: Bearer "***LEAK-0123456789"',
+    ],
+    ids=["prefix", "middle"],
+)
+def test_never_weaker_assertion_rejects_a_partially_masked_secret(
+    truncated: str,
+) -> None:
+    # The old output kept the four-character suffix; a new implementation may
+    # keep that suffix too, but not a six-character prefix or a middle slice
+    # of the value it claimed to mask. Both outputs are different fragments
+    # from the original, so a whole-fragment comparison alone would pass.
+    text = 'Authorization: Bearer "sk-LEAK-0123456789"'
+    legacy_output = 'Authorization: Bearer ***789"'
+
+    with pytest.raises(AssertionError):
+        _assert_never_weaker(text, legacy_output, truncated)
 
 
 # The pre-change log redactor treated every hyphen as a token boundary, so a
@@ -1018,6 +1103,78 @@ def test_record_factory_falls_back_to_pattern_only_when_the_redactor_raises(
 
 
 @pytest.mark.usefixtures("restore_logging_state")
+def test_record_factory_fallback_masks_url_query_only_names_and_websocket_credentials(
+    monkeypatch,
+) -> None:
+    setup_logging(force=True)
+
+    def explode(text: str) -> str:
+        raise RuntimeError("redactor exploded")
+
+    monkeypatch.setattr(logging_config, "redact_log_text", explode)
+    logger = logging.getLogger("xagent.tests.fallback_url_names")
+    logger.setLevel(logging.INFO)
+    records, handler = _capture(logger)
+    try:
+        logger.warning("callback failed for https://e.com/x?code=%s", SECRET)
+        logger.warning("websocket credential xagent-auth-token.v1.%s", SECRET)
+    finally:
+        logger.removeHandler(handler)
+
+    assert [SECRET in record.getMessage() for record in records] == [False, False]
+
+
+@pytest.mark.usefixtures("restore_logging_state")
+def test_record_factory_fallback_keeps_the_access_five_tuple(monkeypatch) -> None:
+    # If the full pass raises on an access record, flattening the five-tuple
+    # would make uvicorn's AccessFormatter unpack a string and drop the line.
+    # The fallback still masks the request target and keeps the tuple.
+    import uvicorn.logging
+
+    setup_logging(force=True)
+
+    def explode(text: str) -> str:
+        raise RuntimeError("redactor exploded")
+
+    monkeypatch.setattr(logging_config, "redact_log_text", explode)
+    access_logger = logging.getLogger("uvicorn.access")
+    access_logger.setLevel(logging.INFO)
+    access_logger.propagate = False
+    records, capture_handler = _capture(access_logger)
+    stream = io.StringIO()
+    stream_handler = logging.StreamHandler(stream)
+    stream_handler.setFormatter(
+        uvicorn.logging.AccessFormatter(
+            '%(client_addr)s - "%(request_line)s" %(status_code)s',
+            use_colors=False,
+        )
+    )
+    access_logger.addHandler(stream_handler)
+    try:
+        access_logger.info(
+            '%s - "%s %s HTTP/%s" %d',
+            "127.0.0.1:1",
+            "GET",
+            f"/cb?token={SECRET}&code={SECRET}",
+            "1.1",
+            200,
+        )
+    finally:
+        access_logger.removeHandler(stream_handler)
+        access_logger.removeHandler(capture_handler)
+
+    record = records[0]
+    assert isinstance(record.args, tuple)
+    assert len(record.args) == 5
+    assert SECRET not in record.getMessage()
+    output = stream.getvalue()
+    assert SECRET not in output
+    assert (
+        '127.0.0.1:1 - "GET /cb?token=[REDACTED]&code=[REDACTED] HTTP/1.1" 200 OK'
+    ) in output
+
+
+@pytest.mark.usefixtures("restore_logging_state")
 def test_record_factory_returns_the_record_when_the_fallback_also_raises(
     monkeypatch, capsys
 ) -> None:
@@ -1041,6 +1198,27 @@ def test_record_factory_returns_the_record_when_the_fallback_also_raises(
     assert [record.getMessage() for record in records] == [f"token={SECRET}"]
     assert not getattr(records[0], "_xagent_log_redacted", False)
     assert "redactor exploded" not in capsys.readouterr().err
+
+
+@pytest.mark.usefixtures("restore_logging_state")
+def test_record_factory_masks_two_adjacent_header_values() -> None:
+    setup_logging(force=True)
+    logger = logging.getLogger("xagent.tests.adjacent_headers")
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+    records, handler = _capture(logger)
+    try:
+        logger.warning(
+            "upstream error: https://e.com/p?api_key=v"
+            "&Authorization: Bearer a&Authorization: Bearer %s",
+            "sk-LEAK-0123456789",
+        )
+    finally:
+        logger.removeHandler(handler)
+
+    message = records[0].getMessage()
+    assert "sk-LEAK-0123456789" not in message
+    assert message.count("Bearer [REDACTED]") == 2
 
 
 @pytest.mark.usefixtures("restore_logging_state")

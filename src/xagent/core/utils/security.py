@@ -304,9 +304,24 @@ def _redact_assignments(text: str, mask: Callable[[str], str]) -> str:
 # semicolon -- the same span the pre-change pattern consumed -- so a quote or
 # a bracket at the end of the value is masked instead of ending the match
 # early. The wrappers are put back by ``_mask_value_keeping_wrappers``.
+#
+# The value also stops before ``&<another header name>[:=]``. A value used to
+# consume the following ``&`` and the next header's name as part of itself,
+# after which the second header's real value was no longer adjacent to a
+# header name and stayed in the clear. Stopping only at a known header name
+# keeps an ordinary value that happens to contain ``&`` masked as a whole.
+# Each character is tested once by the negative lookahead, so this stays
+# linear.
+_HEADER_STOP_NAMES = (
+    r"[\"']?(?:proxy-)?authorization[\"']?"
+    r"|x-goog-api-key"
+    r"|x-api-key"
+    r"|x-shopify-access-token"
+)
+_HEADER_VALUE = rf"(?:(?!&(?:{_HEADER_STOP_NAMES})\s*[:=])[^\s,;])+"
 AUTH_HEADER_PATTERN = re.compile(
     r"(?i)([\"']?(?:proxy-)?authorization[\"']?\s*[:=]\s*[\"']?(?:bearer|basic)\s+)"
-    r"([^\s,;]+)"
+    rf"({_HEADER_VALUE})"
 )
 # The separator may repeat: rebuilding a query that names a credential without
 # a value appends ``=`` in front of whatever separated the name from the value
@@ -315,10 +330,15 @@ AUTH_HEADER_PATTERN = re.compile(
 # only by whitespace (``x-api-key header``) is ordinary text and still does
 # not match.
 HEADER_KEY_PATTERNS = [
-    re.compile(r"(?i)(x-goog-api-key\s*[:=]\s*(?:[:=]\s*)*)([^\s,;]+)"),
-    re.compile(r"(?i)(x-api-key\s*[:=]\s*(?:[:=]\s*)*)([^\s,;]+)"),
-    re.compile(r"(?i)(x-shopify-access-token\s*[:=]\s*(?:[:=]\s*)*)([^\s,;]+)"),
+    re.compile(rf"(?i)(x-goog-api-key\s*[:=]\s*(?:[:=]\s*)*)({_HEADER_VALUE})"),
+    re.compile(rf"(?i)(x-api-key\s*[:=]\s*(?:[:=]\s*)*)({_HEADER_VALUE})"),
+    re.compile(rf"(?i)(x-shopify-access-token\s*[:=]\s*(?:[:=]\s*)*)({_HEADER_VALUE})"),
 ]
+# A coarse ``?name=value`` / ``&name=value`` shape for the pattern-only
+# fallback, which deliberately does not parse a URL. The name still goes
+# through ``is_sensitive_param_name(..., url_query=True)``, so URL-only names
+# such as ``code``, ``state`` and ``ticket`` are covered.
+_URL_QUERY_VALUE_PATTERN = re.compile(r"([?&])([A-Za-z0-9_.~-]+)=([^&\s]+)")
 
 
 class PrivateNetworkHostError(ValueError):
@@ -942,15 +962,44 @@ _RELATIVE_TARGET_LEADING = "([{<"
 _RELATIVE_TARGET_TRAILING = ")]}>.,;:!"
 
 
+def _target_has_unmasked_sensitive_value(target: str) -> bool:
+    """Whether a relative target still holds a sensitive value to mask."""
+    try:
+        parsed = urlsplit(target)
+    except ValueError:
+        return True
+    return any(
+        value
+        and not _is_redaction_placeholder(value)
+        and is_sensitive_param_name(key, url_query=True)
+        for key, value in parse_qsl(parsed.query, keep_blank_values=True)
+    )
+
+
 def _redact_relative_target_token(token: str, *, mask: Callable[[str], str]) -> str:
     start = 0
     end = len(token)
     while start < end and token[start] in _RELATIVE_TARGET_LEADING:
         start += 1
     while end > start and token[end - 1] in _RELATIVE_TARGET_TRAILING:
+        # A ``]`` that closes ``[REDACTED]`` is part of the marker, not
+        # trailing punctuation. Stripping it made the URL rebuild insert an
+        # ``=`` in the middle of the marker (``[REDACTED=]``).
+        if (
+            token[end - 1] == "]"
+            and token[max(start, end - len(_FULL_REDACTION)) : end].upper()
+            == _FULL_REDACTION
+        ):
+            break
         end -= 1
     target = token[start:end]
     if not target.startswith("/") or "?" not in target:
+        return token
+    if _FULL_REDACTION in target and not _target_has_unmasked_sensitive_value(target):
+        # Everything the URL rule would mask here is already a marker: the
+        # header pre-pass ran before this one. Returning the token unchanged
+        # keeps the marker readable instead of percent-encoding it as a query
+        # key and appending ``=`` to it.
         return token
     redacted = _redact_url_credentials_for_logging(target, mask=mask)
     if redacted == target:
@@ -1036,6 +1085,24 @@ def _redact_jwts(text: str) -> str:
     return "".join(parts)
 
 
+def _redact_url_query_values(text: str, mask: Callable[[str], str]) -> str:
+    """Mask coarse ``?name=value`` shapes without parsing a URL.
+
+    Used by the pattern-only fallback. A value already carrying a marker is
+    left alone so a second pass stays idempotent.
+    """
+
+    def replace(match: re.Match[str]) -> str:
+        if not is_sensitive_param_name(match.group(2), url_query=True):
+            return match.group(0)
+        value = match.group(3)
+        if _is_redaction_placeholder(value):
+            return match.group(0)
+        return f"{match.group(1)}{match.group(2)}={mask(value)}"
+
+    return _URL_QUERY_VALUE_PATTERN.sub(replace, text)
+
+
 def _mask_headers(text: str, mask: Callable[[str], str]) -> str:
     """Mask the header-shaped values in ``text``."""
     text = AUTH_HEADER_PATTERN.sub(
@@ -1110,13 +1177,18 @@ def redact_log_text_pattern_only(text: str) -> str:
     A last-resort pass for the log-record factory: if
     :func:`redact_log_text` raises for any reason, this function still masks
     the shapes that need no structural parsing (``Authorization`` and the
-    ``x-api-key``-style headers, ``identifier=value`` assignments, and bare
+    ``x-api-key``-style headers, ``identifier=value`` assignments, coarse
+    ``?name=value`` query values, the websocket credential marker, and bare
     JWTs) so the record is not written out unredacted. It never parses or
     rebuilds a URL, so it cannot hit the encoding or URL-parser failures that
-    the full pass can.
+    the full pass can. Because it does not parse a URL, an encoded query name
+    or a query name it cannot see is outside its scope; the full pass is what
+    covers those.
     """
     if not text:
         return text
-    redacted = _mask_headers(text, _redact_completely)
+    redacted = WEBSOCKET_CREDENTIAL_PATTERN.sub("xagent-auth-token.[REDACTED]", text)
+    redacted = _mask_headers(redacted, _redact_completely)
+    redacted = _redact_url_query_values(redacted, _redact_completely)
     redacted = _redact_assignments(redacted, _redact_completely)
     return _redact_jwts(redacted)

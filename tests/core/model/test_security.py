@@ -14,6 +14,7 @@ from xagent.core.utils.security import (
     PrivateNetworkHostError,
     fetch_public_http_bytes,
     redact_log_text,
+    redact_log_text_pattern_only,
     redact_sensitive_text,
     redact_url_credentials_for_logging,
     reject_private_network_host,
@@ -365,6 +366,118 @@ def test_a_header_shaped_value_beside_a_valueless_credential_is_masked(
 
     assert _N9_SECRET not in redacted, (text, redacted)
     assert redacted != text, text
+
+
+# Two header-shaped values can sit directly beside each other in one malformed
+# query (``...&X-Api-Key: a&Authorization: Bearer sk-...``). The first value
+# used to consume the ``&`` and the next header's name, so the second header's
+# real value was no longer next to a header name and stayed readable. Only a
+# known header name ends the value now; a plain ``&`` inside a value is still
+# masked as part of that value.
+_N15_SECRET = "sk-LEAK-0123456789"
+_N15_HEADER_PAIRS = (
+    ("Authorization", "Authorization"),
+    ("x-goog-api-key", "X-Api-Key"),
+    ("x-api-key", "x-shopify-access-token"),
+)
+_N15_BASES = ("https://e.com/p?api_key=v&", "/cb?api_key=v&")
+_N15_SEPARATORS = (":", ": ", "=", " = ")
+
+
+def _header_with_value(name: str, value: str, separator: str) -> str:
+    scheme = "Bearer " if name.lower().endswith("authorization") else ""
+    return f"{name}{separator}{scheme}{value}"
+
+
+@pytest.mark.parametrize(
+    "redact", [redact_sensitive_text, redact_log_text], ids=["text", "log"]
+)
+@pytest.mark.parametrize(("first_name", "second_name"), _N15_HEADER_PAIRS)
+@pytest.mark.parametrize("base", _N15_BASES)
+@pytest.mark.parametrize("separator", _N15_SEPARATORS)
+@pytest.mark.parametrize("secret_first", [True, False])
+def test_two_adjacent_header_values_are_both_masked(
+    redact,
+    first_name: str,
+    second_name: str,
+    base: str,
+    separator: str,
+    secret_first: bool,
+) -> None:
+    other = "plain"
+    if secret_first:
+        first = _header_with_value(first_name, _N15_SECRET, separator)
+        second = _header_with_value(second_name, other, separator)
+    else:
+        first = _header_with_value(first_name, other, separator)
+        second = _header_with_value(second_name, _N15_SECRET, separator)
+    text = f"{base}{first}&{second}"
+
+    redacted = redact(text)
+
+    assert _N15_SECRET not in redacted, (text, redacted)
+    assert other not in redacted, (text, redacted)
+
+
+@pytest.mark.parametrize(
+    ("redact", "expected"),
+    [
+        (redact_sensitive_text, "x-api-key: ***ef"),
+        (redact_log_text, "x-api-key: [REDACTED]"),
+    ],
+    ids=["text", "log"],
+)
+def test_a_header_value_containing_an_ampersand_is_still_masked(
+    redact, expected: str
+) -> None:
+    # The value only stops at ``&<known header name>[:=]``. An ordinary ``&``
+    # does not split it, so the whole value is masked as one secret.
+    assert redact("x-api-key: abc&def") == expected
+
+
+@pytest.mark.parametrize(
+    ("text", "secret"),
+    [
+        (f"https://e.com/x?code={_N9_SECRET}", _N9_SECRET),
+        (f"https://e.com/x?ticket={_N9_SECRET}", _N9_SECRET),
+        (f"https://e.com/x?state={_N9_SECRET}", _N9_SECRET),
+        (f"https://e.com/x?jwt={_N9_SECRET}", _N9_SECRET),
+        (f"https://e.com/x?session={_N9_SECRET}", _N9_SECRET),
+        (f"callback?page=1&code={_N9_SECRET}&state=ok", _N9_SECRET),
+        (f"xagent-auth-token.v1.{_N9_SECRET}", _N9_SECRET),
+    ],
+    ids=[
+        "code",
+        "ticket",
+        "state",
+        "jwt",
+        "session",
+        "ampersand-query",
+        "websocket",
+    ],
+)
+def test_pattern_only_fallback_masks_url_query_names_and_websocket_credentials(
+    text: str, secret: str
+) -> None:
+    # The pattern-only fallback does not parse a URL, so it also needs the
+    # coarse ``?name=value`` / ``&name=value`` rule for names that are only
+    # credentials in a query, plus the websocket credential marker.
+    redacted = redact_log_text_pattern_only(text)
+
+    assert secret not in redacted, (text, redacted)
+    assert redacted != text, text
+
+
+def test_pattern_only_fallback_leaves_a_non_secret_query_value_alone() -> None:
+    text = "https://e.com/x?page_size=50&sort=name"
+
+    assert redact_log_text_pattern_only(text) == text
+
+
+def test_pattern_only_fallback_keeps_an_existing_marker() -> None:
+    text = "https://e.com/x?code=[REDACTED]"
+
+    assert redact_log_text_pattern_only(text) == text
 
 
 @pytest.mark.parametrize(

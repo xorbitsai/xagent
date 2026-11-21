@@ -61,6 +61,12 @@ def _redact_argument(value: object) -> object:
     return value
 
 
+def _redact_argument_pattern_only(value: object) -> object:
+    if isinstance(value, str):
+        return redact_log_text_pattern_only(value)
+    return value
+
+
 def _redact_args(args: object) -> object:
     """Redact string elements of a tuple/dict of log arguments in place."""
     if isinstance(args, tuple):
@@ -177,8 +183,23 @@ def _redact_record_pattern_only(record: logging.LogRecord) -> None:
         stack_info = redact_log_text_pattern_only(stack_info)
 
     if changed:
-        record.msg = redacted_message
-        record.args = ()
+        if (
+            record.name in _ARG_PRESERVING_LOGGERS
+            and isinstance(record.args, tuple)
+            and len(record.args) == 5
+        ):
+            # uvicorn's access formatter unpacks the five-tuple and ignores
+            # record.msg. Flattening it here would drop an access line that
+            # the full pass could not redact, so mask the tuple elements and
+            # keep the shape the formatter needs. The format string is masked
+            # too, for a plain formatter that reads it.
+            record.msg = _redact_argument_pattern_only(record.msg)
+            record.args = tuple(
+                _redact_argument_pattern_only(item) for item in record.args
+            )
+        else:
+            record.msg = redacted_message
+            record.args = ()
     record.exc_text = exc_text
     record.stack_info = stack_info
     setattr(record, _RECORD_MARKER, True)

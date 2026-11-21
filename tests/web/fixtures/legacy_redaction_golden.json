@@ -83,6 +83,102 @@
     {
       "input": "/cb?X-Api-Key = sk-FUZZ-0123456789",
       "legacy_output": "/cb?X-Api-Key = ***6789"
+    },
+    {
+      "input": "https://e.com/p?api_key=v&Authorization: Bearer sk-LEAK-0123456789&Authorization: Bearer plain",
+      "legacy_output": "https://e.com/p?api_key=***%2Av&Authorization%3A= Bearer sk-LEAK-0123456789&Authorization: Bearer ***in"
+    },
+    {
+      "input": "https://e.com/p?api_key=v&Authorization: Bearer plain&Authorization: Bearer sk-LEAK-0123456789",
+      "legacy_output": "https://e.com/p?api_key=***%2Av&Authorization%3A= Bearer plain&Authorization: Bearer ***6789"
+    },
+    {
+      "input": "https://e.com/p?api_key=v&Authorization = Bearer sk-LEAK-0123456789&Authorization = Bearer plain",
+      "legacy_output": "https://e.com/p?api_key=***%2Av&Authorization= = Bearer sk-LEAK-0123456789&Authorization = Bearer ***in"
+    },
+    {
+      "input": "https://e.com/p?api_key=v&Authorization = Bearer plain&Authorization = Bearer sk-LEAK-0123456789",
+      "legacy_output": "https://e.com/p?api_key=***%2Av&Authorization= = Bearer plain&Authorization = Bearer ***6789"
+    },
+    {
+      "input": "/cb?api_key=v&Authorization: Bearer sk-LEAK-0123456789&Authorization: Bearer plain",
+      "legacy_output": "/cb?api_key=***v&Authorization: Bearer ***ion: Bearer plain"
+    },
+    {
+      "input": "/cb?api_key=v&Authorization: Bearer plain&Authorization: Bearer sk-LEAK-0123456789",
+      "legacy_output": "/cb?api_key=***v&Authorization: Bearer ***ion: Bearer sk-LEAK-0123456789"
+    },
+    {
+      "input": "/cb?api_key=v&Authorization = Bearer sk-LEAK-0123456789&Authorization = Bearer plain",
+      "legacy_output": "/cb?api_key=***v&Authorization = Bearer ***tion = Bearer plain"
+    },
+    {
+      "input": "/cb?api_key=v&Authorization = Bearer plain&Authorization = Bearer sk-LEAK-0123456789",
+      "legacy_output": "/cb?api_key=***v&Authorization = Bearer ***tion = Bearer sk-LEAK-0123456789"
+    },
+    {
+      "input": "https://e.com/p?api_key=v&x-goog-api-key: sk-LEAK-0123456789&X-Api-Key: plain",
+      "legacy_output": "https://e.com/p?api_key=***%2Av&x-goog-api-key%3A= sk-LEAK-0123456789&X-Api-Key: ***in"
+    },
+    {
+      "input": "https://e.com/p?api_key=v&x-goog-api-key: plain&X-Api-Key: sk-LEAK-0123456789",
+      "legacy_output": "https://e.com/p?api_key=***%2Av&x-goog-api-key%3A= plain&X-Api-Key: ***6789"
+    },
+    {
+      "input": "https://e.com/p?api_key=v&x-goog-api-key = sk-LEAK-0123456789&X-Api-Key = plain",
+      "legacy_output": "https://e.com/p?api_key=***%2Av&x-goog-api-key= ***= sk-LEAK-0123456789&X-Api-Key = ***in"
+    },
+    {
+      "input": "https://e.com/p?api_key=v&x-goog-api-key = plain&X-Api-Key = sk-LEAK-0123456789",
+      "legacy_output": "https://e.com/p?api_key=***%2Av&x-goog-api-key= ***= plain&X-Api-Key = ***6789"
+    },
+    {
+      "input": "/cb?api_key=v&x-goog-api-key: sk-LEAK-0123456789&X-Api-Key: plain",
+      "legacy_output": "/cb?api_key=***v&x-goog-api-key: ***Key: plain"
+    },
+    {
+      "input": "/cb?api_key=v&x-goog-api-key: plain&X-Api-Key: sk-LEAK-0123456789",
+      "legacy_output": "/cb?api_key=***v&x-goog-api-key: ***Key: sk-LEAK-0123456789"
+    },
+    {
+      "input": "/cb?api_key=v&x-goog-api-key = sk-LEAK-0123456789&X-Api-Key = plain",
+      "legacy_output": "/cb?api_key=***v&x-goog-api-key = ***-Key = plain"
+    },
+    {
+      "input": "/cb?api_key=v&x-goog-api-key = plain&X-Api-Key = sk-LEAK-0123456789",
+      "legacy_output": "/cb?api_key=***v&x-goog-api-key = ***-Key = sk-LEAK-0123456789"
+    },
+    {
+      "input": "https://e.com/p?api_key=v&x-api-key: sk-LEAK-0123456789&x-shopify-access-token: plain",
+      "legacy_output": "https://e.com/p?api_key=***%2Av&x-api-key%3A= sk-LEAK-0123456789&x-shopify-access-token: ***in"
+    },
+    {
+      "input": "https://e.com/p?api_key=v&x-api-key: plain&x-shopify-access-token: sk-LEAK-0123456789",
+      "legacy_output": "https://e.com/p?api_key=***%2Av&x-api-key%3A= plain&x-shopify-access-token: ***6789"
+    },
+    {
+      "input": "https://e.com/p?api_key=v&x-api-key = sk-LEAK-0123456789&x-shopify-access-token = plain",
+      "legacy_output": "https://e.com/p?api_key=***%2Av&x-api-key= ***= sk-LEAK-0123456789&x-shopify-access-token = ***in"
+    },
+    {
+      "input": "https://e.com/p?api_key=v&x-api-key = plain&x-shopify-access-token = sk-LEAK-0123456789",
+      "legacy_output": "https://e.com/p?api_key=***%2Av&x-api-key= ***= plain&x-shopify-access-token = ***6789"
+    },
+    {
+      "input": "/cb?api_key=v&x-api-key: sk-LEAK-0123456789&x-shopify-access-token: plain",
+      "legacy_output": "/cb?api_key=***v&x-api-key: ***ken: plain"
+    },
+    {
+      "input": "/cb?api_key=v&x-api-key: plain&x-shopify-access-token: sk-LEAK-0123456789",
+      "legacy_output": "/cb?api_key=***v&x-api-key: ***ken: sk-LEAK-0123456789"
+    },
+    {
+      "input": "/cb?api_key=v&x-api-key = sk-LEAK-0123456789&x-shopify-access-token = plain",
+      "legacy_output": "/cb?api_key=***v&x-api-key = ***oken = plain"
+    },
+    {
+      "input": "/cb?api_key=v&x-api-key = plain&x-shopify-access-token = sk-LEAK-0123456789",
+      "legacy_output": "/cb?api_key=***v&x-api-key = ***oken = sk-LEAK-0123456789"
     }
   ],
   "redact_url_credentials_for_logging": [

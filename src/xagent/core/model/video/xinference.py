@@ -5,21 +5,34 @@ import base64
 import json
 import logging
 import math
+import time
+import uuid
 from collections.abc import Mapping
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, List, Optional, Self
 from urllib import parse
 from urllib.request import url2pathname
 
 import aiohttp
+from multidict import CIMultiDict, CIMultiDictProxy
+from yarl import URL
 
-from ....config import get_media_download_max_bytes
+from ....config import (
+    get_media_download_max_bytes,
+    get_xinference_saas_video_async_enabled,
+)
 from ...tools.core.media_errors import MediaParameterError, redact_provider_detail
 from ...utils.public_download import download_public_input
 from ..chat.token_context import MediaCallType
 from ..media_metering import record_provider_usage
 from ..public_http import create_public_model_aiohttp_session
-from .base import BaseVideoModel, BilledVideoTaskError, VideoGenerationCapabilities
+from .base import (
+    BaseVideoModel,
+    BilledVideoTaskError,
+    BilledVideoTaskTimeout,
+    VideoGenerationCapabilities,
+)
 
 logger = logging.getLogger(__name__)
 # "No response body yet", distinct from anything a server could return.
@@ -160,6 +173,70 @@ SAAS_VIDEO_MIN_SECONDS = 4
 SAAS_VIDEO_MAX_SECONDS = 15
 SAAS_VIDEO_MAX_SEED = 2**31 - 1
 
+# Async job API (``XAGENT_XINFERENCE_SAAS_VIDEO_ASYNC``). The server expires a
+# job that sat queued for 30 minutes, so the wait has to outlast that plus the
+# render itself; a shorter configured timeout (the platform default is 30
+# minutes) would give up on jobs the server is still going to run.
+SAAS_VIDEO_QUEUE_EXPIRY_SECONDS = 1800.0
+SAAS_VIDEO_RENDER_ALLOWANCE_SECONDS = 900.0
+SAAS_VIDEO_MIN_JOB_DEADLINE_SECONDS = (
+    SAAS_VIDEO_QUEUE_EXPIRY_SECONDS + SAAS_VIDEO_RENDER_ALLOWANCE_SECONDS
+)
+SAAS_VIDEO_JOB_POLL_SECONDS = 5.0
+SAAS_VIDEO_QUEUE_FULL_RETRY_SECONDS = 30.0
+SAAS_VIDEO_SUBMIT_ATTEMPTS = 3
+SAAS_VIDEO_SUBMIT_PAUSE_SECONDS = 2.0
+SAAS_VIDEO_REQUEST_TIMEOUT_SECONDS = 60.0
+SAAS_VIDEO_CONTENT_TIMEOUT_SECONDS = 600.0
+# Failure codes the server documents as not charged.
+_SAAS_UNBILLED_FAILURE_CODES = frozenset(
+    {"video_expired", "video_cancelled", "upstream_failure"}
+)
+
+
+@dataclass
+class _JobResponse:
+    status: int
+    headers: Any
+    body: Any = None
+    content: bytes = b""
+
+    @property
+    def error_code(self) -> Optional[str]:
+        return _saas_error_code(self.body)
+
+
+def _saas_error_code(body: Any) -> Optional[str]:
+    if not isinstance(body, dict):
+        return None
+    error = body.get("error")
+    if isinstance(error, dict) and isinstance(error.get("code"), str):
+        return str(error["code"])
+    if isinstance(error, str):
+        return error
+    detail = body.get("detail")
+    if isinstance(detail, dict) and isinstance(detail.get("code"), str):
+        return str(detail["code"])
+    return None
+
+
+def _saas_error_message(body: Any) -> str:
+    if isinstance(body, dict):
+        error = body.get("error")
+        if isinstance(error, dict) and error.get("message"):
+            return str(error["message"])
+        if error:
+            return str(error)
+    return ""
+
+
+def _retry_after_seconds(headers: Any, default: float) -> float:
+    try:
+        value = float(headers.get("Retry-After"))
+    except (AttributeError, TypeError, ValueError):
+        return default
+    return value if value > 0 else default
+
 
 def _saas_allowed_sizes() -> list[str]:
     return [f"{w}x{h}" for w, h in SAAS_VIDEO_SIZES]
@@ -237,6 +314,14 @@ def _saas_seed(value: Any) -> int | None:
             allowed_values={"seed": [0, SAAS_VIDEO_MAX_SEED]},
         )
     return int(value)
+
+
+class _JobDeadline(Exception):
+    """The job wait outlived its deadline."""
+
+
+class _JobFatal(Exception):
+    """Polling can no longer reach the job."""
 
 
 class XinferenceVideoModel(BaseVideoModel):
@@ -559,6 +644,17 @@ class XinferenceVideoModel(BaseVideoModel):
         dimensions = _saas_dimensions(size)
         seed_value = _saas_seed(seed)
 
+        if get_xinference_saas_video_async_enabled():
+            return await self._run_saas_video_job(
+                prompt=prompt,
+                duration_value=duration_value,
+                dimensions=dimensions,
+                seed_value=seed_value,
+                resolution=resolution,
+                ratio=ratio,
+                timeout=timeout,
+            )
+
         body: dict[str, Any] = {
             "model": self._model_uid,
             "prompt": prompt,
@@ -625,6 +721,362 @@ class XinferenceVideoModel(BaseVideoModel):
             "frames": video_item.get("frames"),
             "raw_response": data,
         }
+
+    # ----------------------------------------------------------------------
+    # xinference-saas async job API (POST/GET/DELETE /v1/videos)
+    # ----------------------------------------------------------------------
+
+    def _job_host(self) -> str:
+        """Bare host: the job paths carry their own ``/v1``."""
+        host = self.base_url
+        return host[: -len("/v1")] if host.endswith("/v1") else host
+
+    async def _job_call(
+        self,
+        session: aiohttp.ClientSession,
+        method: str,
+        path: str,
+        *,
+        json_body: Optional[dict[str, Any]] = None,
+        headers: Optional[dict[str, str]] = None,
+        read_bytes: bool = False,
+        timeout: float = SAAS_VIDEO_REQUEST_TIMEOUT_SECONDS,
+    ) -> _JobResponse:
+        kwargs: dict[str, Any] = {
+            "headers": {**self._headers(), **(headers or {})},
+            "timeout": aiohttp.ClientTimeout(total=timeout),
+        }
+        if json_body is not None:
+            kwargs["json"] = json_body
+        async with session.request(
+            method, f"{self._job_host()}{path}", **kwargs
+        ) as response:
+            if read_bytes and response.status == 200:
+                return _JobResponse(
+                    response.status, response.headers, content=await response.read()
+                )
+            try:
+                body = await response.json(content_type=None)
+            except Exception:  # noqa: BLE001 - an unreadable body is just absent
+                body = None
+            return _JobResponse(response.status, response.headers, body)
+
+    def _job_http_error(
+        self, path: str, response: _JobResponse, message: str
+    ) -> aiohttp.ClientResponseError:
+        url = URL(f"{self._job_host()}{path}")
+        info = aiohttp.RequestInfo(url, "POST", CIMultiDictProxy(CIMultiDict()), url)
+        return aiohttp.ClientResponseError(
+            info,
+            (),
+            status=response.status,
+            message=message,
+            headers=response.headers,
+        )
+
+    def _record_job_usage(
+        self, quantity: Any, resolution: Optional[str], job_id: str, why: str
+    ) -> None:
+        logger.info(
+            "Recording xinference-saas video usage for %s (%s): %s",
+            job_id,
+            why,
+            quantity,
+        )
+        record_provider_usage(
+            self, MediaCallType.VIDEO, quantity, resolution=resolution or ""
+        )
+
+    async def _submit_video_job(
+        self,
+        session: aiohttp.ClientSession,
+        body: dict[str, Any],
+        deadline: float,
+    ) -> str:
+        """POST the job; return its id. Nothing here has billed yet.
+
+        One ``Idempotency-Key`` covers every attempt, so a POST whose answer
+        was lost cannot start a second render. A full queue (429) is retried
+        after the server's ``Retry-After``; once the attempts run out it is
+        raised as a plain 429, which the retry wrapper may try again because
+        no job exists. Any other failure that could still hide a created job
+        is raised without a retryable cause.
+        """
+        key = uuid.uuid4().hex
+        last_error: Exception | None = None
+        for attempt in range(SAAS_VIDEO_SUBMIT_ATTEMPTS):
+            last = attempt == SAAS_VIDEO_SUBMIT_ATTEMPTS - 1
+            try:
+                response = await self._job_call(
+                    session,
+                    "POST",
+                    "/v1/videos",
+                    json_body=body,
+                    headers={"Idempotency-Key": key},
+                )
+            except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+                # The request may have reached the server and created the job.
+                last_error = exc
+                if last:
+                    raise RuntimeError(
+                        "Xinference video job submission failed and may have "
+                        f"created a job: {type(exc).__name__}"
+                    ) from None
+                await asyncio.sleep(SAAS_VIDEO_SUBMIT_PAUSE_SECONDS)
+                continue
+            if response.status in (200, 201, 202):
+                job_id = (
+                    response.body.get("id") if isinstance(response.body, dict) else None
+                )
+                if not job_id:
+                    raise BilledVideoTaskError(
+                        "Xinference accepted the video job but returned no id"
+                    )
+                return str(job_id)
+            if response.status == 429:
+                wait = _retry_after_seconds(
+                    response.headers, SAAS_VIDEO_QUEUE_FULL_RETRY_SECONDS
+                )
+                if last or time.monotonic() + wait >= deadline:
+                    raise self._job_http_error(
+                        "/v1/videos",
+                        response,
+                        "Xinference video queue is full: "
+                        f"{response.error_code or 'rate limited'}",
+                    )
+                logger.warning(
+                    "Xinference video queue is full; retrying in %.0fs", wait
+                )
+                await asyncio.sleep(wait)
+                continue
+            if response.status >= 500:
+                last_error = RuntimeError(f"HTTP {response.status}")
+                if last:
+                    raise RuntimeError(
+                        "Xinference video job submission failed with HTTP "
+                        f"{response.status} and may have created a job"
+                    )
+                await asyncio.sleep(SAAS_VIDEO_SUBMIT_PAUSE_SECONDS)
+                continue
+            raise self._job_http_error(
+                "/v1/videos",
+                response,
+                f"Xinference video request failed: "
+                f"{response.error_code or response.body}",
+            )
+        raise RuntimeError(  # pragma: no cover - the loop always returns or raises
+            f"Xinference video job submission failed: {last_error}"
+        )
+
+    async def _abandon_video_job(
+        self,
+        session: aiohttp.ClientSession,
+        job_id: str,
+        last_status: Optional[str],
+        requested_seconds: Any,
+        resolution: Optional[str],
+    ) -> str:
+        """DELETE a job nobody is waiting for and record what it may cost.
+
+        Returns ``"free"`` (cancelled while queued), ``"charged"`` (the render
+        runs or ran) or ``"unknown"`` (the DELETE could not tell). A queued job
+        is not charged; a rendering one is, so the requested seconds stand in
+        for the bill the poll never delivered. An unknown outcome is recorded
+        as an unmeasured call so a possible charge is not invisible.
+        """
+        outcome = "unknown"
+        try:
+            response = await asyncio.wait_for(
+                self._job_call(session, "DELETE", f"/v1/videos/{job_id}", timeout=15.0),
+                timeout=20.0,
+            )
+            if response.status == 409 and response.error_code == "video_in_progress":
+                outcome = "charged"
+            elif response.status == 200:
+                # A 200 on a job last seen rendering means it finished first
+                # and its file was deleted without a refund.
+                outcome = "free" if last_status in (None, "queued") else "charged"
+        except Exception as exc:  # noqa: BLE001 - best effort
+            logger.warning(
+                "Could not cancel xinference-saas video job %s: %s",
+                job_id,
+                redact_provider_detail(exc),
+            )
+        finally:
+            if outcome == "charged":
+                self._record_job_usage(
+                    requested_seconds or 0, resolution, job_id, "render not cancellable"
+                )
+            elif outcome == "unknown":
+                self._record_job_usage(0, resolution, job_id, "cancel outcome unknown")
+        return outcome
+
+    async def _run_saas_video_job(
+        self,
+        *,
+        prompt: str,
+        duration_value: int | float | None,
+        dimensions: tuple[int, int] | None,
+        seed_value: int | None,
+        resolution: Optional[str],
+        ratio: Optional[str],
+        timeout: float,
+    ) -> dict[str, Any]:
+        seconds = math.ceil(duration_value) if duration_value is not None else None
+        size = f"{dimensions[0]}x{dimensions[1]}" if dimensions else None
+        body: dict[str, Any] = {"model": self._model_uid, "prompt": prompt}
+        if seconds is not None:
+            body["seconds"] = seconds
+        if size is not None:
+            body["size"] = size
+        if seed_value is not None:
+            body["seed"] = seed_value
+
+        deadline = time.monotonic() + max(timeout, SAAS_VIDEO_MIN_JOB_DEADLINE_SECONDS)
+        async with create_public_model_aiohttp_session(
+            timeout=aiohttp.ClientTimeout(total=None)
+        ) as session:
+            try:
+                job_id = await self._submit_video_job(session, body, deadline)
+            except (asyncio.CancelledError, BilledVideoTaskError):
+                raise
+            except Exception as exc:
+                logger.error(
+                    "Xinference video generation failed: %s",
+                    redact_provider_detail(exc),
+                )
+                raise RuntimeError(
+                    f"Xinference video generation failed: {exc}"
+                ) from exc
+
+            state: dict[str, Any] = {"status": None, "recorded": False}
+            try:
+                completed = await self._wait_for_video_job(
+                    session, job_id, deadline, state
+                )
+            except asyncio.CancelledError:
+                if not state["recorded"]:
+                    state["recorded"] = True
+                    await self._abandon_video_job(
+                        session, job_id, state["status"], seconds, size
+                    )
+                raise
+            except _JobDeadline as exc:
+                state["recorded"] = True
+                outcome = await self._abandon_video_job(
+                    session, job_id, state["status"], seconds, size
+                )
+                message = (
+                    f"Timed out waiting for video job {job_id}; "
+                    f"last status: {state['status']}"
+                )
+                if outcome == "free":
+                    raise TimeoutError(message) from exc
+                raise BilledVideoTaskTimeout(message) from exc
+            except _JobFatal as exc:
+                state["recorded"] = True
+                await self._abandon_video_job(
+                    session, job_id, state["status"], seconds, size
+                )
+                raise BilledVideoTaskError(str(exc)) from None
+
+            billed = self._job_billed_seconds(completed, seconds)
+            state["recorded"] = True
+            self._record_job_usage(billed, size or resolution, job_id, "completed")
+            try:
+                content = await self._job_call(
+                    session,
+                    "GET",
+                    f"/v1/videos/{job_id}/content",
+                    read_bytes=True,
+                    timeout=SAAS_VIDEO_CONTENT_TIMEOUT_SECONDS,
+                )
+            except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+                raise BilledVideoTaskError(
+                    f"Could not download video job {job_id}: {type(exc).__name__}"
+                ) from None
+            if content.status != 200 or not content.content:
+                raise BilledVideoTaskError(
+                    f"Could not download video job {job_id}: HTTP {content.status} "
+                    f"{content.error_code or ''}".strip()
+                )
+
+        encoded = base64.b64encode(content.content).decode("ascii")
+        return {
+            "task_id": job_id,
+            "model": self.model_name,
+            "status": "succeeded",
+            "video_url": f"data:video/mp4;base64,{encoded}",
+            "last_frame_url": None,
+            "seed": completed.get("seed", seed_value),
+            "resolution": size or resolution,
+            "ratio": ratio,
+            "duration": billed,
+            "frames": None,
+            "raw_response": completed,
+        }
+
+    @staticmethod
+    def _job_billed_seconds(job: dict[str, Any], requested: Any) -> Any:
+        usage = job.get("usage")
+        reported = usage.get("video_seconds") if isinstance(usage, dict) else None
+        return reported if reported else requested
+
+    async def _wait_for_video_job(
+        self,
+        session: aiohttp.ClientSession,
+        job_id: str,
+        deadline: float,
+        state: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Poll to ``completed`` and return the job; raise on any other end."""
+        while True:
+            try:
+                response = await self._job_call(session, "GET", f"/v1/videos/{job_id}")
+            except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+                logger.warning(
+                    "Transient error polling video job %s: %s",
+                    job_id,
+                    redact_provider_detail(exc),
+                )
+                response = None
+            if response is not None and response.status == 200:
+                job = response.body if isinstance(response.body, dict) else {}
+                status = job.get("status")
+                state["status"] = status if isinstance(status, str) else state["status"]
+                if status == "completed":
+                    return job
+                if status == "failed":
+                    state["recorded"] = True
+                    code = _saas_error_code(job)
+                    detail = _saas_error_message(job)
+                    if code in _SAAS_UNBILLED_FAILURE_CODES:
+                        raise RuntimeError(
+                            f"Video job {job_id} failed ({code}): {detail}"
+                        )
+                    self._record_job_usage(0, None, job_id, "failed, code unknown")
+                    raise BilledVideoTaskError(
+                        f"Video job {job_id} failed ({code or 'unknown'}): {detail}"
+                    )
+                position = job.get("queue_position")
+                if position is not None:
+                    logger.info("Video job %s queue position %s", job_id, position)
+            elif (
+                response is not None
+                and 400 <= response.status < 500
+                and (response.status != 429)
+            ):
+                # The job id stopped resolving or the key stopped working; the
+                # job may still run, so stop waiting without a second submit.
+                state["recorded"] = False
+                raise _JobFatal(
+                    f"Video job {job_id} could not be polled: HTTP {response.status} "
+                    f"{response.error_code or ''}".strip()
+                )
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise _JobDeadline()
+            await asyncio.sleep(min(SAAS_VIDEO_JOB_POLL_SECONDS, remaining))
 
     async def generate_video(
         self,

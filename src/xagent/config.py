@@ -386,6 +386,7 @@ MCP_PRIVATE_CIDRS = "XAGENT_MCP_PRIVATE_CIDRS"
 
 TOOL_MAX_OUTPUT_LENGTH = "XAGENT_TOOL_MAX_OUTPUT_LENGTH"
 FETCH_WEB_CONTENT_BUDGET = "XAGENT_FETCH_WEB_CONTENT_BUDGET"
+XINFERENCE_SAAS_VIDEO_ASYNC = "XAGENT_XINFERENCE_SAAS_VIDEO_ASYNC"
 FETCH_WEB_CONTENT_MAX_CHARS = "XAGENT_FETCH_WEB_CONTENT_MAX_CHARS"
 DEFAULT_FETCH_WEB_CONTENT_MAX_CHARS = 12_000
 TOOL_MAX_RECURSION_DEPTH = "XAGENT_TOOL_MAX_RECURSION_DEPTH"
@@ -4962,6 +4963,17 @@ def get_tool_max_output_length() -> int:
         except ValueError:
             logger.warning("Invalid %s value: %s", TOOL_MAX_OUTPUT_LENGTH, env_str)
     return 50 * 1024
+
+
+def get_xinference_saas_video_async_enabled() -> bool:
+    """Whether the ``xinference-saas`` video provider uses the async job API.
+
+    Off by default: the provider keeps the single blocking
+    ``POST /v1/video/generations``. Set ``XAGENT_XINFERENCE_SAAS_VIDEO_ASYNC=true``
+    to submit ``POST /v1/videos`` jobs and poll them instead, once the server
+    exposes that API. Read on every call, so flipping it needs no restart.
+    """
+    return _get_strict_bool_env(XINFERENCE_SAAS_VIDEO_ASYNC, False)
 
 
 def get_fetch_web_content_budget_enabled() -> bool:

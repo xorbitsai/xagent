@@ -23,8 +23,6 @@ logger = logging.getLogger(__name__)
 security = HTTPBearer()
 optional_security = HTTPBearer(auto_error=False)
 
-_GENERIC_CREDENTIAL_REJECTION_DETAIL = "Could not validate credentials"
-
 
 class _AccessTokenRejectionReason(Enum):
     """Credential rejection categories owned by access-token authentication."""
@@ -34,6 +32,7 @@ class _AccessTokenRejectionReason(Enum):
     WRONG_TYPE = auto()
     INVALID_CLAIMS = auto()
     USER_NOT_FOUND = auto()
+    SESSION_REVOKED = auto()
     IDLE_EXPIRED = auto()
 
 
@@ -108,7 +107,7 @@ def _authenticate_access_token(
     if user is None:
         raise _AccessTokenRejected(_AccessTokenRejectionReason.USER_NOT_FOUND)
     if not matches_user_session(user, payload):
-        raise _AccessTokenRejected(_AccessTokenRejectionReason.INVALID)
+        raise _AccessTokenRejected(_AccessTokenRejectionReason.SESSION_REVOKED)
     # Applies even when verify_exp is off (WebSocket rechecks): a still valid
     # JWT never outlives its login's idle deadline or revocation. With the
     # policy off, a revoked login or one that expired while enforced is rejected.
@@ -127,6 +126,7 @@ def _required_http_rejection(reason: _AccessTokenRejectionReason) -> NoReturn:
             headers = {"WWW-Authenticate": "Bearer", "Error-Type": "TokenExpired"}
         case (
             _AccessTokenRejectionReason.INVALID
+            | _AccessTokenRejectionReason.SESSION_REVOKED
             | _AccessTokenRejectionReason.WRONG_TYPE
             | _AccessTokenRejectionReason.INVALID_CLAIMS
             | _AccessTokenRejectionReason.USER_NOT_FOUND
@@ -138,7 +138,7 @@ def _required_http_rejection(reason: _AccessTokenRejectionReason) -> NoReturn:
             assert_never(reason)
     raise HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
-        detail=_GENERIC_CREDENTIAL_REJECTION_DETAIL,
+        detail="Could not validate credentials",
         headers=headers,
     )
 

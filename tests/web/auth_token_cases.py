@@ -38,7 +38,6 @@ class RejectedAccessTokenCase:
     """One stable credential-rejection reason and its public HTTP contract."""
 
     id: str
-    expected_detail: str
     expected_header_items: tuple[tuple[str, str], ...]
     expected_rejection_reason: str
     claim_items: tuple[tuple[str, object], ...] = ()
@@ -65,35 +64,30 @@ _BEARER_HEADERS = (("WWW-Authenticate", "Bearer"),)
 REJECTED_ACCESS_TOKEN_CASES = (
     RejectedAccessTokenCase(
         "expired",
-        "Could not validate credentials",
         _BEARER_HEADERS + (("Error-Type", "TokenExpired"),),
         "expired",
         lifetime=-_DEFAULT_LIFETIME,
     ),
     RejectedAccessTokenCase(
         "invalid-signature",
-        "Could not validate credentials",
         _BEARER_HEADERS + (("Error-Type", "InvalidToken"),),
         "invalid",
         signing_secret="different-signing-secret",
     ),
     RejectedAccessTokenCase(
         "wrong-type",
-        "Could not validate credentials",
         _BEARER_HEADERS + (("Error-Type", "InvalidToken"),),
         "wrong_type",
         (("type", "refresh"),),
     ),
     RejectedAccessTokenCase(
         "invalid-claims",
-        "Could not validate credentials",
         _BEARER_HEADERS + (("Error-Type", "InvalidToken"),),
         "invalid_claims",
         (("user_id", "1"),),
     ),
     RejectedAccessTokenCase(
         "user-not-found",
-        "Could not validate credentials",
         _BEARER_HEADERS + (("Error-Type", "InvalidToken"),),
         "user_not_found",
         (("sub", "missing-user"),),

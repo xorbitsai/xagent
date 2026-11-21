@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import logging
 import os
 import tempfile
 from types import SimpleNamespace
@@ -1963,6 +1964,45 @@ class TestModelAPI:
         assert model_module._CONNECTION_TEST_TIMEOUT_SECONDS == 60.0
         assert "60 seconds" in data["error"]
         assert "network" not in data["error"].lower()
+
+    def test_test_connection_error_never_carries_an_authorization_value(
+        self, test_db, regular_user, regular_headers, caplog
+    ):
+        """An upstream error body can echo the request's Authorization header.
+
+        The log line and the error field returned to the client must both
+        carry the redacted text, not the raw exception.
+        """
+        leak = '{"headers": {"Authorization": "Bearer sk-test"}}'
+
+        class FailingLLM:
+            async def chat(self, messages, **kwargs):
+                raise Exception(leak)
+
+        with patch(
+            "xagent.core.model.chat.basic.adapter.create_base_llm",
+            return_value=FailingLLM(),
+        ):
+            with caplog.at_level(logging.ERROR, logger="xagent.web.api.model"):
+                response = client.post(
+                    "/api/models/test-connection",
+                    json={
+                        "model_provider": "openai",
+                        "model_name": "gpt-4o-mini",
+                        "api_key": "test-api-key",
+                        "base_url": "https://api.example.com/v1",
+                        "category": "llm",
+                    },
+                    headers=regular_headers,
+                )
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["status"] == "failed"
+        assert "sk-test" not in data["error"]
+        # The diagnostic header name stays readable.
+        assert "Authorization" in data["error"]
+        assert "sk-test" not in caplog.text
 
     def test_create_model_as_admin(
         self, test_db, admin_user, admin_headers, sample_model_data

@@ -16,49 +16,10 @@ from __future__ import annotations
 import logging
 from urllib.parse import parse_qsl, quote, urlsplit
 
+from ..core.utils.security import is_sensitive_param_name
+
 REDACTED = "[REDACTED]"
 
-# Exact names (lower-cased) whose values are credentials or one-time proofs.
-_SENSITIVE_QUERY_NAMES = frozenset(
-    {
-        "access_token",
-        "api_key",
-        "apikey",
-        "auth",
-        "code",
-        # Composio's hosted-auth redirects (web/composio_auth.py): the
-        # single-use verification session and the connection it activates.
-        "connected_account_id",
-        "credential",
-        "id_token",
-        "jwt",
-        "key",
-        "password",
-        "refresh_token",
-        "secret",
-        "session",
-        "session_uri",
-        "sig",
-        "signature",
-        "state",
-        "ticket",
-        "token",
-    }
-)
-# Any name ending in one of these (``widget_key``, ``share_token``,
-# ``embed_ticket``, ``client_secret``) is treated as a credential too.
-_SENSITIVE_QUERY_SUFFIXES = (
-    "_key",
-    "-key",
-    "_token",
-    "-token",
-    "_ticket",
-    "-ticket",
-    "_secret",
-    "-secret",
-    "_password",
-    "_signature",
-)
 _LOGGER_NAMES = ("uvicorn.access", "uvicorn.error")
 
 # Handshake header lines of both WebSocket implementations uvicorn drives with
@@ -77,10 +38,8 @@ _CREDENTIAL_SUBPROTOCOL_PREFIXES = ("xagent-auth-token.",)
 
 
 def is_sensitive_query_name(name: str) -> bool:
-    lowered = name.lower()
-    return lowered in _SENSITIVE_QUERY_NAMES or lowered.endswith(
-        _SENSITIVE_QUERY_SUFFIXES
-    )
+    """Whether a request query or header name carries a credential."""
+    return is_sensitive_param_name(name, url_query=True)
 
 
 def redact_request_target(target: str) -> str:

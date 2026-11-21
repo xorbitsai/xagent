@@ -21,19 +21,59 @@ from urllib.parse import (
 import httpx
 from yarl import URL
 
-SENSITIVE_QUERY_KEYS = {
-    "api_key",
-    "apikey",
-    "key",
-    "access_token",
-    "token",
-    "ticket",
-    "password",
-    "secret",
-}
+# Parameter names that name a credential or a one-time proof in a URL query
+# string. This is the union of the names the URL redactor and the server
+# request-target filter used to keep apart; ``is_sensitive_param_name`` is the
+# only rule that reads it.
+SENSITIVE_QUERY_KEYS = frozenset(
+    {
+        "access_token",
+        "api_key",
+        "apikey",
+        "auth",
+        "code",
+        "connected_account_id",
+        "credential",
+        "id_token",
+        "jwt",
+        "key",
+        "password",
+        "refresh_token",
+        "secret",
+        "session",
+        "session_uri",
+        "sig",
+        "signature",
+        "state",
+        "ticket",
+        "token",
+    }
+)
+# Query-string names that are one-time proofs without carrying a credential
+# word. The credential-word suffixes (``_key``, ``_token``, ``_secret``,
+# ``_password``, ``_signature``) are decided by ``_is_credential_key``, whose
+# qualifier exemptions keep paging cursors such as ``next_token`` readable.
+_SENSITIVE_QUERY_SUFFIXES = ("_ticket", "-ticket")
+# Names that are credentials wherever they appear, even outside a URL query:
+# signed-URL and raw-header spellings that carry no credential word of their
+# own.
+_ALWAYS_SENSITIVE_PARAM_NAMES = frozenset(
+    {
+        "tempauth",
+        "sig",
+        "signature",
+        "client_secret",
+        "x-amz-credential",
+        "x-amz-security-token",
+    }
+)
 
 URL_PATTERN = re.compile(r"(?:https?|wss?)://[^\s\"'>]+")
 WEBSOCKET_CREDENTIAL_PATTERN = re.compile(r"xagent-auth-token\.[A-Za-z0-9._~-]+")
+# A JWT is ``header.payload.signature``, all base64url; the header of a JSON
+# JWT always starts ``eyJ`` (``{"``). It can reach a log line without a URL or
+# an ``identifier=`` around it (a bare token in a tool result, for instance).
+JWT_PATTERN = re.compile(r"\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+")
 # Every ``identifier=`` in the text; ``_is_credential_key`` decides which
 # identifiers name a secret. Only a credential's value is consumed
 # (``_ASSIGNMENT_VALUE_PATTERN``: up to ``&`` or whitespace). After any other
@@ -66,6 +106,7 @@ _CREDENTIAL_KEY_SUFFIXES = (
     "token",
     "password",
     "secret",
+    "signature",
     "key",
 )
 _NON_CREDENTIAL_KEY_QUALIFIERS = frozenset(
@@ -139,6 +180,8 @@ _NON_CREDENTIAL_QUALIFIERS_BY_SUFFIX = {
 
 def _is_credential_key(key: str) -> bool:
     lowered = key.lower()
+    if lowered in _ALWAYS_SENSITIVE_PARAM_NAMES:
+        return True
     for suffix in _CREDENTIAL_KEY_SUFFIXES:
         if not lowered.endswith(suffix):
             continue
@@ -179,7 +222,27 @@ def is_credential_key(key: str) -> bool:
     return _is_credential_key(key)
 
 
-def _redact_assignments(text: str) -> str:
+def is_sensitive_param_name(name: str, *, url_query: bool = False) -> bool:
+    """Whether ``name`` names a credential or one-time proof worth masking.
+
+    ``url_query`` selects the rules for a URL query string: the union of the
+    names the URL redactor and the server request-target filter used to keep
+    apart, plus credential suffixes such as ``_key`` and ``_signature``.
+    Without it the rule is narrower on purpose: ``code=400``, ``ticket=42``
+    and ``support_ticket=42`` in free text are diagnostics, not credentials,
+    and this text also reaches user- and model-facing error messages.
+    """
+    if _is_credential_key(name):
+        return True
+    if not url_query:
+        return False
+    lowered = name.lower()
+    return lowered in SENSITIVE_QUERY_KEYS or lowered.endswith(
+        _SENSITIVE_QUERY_SUFFIXES
+    )
+
+
+def _redact_assignments(text: str, mask: Callable[[str], str]) -> str:
     # Values are read only for credentials and never overlap, and finditer
     # tries each position once, so every character is examined a constant
     # number of times however many ``identifier=`` runs the text holds.
@@ -194,14 +257,15 @@ def _redact_assignments(text: str) -> str:
         if value is None:
             continue
         parts.append(text[copied : match.end()])
-        parts.append(_mask_secret(value.group(0)))
+        parts.append(mask(value.group(0)))
         copied = value.end()
     parts.append(text[copied:])
     return "".join(parts)
 
 
 AUTH_HEADER_PATTERN = re.compile(
-    r"(?i)(authorization\s*[:=]\s*(?:bearer|basic)\s+)([^\s,;]+)"
+    r"(?i)([\"']?(?:proxy-)?authorization[\"']?\s*[:=]\s*[\"']?\s*"
+    r"(?:bearer|basic)\s+)([^\s,;\"'}\]]+)"
 )
 HEADER_KEY_PATTERNS = [
     re.compile(r"(?i)(x-goog-api-key\s*[:=]\s*)([^\s,;]+)"),
@@ -631,6 +695,14 @@ def _mask_secret(value: str) -> str:
     return "***" + value[-tail_len:]
 
 
+_FULL_REDACTION = "[REDACTED]"
+
+
+def _redact_completely(value: str) -> str:
+    """Mask a secret without keeping any part of it (log records only)."""
+    return _FULL_REDACTION
+
+
 _USERINFO_PREFIX_PATTERN = re.compile(r"://[^/\s@]*@")
 
 
@@ -641,20 +713,10 @@ def host_matches_suffix(hostname: str, suffix: str) -> bool:
     return hostname == suffix or hostname.endswith(f".{suffix}")
 
 
-def redact_url_credentials_for_logging(
-    url: str, *, redact_all_query_values: bool = False
+def _redact_url_credentials_for_logging(
+    url: str, *, mask: Callable[[str], str], redact_all_query_values: bool = False
 ) -> str:
-    """Redact sensitive query credentials and any embedded userinfo from a
-    URL (e.g. a proxy URL's "user:pass@host", the single most common place
-    a URL carries a credential -- a query-string-only check would silently
-    pass it through unchanged).
-
-    ``redact_all_query_values`` is for callers that accept arbitrary query
-    parameters and therefore cannot know which values are credentials. The
-    default remains selective because many existing diagnostic call sites
-    intentionally retain ordinary query values. See issue #2356 for the
-    broader, repository-wide limits of keyword-based secret redaction.
-    """
+    """Redact query credentials and embedded userinfo from ``url``."""
     if not url:
         return url
 
@@ -675,8 +737,10 @@ def redact_url_credentials_for_logging(
 
     redacted_items: list[tuple[str, str]] = []
     for key, value in query_items:
-        if value and (redact_all_query_values or key.lower() in SENSITIVE_QUERY_KEYS):
-            redacted_items.append((key, _mask_secret(value)))
+        if value and (
+            redact_all_query_values or is_sensitive_param_name(key, url_query=True)
+        ):
+            redacted_items.append((key, mask(value)))
         else:
             redacted_items.append((key, value))
     redacted_query = urlencode(redacted_items, doseq=True)
@@ -697,6 +761,44 @@ def redact_url_credentials_for_logging(
     )
 
 
+def redact_url_credentials_for_logging(
+    url: str, *, redact_all_query_values: bool = False
+) -> str:
+    """Redact sensitive query credentials and any embedded userinfo from a
+    URL (e.g. a proxy URL's "user:pass@host", the single most common place
+    a URL carries a credential -- a query-string-only check would silently
+    pass it through unchanged).
+
+    ``redact_all_query_values`` is for callers that accept arbitrary query
+    parameters and therefore cannot know which values are credentials. The
+    default remains selective because many existing diagnostic call sites
+    intentionally retain ordinary query values. See issue #2356 for the
+    broader, repository-wide limits of keyword-based secret redaction.
+    """
+    return _redact_url_credentials_for_logging(
+        url, mask=_mask_secret, redact_all_query_values=redact_all_query_values
+    )
+
+
+def _redact_text(text: str, mask: Callable[[str], str]) -> str:
+    redacted = WEBSOCKET_CREDENTIAL_PATTERN.sub("xagent-auth-token.[REDACTED]", text)
+    redacted = URL_PATTERN.sub(
+        lambda match: _redact_url_credentials_for_logging(match.group(0), mask=mask),
+        redacted,
+    )
+    redacted = _redact_assignments(redacted, mask)
+    redacted = AUTH_HEADER_PATTERN.sub(
+        lambda match: f"{match.group(1)}{mask(match.group(2))}",
+        redacted,
+    )
+    for pattern in HEADER_KEY_PATTERNS:
+        redacted = pattern.sub(
+            lambda match: f"{match.group(1)}{mask(match.group(2))}",
+            redacted,
+        )
+    return redacted
+
+
 def redact_sensitive_text(text: str) -> str:
     """Redact common key/token patterns from arbitrary text.
 
@@ -710,20 +812,19 @@ def redact_sensitive_text(text: str) -> str:
     """
     if not text:
         return text
+    return _redact_text(text, _mask_secret)
 
-    redacted = WEBSOCKET_CREDENTIAL_PATTERN.sub("xagent-auth-token.[REDACTED]", text)
-    redacted = URL_PATTERN.sub(
-        lambda match: redact_url_credentials_for_logging(match.group(0)),
-        redacted,
-    )
-    redacted = _redact_assignments(redacted)
-    redacted = AUTH_HEADER_PATTERN.sub(
-        lambda match: f"{match.group(1)}{_mask_secret(match.group(2))}",
-        redacted,
-    )
-    for pattern in HEADER_KEY_PATTERNS:
-        redacted = pattern.sub(
-            lambda match: f"{match.group(1)}{_mask_secret(match.group(2))}",
-            redacted,
-        )
-    return redacted
+
+def redact_log_text(text: str) -> str:
+    """Redact credentials from one log message at record creation.
+
+    Extends :func:`redact_sensitive_text` to bare JWT-shaped strings, which
+    can reach a log line without a URL or an ``identifier=`` around them (a
+    token inside a tool result, for instance), and replaces every masked
+    value outright instead of keeping a short suffix: a log line should not
+    carry part of a credential either.
+    """
+    if not text:
+        return text
+    redacted = _redact_text(text, _redact_completely)
+    return JWT_PATTERN.sub(_FULL_REDACTION, redacted)

@@ -8,6 +8,7 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+from xagent.core.utils import security
 from xagent.web import logging_config
 from xagent.web.app import global_exception_handler, validation_exception_handler
 from xagent.web.logging_config import setup_logging
@@ -26,8 +27,8 @@ def restore_logging_state() -> Iterator[None]:
     """Snapshot every logger's level/handlers/filters and restore them after.
 
     ``setup_logging(force=True)`` and ``dictConfig`` rewrite global logging
-    state (including resetting child loggers of configured names), which would
-    otherwise leak into later tests.
+    state (including resetting child loggers of configured names), and the
+    process-level record factory is global too, so all of it is restored.
     """
     manager = logging.Logger.manager
     loggers = [logging.getLogger()] + [
@@ -46,6 +47,7 @@ def restore_logging_state() -> Iterator[None]:
         )
         for logger in loggers
     ]
+    record_factory = logging.getLogRecordFactory()
     was_applied = logging_config._is_applied
     try:
         yield
@@ -56,6 +58,7 @@ def restore_logging_state() -> Iterator[None]:
             logger.filters[:] = filters
             logger.propagate = propagate
             logger.disabled = disabled
+        logging.setLogRecordFactory(record_factory)
         logging_config._is_applied = was_applied
 
 
@@ -94,6 +97,18 @@ def restore_logging_state() -> Iterator[None]:
         (
             f"https://host.example/a?api_key={SECRET}&page=2",
             f"https://host.example/a?api_key={REDACTED}&page=2",
+        ),
+        # Signed-URL and pre-authenticated download spellings share the
+        # unified sensitive-name list.
+        (
+            f"/download.aspx?tempauth={SECRET}&sig={SECRET}&X-Amz-Signature={SECRET}",
+            f"/download.aspx?tempauth={REDACTED}&sig={REDACTED}"
+            f"&X-Amz-Signature={REDACTED}",
+        ),
+        # Paging cursors and ordinary parameters stay readable.
+        (
+            "/a?next_token=cursor-1&guest_id=g1&page_size=10",
+            "/a?next_token=cursor-1&guest_id=g1&page_size=10",
         ),
         ("/a?token=", "/a?token="),
         ("/a?validation_only=true", "/a?validation_only=true"),
@@ -341,3 +356,321 @@ def test_debug_websocket_handshake_logs_no_header_credentials(
     # Safe diagnostics remain.
     assert any(m.startswith("< sec-websocket-key: ") for m in lowered)
     assert "< get /api/widget/chat/ws/1 http/1.1" in lowered
+
+
+# ---------------------------------------------------------------------------
+# One sensitive-name list for every log sink
+# ---------------------------------------------------------------------------
+
+_MASKED_QUERY_PARAMS = (
+    "token",
+    "refresh_token",
+    "access_token",
+    "tempauth",
+    "sig",
+    "X-Amz-Signature",
+    "code",
+    "client_secret",
+    "ticket",
+)
+_PRESERVED_QUERY_PARAMS = ("next_token", "guest_id", "page_size")
+
+
+@pytest.mark.parametrize("name", _MASKED_QUERY_PARAMS)
+def test_sensitive_query_values_are_masked(name: str) -> None:
+    text = f"GET https://api.example.com/cb?{name}={SECRET}&page=2"
+
+    for redact in (security.redact_sensitive_text, security.redact_log_text):
+        redacted = redact(text)
+        assert SECRET not in redacted
+        assert f"{name}=" in redacted
+        assert "page=2" in redacted
+
+
+@pytest.mark.parametrize("name", _PRESERVED_QUERY_PARAMS)
+def test_paging_and_non_secret_query_values_are_preserved(name: str) -> None:
+    value = f"{name}-value-123"
+    text = f"GET https://api.example.com/cb?{name}={value}&page=2"
+
+    redacted = security.redact_sensitive_text(text)
+    assert value in redacted
+
+
+def test_code_is_only_sensitive_inside_a_url_query() -> None:
+    assert not security.is_sensitive_param_name("code")
+    assert security.is_sensitive_param_name("code", url_query=True)
+    assert security.redact_sensitive_text("code=400") == "code=400"
+
+
+_AUTHORIZATION_HEADERS = (
+    "Authorization: Bearer sk-secret-value",
+    '{"Authorization": "Bearer sk-secret-value"}',
+    "{'Authorization': 'Bearer sk-secret-value'}",
+    "Authorization: Basic c2VjcmV0OnZhbHVl",
+    "Proxy-Authorization: Basic c2VjcmV0OnZhbHVl",
+)
+
+
+@pytest.mark.parametrize("header", _AUTHORIZATION_HEADERS)
+def test_authorization_header_values_are_masked(header: str) -> None:
+    # Both the text redactor (which carries AUTH_HEADER_PATTERN) and the
+    # log-record redactor must accept the quoted dict/JSON spellings.
+    for redact in (security.redact_sensitive_text, security.redact_log_text):
+        redacted = redact(header)
+        assert "sk-secret-value" not in redacted
+        assert "c2VjcmV0OnZhbHVl" not in redacted
+
+
+def test_jwt_shaped_values_are_masked_outside_a_url() -> None:
+    jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ1c2VyIn0.c2lnbmF0dXJl"
+    text = f"tool output: {jwt} (end)"
+
+    redacted = security.redact_log_text(text)
+
+    assert jwt not in redacted
+    assert "tool output:" in redacted
+    assert "(end)" in redacted
+
+
+def test_jwt_in_a_url_path_is_masked() -> None:
+    jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ1c2VyIn0.c2lnbmF0dXJl"
+
+    redacted = security.redact_log_text(
+        f"GET https://api.example.com/files/{jwt}/content"
+    )
+
+    assert jwt not in redacted
+    assert "https://api.example.com/files/" in redacted
+    assert "/content" in redacted
+
+
+def test_xagent_auth_token_values_are_masked() -> None:
+    text = "Sec-WebSocket-Protocol: xagent-auth-v1, xagent-auth-token.s3cr3t.va1ue"
+
+    redacted = security.redact_log_text(text)
+
+    assert "xagent-auth-token.s3cr3t.va1ue" not in redacted
+    assert "xagent-auth-v1" in redacted
+
+
+# ---------------------------------------------------------------------------
+# Process-level record redaction
+# ---------------------------------------------------------------------------
+
+
+def _capture(logger: logging.Logger) -> tuple[list[logging.LogRecord], logging.Handler]:
+    records: list[logging.LogRecord] = []
+    handler = logging.Handler()
+    handler.emit = records.append  # type: ignore[method-assign]
+    logger.addHandler(handler)
+    return records, handler
+
+
+@pytest.mark.usefixtures("restore_logging_state")
+@pytest.mark.parametrize("name", ["httpx", "httpcore", "httpcore.connection"])
+def test_transport_info_lines_stay_out_of_the_log_after_a_level_change(
+    name: str,
+) -> None:
+    setup_logging(force=True)
+    logger = logging.getLogger(name)
+    # A third-party SDK constructing its own httpx client does exactly this.
+    logger.setLevel(logging.NOTSET)
+    records, handler = _capture(logger)
+    try:
+        logger.info(
+            "HTTP Request: POST https://oauth.example.com/token?refresh_token=%s",
+            SECRET,
+        )
+        logger.warning(
+            "HTTP Request: POST https://oauth.example.com/token?refresh_token=%s",
+            SECRET,
+        )
+    finally:
+        logger.removeHandler(handler)
+
+    assert [record.levelno for record in records] == [logging.WARNING]
+    message = records[0].getMessage()
+    assert SECRET not in message
+    assert "https://oauth.example.com/token" in message
+
+
+@pytest.mark.usefixtures("restore_logging_state")
+def test_record_factory_redacts_fstring_and_argument_messages() -> None:
+    setup_logging(force=True)
+    logger = logging.getLogger("xagent.tests.redaction")
+    logger.setLevel(logging.INFO)
+    records, handler = _capture(logger)
+    try:
+        logger.warning(f"Authorization: Bearer {SECRET}")
+        logger.warning("token=%s", SECRET)
+    finally:
+        logger.removeHandler(handler)
+
+    messages = [record.getMessage() for record in records]
+    assert len(messages) == 2
+    assert all(SECRET not in message for message in messages)
+    assert all("[REDACTED]" in message for message in messages)
+    # The formatted message is final; stale arguments must not be
+    # interpolated a second time by a handler's formatter.
+    assert all(record.args == () for record in records)
+
+
+@pytest.mark.usefixtures("restore_logging_state")
+def test_record_factory_redacts_exception_text() -> None:
+    setup_logging(force=True)
+    logger = logging.getLogger("xagent.tests.redaction_exception")
+    logger.setLevel(logging.INFO)
+    records, handler = _capture(logger)
+    try:
+        try:
+            raise RuntimeError(f"Authorization: Bearer {SECRET}")
+        except RuntimeError:
+            logger.exception("request failed")
+    finally:
+        logger.removeHandler(handler)
+
+    record = records[-1]
+    assert record.getMessage() == "request failed"
+    assert record.exc_text is not None
+    assert SECRET not in record.exc_text
+    assert "Traceback" in record.exc_text
+
+
+@pytest.mark.usefixtures("restore_logging_state")
+def test_record_factory_redacts_stack_info() -> None:
+    setup_logging(force=True)
+    factory = logging.getLogRecordFactory()
+    record = factory(
+        "xagent.tests.stack",
+        logging.WARNING,
+        __file__,
+        1,
+        "task failed",
+        (),
+        None,
+        None,
+        f"Stack (most recent call last):\n  Authorization: Bearer {SECRET}",
+    )
+
+    assert record.stack_info is not None
+    assert SECRET not in record.stack_info
+
+
+@pytest.mark.usefixtures("restore_logging_state")
+def test_record_factory_reaches_a_non_propagating_logger_with_its_own_handler() -> None:
+    setup_logging(force=True)
+    logger = logging.getLogger("xagent.tests.own_handler")
+    logger.propagate = False
+    logger.setLevel(logging.INFO)
+    records, handler = _capture(logger)
+    try:
+        logger.warning("token=%s", SECRET)
+    finally:
+        logger.removeHandler(handler)
+
+    assert len(records) == 1
+    assert SECRET not in records[0].getMessage()
+
+
+@pytest.mark.usefixtures("restore_logging_state")
+def test_record_factory_survives_basic_config_force() -> None:
+    setup_logging(force=True)
+    # Replaces the handlers setup_logging installed; the record factory is
+    # untouched, so the next record is still redacted.
+    logging.basicConfig(force=True, level=logging.INFO)
+    records, handler = _capture(logging.getLogger())
+    try:
+        logging.getLogger("xagent.tests.basic_config").warning("token=%s", SECRET)
+    finally:
+        logging.getLogger().removeHandler(handler)
+
+    assert len(records) == 1
+    assert SECRET not in records[0].getMessage()
+
+
+@pytest.mark.usefixtures("restore_logging_state")
+def test_repeated_setup_logging_does_not_stack_redaction_layers() -> None:
+    setup_logging(force=True)
+    first_factory = logging.getLogRecordFactory()
+    first_filters = list(logging.getLogger("httpx").filters)
+
+    setup_logging(force=True)
+
+    assert logging.getLogRecordFactory() is first_factory
+    assert logging.getLogger("httpx").filters == first_filters
+
+    logger = logging.getLogger("xagent.tests.repeat")
+    logger.setLevel(logging.INFO)
+    records, handler = _capture(logger)
+    try:
+        logger.warning("Authorization: Bearer %s", SECRET)
+    finally:
+        logger.removeHandler(handler)
+    assert SECRET not in records[0].getMessage()
+
+
+@pytest.mark.usefixtures("restore_logging_state")
+def test_record_factory_chains_with_a_preinstalled_factory() -> None:
+    base = logging.getLogRecordFactory()
+
+    def outer(*args, **kwargs):
+        record = base(*args, **kwargs)
+        record.msg = f"outer: {record.msg}"
+        return record
+
+    logging.setLogRecordFactory(outer)
+    setup_logging(force=True)
+
+    logger = logging.getLogger("xagent.tests.chained")
+    logger.setLevel(logging.INFO)
+    records, handler = _capture(logger)
+    try:
+        logger.warning("token=%s", SECRET)
+    finally:
+        logger.removeHandler(handler)
+
+    message = records[0].getMessage()
+    assert message.startswith("outer: ")
+    assert SECRET not in message
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("restore_logging_state")
+async def test_console_trace_payload_is_redacted_in_info_output() -> None:
+    from xagent.core.agent.trace import (
+        ConsoleTraceHandler,
+        TraceAction,
+        TraceCategory,
+        TraceEvent,
+        TraceEventType,
+        TraceScope,
+    )
+
+    setup_logging(force=True)
+    logger = logging.getLogger("xagent.core.agent.trace")
+    logger.setLevel(logging.INFO)
+    records, handler = _capture(logger)
+
+    jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ1c2VyIn0.c2lnbmF0dXJl"
+    url = (
+        "https://helpdesk.example.com/inline/attachment"
+        f"?token={jwt}&tempauth=one-time-token"
+    )
+    event = TraceEvent(
+        TraceEventType(TraceScope.ACTION, TraceAction.INFO, TraceCategory.GENERAL),
+        data=f"Fetched attachment {url} for ticket 42",
+        step_id="s1",
+    )
+    try:
+        await ConsoleTraceHandler().handle_event(event)
+    finally:
+        logger.removeHandler(handler)
+
+    assert len(records) == 1
+    message = records[0].getMessage()
+    assert jwt not in message
+    assert "one-time-token" not in message
+    # The rest of the payload is still there for debugging.
+    assert "https://helpdesk.example.com/inline/attachment" in message
+    assert "Fetched attachment" in message
+    assert "for ticket 42" in message

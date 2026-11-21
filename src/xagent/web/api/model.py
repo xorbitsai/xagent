@@ -861,7 +861,8 @@ async def get_user_default_models(
     try:
         return ModelStore(db).get_user_default_models(user)
     except Exception as e:
-        logger.error(f"Error getting user default models: {e}")
+        safe_error = redact_sensitive_text(str(e))
+        logger.error(f"Error getting user default models: {safe_error}")
         # Return an empty list even if an error occurs, instead of 404
         return []
 
@@ -1220,9 +1221,9 @@ async def test_model_connection(
             ),
         )
     except Exception as e:
-        logger.error(f"Model connection test failed: {e}")
-        response_time = time.time() - start_time
         safe_error = redact_sensitive_text(str(e))
+        logger.error(f"Model connection test failed: {safe_error}")
+        response_time = time.time() - start_time
         return ModelTestResponse(
             model_id=request.model_name,
             status="failed",

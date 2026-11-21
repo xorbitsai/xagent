@@ -118,6 +118,59 @@ def test_display_uses_occurrences_and_excludes_internal_and_child_content(canoni
         assert view.events[2]["data"]["expect_response"] is False
 
 
+@pytest.mark.parametrize("running", [True, False], ids=["run-active", "run-ended"])
+def test_replay_keeps_interrupted_start_and_earlier_steps(canonical, running):
+    """An answer cut short by a newer message replays as interrupted, not failed."""
+    factory, task_id = canonical
+    with factory() as db:
+        fact(
+            db,
+            task_id,
+            "action_start_tool",
+            "tool-start",
+            {"tool_name": "search"},
+            run_id="run",
+        )
+        fact(
+            db,
+            task_id,
+            "final_answer_start",
+            "start-1",
+            {"message_id": "final_answer_1"},
+            run_id="run",
+        )
+        fact(
+            db,
+            task_id,
+            "final_answer_delta",
+            "delta-1",
+            {"message_id": "final_answer_1", "delta": "PARTIAL"},
+            run_id="run",
+        )
+        fact(
+            db,
+            task_id,
+            "final_answer_start",
+            "start-2",
+            {"message_id": "final_answer_1", "status": "interrupted"},
+            run_id="run",
+        )
+        db.commit()
+        view = load_event_display_snapshot(
+            db, task_id, active_run_id="run" if running else None
+        )
+    by_id = {event["event_id"]: event for event in view.events}
+    assert "tool-start" in by_id
+    assert [e["type"] for e in view.events if e["event_id"].startswith("start-")] == [
+        "final_answer_start",
+        "final_answer_start",
+    ]
+    assert by_id["start-2"]["message_id"] == "final_answer_1"
+    assert by_id["start-2"]["status"] == "interrupted"
+    assert not [e for e in view.events if e["type"] == "final_answer_error"]
+    assert by_id["start-1"].get("status") == (None if running else "interrupted")
+
+
 def test_stream_boundaries_fixed_horizon_and_settlement_share_one_bubble(canonical):
     factory, task_id = canonical
     with factory() as db:

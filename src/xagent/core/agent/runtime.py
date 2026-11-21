@@ -259,6 +259,17 @@ class LLMCallInterrupted(ExecutionInterrupted):
     """Raised when an active LLM call is cancelled by an execution interrupt."""
 
 
+LLM_CALL_PREEMPTED_MESSAGE = "preempted by a live user message"
+
+
+class LLMCallPreempted(Exception):
+    """A preemptible model request was dropped for a waiting live user message.
+
+    Not an :class:`ExecutionInterrupted`: the execution carries on, and only
+    the one model request is abandoned.
+    """
+
+
 class ToolCallInterrupted(ExecutionInterrupted):
     """Raised when an active tool call is cancelled by an execution interrupt."""
 
@@ -456,7 +467,8 @@ class PatternRuntime:
     pattern_error_reported: bool = False
     last_final_answer_stream_message_id: str | None = None
     # When this run emitted its first non-empty final-answer chunk; None when
-    # it streamed no answer text.
+    # it streamed no answer text. The first text of an answer that is later
+    # given up for a live user message counts too.
     first_final_answer_delta_at: datetime | None = None
     inline_file_delivery: InlineFileDelivery | None = None
     _approved_answers: dict[str, OutputDecision] = field(
@@ -474,6 +486,16 @@ class PatternRuntime:
         repr=False,
     )
     _active_tool_tasks: set[asyncio.Future[Any]] = field(
+        default_factory=set,
+        init=False,
+        repr=False,
+    )
+    _preemptible_llm_tasks: set[asyncio.Future[Any]] = field(
+        default_factory=set,
+        init=False,
+        repr=False,
+    )
+    _preempted_llm_tasks: set[asyncio.Future[Any]] = field(
         default_factory=set,
         init=False,
         repr=False,
@@ -516,6 +538,37 @@ class PatternRuntime:
         for task in list(self._active_tool_tasks):
             if not task.done():
                 task.cancel()
+
+    def request_llm_preempt(self) -> bool:
+        """Cancel the in-flight preemptible model requests, if no tool is running.
+
+        Only requests started with ``preemptible=True`` are cancelled, each
+        at most once: a request already being given up is left to finish its
+        cleanup. They raise :class:`LLMCallPreempted` to their caller instead
+        of failing, unless an interrupt was also requested, which always wins,
+        or the caller's own task was cancelled, which then reaches the caller
+        as it is. Returns whether any request was cancelled.
+        """
+        if self._active_tool_tasks:
+            return False
+        cancelled = False
+        for task in list(self._preemptible_llm_tasks):
+            if not task.done() and task not in self._preempted_llm_tasks:
+                self._preempted_llm_tasks.add(task)
+                task.cancel()
+                cancelled = True
+        return cancelled
+
+    @staticmethod
+    def _caller_cancelled() -> bool:
+        """Whether the task running this call was itself asked to cancel."""
+        current = asyncio.current_task()
+        return current is not None and current.cancelling() > 0
+
+    def _raise_if_live_input_pending(self) -> None:
+        mailbox = self.live_input
+        if mailbox is not None and mailbox.pending():
+            raise LLMCallPreempted(LLM_CALL_PREEMPTED_MESSAGE)
 
     def clear_interrupt(self) -> None:
         self._interrupt_requested = False
@@ -636,8 +689,15 @@ class PatternRuntime:
             return False
         return True
 
-    async def run_llm_call(self, llm: Any, **kwargs: Any) -> Any:
-        """Run an LLM call as a cancellable subtask owned by this runtime."""
+    async def run_llm_call(
+        self, llm: Any, *, preemptible: bool = False, **kwargs: Any
+    ) -> Any:
+        """Run an LLM call as a cancellable subtask owned by this runtime.
+
+        A ``preemptible`` call is also dropped, with :class:`LLMCallPreempted`,
+        when a live user message is already waiting before it is sent, or when
+        :meth:`request_llm_preempt` is called while it runs.
+        """
 
         kwargs = await materialize_llm_kwargs(
             llm=llm,
@@ -649,12 +709,16 @@ class PatternRuntime:
             raise LLMCallInterrupted(
                 self.interrupt_reason or "interrupted before LLM call"
             )
+        if preemptible:
+            self._raise_if_live_input_pending()
         call = llm.chat(**kwargs)
         if not inspect.isawaitable(call):
             return call
 
         task: asyncio.Future[Any] = self._cache_session.create_task(call)
         self._active_llm_tasks.add(task)
+        if preemptible:
+            self._preemptible_llm_tasks.add(task)
         try:
             await self._sync_cache_phase()
             return await task
@@ -663,6 +727,8 @@ class PatternRuntime:
                 raise LLMCallInterrupted(
                     self.interrupt_reason or "interrupted during LLM call"
                 ) from exc
+            if task in self._preempted_llm_tasks and not self._caller_cancelled():
+                raise LLMCallPreempted(LLM_CALL_PREEMPTED_MESSAGE) from exc
             raise
         except Exception as exc:  # noqa: BLE001
             if is_context_length_error(exc):
@@ -677,6 +743,8 @@ class PatternRuntime:
                     await asyncio.gather(task, return_exceptions=True)
             finally:
                 self._active_llm_tasks.discard(task)
+                self._preemptible_llm_tasks.discard(task)
+                self._preempted_llm_tasks.discard(task)
                 await self._sync_cache_phase()
 
     async def run_tool_call(self, invoke: Callable[[], Any]) -> Any:
@@ -711,19 +779,30 @@ class PatternRuntime:
                 self._active_tool_tasks.discard(task)
                 await self._sync_cache_phase()
 
-    async def stream_final_answer(self, llm: Any, **kwargs: Any) -> Any:
-        """Stream only the final user-facing answer through the outbound boundary."""
+    async def stream_final_answer(
+        self, llm: Any, *, preemptible: bool = False, **kwargs: Any
+    ) -> Any:
+        """Stream only the final user-facing answer through the outbound boundary.
+
+        A ``preemptible`` request opens the answer stream only once it has
+        answer text to send. When it is dropped for a live user message, a
+        partial answer is closed with an interrupted start frame, not a
+        failure, and :class:`LLMCallPreempted` propagates; a request dropped
+        before any text sends no frame.
+        """
 
         if self.outbound_message_handler is None or not self._has_native_stream_chat(
             llm
         ):
-            return await self.run_llm_call(llm, **kwargs)
+            return await self.run_llm_call(llm, preemptible=preemptible, **kwargs)
 
         from .pattern.final_answer_stream import FinalAnswerStreamSession
 
         stream = FinalAnswerStreamSession(self)
-        if await stream.start() is None:
-            return await self.run_llm_call(llm, **kwargs)
+        # A request that may be given up opens the stream only once it has
+        # answer text to send, so one dropped before that sends no frame.
+        if not preemptible and await stream.start() is None:
+            return await self.run_llm_call(llm, preemptible=preemptible, **kwargs)
 
         async def emit_text_delta(chunk: Any) -> None:
             delta = self._chunk_text_delta(chunk)
@@ -732,11 +811,14 @@ class PatternRuntime:
 
         try:
             response = await self.run_streaming_llm_call(
-                llm, on_chunk=emit_text_delta, **kwargs
+                llm, on_chunk=emit_text_delta, preemptible=preemptible, **kwargs
             )
             content = self._response_content(response)
             await stream.finish(content)
             return response
+        except LLMCallPreempted:
+            await stream.interrupt()
+            raise
         except Exception as exc:
             if self.last_final_answer_stream_message_id != stream.message_id:
                 await stream.fail(str(exc))
@@ -753,13 +835,18 @@ class PatternRuntime:
         llm: Any,
         *,
         on_chunk: Callable[[Any], Any] | None = None,
+        preemptible: bool = False,
         **kwargs: Any,
     ) -> Any:
-        """Run a native streaming LLM call and reconstruct a chat-like response."""
+        """Run a native streaming LLM call and reconstruct a chat-like response.
+
+        ``preemptible`` has the meaning it has for :meth:`run_llm_call`,
+        including for a model that has to fall back to it.
+        """
 
         stream_chat = getattr(llm, "stream_chat", None)
         if not callable(stream_chat) or not self._has_native_stream_chat(llm):
-            return await self.run_llm_call(llm, **kwargs)
+            return await self.run_llm_call(llm, preemptible=preemptible, **kwargs)
         kwargs = await materialize_llm_kwargs(
             llm=llm,
             kwargs=budget_llm_kwargs(kwargs),
@@ -769,6 +856,8 @@ class PatternRuntime:
             raise LLMCallInterrupted(
                 self.interrupt_reason or "interrupted before LLM stream"
             )
+        if preemptible:
+            self._raise_if_live_input_pending()
 
         async def consume_stream() -> Any:
             content_parts: list[str] = []
@@ -913,6 +1002,8 @@ class PatternRuntime:
 
         task: asyncio.Future[Any] = self._cache_session.create_task(consume_stream())
         self._active_llm_tasks.add(task)
+        if preemptible:
+            self._preemptible_llm_tasks.add(task)
         try:
             await self._sync_cache_phase()
             return await task
@@ -921,6 +1012,8 @@ class PatternRuntime:
                 raise LLMCallInterrupted(
                     self.interrupt_reason or "interrupted during LLM stream"
                 ) from exc
+            if task in self._preempted_llm_tasks and not self._caller_cancelled():
+                raise LLMCallPreempted(LLM_CALL_PREEMPTED_MESSAGE) from exc
             raise
         finally:
             try:
@@ -929,6 +1022,8 @@ class PatternRuntime:
                     await asyncio.gather(task, return_exceptions=True)
             finally:
                 self._active_llm_tasks.discard(task)
+                self._preemptible_llm_tasks.discard(task)
+                self._preempted_llm_tasks.discard(task)
                 await self._sync_cache_phase()
 
     def _stamp_stream_fallback(
@@ -1320,6 +1415,31 @@ class PatternRuntime:
             self.active_turn_id,
             message_id,
             _normalize_stream_close_reason(error),
+        )
+
+    async def interrupt_final_answer_stream(self, message_id: str) -> None:
+        """Close a partial answer as interrupted, on the same message.
+
+        The answer was cut short because a newer message is being taken in,
+        so it is not reported as an error. The new start frame carries the
+        same ``message_id`` with ``status`` ``interrupted``.
+        """
+        self._inline_stream_guards.pop(message_id, None)
+        self._reviewed_output_streams.pop(message_id, None)
+        await self._emit_outbound(
+            {
+                "type": "final_answer_start",
+                "message_id": message_id,
+                "task_id": self.execution_id,
+                "status": "interrupted",
+            }
+        )
+        logger.info(
+            "final_answer stream interrupted. task_id=%s step=%s turn=%s message_id=%s",
+            self.execution_id,
+            self.active_react_step_id,
+            self.active_turn_id,
+            message_id,
         )
 
     def _has_native_stream_chat(self, llm: Any) -> bool:

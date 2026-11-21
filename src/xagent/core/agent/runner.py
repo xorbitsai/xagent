@@ -1620,6 +1620,22 @@ class AgentRunner:
         Synchronous, and valid only on the event loop that runs the execution.
         After ``QUEUED`` the admission is finished exactly once by the
         execution; after any other answer it has not been touched.
+
+        Queueing also cancels the main model request in flight, so the message
+        is taken in at the next safe point without waiting for the request to
+        finish. That applies only while no tool is running and only to a
+        request that may be given up for live input: never a forced answer
+        turn's request, and not once the iteration has been repeated
+        ``LIVE_INPUT_PREEMPT_LIMIT`` times. Where the request is not
+        cancelled, the message is taken in at the next safe point, or handed
+        back unapplied if that request gives the final answer. Tool calls and
+        the execution itself are never cancelled by an offer.
+
+        The request is cancelled as soon as the message is queued, before the
+        host authorizes it and before its input review; both run only when
+        the safe point claims the message. A message that is not applied
+        there has still cost the cancelled request and one of the
+        iteration's ``LIVE_INPUT_PREEMPT_LIMIT`` repeats.
         """
         offer = self._offer_live_user_message(
             execution_id,
@@ -1676,7 +1692,7 @@ class AgentRunner:
             return LiveInputOffer.CONFLICT
         if replay is _TurnReplay.ACCEPTED:
             return LiveInputOffer.ALREADY_ACCEPTED
-        return mailbox.offer(
+        offered = mailbox.offer(
             LiveUserInput(
                 turn_id=normalized_turn_id,
                 execution_message=execution_message,
@@ -1684,6 +1700,15 @@ class AgentRunner:
                 admission=admission,
             )
         )
+        if offered is LiveInputOffer.QUEUED:
+            cancelled = control.runtime.request_llm_preempt()
+            increment_counter(
+                "xagent.live_input.preempts",
+                attributes={
+                    "outcome": "cancelled" if cancelled else "nothing_to_cancel"
+                },
+            )
+        return offered
 
     async def _admit_live_input_until_finished(
         self, execution_id: str, item: LiveUserInput

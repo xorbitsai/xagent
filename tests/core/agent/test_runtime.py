@@ -26,17 +26,21 @@ from xagent.core.agent.context.execution import (
     COMPACT_WATERMARK_METADATA_KEY,
     TRANSCRIPT_WATERMARK_METADATA_KEY,
 )
+from xagent.core.agent.live_input import LiveInputMailbox, LiveUserInput
 from xagent.core.agent.pattern.final_answer_stream import (
+    ReActFinalAnswerStreamer,
     ToolCallStringFieldStreamer,
     _JsonStringFieldReader,
 )
 from xagent.core.agent.runtime import (
     LLMCallInterrupted,
+    LLMCallPreempted,
     ToolCallInterrupted,
     prepare_llm_for_context,
     resolve_compact_llm,
     resolved_llm_metadata,
 )
+from xagent.core.guardrails.output import OutputDecision
 from xagent.core.model.chat.basic.adapter import create_base_llm
 from xagent.core.model.chat.basic.call_boundary import (
     BUDGET_INSENSITIVE_FAILURE_CODES,
@@ -3789,3 +3793,331 @@ async def test_unresolvable_virtual_compact_model_falls_back_to_dropping() -> No
     assert virtual.prepared == 1
     assert result.compacted
     assert result.strategy != "llm_summary"
+
+
+class GatedLLM:
+    """Native-streaming model that emits one token, then waits for its gate."""
+
+    def __init__(self) -> None:
+        self.started = asyncio.Event()
+        self.gate = asyncio.Event()
+        self.calls = 0
+
+    async def stream_chat(self, **_: Any) -> Any:
+        self.calls += 1
+        yield StreamChunk(type=ChunkType.TOKEN, delta="partial")
+        self.started.set()
+        await self.gate.wait()
+        yield StreamChunk(type=ChunkType.TOKEN, delta=" rest")
+        yield StreamChunk(type=ChunkType.END)
+
+    async def chat(self, **_: Any) -> str:
+        self.calls += 1
+        self.started.set()
+        await self.gate.wait()
+        return "complete"
+
+
+class GatedChatOnlyLLM:
+    """A model without native streaming: it only answers through ``chat``."""
+
+    def __init__(self) -> None:
+        self.started = asyncio.Event()
+        self.gate = asyncio.Event()
+        self.calls = 0
+
+    async def chat(self, **_: Any) -> str:
+        self.calls += 1
+        self.started.set()
+        await self.gate.wait()
+        return "complete"
+
+
+LLM_CALL_KINDS = ["run_streaming_llm_call", "run_llm_call", "streaming_falls_back"]
+LLM_CALL_RESULTS = {
+    "run_streaming_llm_call": "partial rest",
+    "run_llm_call": "complete",
+    "streaming_falls_back": "complete",
+    "stream_final_answer": "partial rest",
+}
+
+
+def gated_call(runtime: PatternRuntime, kind: str, *, preemptible: bool) -> Any:
+    """A (model, coroutine) pair for one kind of call through the runtime."""
+    if kind == "streaming_falls_back":
+        llm: Any = GatedChatOnlyLLM()
+    else:
+        llm = GatedLLM()
+    method: Any
+    if kind == "run_llm_call":
+        method = runtime.run_llm_call
+    elif kind == "stream_final_answer":
+        method = runtime.stream_final_answer
+    else:
+        method = runtime.run_streaming_llm_call
+    return llm, method(llm, messages=[], preemptible=preemptible)
+
+
+def pending_live_input() -> LiveInputMailbox:
+    mailbox = LiveInputMailbox()
+    mailbox.offer(LiveUserInput("t1", "m", "m", Mock()))
+    return mailbox
+
+
+@pytest.mark.parametrize("kind", LLM_CALL_KINDS)
+async def test_preemptible_stream_cancel_raises_preempted(kind: str) -> None:
+    runtime = PatternRuntime()
+    llm, call = gated_call(runtime, kind, preemptible=True)
+    task = asyncio.create_task(call)
+    await llm.started.wait()
+    assert runtime.request_llm_preempt() is True
+    with pytest.raises(LLMCallPreempted):
+        await task
+    assert not runtime._interrupt_requested
+    assert not runtime._active_llm_tasks
+    assert not runtime._preemptible_llm_tasks
+    assert not runtime._preempted_llm_tasks
+
+
+@pytest.mark.parametrize("kind", LLM_CALL_KINDS)
+async def test_non_preemptible_call_ignores_preempt(kind: str) -> None:
+    runtime = PatternRuntime()
+    llm, call = gated_call(runtime, kind, preemptible=False)
+    task = asyncio.create_task(call)
+    await llm.started.wait()
+    assert runtime.request_llm_preempt() is False
+    llm.gate.set()
+    assert await task == LLM_CALL_RESULTS[kind]
+    assert not task.cancelled()
+
+
+@pytest.mark.parametrize(
+    "order", ["preempt-then-interrupt", "interrupt-then-preempt", "same-turn"]
+)
+async def test_interrupt_wins_over_preempt(order: str) -> None:
+    runtime = PatternRuntime()
+    llm, call = gated_call(runtime, "run_streaming_llm_call", preemptible=True)
+    task = asyncio.create_task(call)
+    await llm.started.wait()
+    if order == "preempt-then-interrupt":
+        runtime.request_llm_preempt()
+        runtime.request_interrupt("stop")
+    elif order == "interrupt-then-preempt":
+        runtime.request_interrupt("stop")
+        runtime.request_llm_preempt()
+    else:
+        loop = asyncio.get_running_loop()
+        loop.call_soon(runtime.request_llm_preempt)
+        loop.call_soon(runtime.request_interrupt, "stop")
+    with pytest.raises(LLMCallInterrupted):
+        await task
+
+
+async def test_request_llm_preempt_refuses_with_tool_task() -> None:
+    runtime = PatternRuntime()
+    llm, call = gated_call(runtime, "run_streaming_llm_call", preemptible=True)
+    task = asyncio.create_task(call)
+    await llm.started.wait()
+    tool_task: asyncio.Future[Any] = asyncio.get_running_loop().create_future()
+    runtime._active_tool_tasks.add(tool_task)
+    try:
+        assert runtime.request_llm_preempt() is False
+        await asyncio.sleep(0)
+        assert not task.done()
+        assert not runtime._preempted_llm_tasks
+    finally:
+        runtime._active_tool_tasks.discard(tool_task)
+    llm.gate.set()
+    assert await task == "partial rest"
+
+
+@pytest.mark.parametrize("kind", [*LLM_CALL_KINDS, "stream_final_answer"])
+async def test_preemptible_call_not_sent_when_mailbox_pending(kind: str) -> None:
+    outbound = OutboundCollector()
+    runtime = PatternRuntime(execution_id="task-123", outbound_message_handler=outbound)
+    runtime.live_input = pending_live_input()
+    llm, call = gated_call(runtime, kind, preemptible=True)
+    llm.gate.set()
+    with pytest.raises(LLMCallPreempted):
+        await call
+    assert llm.calls == 0
+    assert outbound.events == []
+    llm, call = gated_call(runtime, kind, preemptible=False)
+    llm.gate.set()
+    assert await call == LLM_CALL_RESULTS[kind]
+    assert llm.calls == 1
+
+
+class PassthroughReview:
+    async def feed(self, delta: str) -> str:
+        return delta
+
+    def approved_suffix(self, content: str) -> str:
+        return ""
+
+
+class PassthroughGuardrail:
+    def open_stream(self) -> PassthroughReview:
+        return PassthroughReview()
+
+    async def check(self, text: str, *, structured: bool = False) -> OutputDecision:
+        return OutputDecision("allow", text)
+
+
+@pytest.mark.parametrize("mode", ["plain", "output-guardrail", "inline-files"])
+async def test_stream_final_answer_preempt_emits_interrupted_start(
+    mode: str,
+) -> None:
+    outbound = OutboundCollector()
+    runtime = PatternRuntime(execution_id="task-123", outbound_message_handler=outbound)
+    if mode == "output-guardrail":
+        runtime.output_guardrail = PassthroughGuardrail()  # type: ignore[assignment]
+    if mode == "inline-files":
+        runtime.inline_file_delivery = object()  # type: ignore[assignment]
+    llm = GatedLLM()
+    task = asyncio.create_task(
+        runtime.stream_final_answer(llm, messages=[], preemptible=True)
+    )
+    await llm.started.wait()
+    assert runtime.request_llm_preempt() is True
+    with pytest.raises(LLMCallPreempted):
+        await task
+    assert [event["type"] for event in outbound.events] == [
+        "final_answer_start",
+        "final_answer_delta",
+        "final_answer_start",
+    ]
+    opened, _, interrupted = outbound.events
+    assert interrupted == {
+        "type": "final_answer_start",
+        "message_id": opened["message_id"],
+        "task_id": "task-123",
+        "status": "interrupted",
+    }
+    assert "status" not in opened
+    assert not runtime._inline_stream_guards
+    assert not runtime._reviewed_output_streams
+
+
+async def test_stream_final_answer_not_preempted_without_flag() -> None:
+    outbound = OutboundCollector()
+    runtime = PatternRuntime(execution_id="task-123", outbound_message_handler=outbound)
+    llm = GatedLLM()
+    task = asyncio.create_task(runtime.stream_final_answer(llm, messages=[]))
+    await llm.started.wait()
+    assert runtime.request_llm_preempt() is False
+    llm.gate.set()
+    assert await task == "partial rest"
+    assert [event["type"] for event in outbound.events][-1] == "final_answer_end"
+
+
+@pytest.mark.parametrize("kind", ["run_streaming_llm_call", "run_llm_call"])
+async def test_outer_cancel_is_not_swallowed_by_preempt(kind: str) -> None:
+    runtime = PatternRuntime()
+    llm, call = gated_call(runtime, kind, preemptible=True)
+    outer = asyncio.create_task(call)
+    await llm.started.wait()
+    assert runtime.request_llm_preempt() is True
+    # The caller's own task is cancelled in the same loop turn, without an
+    # interrupt request: that cancellation must reach the caller.
+    outer.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(outer, timeout=5)
+    assert outer.cancelled()
+
+
+async def test_interrupt_wins_over_preempt_in_plain_call() -> None:
+    runtime = PatternRuntime()
+    llm, call = gated_call(runtime, "run_llm_call", preemptible=True)
+    task = asyncio.create_task(call)
+    await llm.started.wait()
+    runtime.request_llm_preempt()
+    runtime.request_interrupt("stop")
+    with pytest.raises(LLMCallInterrupted):
+        await asyncio.wait_for(task, timeout=5)
+
+
+async def test_request_llm_preempt_ignores_finished_tasks() -> None:
+    runtime = PatternRuntime()
+    finished: asyncio.Future[Any] = asyncio.get_running_loop().create_future()
+    finished.set_result("done")
+    runtime._preemptible_llm_tasks.add(finished)
+    assert runtime.request_llm_preempt() is False
+    assert not runtime._preempted_llm_tasks
+
+
+async def test_interrupt_before_any_frame_emits_nothing() -> None:
+    outbound = OutboundCollector()
+    runtime = PatternRuntime(execution_id="task-123", outbound_message_handler=outbound)
+    streamer = ReActFinalAnswerStreamer(runtime)
+    await streamer.interrupt()
+    assert outbound.events == []
+
+
+class SilentGatedLLM:
+    """Native-streaming model that waits for its gate before any text."""
+
+    def __init__(self) -> None:
+        self.started = asyncio.Event()
+        self.gate = asyncio.Event()
+
+    async def stream_chat(self, **_: Any) -> Any:
+        self.started.set()
+        await self.gate.wait()
+        yield StreamChunk(type=ChunkType.TOKEN, delta="late")
+        yield StreamChunk(type=ChunkType.END)
+
+
+async def test_stream_final_answer_preempt_before_text_emits_nothing() -> None:
+    outbound = OutboundCollector()
+    runtime = PatternRuntime(execution_id="task-123", outbound_message_handler=outbound)
+    llm = SilentGatedLLM()
+    task = asyncio.create_task(
+        runtime.stream_final_answer(llm, messages=[], preemptible=True)
+    )
+    await llm.started.wait()
+    assert runtime.request_llm_preempt() is True
+    with pytest.raises(LLMCallPreempted):
+        await task
+    assert outbound.events == []
+    assert runtime.first_final_answer_delta_at is None
+    assert runtime.last_final_answer_stream_message_id is None
+
+
+class CleanupGatedLLM:
+    """Streams one token and waits; its cleanup waits for ``release``."""
+
+    def __init__(self) -> None:
+        self.started = asyncio.Event()
+        self.cleanup_started = asyncio.Event()
+        self.release = asyncio.Event()
+        self.cleanup_finished = False
+
+    async def stream_chat(self, **_: Any) -> Any:
+        try:
+            yield StreamChunk(type=ChunkType.TOKEN, delta="partial")
+            self.started.set()
+            await asyncio.Event().wait()
+        finally:
+            self.cleanup_started.set()
+            await self.release.wait()
+            self.cleanup_finished = True
+
+
+async def test_second_preempt_leaves_request_cleanup_running() -> None:
+    runtime = PatternRuntime()
+    llm = CleanupGatedLLM()
+    task = asyncio.create_task(
+        runtime.run_streaming_llm_call(llm, messages=[], preemptible=True)
+    )
+    await llm.started.wait()
+    assert runtime.request_llm_preempt() is True
+    await llm.cleanup_started.wait()
+    assert runtime.request_llm_preempt() is False
+    llm.release.set()
+    with pytest.raises(LLMCallPreempted):
+        await asyncio.wait_for(task, timeout=5)
+    assert llm.cleanup_finished
+    assert not runtime._active_llm_tasks
+    assert not runtime._preemptible_llm_tasks
+    assert not runtime._preempted_llm_tasks

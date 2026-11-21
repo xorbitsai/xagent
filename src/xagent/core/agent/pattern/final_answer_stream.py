@@ -75,6 +75,12 @@ class FinalAnswerStreamSession:
             await self.runtime.fail_final_answer_stream(self.message_id, error)
             self._closed = True
 
+    async def interrupt(self) -> None:
+        """Close the stream as interrupted; later frames for it are dropped."""
+        if self.message_id is not None and not self._closed:
+            await self.runtime.interrupt_final_answer_stream(self.message_id)
+            self._closed = True
+
 
 class FinalAnswerStreamEmitter(FinalAnswerStreamSession):
     """Lazy final-answer UI stream emitter."""
@@ -185,6 +191,9 @@ class ReActFinalAnswerStreamer:
 
     async def fail(self, error: str) -> None:
         await self.emitter.fail(error)
+
+    async def interrupt(self) -> None:
+        await self.emitter.interrupt()
 
 
 def _is_tool_call_chunk(chunk: Any) -> bool:

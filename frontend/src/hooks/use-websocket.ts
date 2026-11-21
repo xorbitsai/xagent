@@ -139,6 +139,9 @@ interface WebSocketMessage {
 interface MessageDeliveryAck {
   client_message_id: string
   turn_id: string
+  // Present when a server answered a send-now frame by saying the message is
+  // already in the conversation.
+  live_input?: "applied"
 }
 
 // Files that were already uploaded elsewhere and are attached to a chat frame
@@ -149,9 +152,11 @@ export interface ChatMessageFileIds {
   maxFileIds?: number
 }
 
-// The only delivery declaration a chat frame can carry: the message starts a
-// new turn and is never taken as the answer to a pending question.
-export type ChatDelivery = "new_turn"
+// The delivery declarations a chat frame can carry. "new_turn": the message
+// starts a new turn and is never taken as the answer to a pending question.
+// "send_now": the message is inserted into the turn in progress and is never
+// taken as the answer to a pending question.
+export type ChatDelivery = "new_turn" | "send_now"
 
 export type MessageDeliveryDisposition = "not_sent" | "rejected" | "outcome_unknown"
 
@@ -1384,6 +1389,7 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
                 pending.resolve({
                   client_message_id: clientMessageId,
                   turn_id: typeof data.turn_id === 'string' ? data.turn_id : clientMessageId,
+                  ...(data.live_input === 'applied' ? { live_input: 'applied' as const } : {}),
                 })
               } else {
                 const hasErrorCode = Object.prototype.hasOwnProperty.call(data, "error_code")
@@ -1757,7 +1763,7 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
       if (requestId) {
         throw deliveryError("A delivery declaration cannot accompany an answer to a request.", "not_sent")
       }
-      if (chatDelivery !== "new_turn") {
+      if (chatDelivery !== "new_turn" && chatDelivery !== "send_now") {
         throw deliveryError("Message not sent: the delivery declaration is not valid.", "not_sent")
       }
     }

@@ -1660,6 +1660,106 @@ describe("SessionAgentChatPage file attachments", () => {
         acceptLast(socket)
         await waitFor(() => expect(queued()).toBeNull())
       })
+
+      it.each([
+        ["the server takes send-now", ["heartbeat", "conversation_attached", "delivery_new_turn", "delivery_send_now"], true],
+        ["the server does not", ["heartbeat", "conversation_attached", "delivery_new_turn"], false],
+      ])("offers send-now on a listed message only when %s", async (_name, announced, offered) => {
+        const socket = await mountActive()
+        receive(socket, { type: "connection_capabilities", capabilities: announced })
+        bindTaskWithStatus(socket, "running")
+        receive(socket, ATTACHED)
+        await waitFor(() => expect(editor()).toBeInTheDocument())
+        submit("A")
+        await waitFor(() => expect(chatFrames(socket)).toHaveLength(1))
+        acceptLast(socket)
+        await waitFor(() => expect(editor().textContent).toBe(""))
+        await act(async () => { await new Promise((resolve) => setTimeout(resolve, 600)) })
+        submit("B")
+        await waitFor(() => expect(queued()).toHaveTextContent("B"))
+
+        const button = () => screen.queryByRole("button", { name: "messageQueue.sendNow" })
+        expect(button() !== null).toBe(offered)
+        if (!offered) return
+        fireEvent.click(button()!)
+        await waitFor(() => expect(chatFrames(socket)).toHaveLength(2))
+        expect(chatFrames(socket)[1]).toMatchObject({ message: "B", delivery: "send_now" })
+        expect(chatFrames(socket)[1]).not.toHaveProperty("request_id")
+        expect(button()).toBeDisabled()
+        expect(queued()).toHaveTextContent("messageQueue.status.inserting")
+      })
+
+      // Frames reach the page through the real socket layer, which reshapes a
+      // frame it does not know: the server's own fields end up nested.
+      describe("a message handed back by the turn", () => {
+        const NOW = ["heartbeat", "conversation_attached", "delivery_new_turn", "delivery_send_now"]
+        const sendBNow = async () => {
+          const socket = await mountActive()
+          receive(socket, { type: "connection_capabilities", capabilities: NOW })
+          bindTaskWithStatus(socket, "running")
+          receive(socket, ATTACHED)
+          await waitFor(() => expect(editor()).toBeInTheDocument())
+          submit("A")
+          await waitFor(() => expect(chatFrames(socket)).toHaveLength(1))
+          acceptLast(socket)
+          await waitFor(() => expect(editor().textContent).toBe(""))
+          await act(async () => { await new Promise((resolve) => setTimeout(resolve, 600)) })
+          submit("B")
+          await waitFor(() => expect(queued()).toHaveTextContent("B"))
+          fireEvent.click(screen.getByRole("button", { name: "messageQueue.sendNow" }))
+          await waitFor(() => expect(chatFrames(socket)).toHaveLength(2))
+          const id = chatFrames(socket)[1].client_message_id as string
+          acceptLast(socket)
+          return { socket, id }
+        }
+        const returned = (socket: MockWebSocket, id: string, reason: string, taskId = 42) =>
+          receive(socket, { type: "live_input_returned", task_id: taskId, turn_id: id, reason })
+        const endTurn = (socket: MockWebSocket) => receive(socket, {
+          type: "trace_event",
+          timestamp: "2026-05-27T05:01:00Z",
+          data: {
+            event_id: "task-info-42-done",
+            event_type: "task_info",
+            data: {
+              id: 42, title: "Task 42", status: "completed", state_version: 2,
+              description: "Session task", created_at: "2026-05-27T05:00:00Z", updated_at: "2026-05-27T05:01:00Z",
+            },
+          },
+        })
+
+        it("goes first on the next turn when the turn ended", async () => {
+          const { socket, id } = await sendBNow()
+          returned(socket, id, "run_ended")
+          await waitFor(() => expect(queued()).toHaveTextContent("messageQueue.status.next"))
+          endTurn(socket)
+          await waitFor(() => expect(chatFrames(socket)).toHaveLength(3))
+          expect(chatFrames(socket)[2]).toMatchObject({ message: "B", delivery: "new_turn", client_message_id: id })
+        })
+
+        it("is sent into the turn again after a pause when the turn has not started", async () => {
+          const { socket, id } = await sendBNow()
+          returned(socket, id, "not_started")
+          expect(chatFrames(socket)).toHaveLength(2)
+          await waitFor(() => expect(chatFrames(socket)).toHaveLength(3), { timeout: 3000 })
+          expect(chatFrames(socket)[2]).toMatchObject({ message: "B", delivery: "send_now", client_message_id: id })
+        })
+
+        it("goes out under a new id when the server withdrew it", async () => {
+          const { socket, id } = await sendBNow()
+          returned(socket, id, "not_applied")
+          await waitFor(() => expect(queued()).toHaveTextContent("messageQueue.status.next"))
+          endTurn(socket)
+          await waitFor(() => expect(chatFrames(socket)).toHaveLength(3))
+          expect(chatFrames(socket)[2]).toMatchObject({ message: "B", delivery: "new_turn" })
+          expect(chatFrames(socket)[2].client_message_id).not.toBe(id)
+        })
+
+        it("leaves the list when another delivery took it", async () => {
+          const { socket, id } = await sendBNow()
+          returned(socket, id, "taken")
+          await waitFor(() => expect(queued()).toBeNull())
+        })
+      })
     })
   })
 })

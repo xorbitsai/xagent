@@ -953,8 +953,9 @@ def _reconcile_finalized_turn_delivery(
       raising. Note this does not certify success — ``execute_task_background``
       may set ``task.status = FAILED`` internally and return normally, leaving
       ``settlement_error`` unset. Downstream, both ``completed`` and
-      ``dispatched`` mean "delivered, do not retry"; only ``completed`` also
-      says the message is in the conversation.
+      ``dispatched`` mean "delivered, do not retry". Here ``completed`` means
+      only that the run returned without raising; the live input admission
+      marks its row ``completed`` once the injection was applied.
     - error and ``execution_started`` → ``dispatched``: the run may have
       consumed the message (and produced side effects) before failing, so the
       one certain fact is "no longer in flight". A retry invitation here would

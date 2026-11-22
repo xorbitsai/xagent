@@ -226,6 +226,12 @@ const without = (items: QueuedMessage[], clientMessageId: string) =>
 const isPlaced = (item: QueuedMessage) =>
   item.status === "sending" || item.status === "inserting" || item.next === true
 
+// A message sent into the running turn whose request is on its way, or that the
+// server holds, cannot be taken back: neither removing it nor clearing the
+// queue drops it.
+export const isPinned = (item: QueuedMessage): boolean =>
+  item.status === "inserting" && (item.insert?.inFlight === true || item.insert?.confirmed === true)
+
 const dropInsert = (item: QueuedMessage): QueuedMessage => {
   const copy = { ...item }
   delete copy.insert
@@ -420,14 +426,12 @@ export function transitionMessageQueue(
       // A message the server holds, or whose request is on its way, cannot be
       // taken back; one that only waits to be tried again can.
       const target = items.find(item => item.clientMessageId === event.clientMessageId)
-      if (target?.status === "inserting" && (target.insert?.inFlight || target.insert?.confirmed)) return to(state)
+      if (target !== undefined && isPinned(target)) return to(state)
       return to(settleEmpty({ ...state, items: without(items, event.clientMessageId) }))
     }
     case "CLEAR": {
       // Messages the server holds or a request is on its way for stay.
-      const keeps = (item: QueuedMessage) =>
-        (item.status === "inserting" && (item.insert?.inFlight === true || item.insert?.confirmed === true))
-        || (phase.kind === "sending" && item.status === "sending")
+      const keeps = (item: QueuedMessage) => isPinned(item) || (phase.kind === "sending" && item.status === "sending")
       const kept = { ...state, items: items.filter(keeps) }
       if (phase.kind === "held" && kept.items.length > 0) return to(enterWaiting(kept, state.observed.version))
       return to(settleEmpty(kept))

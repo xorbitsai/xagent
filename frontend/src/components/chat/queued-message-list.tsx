@@ -7,6 +7,7 @@ import type { SessionMessageQueueControls } from "@/contexts/app-context-chat"
 import { useI18n } from "@/contexts/i18n-context"
 import {
   isAwaitingAnswer,
+  isPinned,
   type MessageQueueState,
   type QueuedMessage,
 } from "@/contexts/session-message-queue"
@@ -36,10 +37,9 @@ function sendNowControl(state: MessageQueueState, item: QueuedMessage, available
   return item.status === "waiting" && !item.next ? "enabled" : "disabled"
 }
 
-// A message the server holds or whose request is on its way cannot be taken back.
-const removeDisabled = (item: QueuedMessage) =>
-  item.status === "sending"
-  || (item.status === "inserting" && (item.insert?.inFlight === true || item.insert?.confirmed === true))
+// The message being sent, and one the server holds or whose request is on its
+// way, cannot be taken back.
+const removeDisabled = (item: QueuedMessage) => item.status === "sending" || isPinned(item)
 
 function QueuedRow({
   item,

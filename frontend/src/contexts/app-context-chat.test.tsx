@@ -14531,6 +14531,24 @@ describe("session message queue", () => {
       if (when !== "ready") expect(first[1]).toBe(head.clientMessageId)
     })
 
+    it("sends no queued message as a new turn while a send-now acknowledgement is pending", async () => {
+      const { server, live } = await startRunning()
+      // A could not join this turn and now goes out first on the next one, so
+      // the head is a waiting message and only the pending acknowledgement
+      // keeps it from going out when the turn ends.
+      live.reply = async () => { throw refusal("live_input_not_running") }
+      await sendNow("id-A")
+      const ack = deferred<void>()
+      live.reply = () => ack.promise
+      await sendNow("id-B")
+      expect(statuses()).toEqual(["A:waiting:next", "B:inserting"])
+      await push(server.end())
+      await push(server.snapshot())
+      expect(newTurnFrames()).toEqual([])
+      await act(async () => { ack.resolve() })
+      expect(newTurnFrames()[0]).toEqual(["A", "id-A"])
+    })
+
     it("sends again once when the turn ended without the message being taken in", async () => {
       const { server, live } = await startRunning()
       await sendNow("id-A")

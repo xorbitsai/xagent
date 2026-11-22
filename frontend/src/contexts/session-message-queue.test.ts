@@ -276,6 +276,7 @@ describe("sending a queued message into the running turn", () => {
   const HELD_UNKNOWN: MessageQueuePhase = { kind: "held", reason: "send_now_unknown" }
 
   it("follows every new cell of the transition table", () => {
+    // A row without an effect expects none.
     const rows: Array<[string, MessageQueueState, MessageQueueEvent, MessageQueuePhase, string[], MessageQueueEffect?]> = [
       // REQUEUE_REFUSED goes behind every message being inserted or going out next.
       ["requeue: waiting", state(waiting(1), [ins("x", 3), B]), { type: "REQUEUE_REFUSED", item: A, sinceVersion: 9 }, waiting(1), ["x:inserting", "a:waiting", "b:waiting"]],
@@ -338,7 +339,7 @@ describe("sending a queued message into the running turn", () => {
       const { next, effect: actual } = apply(from, event)
       expect(next.phase, name).toEqual(phase)
       expect(ids(next), name).toEqual(expectedIds)
-      if (effect !== undefined) expect(actual, name).toBe(effect)
+      expect(actual, name).toBe(effect ?? null)
     }
     expect(rows).toHaveLength(44)
   })

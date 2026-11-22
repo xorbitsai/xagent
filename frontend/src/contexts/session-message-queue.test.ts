@@ -293,7 +293,8 @@ describe("sending a queued message into the running turn", () => {
       ["clear: waiting", state(waiting(1), [ins("x", 1, { inFlight: false, confirmed: true }), ins("y", 2, { inFlight: false, retryAt: NOW }), item("c", 3)]), { type: "CLEAR" }, waiting(1), ["x:inserting"]],
       ["clear: ready, emptied", state(READY, [ins("y", 2, { inFlight: false, retryAt: NOW }), item("c", 3)]), { type: "CLEAR" }, IDLE, []],
       ["clear: sending", state(SENDING, [H, ins("x", 1), item("c", 3)]), { type: "CLEAR" }, SENDING, ["h:sending", "x:inserting"]],
-      ["clear: held keeps a message being inserted and waits", state(HELD, [ins("x", 1, { confirmed: true }), item("c", 3)], { version: 4, status: "failed" }), { type: "CLEAR" }, waiting(4), ["x:inserting"]],
+      ["clear: held with an ended task keeps a message being inserted and is ready", state(HELD, [ins("x", 1, { confirmed: true }), item("c", 3)], { version: 4, status: "failed" }), { type: "CLEAR" }, READY, ["x:inserting"]],
+      ["clear: held with a running task keeps a message being inserted and waits", state(HELD, [ins("x", 1, { confirmed: true }), item("c", 3)], { version: 4, status: "running" }), { type: "CLEAR" }, waiting(4), ["x:inserting"]],
       // Leaving the sending phase with a failed message stops the queue.
       ["accepted: leaving sending with a failed message holds", state(SENDING, [H, item("f", 1, "failed")]), { type: "DELIVERY_ACCEPTED", clientMessageId: "h", sinceVersion: 2 }, HELD_UNKNOWN, ["f:failed"], "send_now_unknown"],
       ["send failed: leaving sending with a failed message holds", state(SENDING, [H, item("f", 1, "failed")]), { type: "SEND_FAILED", clientMessageId: "h", verdict: "wait" }, HELD_UNKNOWN, ["h:waiting", "f:failed"], "send_now_unknown"],
@@ -339,7 +340,7 @@ describe("sending a queued message into the running turn", () => {
       expect(ids(next), name).toEqual(expectedIds)
       if (effect !== undefined) expect(actual, name).toBe(effect)
     }
-    expect(rows).toHaveLength(43)
+    expect(rows).toHaveLength(44)
   })
 
   it("ignores every new event while idle", () => {
@@ -352,14 +353,16 @@ describe("sending a queued message into the running turn", () => {
     for (const event of events) expect(apply(idle, event).next).toBe(idle)
   })
 
-  it.each([
-    ["failed", { version: 4, status: "failed" as const }],
-    ["paused", { version: 4, status: "paused" as const }],
-  ])("clearing a held queue that keeps a message being inserted waits from the observed version (%s)", (_name, observed) => {
-    const from = state(HELD, [ins("x", 1, { confirmed: true }), A], observed)
-    const { next } = apply(from, { type: "CLEAR" })
-    expect(next.phase).toEqual(waiting(observed.version))
-    expect(ids(next)).toEqual(["x:inserting"])
+  it.each(["completed", "failed", "paused"] as const)("clearing a held queue whose task ended keeps a message being inserted and moves on once it settles (%s)", status => {
+    const cleared = apply(state(HELD, [ins("x", 1, { confirmed: true }), A], { version: 4, status }), { type: "CLEAR" }).next
+    expect(cleared.phase).toEqual(READY)
+    expect(ids(cleared)).toEqual(["x:inserting"])
+    const applied = apply(cleared, { type: "LIVE_INPUT_APPLIED", clientMessageId: "x" }).next
+    expect(applied.phase).toEqual(IDLE)
+    expect(decideComposerSubmit(applied, { active: true, deliveryInFlight: false, hasFiles: false })).toBe("send")
+    const handedBack = apply(cleared, returned("x", "run_ended")).next
+    expect(handedBack.phase).toEqual(READY)
+    expect(ids(handedBack)).toEqual(["x:waiting"])
   })
 
   describe("every phase column of the send-now cells", () => {

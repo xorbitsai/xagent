@@ -433,7 +433,14 @@ export function transitionMessageQueue(
       // Messages the server holds or a request is on its way for stay.
       const keeps = (item: QueuedMessage) => isPinned(item) || (phase.kind === "sending" && item.status === "sending")
       const kept = { ...state, items: items.filter(keeps) }
-      if (phase.kind === "held" && kept.items.length > 0) return to(enterWaiting(kept, state.observed.version))
+      if (phase.kind === "held" && kept.items.length > 0) {
+        // Clearing a stopped queue removes its notice. A task that can take a
+        // new turn has no turn left to wait for, so the queue is ready and the
+        // kept message's outcome moves it on; a running task's turn is awaited.
+        const { status, version } = state.observed
+        if (status !== undefined && APPENDABLE.has(status)) return to({ ...kept, phase: READY })
+        return to(enterWaiting(kept, version))
+      }
       return to(settleEmpty(kept))
     }
     case "SUPPORT_LOST": {

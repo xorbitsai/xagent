@@ -540,9 +540,12 @@ import { deriveConnectionNotice, type ConnectionNotice } from "./connection-noti
 import {
   MESSAGE_QUEUE_LIMIT,
   classifyQueuedSendFailure,
+  classifySendNowFailure,
   decideComposerSubmit,
   initialMessageQueueState,
   isBusyRefusal,
+  isLiveInputReturnReason,
+  readTurn,
   transitionMessageQueue,
   type MessageQueueEvent,
   type MessageQueueState,
@@ -2790,6 +2793,13 @@ export type SessionConversationAttachment = "pending" | "attached" | "unsupporte
 // authorize a send.
 export type NewTurnDeliveryCapability = "unknown" | "supported" | "unsupported"
 
+// Whether the Session server said, in the capabilities frame of the latest
+// connection that sent one, that it takes a queued message sent into the turn
+// in progress. Kept like NewTurnDeliveryCapability: only the next capabilities
+// frame changes it, and a send additionally requires that the connection which
+// reported "supported" is the current one.
+export type SendNowDeliveryCapability = NewTurnDeliveryCapability
+
 export interface SessionMessageQueueControls {
   state: MessageQueueState
   /**
@@ -2806,6 +2816,15 @@ export interface SessionMessageQueueControls {
     send: () => void | Promise<void>,
   ) => Promise<"sent" | "queued">
   continueSending: () => void
+  /**
+   * Sends a waiting queued message into the turn in progress instead of after
+   * it. Does nothing unless the current connection announced the capability
+   * and the conversation is attached. The outcome shows in `state`: the
+   * message leaves the list once the turn has taken it in, goes first on the
+   * next turn when it did not make it, or stops the queue when it may or may
+   * not have arrived.
+   */
+  sendNow: (clientMessageId: string) => void
   remove: (clientMessageId: string) => void
   clear: () => void
 }
@@ -2844,6 +2863,7 @@ interface AppContextType {
   sessionConversationState: SessionConversationState["phase"]
   sessionConversationAttachment: SessionConversationAttachment
   newTurnDelivery: NewTurnDeliveryCapability
+  sendNowDelivery: SendNowDeliveryCapability
   messageQueue: SessionMessageQueueControls | null
   setTaskId: (taskId: number | null, options?: { navigate?: boolean }) => void
   requestStatus: () => void
@@ -3202,6 +3222,16 @@ export function AppProvider({
     if (mountedRef.current) setSessionAttachment(next)
   }, [])
 
+  // Whether the current Session socket has finished attaching, read from the
+  // refs for code that runs outside a render. The same rule as
+  // sessionConversationAttachment not being "pending".
+  const isSessionAttachmentComplete = useCallback(() => {
+    const attachment = sessionAttachmentRef.current
+    return attachment.connectionIdentity === sessionConnectionIdentityRef.current
+      && (attachment.capability === "absent"
+        || (attachment.capability === "declared" && attachment.attached))
+  }, [])
+
   // Written only from the capabilities frame of the current Session socket.
   // The connection ref records which connection's frame wrote the value, so a
   // send can tell a value reported by the current connection from one left
@@ -3217,6 +3247,24 @@ export function AppProvider({
     newTurnDeliveryRef.current = next
     newTurnDeliveryConnectionRef.current = connectionIdentity
     if (mountedRef.current) setNewTurnDelivery(next)
+  }, [])
+
+  const sendNowDeliveryRef = useRef<SendNowDeliveryCapability>("unknown")
+  const sendNowDeliveryConnectionRef = useRef<string | null>(null)
+  // The state mirrors the connection too: a reconnect that announces the same
+  // capability again still has to wake the code that waits for it.
+  const [sendNowDeliveryState, setSendNowDeliveryState] = useState<{
+    capability: SendNowDeliveryCapability
+    connectionIdentity: string | null
+  }>({ capability: "unknown", connectionIdentity: null })
+  const sendNowDelivery = sendNowDeliveryState.capability
+  const writeSendNowDelivery = useCallback((
+    next: SendNowDeliveryCapability,
+    connectionIdentity: string,
+  ) => {
+    sendNowDeliveryRef.current = next
+    sendNowDeliveryConnectionRef.current = connectionIdentity
+    if (mountedRef.current) setSendNowDeliveryState({ capability: next, connectionIdentity })
   }, [])
 
   // The page asks for a queue, the transport is taskless, and the Session
@@ -3252,12 +3300,14 @@ export function AppProvider({
     if (
       newTurnDeliveryRef.current !== "supported"
       && event.type !== "REMOVE" && event.type !== "CLEAR" && event.type !== "SUPPORT_LOST"
+      && event.type !== "SEND_NOW_SUPPORT_LOST"
     ) return
     const current = stateRef.current.messageQueue
     const { next, effect } = transitionMessageQueue(current, event)
     if (next !== current) dispatch({ type: "SET_MESSAGE_QUEUE", payload: next })
     if (effect === "send_failed") toast.error(translateRef.current("messageQueue.held.sendFailed"))
     if (effect === "support_lost") toast.error(translateRef.current("messageQueue.supportLost"))
+    if (effect === "send_now_unknown") toast.error(translateRef.current("clientErrors.liveInputOutcomeUnknown"))
   }, [dispatch])
 
   const rejectSessionResetFlight = useCallback(
@@ -3643,6 +3693,12 @@ export function AppProvider({
           sessionMessageOwner.connectionIdentity,
         )
         if (!takesNewTurns) applyMessageQueue({ type: "SUPPORT_LOST" })
+        const takesSendNow = capabilities.includes("delivery_send_now")
+        writeSendNowDelivery(
+          takesSendNow ? "supported" : "unsupported",
+          sessionMessageOwner.connectionIdentity,
+        )
+        if (!takesSendNow) applyMessageQueue({ type: "SEND_NOW_SUPPORT_LOST" })
       }
       : undefined,
     onConnect: onConnect, // Pass the callback
@@ -3948,6 +4004,8 @@ export function AppProvider({
     options?: {
       skipHistory?: boolean
       filesDisabled?: boolean
+      // The frame arrived live on the Session socket, not from a replay.
+      liveSessionFrame?: boolean
     },
   ) => {
     // A task's WebSocket connection is per-task (or, for session transports,
@@ -4471,6 +4529,20 @@ export function AppProvider({
               eventData,
               message.event_id || traceEventData.event_id,
             )
+            // The echo of a message sent into the running turn: the turn took
+            // it in. Only an echo that arrives after the conversation has
+            // finished attaching counts, because the history replay draws the
+            // bubble of a message that was withdrawn again too.
+            // Only the live Session socket reaches this with an attached conversation
+            // today; the flag keeps any other caller from marking a message applied.
+            if (
+              options?.liveSessionFrame
+              && typeof eventData.turn_id === "string"
+              && eventData.turn_id.trim()
+              && isSessionAttachmentComplete()
+            ) {
+              applyMessageQueue({ type: "LIVE_INPUT_APPLIED", clientMessageId: eventData.turn_id.trim() })
+            }
 
             // Debug log
             console.log('🔍 User message debug:', {
@@ -7459,7 +7531,7 @@ export function AppProvider({
         }
         break
     }
-  }, [applySessionStop, trustLegacyErrorProse])
+  }, [applyMessageQueue, applySessionStop, isSessionAttachmentComplete, trustLegacyErrorProse])
 
   const handleSessionMessage = (
     message: WebSocketMessage,
@@ -7698,9 +7770,38 @@ export function AppProvider({
       }
     }
 
+    // The turn handed a message sent into it back: it will not take it in.
+    if (message.type === "live_input_returned") {
+      // The socket layer nests a frame it has no shape for: the server's own
+      // fields (turn_id, reason) arrive inside `data`.
+      const { turn_id: turnId, reason } = asMessageRecord(message.data)
+      // The checks above already end the session on a task id that is not the
+      // current one; the comparison stays so the frame is ignored if they change.
+      if (
+        binding.present
+        && binding.valid
+        && binding.taskId === sessionTaskIdRef.current
+        && typeof turnId === "string"
+        && typeof reason === "string"
+        && isLiveInputReturnReason(reason)
+      ) {
+        applyMessageQueue({
+          type: "LIVE_INPUT_RETURNED",
+          clientMessageId: turnId,
+          reason,
+          now: Date.now(),
+          // Only the server's own account of this attempt was withdrawn, so
+          // the message goes out on the next turn under an id never used.
+          ...(reason === "not_applied" ? { newClientMessageId: generateClientMessageId() } : {}),
+        })
+      }
+      return
+    }
+
     handleMessage(message, dispatch, stateRef.current, {
       skipHistory: true,
       filesDisabled,
+      liveSessionFrame: true,
     })
     applyMessageQueue({
       type: "OBSERVE",
@@ -7791,10 +7892,11 @@ export function AppProvider({
     if (sourceTaskId !== undefined && !sessionTransport?.allowTasklessChat) {
       throw new MessageDeliveryError("A conversation source is not supported for this connection.", "not_sent")
     }
-    // Marks the message a new turn instead of a possible answer to a pending
-    // question. Only the Session window's chat frame carries it.
+    // Marks the message a new turn, or a message inserted into the turn in
+    // progress, instead of a possible answer to a pending question. Only the
+    // Session window's chat frame carries it.
     const delivery: unknown = config?.delivery
-    if (delivery !== undefined && delivery !== "new_turn") {
+    if (delivery !== undefined && delivery !== "new_turn" && delivery !== "send_now") {
       throw new MessageDeliveryError("Message not sent: the delivery declaration is not valid.", "not_sent")
     }
     if (delivery !== undefined && !sessionTransport?.allowTasklessChat) {
@@ -7808,9 +7910,16 @@ export function AppProvider({
     // connection announced it. A resend after a lost connection reuses these
     // arguments on the next connection before its capabilities frame arrives.
     if (
-      delivery !== undefined
+      delivery === "new_turn"
       && (newTurnDeliveryRef.current !== "supported"
         || newTurnDeliveryConnectionRef.current !== sessionConnectionIdentityRef.current)
+    ) {
+      throw new MessageDeliveryError("Message not sent: this connection does not take a delivery declaration.", "not_sent")
+    }
+    if (
+      delivery === "send_now"
+      && (sendNowDeliveryRef.current !== "supported"
+        || sendNowDeliveryConnectionRef.current !== sessionConnectionIdentityRef.current)
     ) {
       throw new MessageDeliveryError("Message not sent: this connection does not take a delivery declaration.", "not_sent")
     }
@@ -7931,6 +8040,34 @@ export function AppProvider({
           "Message not sent: a conversation source can only start a new conversation.",
           "not_sent",
         )
+      }
+
+      if (delivery === "send_now") {
+        // A message sent into the turn in progress belongs to the bound
+        // conversation, carries nothing but its text, and is never sent a
+        // second time on another connection by this function: the caller
+        // decides that from the connection's capabilities. The optimistic
+        // bubble is left out as well: the turn's own echo draws it once the
+        // message has been taken in, and an acknowledgement saying the message
+        // is already in the conversation draws it when no echo did.
+        if (
+          sessionConversationRef.current.phase !== "bound"
+          || sourceTaskId !== undefined
+          || (files?.length ?? 0) > 0
+          || uploadedFiles.length > 0
+        ) {
+          throw new MessageDeliveryError("Message not sent: it cannot be sent into the turn in progress.", "not_sent")
+        }
+        beginSessionMessageDelivery()
+        try {
+          const ack = await sendChatMessage(message, undefined, false, clientMessageId, undefined, undefined, undefined, "send_now")
+          // The executor reads this once the send resolves; sendMessage itself
+          // returns nothing.
+          if (ack?.live_input === "applied") sendNowAppliedRef.current.add(clientMessageId)
+        } finally {
+          endSessionMessageDelivery()
+        }
+        return
       }
 
       const startsReplacementConversation =
@@ -8451,6 +8588,7 @@ export function AppProvider({
     filesDisabled,
     queuePendingMessage,
     readObservedTaskState,
+    sendChatMessage,
     sendChatWithResend,
     sessionTransport,
     state.currentTask?.status,
@@ -8519,6 +8657,31 @@ export function AppProvider({
       return "queued"
     }
   }, [applyMessageQueue, isMessageQueueOn, readObservedTaskState])
+
+  // Whether a queued message can be sent into the turn in progress right now:
+  // the current connection announced it and the bound conversation is attached.
+  const canSendNowFrom = useCallback(() => (
+    messageQueueOfferedRef.current
+    && mountedRef.current
+    && sessionConversationRef.current.phase === "bound"
+    && sendNowDeliveryRef.current === "supported"
+    && sendNowDeliveryConnectionRef.current === sessionConnectionIdentityRef.current
+    && sessionConnectionIdentityRef.current !== null
+    && isSessionAttachmentComplete()
+  ), [isSessionAttachmentComplete])
+
+  const sendQueuedMessageNow = useCallback((clientMessageId: string) => {
+    if (!canSendNowFrom()) return
+    const observed = readObservedTaskState()
+    applyMessageQueue({
+      type: "SEND_NOW_REQUESTED",
+      clientMessageId,
+      sinceVersion: observed.version,
+      connection: sessionConnectionIdentityRef.current,
+      // Nothing waits on an answer: a message cannot be taken in ahead of one.
+      canInsert: observed.status !== "waiting_for_user",
+    })
+  }, [applyMessageQueue, canSendNowFrom, readObservedTaskState])
 
   const startNewConversation = useCallback((): Promise<void> => {
     const existingReset = sessionResetFlightRef.current
@@ -8883,6 +9046,117 @@ export function AppProvider({
     trackedSendMessage,
   ])
 
+  // Messages with a request into the turn in progress on the wire, and the
+  // connection each request was lost on. A message has at most one request
+  // waiting, and a request lost on a connection is not repeated on it.
+  const sendNowOnWireRef = useRef(new Set<string>())
+  const sendNowLostOnRef = useRef(new Map<string, string | null>())
+  // Messages whose acknowledgement said they are already in the conversation,
+  // until the executor has settled them.
+  const sendNowAppliedRef = useRef(new Set<string>())
+  const scanSendNow = () => {
+    if (!canSendNowFrom() || !isConnected) return
+    const connection = sessionConnectionIdentityRef.current
+    const wire = sendNowOnWireRef.current
+    const send = (clientMessageId: string, text: string) => {
+      wire.add(clientMessageId)
+      sendNowLostOnRef.current.delete(clientMessageId)
+      trackedSendMessage(text, { clientMessageId, delivery: "send_now" }).then(() => {
+        wire.delete(clientMessageId)
+        const applied = sendNowAppliedRef.current.delete(clientMessageId)
+        if (!mountedRef.current) return
+        if (applied) {
+          const current = stateRef.current
+          const stillInserting = current.messageQueue.items.some(
+            item => item.clientMessageId === clientMessageId && item.status === "inserting",
+          )
+          const bubbleId = userTurnMessageId(clientMessageId)
+          // The live echo may never have reached this connection; the message
+          // is in the conversation, so it gets a bubble until the transcript's
+          // own copy replaces it. A bubble already there is left as it is.
+          if (stillInserting) {
+            dispatch({
+              type: "ADD_MESSAGE",
+              payload: { id: bubbleId, role: "user", content: text, timestamp: Date.now().toString(), isOptimistic: true },
+            })
+          }
+        }
+        // "Already in the conversation" settles the message the way its live
+        // echo would; any other acceptance means the server holds it.
+        applyMessageQueue({ type: applied ? "LIVE_INPUT_APPLIED" : "SEND_NOW_ACCEPTED", clientMessageId })
+      }, (error: unknown) => {
+        wire.delete(clientMessageId)
+        if (!mountedRef.current) return
+        const failure = classifySendNowFailure(error)
+        if (failure === null) {
+          // The connection ended while the request waited: the same message is
+          // sent again once the next connection has announced the capability.
+          sendNowLostOnRef.current.set(clientMessageId, connection)
+          return
+        }
+        applyMessageQueue({
+          type: "SEND_NOW_FAILED",
+          clientMessageId,
+          verdict: failure.verdict,
+          now: Date.now(),
+          ...(failure.replaceId ? { newClientMessageId: generateClientMessageId() } : {}),
+        })
+      })
+    }
+    const now = Date.now()
+    const observed = readObservedTaskState()
+    // Each message is picked at most once per pass: a retry that has come due,
+    // else a request lost with its connection, else a message the server holds
+    // although the turn it was sent into has ended.
+    for (const item of stateRef.current.messageQueue.items) {
+      const { insert } = item
+      if (item.status !== "inserting" || !insert || wire.has(item.clientMessageId)) continue
+      // `atVersion` becomes the message's `resentAt`; a retry that came due
+      // keeps the one it had.
+      const resend = (atVersion: number | undefined) => {
+        applyMessageQueue({ type: "SEND_NOW_RESENT", clientMessageId: item.clientMessageId, atVersion, connection })
+        send(item.clientMessageId, item.text)
+      }
+      if (!insert.inFlight && insert.retryAt !== undefined) {
+        if (insert.retryAt <= now) resend(insert.resentAt)
+      } else if (insert.inFlight) {
+        if (insert.connection !== connection) resend(observed.version)
+        else if (sendNowLostOnRef.current.get(item.clientMessageId) !== connection) send(item.clientMessageId, item.text)
+      } else if (insert.confirmed && insert.resentAt !== observed.version) {
+        const reading = readTurn(observed, insert.since)
+        if (reading !== "unseen" && reading !== "running") resend(observed.version)
+      }
+    }
+  }
+  const scanSendNowRef = useRef(scanSendNow)
+  useLayoutEffect(() => {
+    scanSendNowRef.current = scanSendNow
+  })
+  // Runs the pass whenever the queue, the connection or its announced
+  // capabilities change, and once more when the earliest retry falls due.
+  useEffect(() => {
+    scanSendNowRef.current()
+    if (!canSendNowFrom()) return
+    let due: number | undefined
+    for (const item of stateRef.current.messageQueue.items) {
+      const { insert } = item
+      if (item.status === "inserting" && insert && !insert.inFlight && insert.retryAt !== undefined
+        && (due === undefined || insert.retryAt < due)) due = insert.retryAt
+    }
+    if (due === undefined) return
+    const timer = setTimeout(() => scanSendNowRef.current(), Math.max(0, due - Date.now()))
+    return () => clearTimeout(timer)
+  }, [
+    canSendNowFrom,
+    isConnected,
+    messageDeliveryCount,
+    sendNowDeliveryState,
+    sessionConnectionIdentity,
+    sessionConversationAttachment,
+    state.messageQueue,
+    state.sessionConversation.phase,
+  ])
+
   return (
     <AgentCardPresentationCapability.Provider value={agentCardsEnabled}>
       <LinksOpenInNewTabCapability.Provider value={linksOpenInNewTab}>
@@ -8919,11 +9193,13 @@ export function AppProvider({
           sessionConversationState: state.sessionConversation.phase,
           sessionConversationAttachment,
           newTurnDelivery,
+          sendNowDelivery,
           messageQueue: messageQueueOffered
             ? {
               state: state.messageQueue,
               submit: submitQueuedMessage,
               continueSending: () => applyMessageQueue({ type: "CONTINUE" }),
+              sendNow: sendQueuedMessageNow,
               remove: (clientMessageId) => applyMessageQueue({ type: "REMOVE", clientMessageId }),
               clear: () => applyMessageQueue({ type: "CLEAR" }),
             }

@@ -27,6 +27,7 @@ const controls = (
   state: { items, phase, observed },
   submit: vi.fn(),
   continueSending: vi.fn(),
+  sendNow: vi.fn(),
   remove: vi.fn(),
   clear: vi.fn(),
 })
@@ -98,6 +99,7 @@ describe("QueuedMessageList", () => {
     ["turn_paused", "messageQueue.held.turnInterrupted"],
     ["send_failed", "messageQueue.held.sendFailed"],
     ["earlier_send_failed", "messageQueue.held.earlierSendFailed"],
+    ["send_now_unknown", "clientErrors.liveInputOutcomeUnknown"],
   ] as const)("explains a queue held for %s and offers continue and clear", (reason, text) => {
     const queue = controls([item("a", "waiting"), item("b", "waiting")], { kind: "held", reason })
     render(<QueuedMessageList queue={queue} canContinue />)
@@ -133,10 +135,64 @@ describe("QueuedMessageList", () => {
     expect(screen.queryByText("messageQueue.waitingAnswer") !== null).toBe(shown)
   })
 
-  it("has no send-now button", () => {
+  it("has no send-now button when the connection does not announce it", () => {
     render(<QueuedMessageList queue={controls([item("a", "waiting")], { kind: "held", reason: "turn_failed" })} canContinue />)
     expect(screen.getAllByRole("button").map(button => button.getAttribute("aria-label") ?? button.textContent)).toEqual([
       "messageQueue.continue", "messageQueue.clear", "messageQueue.expand", "messageQueue.remove",
     ])
+  })
+  describe("send-now button", () => {
+    const inserting = (id: string, insert: Partial<NonNullable<QueuedMessage["insert"]>> = {}): QueuedMessage => ({
+      ...item(id, "inserting"),
+      insert: { confirmed: false, inFlight: true, since: 1, connection: "c", resentAt: undefined, retries: 0, retryAt: undefined, ...insert },
+    })
+    const HELD: MessageQueuePhase = { kind: "held", reason: "turn_failed" }
+    const sendNowButton = () => screen.queryByRole("button", { name: "messageQueue.sendNow" })
+
+    it.each([
+      ["the connection does not announce it", false, WAITING, item("a", "waiting"), undefined, "hidden"],
+      ["the row is being sent", true, WAITING, item("a", "sending"), undefined, "disabled"],
+      ["the row is being sent into the turn", true, WAITING, inserting("a"), undefined, "disabled"],
+      ["the task waits on an answer", true, WAITING, item("a", "waiting"), { version: 2, status: "waiting_for_user" as const }, "disabled"],
+      ["a stopped queue holds a waiting row", true, HELD, item("a", "waiting"), undefined, "enabled"],
+      ["a stopped queue holds a failed row", true, HELD, item("a", "failed"), undefined, "enabled"],
+      ["a waiting row in a waiting queue", true, WAITING, item("a", "waiting"), undefined, "enabled"],
+      ["a failed row outside a stopped queue", true, WAITING, item("a", "failed"), undefined, "disabled"],
+      ["a row that already goes first on the next turn", true, WAITING, { ...item("a", "waiting"), next: true }, undefined, "disabled"],
+    ] as const)("send-now button state [%s]", (_name, available, phase, row, observed, expected) => {
+      const queue = controls([row], phase, observed)
+      render(<QueuedMessageList queue={queue} canContinue canSendNow={available} />)
+      const button = sendNowButton()
+      if (expected === "hidden") {
+        expect(button).toBeNull()
+        return
+      }
+      expect(button).toHaveProperty("disabled", expected === "disabled")
+      fireEvent.click(button!)
+      expect(queue.sendNow).toHaveBeenCalledTimes(expected === "enabled" ? 1 : 0)
+      if (expected === "enabled") expect(queue.sendNow).toHaveBeenCalledWith("a")
+    })
+
+    it.each([
+      ["a request is on its way", { inFlight: true }, true],
+      ["the server holds it", { inFlight: false, confirmed: true }, true],
+      ["only a retry waits", { inFlight: false, retryAt: 5000 }, false],
+    ])("remove enabled only while a send-now retry is waiting [%s]", (_name, insert, disabled) => {
+      render(<QueuedMessageList queue={controls([inserting("a", insert)], WAITING)} canContinue canSendNow />)
+      expect(screen.getByRole("button", { name: "messageQueue.remove" })).toHaveProperty("disabled", disabled)
+    })
+
+    it("status shows Sends next", () => {
+      render(<QueuedMessageList queue={controls([{ ...item("a", "waiting"), next: true }, inserting("b"), item("c", "waiting")], WAITING)} canContinue canSendNow />)
+      expect(screen.getByText("messageQueue.status.next")).toBeInTheDocument()
+      expect(screen.getByText("messageQueue.status.inserting")).toBeInTheDocument()
+      expect(screen.getByText("messageQueue.status.waiting")).toBeInTheDocument()
+    })
+
+    it("send-now button names its row for screen readers", () => {
+      render(<QueuedMessageList queue={controls([item("a", "waiting", "first"), item("b", "waiting", "second")], WAITING)} canContinue canSendNow />)
+      const [, second] = screen.getAllByRole("button", { name: "messageQueue.sendNow" })
+      expect(second).toHaveAttribute("aria-describedby", screen.getByText("second").id)
+    })
   })
 })

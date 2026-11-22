@@ -898,6 +898,65 @@ describe("AppProvider websocket message routing", () => {
     expect(JSON.parse(screen.getByTestId("message-statuses").textContent || "[]")).toEqual(["interrupted"])
   })
 
+  it.each([
+    ["shared live frames", { stream_run_id: "run-1", stream_attempt_id: "attempt-1" }, (sequence: number) => ({ _sequence: sequence })],
+    ["sequenced frames", {}, (sequence: number) => ({ execution_sequence: sequence })],
+  ])("interrupted start keeps text and a second answer streams in the same run [%s]", (_path, envelope, sequenced) => {
+    render(<AppProvider token="token"><SeedRunningTask /><StateProbe /></AppProvider>)
+    let sequence = 10
+    const send = (type: string, data: Record<string, unknown>) => act(() => {
+      sequence += 1
+      const extra = sequenced(sequence)
+      delete (extra as { _sequence?: number })._sequence
+      webSocketOptions.current?.onMessage?.({
+        type, task_id: 1, timestamp: "2026-05-27T05:00:00Z", ...envelope, ...extra, ...data,
+      } as never)
+    })
+    const bubbles = () => (JSON.parse(screen.getByTestId("messages").textContent || "[]") as
+      Array<{ id: string; status: string; content: string }>).map(({ id, status, content }) => ({ id, status, content }))
+    send("final_answer_start", { message_id: "final_answer_1" })
+    send("final_answer_delta", { message_id: "final_answer_1", delta: "PARTIAL sydney" })
+    send("final_answer_start", { message_id: "final_answer_1", status: "interrupted" })
+    expect(bubbles()).toEqual([{ id: "final_answer_1", status: "interrupted", content: "PARTIAL sydney" }])
+
+    send("final_answer_start", { message_id: "final_answer_2" })
+    send("final_answer_delta", { message_id: "final_answer_2", delta: "NEW mel" })
+    expect(bubbles()).toEqual([
+      { id: "final_answer_1", status: "interrupted", content: "PARTIAL sydney" },
+      { id: "final_answer_2", status: "running", content: "NEW mel" },
+    ])
+    send("final_answer_end", { message_id: "final_answer_2", content: "NEW melbourne answer" })
+    expect(bubbles()).toEqual([
+      { id: "final_answer_1", status: "interrupted", content: "PARTIAL sydney" },
+      { id: "final_answer_2", status: "completed", content: "NEW melbourne answer" },
+    ])
+    expect(screen.getByTestId("stream-recovery").textContent).toBe("")
+  })
+
+  it("replayed interrupted empty answer keeps its tool steps", () => {
+    render(<AppProvider token="token"><SeedRunningTask /><StateProbe /></AppProvider>)
+    const send = (message: Record<string, unknown>) => act(() => {
+      webSocketOptions.current?.onMessage?.({ task_id: 1, timestamp: "2026-05-27T05:00:00Z", ...message } as never)
+    })
+    const tool = (eventType: string, eventId: string, sequence: number) => send({
+      type: "trace_event", execution_sequence: sequence, step_id: "step-1",
+      data: { event_id: eventId, event_type: eventType, data: { tool_name: "search" } },
+    })
+    const staged = () => JSON.parse(screen.getByTestId("staged-trace-events").textContent || "[]") as string[]
+    tool("tool_execution_start", "tool-start", 11)
+    tool("tool_execution_end", "tool-end", 12)
+    expect(staged()).toEqual([expect.stringMatching(/^trace-tool-start-/), expect.stringMatching(/^trace-tool-end-/)])
+
+    send({ type: "final_answer_start", message_id: "final_answer_1", status: "interrupted", execution_sequence: 13 })
+    const messages = JSON.parse(screen.getByTestId("messages").textContent || "[]")
+    expect(messages).toHaveLength(1)
+    expect(messages[0]).toMatchObject({ id: "final_answer_1", status: "interrupted", content: "" })
+    expect(staged()).toEqual([])
+    expect(JSON.parse(screen.getByTestId("trace-events").textContent || "[]").map(
+      (event: { event_type: string }) => event.event_type,
+    )).toEqual(["tool_execution_start", "tool_execution_end"])
+  })
+
   it("continues the current V2 attempt after an older history terminal arrives", () => {
     render(<AppProvider token="token"><SeedRunningTask /><StateProbe /></AppProvider>)
     const send = (message: Record<string, unknown>) => act(() => {
@@ -14310,6 +14369,469 @@ describe("session message queue", () => {
     const before = queue()
     await push(server.snapshot())
     expect(queue()).toBe(before)
+  })
+
+  describe("sending a queued message into the turn in progress", () => {
+    const NOW_CAPABILITIES = [...CAPABILITIES, "delivery_send_now"]
+    const refusal = (code: ClientErrorCode, retryWithNewId = false) =>
+      new MessageDeliveryError("refused", "rejected", { errorCode: code, retryWithNewId })
+    const lost = () => new MessageDeliveryError("lost", "outcome_unknown", { connectionLost: true })
+    const liveFrames = () => sendChatMessageMock.mock.calls.filter(call => call[7] === "send_now").map(call => call[3])
+    const newTurnFrames = () => sendChatMessageMock.mock.calls.filter(call => call[7] === "new_turn").map(call => [call[0], call[3]])
+    const sendNow = (id: string) => act(async () => getSessionControls().messageQueue!.sendNow(id))
+    const echo = (id: string) => push({
+      type: "trace_event", task_id: TASK, timestamp: "2026-11-17T00:00:02Z",
+      data: { event_id: `echo-${id}`, event_type: "user_message", data: { message: id, turn_id: id } },
+    })
+    // The socket layer nests the server's own fields of a frame it has no
+    // shape for inside `data`; the provider is fed what that layer produces.
+    const returned = (id: string, reason: string, taskId = TASK) => push({
+      type: "live_input_returned", task_id: taskId, timestamp: "2026-11-17T00:00:02Z", data: { turn_id: id, reason },
+    } as TestWebSocketMessage)
+    // In steps, because a retry is scheduled by an effect that runs once the
+    // step's updates have been applied.
+    const advance = async (ms: number) => {
+      for (let left = ms; left > 0; left -= 1000) await act(async () => { await vi.advanceTimersByTimeAsync(Math.min(left, 1000)) })
+    }
+    const insert = (id: string) => queue().items.find(entry => entry.clientMessageId === id)?.insert
+
+    // A running turn with A and B queued behind it. `live.reply` answers each
+    // request into the turn: it may refuse, wait or return.
+    const startRunning = async (capabilities: readonly string[] = NOW_CAPABILITIES) => {
+      const server = makeServer({ status: "running", version: 3 })
+      const live = {
+        attempts: 0, active: 0, mostActive: 0,
+        // When set, the acknowledgement says the message is already in the
+        // conversation.
+        applied: false,
+        reply: (async () => undefined) as (id: string, attempt: number) => Promise<void>,
+      }
+      sendChatMessageMock.mockImplementation(async (...args: unknown[]) => {
+        if (args[7] !== "send_now") return server.chat(...args)
+        live.attempts += 1
+        live.active += 1
+        live.mostActive = Math.max(live.mostActive, live.active)
+        try {
+          await live.reply(args[3] as string, live.attempts)
+          return { client_message_id: args[3], turn_id: args[3], ...(live.applied ? { live_input: "applied" } : {}) }
+        } finally {
+          live.active -= 1
+        }
+      })
+      const view = render(tree())
+      await connect(capabilities)
+      await push(taskInfoMessage(TASK, { status: "running", state_version: 3 }))
+      expect(await submit("A")).toBe("queued")
+      expect(await submit("B")).toBe("queued")
+      return { server, live, view }
+    }
+    const statuses = () => queue().items.map(entry => `${entry.text}:${entry.status}${entry.next ? ":next" : ""}`)
+
+    beforeEach(() => { vi.useFakeTimers() })
+    afterEach(() => { vi.useRealTimers() })
+
+    it.each([
+      ["only a heartbeat", ["heartbeat"], false],
+      ["attach completion", ["heartbeat", "conversation_attached"], false],
+      ["new turns", CAPABILITIES, true],
+    ])("hides send-now and never sends it without the capability [%s]", async (_name, capabilities, holdsMessages) => {
+      const server = makeServer({ status: "running", version: 3 })
+      sendChatMessageMock.mockImplementation(server.chat)
+      render(tree())
+      await connect(capabilities)
+      await push(taskInfoMessage(TASK, { status: "running", state_version: 3 }))
+      if (holdsMessages) {
+        expect(await submit("A")).toBe("queued")
+        expect(queue().items).toHaveLength(1)
+      }
+      expect(getSessionControls().sendNowDelivery).toBe("unsupported")
+      const before = queue()
+      await sendNow("id-A")
+      expect(queue()).toBe(before)
+      expect(liveFrames()).toEqual([])
+    })
+
+    it("sends the message first, once, without a bubble of its own", async () => {
+      await startRunning()
+      await sendNow("id-B")
+      await sendNow("id-B")
+      expect(liveFrames()).toEqual(["id-B"])
+      expect(statuses()).toEqual(["B:inserting", "A:waiting"])
+      expect(getSessionControls().state.messages).toEqual([])
+      await echo("id-B")
+      expect(statuses()).toEqual(["A:waiting"])
+    })
+
+    it("does not send into a turn that waits on an answer", async () => {
+      const { server } = await startRunning()
+      await push(server.ask())
+      await sendNow("id-A")
+      expect(liveFrames()).toEqual([])
+      expect(statuses()).toEqual(["A:waiting", "B:waiting"])
+    })
+
+    it.each([
+      ["no run", () => refusal("live_input_not_running"), ["A:waiting:next", "B:waiting"], null],
+      ["a pending question", () => refusal("interaction_response_required"), ["A:waiting:next", "B:waiting"], null],
+      ["unavailable", () => refusal("live_input_unavailable"), ["A:failed", "B:waiting"], "messageQueue.held.sendFailed"],
+      ["outcome unknown", () => refusal("live_input_outcome_unknown"), ["A:failed", "B:waiting"], "clientErrors.liveInputOutcomeUnknown"],
+      ["an unusable id", () => refusal("message_id_conflict", true), ["A:failed", "B:waiting"], "messageQueue.held.sendFailed"],
+      ["not sent", () => new MessageDeliveryError("no", "not_sent", {}), ["A:waiting", "B:waiting"], null],
+    ])("a refusal for %s lands in its own outcome", async (_name, error, expected, alert) => {
+      const { live } = await startRunning()
+      live.reply = async () => { throw error() }
+      await sendNow("id-A")
+      expect(statuses()).toEqual(expected)
+      expect(toasts()).toEqual(alert ? [alert] : [])
+      if (alert) expect(phase().kind).toBe("held")
+    })
+
+    it.each([
+      ["has", true],
+      ["lacks", false],
+    ])("waits for the new connection's capabilities before sending again [the new connection %s send-now]", async (_name, has) => {
+      const { live, view } = await startRunning()
+      live.reply = async () => { throw lost() }
+      await sendNow("id-A")
+      live.reply = async () => undefined
+      view.rerender(tree("session-two"))
+      act(() => socket()?.onConnect?.())
+      expect(liveFrames()).toEqual(["id-A"])
+      await connect(has ? NOW_CAPABILITIES : CAPABILITIES)
+      if (has) {
+        expect(liveFrames()).toEqual(["id-A", "id-A"])
+        expect(statuses()[0]).toBe("A:inserting")
+        expect(insert("id-A")).toMatchObject({ connection: "session-two", confirmed: true })
+      } else {
+        expect(liveFrames()).toEqual(["id-A"])
+        expect(statuses()).toEqual(["A:failed", "B:waiting"])
+        expect(phase()).toEqual({ kind: "held", reason: "send_now_unknown" })
+        expect(toasts()).toEqual(["clientErrors.liveInputOutcomeUnknown"])
+      }
+    })
+
+    it.each([
+      ["run_ended", "waiting"], ["run_ended", "ready"], ["run_ended", "held"],
+      ["not_applied", "waiting"], ["not_applied", "ready"], ["not_applied", "held"],
+    ])("a returned message goes first [%s %s]", async (reason, when) => {
+      const { server } = await startRunning()
+      await sendNow("id-A")
+      if (when !== "waiting") await push(server.end(when === "held" ? "failed" : "completed"))
+      await returned("id-A", reason)
+      // A ready queue sends the head at once, so only the other two phases
+      // still show it first in the list.
+      const head = queue().items[0]
+      if (when !== "ready") expect(head).toMatchObject({ text: "A", status: "waiting", next: true, seq: 0 })
+      if (when === "waiting") await push(server.end())
+      if (when === "held") await act(async () => getSessionControls().messageQueue!.continueSending())
+      const [first] = newTurnFrames()
+      expect(first[0]).toBe("A")
+      if (reason === "not_applied") expect(first[1]).not.toBe("id-A")
+      else expect(first[1]).toBe("id-A")
+      if (when !== "ready") expect(first[1]).toBe(head.clientMessageId)
+    })
+
+    it("sends no queued message as a new turn while a send-now acknowledgement is pending", async () => {
+      const { server, live } = await startRunning()
+      // A could not join this turn and now goes out first on the next one, so
+      // the head is a waiting message and only the pending acknowledgement
+      // keeps it from going out when the turn ends.
+      live.reply = async () => { throw refusal("live_input_not_running") }
+      await sendNow("id-A")
+      const ack = deferred<void>()
+      live.reply = () => ack.promise
+      await sendNow("id-B")
+      expect(statuses()).toEqual(["A:waiting:next", "B:inserting"])
+      await push(server.end())
+      await push(server.snapshot())
+      expect(newTurnFrames()).toEqual([])
+      await act(async () => { ack.resolve() })
+      expect(newTurnFrames()[0]).toEqual(["A", "id-A"])
+    })
+
+    it("sends again once when the turn ended without the message being taken in", async () => {
+      const { server, live } = await startRunning()
+      await sendNow("id-A")
+      live.reply = async (_id, attempt) => { if (attempt === 2) throw refusal("live_input_not_running") }
+      await push(server.end())
+      await push(server.snapshot())
+      await push(server.snapshot())
+      expect(liveFrames()).toEqual(["id-A", "id-A"])
+      expect(newTurnFrames()[0]).toEqual(["A", "id-A"])
+    })
+
+    describe("when the turn has not started yet", () => {
+      const notStarted = (until: number) => async (_id: string, attempt: number) => {
+        if (attempt <= until) throw refusal("live_input_not_started")
+      }
+      it("sends again after a second and the message is taken in", async () => {
+        const { live } = await startRunning()
+        live.reply = notStarted(1)
+        await sendNow("id-A")
+        expect(statuses()[0]).toBe("A:inserting")
+        expect(liveFrames()).toHaveLength(1)
+        await advance(999)
+        expect(liveFrames()).toHaveLength(1)
+        await advance(1)
+        expect(liveFrames()).toHaveLength(2)
+        expect(insert("id-A")).toMatchObject({ confirmed: true, retries: 1, retryAt: undefined })
+        expect(live.mostActive).toBe(1)
+      })
+
+      it("gives up after six sends and goes first on the next turn", async () => {
+        const { live } = await startRunning()
+        live.reply = notStarted(99)
+        await sendNow("id-A")
+        await advance(10_000)
+        expect(liveFrames()).toHaveLength(6)
+        expect(statuses()).toEqual(["A:waiting:next", "B:waiting"])
+        expect(live.mostActive).toBe(1)
+      })
+
+      it.each([
+        ["the visitor deletes it", (id: string) => getSessionControls().messageQueue!.remove(id)],
+        ["the visitor clears the queue", () => getSessionControls().messageQueue!.clear()],
+      ])("stops when %s", async (_name, act_) => {
+        const { live } = await startRunning()
+        live.reply = notStarted(99)
+        await sendNow("id-A")
+        await act(async () => act_("id-A"))
+        await advance(10_000)
+        expect(liveFrames()).toHaveLength(1)
+        expect(queue().items.some(entry => entry.text === "A")).toBe(false)
+      })
+
+      it("keeps the count across a disconnect and sends once the new connection has the capability", async () => {
+        const { live, view } = await startRunning()
+        live.reply = notStarted(1)
+        await sendNow("id-A")
+        view.rerender(tree("session-two"))
+        act(() => socket()?.onConnect?.())
+        await advance(3000)
+        expect(liveFrames()).toHaveLength(1)
+        await connect(NOW_CAPABILITIES)
+        expect(liveFrames()).toHaveLength(2)
+        expect(insert("id-A")).toMatchObject({ retries: 1, confirmed: true })
+      })
+
+      it("fails the message when the new connection has no capability", async () => {
+        const { live, view } = await startRunning()
+        live.reply = notStarted(99)
+        await sendNow("id-A")
+        view.rerender(tree("session-two"))
+        await connect(CAPABILITIES)
+        await advance(10_000)
+        expect(liveFrames()).toHaveLength(1)
+        expect(statuses()).toEqual(["A:failed", "B:waiting"])
+        expect(phase()).toEqual({ kind: "held", reason: "send_now_unknown" })
+      })
+
+      it("goes first on the next turn when the turn failed to start", async () => {
+        const { server, live } = await startRunning()
+        live.reply = async (_id, attempt) => {
+          throw refusal(attempt === 1 ? "live_input_not_started" : "live_input_not_running")
+        }
+        await sendNow("id-A")
+        await advance(1000)
+        expect(statuses()).toEqual(["A:waiting:next", "B:waiting"])
+        await push(server.end("failed"))
+        await act(async () => getSessionControls().messageQueue!.continueSending())
+        expect(newTurnFrames()[0]).toEqual(["A", "id-A"])
+      })
+
+      it("does not send again early when the turn ends while the retry waits", async () => {
+        const { server, live } = await startRunning()
+        live.reply = async (_id, attempt) => {
+          throw refusal(attempt === 1 ? "live_input_not_started" : "live_input_not_running")
+        }
+        await sendNow("id-A")
+        await push(server.end())
+        await push(server.snapshot())
+        expect(liveFrames()).toHaveLength(1)
+        await advance(999)
+        expect(liveFrames()).toHaveLength(1)
+        await advance(1)
+        expect(liveFrames()).toHaveLength(2)
+        expect(live.mostActive).toBe(1)
+      })
+
+      it("late ack after not started keeps the retry wait", async () => {
+        const { live } = await startRunning()
+        const gate = deferred<void>()
+        live.reply = async (_id, attempt) => { if (attempt === 1) await gate.promise }
+        await sendNow("id-A")
+        await returned("id-A", "not_started")
+        await act(async () => gate.resolve())
+        expect(insert("id-A")).toMatchObject({ confirmed: false, inFlight: false, retries: 1 })
+        expect(insert("id-A")?.retryAt).toEqual(expect.any(Number))
+        await advance(1000)
+        expect(liveFrames()).toHaveLength(2)
+        await advance(5000)
+        expect(liveFrames()).toHaveLength(2)
+      })
+    })
+
+    it("history replay bubble does not mark send-now applied", async () => {
+      const { view } = await startRunning()
+      await sendNow("id-A")
+      view.rerender(tree("session-two"))
+      act(() => socket()?.onConnect?.())
+      act(() => socket()?.onConnectionCapabilities?.(NOW_CAPABILITIES))
+      await echo("id-A")
+      expect(statuses()[0]).toBe("A:inserting")
+      await push({ type: "conversation_attached", timestamp: "2026-11-17T00:00:00Z", data: { type: "conversation_attached" } })
+      await echo("id-A")
+      expect(statuses()).toEqual(["B:waiting"])
+    })
+
+    describe("an acknowledgement saying the message is already in the conversation", () => {
+      const userBubbles = (id: string) =>
+        getSessionControls().state.messages.filter(m => m.role === "user" && m.id === `msg-user-turn-${id}`)
+
+      it("a resend after the replay removes the row and leaves one bubble", async () => {
+        const { live, view } = await startRunning()
+        live.reply = async (_id, attempt) => { if (attempt === 1) throw lost() }
+        await sendNow("id-A")
+        view.rerender(tree("session-two"))
+        act(() => socket()?.onConnect?.())
+        act(() => socket()?.onConnectionCapabilities?.(NOW_CAPABILITIES))
+        await echo("id-A")
+        expect(statuses()[0]).toBe("A:inserting")
+        live.applied = true
+        await push({ type: "conversation_attached", timestamp: "2026-11-17T00:00:00Z", data: { type: "conversation_attached" } })
+        await advance(1000)
+        expect(liveFrames()).toHaveLength(2)
+        expect(statuses()).toEqual(["B:waiting"])
+        expect(userBubbles("id-A")).toHaveLength(1)
+      })
+
+      it("a resend after the turn ended removes the row", async () => {
+        const { server, live } = await startRunning()
+        await sendNow("id-A")
+        expect(insert("id-A")).toMatchObject({ confirmed: true })
+        live.applied = true
+        await push(server.end())
+        await push(server.snapshot())
+        await advance(1000)
+        expect(liveFrames()).toHaveLength(2)
+        expect(statuses()).not.toContain("A:inserting")
+        expect(queue().items.some(entry => entry.clientMessageId === "id-A")).toBe(false)
+      })
+
+      it("draws the bubble that no echo brought, once", async () => {
+        const { server, live } = await startRunning()
+        await sendNow("id-A")
+        expect(userBubbles("id-A")).toHaveLength(0)
+        live.applied = true
+        await push(server.end())
+        await push(server.snapshot())
+        await advance(1000)
+        expect(queue().items.some(entry => entry.clientMessageId === "id-A")).toBe(false)
+        const bubbles = userBubbles("id-A")
+        expect(bubbles).toHaveLength(1)
+        expect(bubbles[0]).toMatchObject({ content: "A", isOptimistic: true })
+        await echo("id-A")
+        expect(userBubbles("id-A")).toHaveLength(1)
+        expect(userBubbles("id-A")[0].isOptimistic).toBeFalsy()
+      })
+
+      it("after the live echo leaves one bubble that is not optimistic", async () => {
+        const { live } = await startRunning()
+        const gate = deferred<void>()
+        live.reply = async () => { await gate.promise }
+        await sendNow("id-A")
+        await echo("id-A")
+        expect(queue().items.some(entry => entry.clientMessageId === "id-A")).toBe(false)
+        expect(userBubbles("id-A")).toHaveLength(1)
+        live.applied = true
+        await act(async () => gate.resolve())
+        const bubbles = userBubbles("id-A")
+        expect(bubbles).toHaveLength(1)
+        expect(bubbles[0].isOptimistic).toBeFalsy()
+      })
+
+      it("for a message no longer listed changes nothing", async () => {
+        const { live } = await startRunning()
+        const gate = deferred<void>()
+        live.reply = async () => { await gate.promise }
+        await sendNow("id-A")
+        await echo("id-A")
+        expect(queue().items.some(entry => entry.clientMessageId === "id-A")).toBe(false)
+        const before = queue()
+        const messagesBefore = getSessionControls().state.messages
+        live.applied = true
+        await act(async () => gate.resolve())
+        expect(queue()).toBe(before)
+        expect(getSessionControls().state.messages).toBe(messagesBefore)
+      })
+
+      it("for a message whose row went away without a bubble draws none", async () => {
+        const { live } = await startRunning()
+        const gate = deferred<void>()
+        live.reply = async () => { await gate.promise }
+        await sendNow("id-A")
+        await returned("id-A", "taken")
+        expect(queue().items.some(entry => entry.clientMessageId === "id-A")).toBe(false)
+        expect(userBubbles("id-A")).toHaveLength(0)
+        live.applied = true
+        await act(async () => gate.resolve())
+        expect(userBubbles("id-A")).toHaveLength(0)
+      })
+
+      it("is not assumed when the acknowledgement has no marker", async () => {
+        await startRunning()
+        await sendNow("id-A")
+        expect(statuses()[0]).toBe("A:inserting")
+        expect(insert("id-A")).toMatchObject({ confirmed: true })
+        expect(userBubbles("id-A")).toHaveLength(0)
+      })
+    })
+
+    it.each([
+      ["an unknown reason", "id-A", "something_new"],
+      ["a turn id that is not in the list", "unknown-id", "run_ended"],
+    ])("ignores a returned message with %s", async (_name, id, reason) => {
+      await startRunning()
+      await sendNow("id-A")
+      const before = queue()
+      await returned(id, reason)
+      expect(queue()).toBe(before)
+      expect(statuses()[0]).toBe("A:inserting")
+    })
+
+    it("a returned message for another task requires a reload and leaves the queue as it was", async () => {
+      await startRunning()
+      await sendNow("id-A")
+      const before = queue()
+      await returned("id-A", "run_ended", TASK + 1)
+      expect(getSessionControls().sessionConversationState).toBe("reload_required")
+      expect(queue()).toBe(before)
+    })
+
+    it("ignores a returned message that names no task", async () => {
+      await startRunning()
+      await sendNow("id-A")
+      const before = queue()
+      await push({
+        type: "live_input_returned", timestamp: "2026-11-17T00:00:02Z", data: { turn_id: "id-A", reason: "run_ended" },
+      } as TestWebSocketMessage)
+      expect(queue()).toBe(before)
+      expect(statuses()[0]).toBe("A:inserting")
+    })
+
+    // Both server-side causes (an injection proven unwritten, a claim that failed
+    // to commit and was withdrawn) arrive as the same frame, so one case covers
+    // what the browser does with either.
+    it("not applied send-now switches to a new id", async () => {
+      const { server } = await startRunning()
+      await sendNow("id-A")
+      await returned("id-A", "not_applied")
+      const [head] = queue().items
+      expect(head).toMatchObject({ text: "A", status: "waiting", next: true, seq: 0 })
+      expect(head.clientMessageId).not.toBe("id-A")
+      await push(server.end())
+      expect(newTurnFrames()[0]).toEqual(["A", head.clientMessageId])
+    })
   })
 
   describe("opening the chat with a message while the queue sends", () => {

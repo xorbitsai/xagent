@@ -7,12 +7,41 @@ import type { TaskStatus } from "@/lib/task-status"
 
 export const MESSAGE_QUEUE_LIMIT = 5
 
+// How long a "not started yet" refusal waits before the same message is sent
+// into the running turn again, and how many such retries one message gets.
+const SEND_NOW_RETRY_DELAY_MS = 1000
+const SEND_NOW_RETRY_LIMIT = 5
+
+// The bookkeeping of a message being sent into the turn in progress.
+export interface InsertState {
+  // The server accepted the request: it holds the message until the turn takes
+  // it in or hands it back.
+  confirmed: boolean
+  // One request is waiting for its acknowledgement. A message has at most one.
+  inFlight: boolean
+  // The observed state version when the request went out.
+  since: number | undefined
+  // The connection identity the request went out on.
+  connection: string | null
+  // The observed version at which the request was last sent again because the
+  // turn ended without the message being seen.
+  resentAt: number | undefined
+  // How many "not started yet" refusals have been retried.
+  retries: number
+  // When the next retry is due (milliseconds); undefined when none is waiting.
+  retryAt: number | undefined
+}
+
 export interface QueuedMessage {
   clientMessageId: string
   text: string
   // Submission order, assigned when the visitor pressed send.
   seq: number
-  status: "waiting" | "sending" | "failed"
+  // "inserting": being sent into the turn in progress.
+  status: "waiting" | "sending" | "failed" | "inserting"
+  // The message could not join this turn and goes out first on the next one.
+  next?: boolean
+  insert?: InsertState
 }
 
 export interface ObservedTaskState {
@@ -22,7 +51,14 @@ export interface ObservedTaskState {
 
 // "earlier_send_failed": a message sent past the queue failed after a message
 // queued behind it was submitted, so that message would have gone out first.
-export type HeldReason = "turn_failed" | "turn_paused" | "send_failed" | "earlier_send_failed"
+// "send_now_unknown": a message sent into the running turn may or may not have
+// arrived.
+export type HeldReason =
+  | "turn_failed"
+  | "turn_paused"
+  | "send_failed"
+  | "earlier_send_failed"
+  | "send_now_unknown"
 
 export type MessageQueuePhase =
   | { kind: "idle" }
@@ -72,6 +108,23 @@ const APPENDABLE: ReadonlySet<TaskStatus> = new Set(["completed", "failed", "pau
 
 export type QueuedSendVerdict = "wait" | "answer_first" | "hold"
 
+// Where a failed send into the running turn goes: "next" goes out first on the
+// next turn, "retry" was never sent, "later" is tried again shortly, "hold"
+// stops the queue, "unknown" stops it because the message may have arrived.
+export type SendNowVerdict = "next" | "hold" | "unknown" | "retry" | "later"
+
+const LIVE_INPUT_RETURN_REASONS = [
+  "run_ended", "not_started", "not_applied", "unavailable", "taken", "refused", "conflict", "outcome_unknown",
+] as const
+
+export type LiveInputReturnReason = (typeof LIVE_INPUT_RETURN_REASONS)[number]
+
+const KNOWN_RETURN_REASONS: ReadonlySet<string> = new Set(LIVE_INPUT_RETURN_REASONS)
+
+// Whether a reason read from a frame is one this client knows.
+export const isLiveInputReturnReason = (reason: string): reason is LiveInputReturnReason =>
+  KNOWN_RETURN_REASONS.has(reason)
+
 export type MessageQueueEvent =
   // `snapshot`: the frame is a periodic reconciliation snapshot.
   | { type: "OBSERVE"; observed: ObservedTaskState; snapshot: boolean }
@@ -87,9 +140,35 @@ export type MessageQueueEvent =
   | { type: "REMOVE"; clientMessageId: string }
   | { type: "CLEAR" }
   | { type: "SUPPORT_LOST" }
+  | {
+    type: "SEND_NOW_REQUESTED"
+    clientMessageId: string
+    sinceVersion: number | undefined
+    connection: string | null
+    // The turn can take the message: nothing is waiting on an answer.
+    canInsert: boolean
+  }
+  | { type: "SEND_NOW_ACCEPTED"; clientMessageId: string }
+  | {
+    type: "SEND_NOW_FAILED"
+    clientMessageId: string
+    verdict: SendNowVerdict
+    newClientMessageId?: string
+    now: number
+  }
+  | { type: "SEND_NOW_RESENT"; clientMessageId: string; atVersion: number | undefined; connection: string | null }
+  | { type: "LIVE_INPUT_APPLIED"; clientMessageId: string }
+  | {
+    type: "LIVE_INPUT_RETURNED"
+    clientMessageId: string
+    reason: LiveInputReturnReason
+    newClientMessageId?: string
+    now: number
+  }
+  | { type: "SEND_NOW_SUPPORT_LOST" }
 
 // What the caller tells the visitor, once, after applying a transition.
-export type MessageQueueEffect = null | "send_failed" | "support_lost"
+export type MessageQueueEffect = null | "send_failed" | "support_lost" | "send_now_unknown"
 
 const IDLE: MessageQueuePhase = { kind: "idle" }
 const READY: MessageQueuePhase = { kind: "ready" }
@@ -146,12 +225,151 @@ const mapItem = (
 const without = (items: QueuedMessage[], clientMessageId: string) =>
   items.filter(item => item.clientMessageId !== clientMessageId)
 
+const isPlaced = (item: QueuedMessage) =>
+  item.status === "sending" || item.status === "inserting" || item.next === true
+
+// A message sent into the running turn whose request is on its way, or that the
+// server holds, cannot be taken back: neither removing it nor clearing the
+// queue drops it.
+export const isPinned = (item: QueuedMessage): boolean =>
+  item.status === "inserting" && (item.insert?.inFlight === true || item.insert?.confirmed === true)
+
+const dropInsert = (item: QueuedMessage): QueuedMessage => {
+  const copy = { ...item }
+  delete copy.insert
+  return copy
+}
+
+const dropNext = (item: QueuedMessage): QueuedMessage => {
+  const copy = { ...item }
+  delete copy.next
+  return copy
+}
+
+// Moves a message behind the one being sent and every message already going
+// into this turn or first on the next one, ahead of the rest.
+function placeFirst(items: QueuedMessage[], clientMessageId: string): QueuedMessage[] {
+  const target = items.find(item => item.clientMessageId === clientMessageId)
+  if (!target) return items
+  const rest = items.filter(item => item !== target)
+  const at = rest.reduce((last, item, index) => (isPlaced(item) ? index + 1 : last), 0)
+  return [...rest.slice(0, at), target, ...rest.slice(at)]
+}
+
+// Puts a message in submission order behind every message going into this turn
+// or first on the next one.
+function insertBySeq(items: QueuedMessage[], item: QueuedMessage): QueuedMessage[] {
+  const lower = items.reduce(
+    (last, other, index) => (other.status === "inserting" || other.next === true ? index + 1 : last),
+    0,
+  )
+  const offset = items.slice(lower).findIndex(other => other.seq > item.seq)
+  const at = offset < 0 ? items.length : lower + offset
+  return [...items.slice(0, at), item, ...items.slice(at)]
+}
+
+function placeBySeq(items: QueuedMessage[], clientMessageId: string): QueuedMessage[] {
+  const target = items.find(item => item.clientMessageId === clientMessageId)
+  if (!target) return items
+  return insertBySeq(items.filter(item => item !== target), dropNext(target))
+}
+
+// A message that could not join this turn: it waits at the front for the next.
+const toNext = (item: QueuedMessage, newClientMessageId?: string): QueuedMessage => ({
+  ...dropInsert(item),
+  status: "waiting",
+  next: true,
+  ...(newClientMessageId ? { clientMessageId: newClientMessageId } : {}),
+})
+
+const toFailed = (item: QueuedMessage, newClientMessageId?: string): QueuedMessage => ({
+  ...dropInsert(item),
+  status: "failed",
+  ...(newClientMessageId ? { clientMessageId: newClientMessageId } : {}),
+})
+
+// A message the turn has not started yet is tried again after a pause, up to
+// the retry limit, and then goes out first on the next turn. `clearInFlight`:
+// the pause follows the result of the request that was waiting.
+function toRetryLater(item: QueuedMessage, now: number, clearInFlight: boolean): QueuedMessage {
+  const { insert } = item
+  if (!insert) return item
+  if (insert.retries >= SEND_NOW_RETRY_LIMIT) return toNext(item)
+  return {
+    ...item,
+    insert: {
+      ...insert,
+      retries: insert.retries + 1,
+      retryAt: now + SEND_NOW_RETRY_DELAY_MS,
+      confirmed: false,
+      inFlight: clearInFlight ? false : insert.inFlight,
+    },
+  }
+}
+
+// Leaving the sending phase with a failed message stops the queue: a message
+// sent into the running turn failed while another message was being sent.
+function holdIfFailedItems(result: { next: MessageQueueState; effect: MessageQueueEffect }) {
+  const { next } = result
+  if (next.phase.kind === "sending" || !next.items.some(item => item.status === "failed")) return result
+  return { next: { ...next, phase: held("send_now_unknown") }, effect: "send_now_unknown" as MessageQueueEffect }
+}
+
+type InsertOutcome =
+  | { kind: "next"; newClientMessageId?: string }
+  | { kind: "retry" }
+  | { kind: "later"; now: number; clearInFlight: boolean }
+  | { kind: "hold"; newClientMessageId?: string }
+  | { kind: "unknown" }
+
+// Applies how a message sent into the running turn ended. Only a message that
+// is still being inserted can end.
+function endInsert(
+  state: MessageQueueState,
+  clientMessageId: string,
+  outcome: InsertOutcome,
+): { next: MessageQueueState; effect: MessageQueueEffect } {
+  const { phase, items } = state
+  const target = items.find(item => item.clientMessageId === clientMessageId)
+  if (phase.kind === "idle" || !target || target.status !== "inserting") return { next: state, effect: null }
+  const replace = (replacement: QueuedMessage) =>
+    items.map(item => (item === target ? replacement : item))
+  switch (outcome.kind) {
+    case "next":
+      return { next: { ...state, items: replace(toNext(target, outcome.newClientMessageId)) }, effect: null }
+    case "retry":
+      return {
+        next: { ...state, items: placeBySeq(replace(dropInsert({ ...target, status: "waiting" })), target.clientMessageId) },
+        effect: null,
+      }
+    case "later":
+      return { next: { ...state, items: replace(toRetryLater(target, outcome.now, outcome.clearInFlight)) }, effect: null }
+    case "hold":
+    case "unknown": {
+      const unknown = outcome.kind === "unknown"
+      const failed = {
+        ...state,
+        items: replace(toFailed(target, outcome.kind === "hold" ? outcome.newClientMessageId : undefined)),
+      }
+      // While a message is being sent, or the queue is already stopped, the
+      // phase stays and the end of the sending phase stops the queue.
+      if (phase.kind === "sending" || phase.kind === "held") return { next: failed, effect: null }
+      return {
+        next: { ...failed, phase: held(unknown ? "send_now_unknown" : "send_failed") },
+        effect: unknown ? "send_now_unknown" : "send_failed",
+      }
+    }
+  }
+}
+
 export function transitionMessageQueue(
   state: MessageQueueState,
   event: MessageQueueEvent,
 ): { next: MessageQueueState; effect: MessageQueueEffect } {
   const { phase, items } = state
   const to = (next: MessageQueueState, effect: MessageQueueEffect = null) => ({ next, effect })
+  const inserting = (clientMessageId: string) =>
+    items.find(item => item.clientMessageId === clientMessageId && item.status === "inserting")
   switch (event.type) {
     case "OBSERVE": {
       const { version, status } = state.observed
@@ -167,7 +385,7 @@ export function transitionMessageQueue(
         return to(emptied ? enterWaiting(removed, event.sinceVersion) : removed)
       }
       if (phase.kind === "sending" && phase.clientMessageId !== event.clientMessageId) return to(state)
-      return to(enterWaiting(removed, event.sinceVersion))
+      return holdIfFailedItems(to(enterWaiting(removed, event.sinceVersion)))
     }
     case "DELIVERY_FAILED": {
       // The queue's own head reports through SEND_FAILED, and a held queue
@@ -179,8 +397,7 @@ export function transitionMessageQueue(
     case "ENQUEUE":
       return to({ ...state, items: [...items, event.item], phase: phase.kind === "idle" ? READY : phase })
     case "REQUEUE_REFUSED": {
-      const at = items.findIndex(other => other.seq > event.item.seq)
-      const inserted = { ...state, items: at < 0 ? [...items, event.item] : [...items.slice(0, at), event.item, ...items.slice(at)] }
+      const inserted = { ...state, items: insertBySeq(items, event.item) }
       return to(phase.kind === "idle" || phase.kind === "ready" ? enterWaiting(inserted, event.sinceVersion) : inserted)
     }
     case "SEND_STARTED":
@@ -197,20 +414,134 @@ export function transitionMessageQueue(
         return to({ ...state, items: mapItem(items, event.clientMessageId, change), phase: held("send_failed") }, "send_failed")
       }
       const waiting = { ...state, items: mapItem(items, event.clientMessageId, { status: "waiting" }) }
-      return to(enterWaiting(waiting, phase.since, event.verdict === "answer_first"))
+      return holdIfFailedItems(to(enterWaiting(waiting, phase.since, event.verdict === "answer_first")))
     }
     case "CONTINUE":
       if (phase.kind !== "held") return to(state)
-      return to(settleEmpty({ ...state, phase: READY, items: items.map(item => ({ ...item, status: "waiting" })) }))
-    case "REMOVE":
+      return to(settleEmpty({
+        ...state,
+        phase: READY,
+        items: items.map(item => (item.status === "inserting" ? item : { ...item, status: "waiting" as const })),
+      }))
+    case "REMOVE": {
       if (phase.kind === "sending" && phase.clientMessageId === event.clientMessageId) return to(state)
+      // A message the server holds, or whose request is on its way, cannot be
+      // taken back; one that only waits to be tried again can.
+      const target = items.find(item => item.clientMessageId === event.clientMessageId)
+      if (target !== undefined && isPinned(target)) return to(state)
       return to(settleEmpty({ ...state, items: without(items, event.clientMessageId) }))
-    case "CLEAR":
-      return to(settleEmpty({ ...state, items: phase.kind === "sending" ? items.filter(item => item.status === "sending") : [] }))
+    }
+    case "CLEAR": {
+      // Messages the server holds or a request is on its way for stay.
+      const keeps = (item: QueuedMessage) => isPinned(item) || (phase.kind === "sending" && item.status === "sending")
+      const kept = { ...state, items: items.filter(keeps) }
+      if (phase.kind === "held" && kept.items.length > 0) {
+        // Clearing a stopped queue removes its notice. A task that can take a
+        // new turn has no turn left to wait for, so the queue is ready and the
+        // kept message's outcome moves it on; in every other status the queue
+        // keeps waiting for the turn to end.
+        const { status, version } = state.observed
+        if (status !== undefined && APPENDABLE.has(status)) return to({ ...kept, phase: READY })
+        return to(enterWaiting(kept, version))
+      }
+      return to(settleEmpty(kept))
+    }
     case "SUPPORT_LOST": {
       if (items.length === 0) return to(phase.kind === "idle" ? state : { ...state, phase: IDLE })
       const failed = { ...state, items: items.map(item => ({ ...item, status: "failed" as const })) }
       return phase.kind === "held" ? to(failed) : to({ ...failed, phase: held("send_failed") }, "support_lost")
+    }
+    case "SEND_NOW_REQUESTED": {
+      const target = items.find(item => item.clientMessageId === event.clientMessageId)
+      if (phase.kind === "idle" || !target) return to(state)
+      const marked = items.map(item => (item === target ? { ...item, next: true } : item))
+      if (phase.kind === "held") {
+        if (target.status !== "waiting" && target.status !== "failed") return to(state)
+        return transitionMessageQueue(
+          { ...state, items: placeFirst(marked, event.clientMessageId) },
+          { type: "CONTINUE" },
+        )
+      }
+      if (target.status !== "waiting") return to(state)
+      if (phase.kind === "ready") return to({ ...state, items: placeFirst(marked, event.clientMessageId) })
+      if (!event.canInsert) return to(state)
+      const insert: InsertState = {
+        confirmed: false,
+        inFlight: true,
+        since: event.sinceVersion,
+        connection: event.connection,
+        resentAt: undefined,
+        retries: 0,
+        retryAt: undefined,
+      }
+      const inserted = items.map(item => (item === target ? { ...item, status: "inserting" as const, insert } : item))
+      return to({ ...state, items: placeFirst(inserted, event.clientMessageId) })
+    }
+    case "SEND_NOW_ACCEPTED": {
+      const target = inserting(event.clientMessageId)
+      if (phase.kind === "idle" || !target?.insert) return to(state)
+      // An acknowledgement that arrives while the message waits to be tried
+      // again belongs to the attempt the "not started yet" answer ended.
+      const insert = { ...target.insert, inFlight: false, confirmed: target.insert.retryAt === undefined }
+      return to({ ...state, items: mapItem(items, event.clientMessageId, { insert }) })
+    }
+    case "SEND_NOW_FAILED": {
+      const { verdict } = event
+      switch (verdict) {
+        case "next": return endInsert(state, event.clientMessageId, { kind: "next" })
+        case "retry": return endInsert(state, event.clientMessageId, { kind: "retry" })
+        case "later": return endInsert(state, event.clientMessageId, { kind: "later", now: event.now, clearInFlight: true })
+        case "hold": return endInsert(state, event.clientMessageId, { kind: "hold", newClientMessageId: event.newClientMessageId })
+        case "unknown": return endInsert(state, event.clientMessageId, { kind: "unknown" })
+        default: {
+          const unhandled: never = verdict
+          return unhandled
+        }
+      }
+    }
+    case "SEND_NOW_RESENT": {
+      const target = inserting(event.clientMessageId)
+      if (phase.kind === "idle" || !target?.insert) return to(state)
+      const insert = {
+        ...target.insert,
+        inFlight: true,
+        confirmed: false,
+        connection: event.connection,
+        resentAt: event.atVersion,
+        retryAt: undefined,
+      }
+      return to({ ...state, items: mapItem(items, event.clientMessageId, { insert }) })
+    }
+    case "LIVE_INPUT_APPLIED":
+      if (phase.kind === "idle" || !inserting(event.clientMessageId)) return to(state)
+      return to(settleEmpty({ ...state, items: without(items, event.clientMessageId) }))
+    case "LIVE_INPUT_RETURNED": {
+      const { clientMessageId, reason } = event
+      switch (reason) {
+        case "run_ended": return endInsert(state, clientMessageId, { kind: "next" })
+        case "not_applied":
+          return endInsert(state, clientMessageId, { kind: "next", newClientMessageId: event.newClientMessageId })
+        case "not_started":
+          return endInsert(state, clientMessageId, { kind: "later", now: event.now, clearInFlight: false })
+        case "taken":
+          if (phase.kind === "idle" || !inserting(clientMessageId)) return to(state)
+          return to(settleEmpty({ ...state, items: without(items, clientMessageId) }))
+        case "unavailable":
+        case "refused":
+        case "conflict":
+          return endInsert(state, clientMessageId, { kind: "hold" })
+        case "outcome_unknown": return endInsert(state, clientMessageId, { kind: "unknown" })
+        default: {
+          const unhandled: never = reason
+          return unhandled
+        }
+      }
+    }
+    case "SEND_NOW_SUPPORT_LOST": {
+      if (phase.kind === "idle" || !items.some(item => item.status === "inserting")) return to(state)
+      const failed = { ...state, items: items.map(item => (item.status === "inserting" ? toFailed(item) : item)) }
+      if (phase.kind === "sending" || phase.kind === "held") return to(failed)
+      return to({ ...failed, phase: held("send_now_unknown") }, "send_now_unknown")
     }
   }
 }
@@ -278,6 +609,43 @@ export function classifyQueuedSendFailure(error: unknown): { verdict: QueuedSend
       if (retryWithNewId) return outcome("hold", true)
       if (errorCode === "task_busy") return outcome("wait")
       return outcome(errorCode === "interaction_response_required" ? "answer_first" : "hold")
+    case null:
+      return outcome("hold")
+    default: {
+      const unhandled: never = disposition
+      return unhandled
+    }
+  }
+}
+
+// Where a failed send into the running turn goes. `replaceId`: the server will
+// not take that id again. Null: the connection was lost while the request
+// waited, so the same id is sent again on the next connection instead.
+export function classifySendNowFailure(
+  error: unknown,
+): { verdict: SendNowVerdict; replaceId: boolean } | null {
+  const { disposition, errorCode, retryWithNewId } = readDeliveryFailure(error)
+  const fields = (typeof error === "object" && error !== null ? error : {}) as Record<string, unknown>
+  const outcome = (verdict: SendNowVerdict, replaceId = false) => ({ verdict, replaceId })
+  switch (disposition) {
+    case "not_sent":
+      return outcome("retry")
+    case "outcome_unknown":
+      if (errorCode === "live_input_outcome_unknown") return outcome("unknown")
+      return fields.connectionLost === true ? null : outcome("unknown")
+    case "rejected":
+      if (retryWithNewId) return outcome("hold", true)
+      switch (errorCode) {
+        case "live_input_not_running":
+        case "interaction_response_required":
+          return outcome("next")
+        case "live_input_not_started":
+          return outcome("later")
+        case "live_input_outcome_unknown":
+          return outcome("unknown")
+        default:
+          return outcome("hold")
+      }
     case null:
       return outcome("hold")
     default: {

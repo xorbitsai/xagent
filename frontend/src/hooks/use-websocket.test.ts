@@ -3664,6 +3664,73 @@ describe("useWebSocket normalized connections", () => {
         message: "This conversation is waiting on a question above; answer it to continue.",
       })
     })
+
+    it("accepts the send_now delivery declaration", async () => {
+      const { result, socket } = await openSocket()
+      const sent = result.current.sendChatMessage(
+        "now", undefined, false, "msg-now", undefined, undefined, undefined, "send_now",
+      )
+      expect(sentFrame(socket, 0)).toMatchObject({
+        type: "chat",
+        message: "now",
+        client_message_id: "msg-now",
+        delivery: "send_now",
+      })
+      act(() => socket.receive({ type: "message_accepted", client_message_id: "msg-now" }))
+      await expect(sent).resolves.toEqual({ client_message_id: "msg-now", turn_id: "msg-now" })
+    })
+
+    it("resolves an applied acknowledgement with its marker", async () => {
+      const { result, socket } = await openSocket()
+      const sent = result.current.sendChatMessage(
+        "now", undefined, false, "msg-now", undefined, undefined, undefined, "send_now",
+      )
+      act(() => socket.receive({
+        type: "message_accepted", client_message_id: "msg-now", turn_id: "msg-now", live_input: "applied",
+      }))
+      await expect(sent).resolves.toEqual({
+        client_message_id: "msg-now", turn_id: "msg-now", live_input: "applied",
+      })
+    })
+
+    it.each([
+      ["a different string", "pending"],
+      ["a boolean", true],
+    ])("ignores an acknowledgement marker that is %s", async (_name, marker) => {
+      const { result, socket } = await openSocket()
+      const sent = result.current.sendChatMessage(
+        "now", undefined, false, "msg-now", undefined, undefined, undefined, "send_now",
+      )
+      act(() => socket.receive({
+        type: "message_accepted", client_message_id: "msg-now", turn_id: "msg-now", live_input: marker,
+      }))
+      await expect(sent).resolves.toEqual({ client_message_id: "msg-now", turn_id: "msg-now" })
+    })
+
+    it("does not read the marker on a rejection", async () => {
+      const { result, socket } = await openSocket()
+      const sent = result.current.sendChatMessage(
+        "now", undefined, false, "msg-now", undefined, undefined, undefined, "send_now",
+      )
+      const settled = sent.then(() => "resolved", () => "rejected")
+      act(() => socket.receive({
+        type: "message_rejected", client_message_id: "msg-now", rejection_outcome: "not_accepted",
+        error_code: "live_input_not_running", live_input: "applied",
+      }))
+      await expect(settled).resolves.toBe("rejected")
+    })
+
+    it("still refuses an unknown delivery declaration", async () => {
+      const { result, socket } = await openSocket()
+      const sent = result.current.sendChatMessage(
+        "now", undefined, false, "msg-bad", undefined, undefined, undefined, "inject" as unknown as ChatDelivery,
+      )
+      await expect(sent).rejects.toMatchObject({
+        message: "Message not sent: the delivery declaration is not valid.",
+        disposition: "not_sent",
+      })
+      expect(socket.send).not.toHaveBeenCalled()
+    })
   })
 
   describe("chat frames checked against their delivery declaration", () => {
@@ -3672,7 +3739,7 @@ describe("useWebSocket normalized connections", () => {
       request: "A delivery declaration cannot accompany an answer to a request.",
       value: "Message not sent: the delivery declaration is not valid.",
     } as const
-    const DELIVERIES = [undefined, "new_turn", "inject"] as const
+    const DELIVERIES = [undefined, "new_turn", "send_now", "inject"] as const
     const CONNECTIONS = ["omit", "required"] as const
     const REQUEST_IDS = [undefined, "request-1"] as const
     const CASES = DELIVERIES.flatMap((delivery) => CONNECTIONS.flatMap((mode) => (
@@ -3688,7 +3755,7 @@ describe("useWebSocket normalized connections", () => {
       if (delivery === undefined) return null
       if (mode !== "omit") return DELIVERY_REFUSALS.connection
       if (requestId) return DELIVERY_REFUSALS.request
-      if (delivery !== "new_turn") return DELIVERY_REFUSALS.value
+      if (delivery !== "new_turn" && delivery !== "send_now") return DELIVERY_REFUSALS.value
       return null
     }
 
@@ -3721,7 +3788,7 @@ describe("useWebSocket normalized connections", () => {
         expect(socket.send).toHaveBeenCalledTimes(1)
         const frame = JSON.parse(socket.send.mock.calls[0][0] as string) as Record<string, unknown>
         if (delivery === undefined) expect(frame).not.toHaveProperty("delivery")
-        else expect(frame.delivery).toBe("new_turn")
+        else expect(frame.delivery).toBe(delivery)
         act(() => socket.receive({ type: "message_accepted", client_message_id: "msg-delivery" }))
         await sent
       },

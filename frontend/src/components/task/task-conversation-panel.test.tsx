@@ -450,13 +450,15 @@ describe("TaskConversationPanel", () => {
     })
 
     it.each([
-      ["announced", "supported", "bound", "attached", true],
-      ["not announced", "unsupported", "bound", "attached", false],
-      ["not yet known", "unknown", "bound", "attached", false],
-      ["announced, conversation not bound", "supported", "reload_required", "attached", false],
-      ["announced, conversation still attaching", "supported", "bound", "pending", false],
-    ])("passes send-now availability to the queued list [%s]", (_name, delivery, phase, attachment, shown) => {
+      ["announced", "supported", "supported", "bound", "attached", true],
+      ["not announced", "supported", "unsupported", "bound", "attached", false],
+      ["not yet known", "supported", "unknown", "bound", "attached", false],
+      ["announced without new turns", "unsupported", "supported", "bound", "attached", false],
+      ["announced, conversation not bound", "supported", "supported", "reload_required", "attached", false],
+      ["announced, conversation still attaching", "supported", "supported", "bound", "pending", false],
+    ])("passes send-now availability to the queued list [%s]", (_name, newTurn, delivery, phase, attachment, shown) => {
       appControls.messageQueue = queueControls({ kind: "waiting", since: 1, answerRequired: false })
+      appControls.newTurnDelivery = newTurn
       appControls.sendNowDelivery = delivery
       appControls.sessionConversationState = phase
       appControls.sessionConversationAttachment = attachment

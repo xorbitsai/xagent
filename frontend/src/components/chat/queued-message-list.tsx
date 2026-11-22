@@ -106,8 +106,9 @@ function QueuedRow({
 
 // The messages held for the turn in progress, with what the visitor can do
 // about them. `canContinue` is false while the queue cannot send.
-// `canSendNow` is true while the current connection takes a message sent into
-// the turn in progress; without it no row has the button.
+// `canSendNow` is true while the queue can send and the current connection
+// takes a message sent into the turn in progress; without it no row has the
+// button.
 export function QueuedMessageList({
   queue,
   canContinue,

@@ -1250,7 +1250,8 @@ export function TaskConversationPanel({
                 queue={messageQueue}
                 canContinue={newTurnDelivery === "supported" && sessionConversationState === "bound"}
                 canSendNow={
-                  sendNowDelivery === "supported"
+                  newTurnDelivery === "supported"
+                  && sendNowDelivery === "supported"
                   && sessionConversationState === "bound"
                   && sessionConversationAttachment !== "pending"
                 }

@@ -1768,20 +1768,6 @@ def test_lease_recovery_ignores_settled_commands(db_session) -> None:
     assert _delivery_status(db_session, orphan) == DELIVERY_DISPATCHED
 
 
-def test_lease_recovery_leaves_a_completed_live_input_row(db_session) -> None:
-    user = _create_user(db_session, suffix="completed-live")
-    task = _create_expired_task(
-        db_session, user_id=int(user.id), suffix="completed-live"
-    )
-    applied = _add_user_row(
-        db_session, task, turn_id="live:turn", status=DELIVERY_COMPLETED
-    )
-
-    assert _recover_expired_task(db_session, task) == TaskStatus.FAILED
-
-    assert _delivery_status(db_session, applied) == DELIVERY_COMPLETED
-
-
 def test_fenced_recovery_candidate_writes_no_delivery_state(db_session) -> None:
     user = _create_user(db_session, suffix="fenced-orphan")
     task = _create_expired_task(

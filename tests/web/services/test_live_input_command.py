@@ -44,6 +44,7 @@ from xagent.web.services.chat_history_service import (
     DELIVERY_OUTCOME_UNKNOWN,
     DELIVERY_PENDING,
     claim_user_message_delivery_no_commit,
+    mark_user_message_delivery_sync,
     withdraw_pending_user_message_delivery_sync,
 )
 from xagent.web.services.task_command_execution import _execute_durable_task_command
@@ -238,6 +239,25 @@ async def test_applied_after_the_stop_fallback_closed_the_row_marks_completed(
     assert len(host.applied) == 1 and published == []
 
 
+@pytest.mark.parametrize("prior", [DELIVERY_OUTCOME_UNKNOWN, DELIVERY_FAILED])
+async def test_applied_keeps_a_row_another_writer_settled_and_still_meters(
+    db: Any, task: Any, published: list, prior: str
+) -> None:
+    """``APPLIED`` cannot move a row out of ``outcome_unknown`` or ``failed``.
+
+    Neither status has an outgoing transition, so when another writer settled
+    the row first the ``completed`` mark is a conflict: the row keeps that
+    status, and the message is still metered once.
+    """
+    host = FakeHost(task.user_id)
+    admission = lic.DeliveryLedgerAdmission(payload_for(task), host)
+    assert await admission.claim() is LiveInputClaim.CLAIMED
+    assert mark_user_message_delivery_sync(task.id, TURN, prior).outcome == "updated"
+    await admission.finish(LiveInputResult.APPLIED)
+    assert [r.delivery_status for r in rows(db, task)] == [prior]
+    assert len(host.applied) == 1 and published == []
+
+
 async def test_applied_mark_failure_leaves_the_row_pending_and_still_meters(
     monkeypatch: pytest.MonkeyPatch,
     db: Any,
@@ -261,8 +281,21 @@ async def test_applied_mark_failure_leaves_the_row_pending_and_still_meters(
     assert "live input delivery marker completed failed" in caplog.text
 
 
-async def test_applied_records_one_completed_delivery_fact(canonical: Any) -> None:
+@pytest.mark.parametrize(
+    ("prior", "statuses"),
+    [
+        (DELIVERY_PENDING, [DELIVERY_COMPLETED]),
+        (DELIVERY_DISPATCHED, [DELIVERY_DISPATCHED, DELIVERY_COMPLETED]),
+    ],
+    ids=["from_pending", "from_dispatched"],
+)
+async def test_applied_records_one_completed_delivery_fact(
+    canonical: Any, prior: str, statuses: list[str]
+) -> None:
     from xagent.web.models.task_execution_event import TaskExecutionEvent
+    from xagent.web.services.external_task_cancel import (
+        _mark_cancelled_turn_delivery_dispatched,
+    )
 
     factory, task_id = canonical
     with factory() as db:
@@ -271,15 +304,21 @@ async def test_applied_records_one_completed_delivery_fact(canonical: Any) -> No
     payload = lic.LiveInputPayload(task_id=task_id, turn_id=TURN, message="hi")
     admission = lic.DeliveryLedgerAdmission(payload, host)
     assert await admission.claim() is LiveInputClaim.CLAIMED
+    if prior == DELIVERY_DISPATCHED:
+        # The stop fallback closes the live row before the injection reports.
+        with factory() as db:
+            _mark_cancelled_turn_delivery_dispatched(db, task_id, turn_id=None)
+            db.commit()
     await admission.finish(LiveInputResult.APPLIED)
     with factory() as db:
         keys = [
             e.idempotency_key
             for e in db.query(TaskExecutionEvent)
             .filter_by(task_id=task_id, kind="input_delivery_changed")
+            .order_by(TaskExecutionEvent.sequence)
             .all()
         ]
-    assert keys == [f"delivery:{TURN}:completed"]
+    assert keys == [f"delivery:{TURN}:{status}" for status in statuses]
 
 
 async def test_returned_after_claim_withdraws_row_and_reports_not_applied(

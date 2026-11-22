@@ -31,6 +31,15 @@ HOST = "https://cloud.xinference.co"
 MP4 = b"\x00\x00\x00\x18ftypmp42-fake"
 
 
+class _Stream:
+    def __init__(self, raw: bytes):
+        self._raw = raw
+
+    async def iter_chunked(self, size):
+        for i in range(0, len(self._raw), size):
+            yield self._raw[i : i + size]
+
+
 class FakeResponse:
     def __init__(self, status: int, body: Any = None, headers=None):
         self.status = status
@@ -38,6 +47,9 @@ class FakeResponse:
         self.headers = headers or {}
         self.request_info = None
         self.history = ()
+        raw = body if isinstance(body, bytes) else b""
+        self.content_length = len(raw) if raw else None
+        self.content = _Stream(raw)
 
     async def json(self, content_type=None):
         if self._body is None or isinstance(self._body, bytes):
@@ -52,6 +64,19 @@ class FakeResponse:
 
     async def __aexit__(self, *exc):
         return False
+
+
+class StallingResponse(FakeResponse):
+    """Never answers; ``entered`` is set once the request is in flight."""
+
+    def __init__(self):
+        super().__init__(200, {})
+        self.entered = asyncio.Event()
+
+    async def __aenter__(self):
+        self.entered.set()
+        await asyncio.sleep(3600)
+        return self
 
 
 class FakeServer:
@@ -80,7 +105,11 @@ class FakeServer:
             reply = self.delete_reply
             self.deleted = True
         elif url.endswith("/content"):
-            reply = self.content_reply
+            reply = (
+                self.content_reply.pop(0)
+                if isinstance(self.content_reply, list)
+                else self.content_reply
+            )
         elif self.deleted and self.get_after_delete is not None:
             reply = self.get_after_delete
         else:
@@ -595,3 +624,99 @@ async def test_legacy_xinference_provider_ignores_the_switch(monkeypatch):
     monkeypatch.setattr(XinferenceVideoModel, "_post_video_json", post_json)
     await _build("xinference").generate_video(prompt="a fox")
     assert posted == ["/v1/video/generations"]
+
+
+async def test_second_cancel_during_abandon_still_records_the_job(server):
+    server.post_replies = [accepted()]
+    server.get_replies = [job("in_progress")]
+    stalled = StallingResponse()
+    server.delete_reply = stalled
+    real_sleep = asyncio.sleep
+    gate = asyncio.Event()
+
+    async def stall(delay):
+        gate.set()
+        await real_sleep(3600)
+
+    with TokenContextManager() as manager:
+        xinference_module.asyncio.sleep = stall
+        try:
+            task = asyncio.ensure_future(_build().generate_video(prompt="a", seconds=4))
+            await gate.wait()
+            task.cancel()
+            await stalled.entered.wait()
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        finally:
+            xinference_module.asyncio.sleep = real_sleep
+    [row] = _rows(manager)
+    assert row["quantity"] == 0.0
+
+
+async def test_public_http_refusal_while_polling_abandons_the_job(server):
+    server.post_replies = [accepted()]
+    server.get_replies = [ValueError("blocked host")]
+    server.get_after_delete = job("in_progress")
+    with TokenContextManager() as manager:
+        with pytest.raises(BilledVideoTaskError):
+            await _build().generate_video(prompt="a fox", seconds=4)
+    assert server.urls("DELETE") == [f"{HOST}/v1/videos/vid_1"]
+    [row] = _rows(manager)
+    assert row["quantity"] == 0.0
+
+
+async def test_request_timeout_status_is_polled_again(server):
+    server.post_replies = [accepted()]
+    server.get_replies = [FakeResponse(408, {}), completed(4)]
+    result = await _build().generate_video(prompt="a fox", seconds=4)
+    assert result["status"] == "succeeded"
+    assert server.urls("DELETE") == []
+
+
+async def test_fatal_poll_on_a_job_cancelled_for_free_is_not_billed(server):
+    server.post_replies = [accepted()]
+    server.get_replies = [FakeResponse(404, {"error": {"code": "not_found"}})]
+    server.get_after_delete = cancelled_job()
+    with TokenContextManager() as manager:
+        with pytest.raises(RuntimeError) as info:
+            await _build().generate_video(prompt="a fox", seconds=4)
+    assert not isinstance(info.value, BilledVideoTaskError)
+    assert retry_on(info.value) is False
+    assert _rows(manager) == []
+
+
+async def test_content_download_is_retried_after_a_transient_error(server):
+    server.post_replies = [accepted()]
+    server.get_replies = [completed(4)]
+    server.content_reply = [
+        aiohttp.ClientConnectionError("blip"),
+        FakeResponse(200, MP4),
+    ]
+    result = await _build().generate_video(prompt="a fox", seconds=4)
+    assert result["status"] == "succeeded"
+    assert server.urls("GET").count(f"{HOST}/v1/videos/vid_1/content") == 2
+
+
+async def test_content_larger_than_the_video_cap_is_rejected(server, monkeypatch):
+    server.post_replies = [accepted()]
+    server.get_replies = [completed(4)]
+    monkeypatch.setattr(xinference_module, "get_media_download_max_bytes", lambda k: 4)
+    with TokenContextManager() as manager:
+        with pytest.raises(BilledVideoTaskError):
+            await _build().generate_video(prompt="a fox", seconds=4)
+    [row] = _rows(manager)
+    assert row["quantity"] == 4.0
+
+
+async def test_content_cap_also_applies_when_the_length_is_not_declared(
+    server, monkeypatch
+):
+    server.post_replies = [accepted()]
+    server.get_replies = [completed(4)]
+    undeclared = FakeResponse(200, MP4)
+    undeclared.content_length = None
+    server.content_reply = undeclared
+    monkeypatch.setattr(xinference_module, "get_media_download_max_bytes", lambda k: 4)
+    with pytest.raises(BilledVideoTaskError):
+        await _build().generate_video(prompt="a fox", seconds=4)

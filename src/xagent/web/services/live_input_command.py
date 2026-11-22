@@ -33,7 +33,7 @@ from ...core.runtime_performance import increment_counter
 from . import task_execution as task_execution_service
 from .agent_service_manager import get_agent_manager
 from .chat_history_service import (
-    DELIVERY_DISPATCHED,
+    DELIVERY_COMPLETED,
     DELIVERY_FAILED,
     DELIVERY_OUTCOME_UNKNOWN,
     claim_user_message_delivery_no_commit,
@@ -364,7 +364,19 @@ class DeliveryLedgerAdmission:
         if result is LiveInputResult.UNKNOWN:
             result = self._result_for_unreturned_claim()
         if result is LiveInputResult.APPLIED:
-            await self._mark(DELIVERY_DISPATCHED)
+            # APPLIED is reported only after the message is in the run's
+            # checkpoint, so the row records that as ``completed``. Other
+            # writers can close a live input row as ``dispatched``, which does
+            # not say whether the message was written: the orphan sweep in
+            # lease recovery, the stop fallbacks, and the message command path
+            # when a same-id message finds the row already accepted
+            # (``settle_accepted_outcome_unknown``) or takes it over while it
+            # is still pending. ``dispatched -> completed`` is allowed, so this
+            # mark still moves such a row to ``completed``. If the mark raises,
+            # the row keeps its prior status; if another writer already moved
+            # it to ``outcome_unknown`` or ``failed``, the mark is a conflict
+            # and that status is kept.
+            await self._mark(DELIVERY_COMPLETED)
             await self._record_applied()
         elif result is LiveInputResult.RETURNED:
             if not self._claimed:

@@ -438,7 +438,8 @@ export function transitionMessageQueue(
       if (phase.kind === "held" && kept.items.length > 0) {
         // Clearing a stopped queue removes its notice. A task that can take a
         // new turn has no turn left to wait for, so the queue is ready and the
-        // kept message's outcome moves it on; a running task's turn is awaited.
+        // kept message's outcome moves it on; in every other status the queue
+        // keeps waiting for the turn to end.
         const { status, version } = state.observed
         if (status !== undefined && APPENDABLE.has(status)) return to({ ...kept, phase: READY })
         return to(enterWaiting(kept, version))

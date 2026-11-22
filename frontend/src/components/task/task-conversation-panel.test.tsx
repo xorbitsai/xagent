@@ -453,6 +453,7 @@ describe("TaskConversationPanel", () => {
       ["announced", "supported", "supported", "bound", "attached", true],
       ["not announced", "supported", "unsupported", "bound", "attached", false],
       ["not yet known", "supported", "unknown", "bound", "attached", false],
+      ["announced, new turns not yet announced", "unknown", "supported", "bound", "attached", false],
       ["announced without new turns", "unsupported", "supported", "bound", "attached", false],
       ["announced, conversation not bound", "supported", "supported", "reload_required", "attached", false],
       ["announced, conversation still attaching", "supported", "supported", "bound", "pending", false],

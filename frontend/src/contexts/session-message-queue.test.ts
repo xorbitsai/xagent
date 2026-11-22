@@ -297,6 +297,9 @@ describe("sending a queued message into the running turn", () => {
       ["clear: sending", state(SENDING, [H, ins("x", 1), item("c", 3)]), { type: "CLEAR" }, SENDING, ["h:sending", "x:inserting"]],
       ["clear: held with an ended task keeps a message being inserted and is ready", state(HELD, [ins("x", 1, { confirmed: true }), item("c", 3)], { version: 4, status: "failed" }), { type: "CLEAR" }, READY, ["x:inserting"]],
       ["clear: held with a running task keeps a message being inserted and waits", state(HELD, [ins("x", 1, { confirmed: true }), item("c", 3)], { version: 4, status: "running" }), { type: "CLEAR" }, waiting(4), ["x:inserting"]],
+      ["clear: held with a pending task keeps a message being inserted and waits", state(HELD, [ins("x", 1, { confirmed: true }), item("c", 3)], { version: 4, status: "pending" }), { type: "CLEAR" }, waiting(4), ["x:inserting"]],
+      ["clear: held with a task waiting for the visitor keeps a message being inserted and waits", state(HELD, [ins("x", 1, { confirmed: true }), item("c", 3)], { version: 4, status: "waiting_for_user" }), { type: "CLEAR" }, waiting(4), ["x:inserting"]],
+      ["clear: held with no task status observed yet keeps a message being inserted and waits", state(HELD, [ins("x", 1, { confirmed: true }), item("c", 3)], { version: undefined, status: undefined }), { type: "CLEAR" }, waiting(undefined), ["x:inserting"]],
       // Leaving the sending phase with a failed message stops the queue.
       ["accepted: leaving sending with a failed message holds", state(SENDING, [H, item("f", 1, "failed")]), { type: "DELIVERY_ACCEPTED", clientMessageId: "h", sinceVersion: 2 }, HELD_UNKNOWN, ["f:failed"], "send_now_unknown"],
       ["send failed: leaving sending with a failed message holds", state(SENDING, [H, item("f", 1, "failed")]), { type: "SEND_FAILED", clientMessageId: "h", verdict: "wait" }, HELD_UNKNOWN, ["h:waiting", "f:failed"], "send_now_unknown"],

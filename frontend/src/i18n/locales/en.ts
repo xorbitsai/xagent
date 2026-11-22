@@ -111,7 +111,6 @@ const en = {
       turnInterrupted: "The last response was interrupted, so queued messages have not been sent.",
       sendFailed: "Some queued messages could not be sent.",
       earlierSendFailed: "An earlier message could not be sent, so queued messages have not been sent. To send that message first, clear the queue and send it again.",
-      sendNowUnknown: "A message sent with Send now may not have reached the reply. If it appears in the conversation, it was sent.",
     },
     supportLost: "Queued messages can't be sent automatically right now. If one already appears in the conversation, it was sent.",
     full: "You can queue up to {count} messages.",

@@ -99,6 +99,7 @@ describe("QueuedMessageList", () => {
     ["turn_paused", "messageQueue.held.turnInterrupted"],
     ["send_failed", "messageQueue.held.sendFailed"],
     ["earlier_send_failed", "messageQueue.held.earlierSendFailed"],
+    ["send_now_unknown", "clientErrors.liveInputOutcomeUnknown"],
   ] as const)("explains a queue held for %s and offers continue and clear", (reason, text) => {
     const queue = controls([item("a", "waiting"), item("b", "waiting")], { kind: "held", reason })
     render(<QueuedMessageList queue={queue} canContinue />)

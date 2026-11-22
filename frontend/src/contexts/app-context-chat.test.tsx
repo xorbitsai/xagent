@@ -14474,7 +14474,7 @@ describe("session message queue", () => {
       ["no run", () => refusal("live_input_not_running"), ["A:waiting:next", "B:waiting"], null],
       ["a pending question", () => refusal("interaction_response_required"), ["A:waiting:next", "B:waiting"], null],
       ["unavailable", () => refusal("live_input_unavailable"), ["A:failed", "B:waiting"], "messageQueue.held.sendFailed"],
-      ["outcome unknown", () => refusal("live_input_outcome_unknown"), ["A:failed", "B:waiting"], "messageQueue.held.sendNowUnknown"],
+      ["outcome unknown", () => refusal("live_input_outcome_unknown"), ["A:failed", "B:waiting"], "clientErrors.liveInputOutcomeUnknown"],
       ["an unusable id", () => refusal("message_id_conflict", true), ["A:failed", "B:waiting"], "messageQueue.held.sendFailed"],
       ["not sent", () => new MessageDeliveryError("no", "not_sent", {}), ["A:waiting", "B:waiting"], null],
     ])("a refusal for %s lands in its own outcome", async (_name, error, expected, alert) => {
@@ -14506,7 +14506,7 @@ describe("session message queue", () => {
         expect(liveFrames()).toEqual(["id-A"])
         expect(statuses()).toEqual(["A:failed", "B:waiting"])
         expect(phase()).toEqual({ kind: "held", reason: "send_now_unknown" })
-        expect(toasts()).toEqual(["messageQueue.held.sendNowUnknown"])
+        expect(toasts()).toEqual(["clientErrors.liveInputOutcomeUnknown"])
       }
     })
 

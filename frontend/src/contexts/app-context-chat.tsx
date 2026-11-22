@@ -544,9 +544,9 @@ import {
   decideComposerSubmit,
   initialMessageQueueState,
   isBusyRefusal,
+  isLiveInputReturnReason,
   readTurn,
   transitionMessageQueue,
-  type LiveInputReturnReason,
   type MessageQueueEvent,
   type MessageQueueState,
   type ObservedTaskState,
@@ -643,17 +643,6 @@ const dispatchAutoOpenPreview = (
     }
   })
 }
-
-const LIVE_INPUT_RETURN_REASONS: ReadonlySet<string> = new Set<LiveInputReturnReason>([
-  "run_ended",
-  "not_started",
-  "not_applied",
-  "unavailable",
-  "taken",
-  "refused",
-  "conflict",
-  "outcome_unknown",
-])
 
 const USER_TURN_MESSAGE_PREFIX = "msg-user-turn"
 const USER_EVENT_MESSAGE_PREFIX = "msg-user-event"
@@ -2809,7 +2798,7 @@ export type NewTurnDeliveryCapability = "unknown" | "supported" | "unsupported"
 // in progress. Kept like NewTurnDeliveryCapability: only the next capabilities
 // frame changes it, and a send additionally requires that the connection which
 // reported "supported" is the current one.
-export type SendNowDeliveryCapability = "unknown" | "supported" | "unsupported"
+export type SendNowDeliveryCapability = NewTurnDeliveryCapability
 
 export interface SessionMessageQueueControls {
   state: MessageQueueState
@@ -3318,7 +3307,7 @@ export function AppProvider({
     if (next !== current) dispatch({ type: "SET_MESSAGE_QUEUE", payload: next })
     if (effect === "send_failed") toast.error(translateRef.current("messageQueue.held.sendFailed"))
     if (effect === "support_lost") toast.error(translateRef.current("messageQueue.supportLost"))
-    if (effect === "send_now_unknown") toast.error(translateRef.current("messageQueue.held.sendNowUnknown"))
+    if (effect === "send_now_unknown") toast.error(translateRef.current("clientErrors.liveInputOutcomeUnknown"))
   }, [dispatch])
 
   const rejectSessionResetFlight = useCallback(
@@ -7794,12 +7783,12 @@ export function AppProvider({
         && binding.taskId === sessionTaskIdRef.current
         && typeof turnId === "string"
         && typeof reason === "string"
-        && LIVE_INPUT_RETURN_REASONS.has(reason)
+        && isLiveInputReturnReason(reason)
       ) {
         applyMessageQueue({
           type: "LIVE_INPUT_RETURNED",
           clientMessageId: turnId,
-          reason: reason as LiveInputReturnReason,
+          reason,
           now: Date.now(),
           // Only the server's own account of this attempt was withdrawn, so
           // the message goes out on the next turn under an id never used.
@@ -9122,35 +9111,20 @@ export function AppProvider({
     for (const item of stateRef.current.messageQueue.items) {
       const { insert } = item
       if (item.status !== "inserting" || !insert || wire.has(item.clientMessageId)) continue
-      const resend = () => {
-        applyMessageQueue({
-          type: "SEND_NOW_RESENT",
-          clientMessageId: item.clientMessageId,
-          atVersion: observed.version,
-          connection,
-        })
+      // `atVersion` becomes the message's `resentAt`; a retry that came due
+      // keeps the one it had.
+      const resend = (atVersion: number | undefined) => {
+        applyMessageQueue({ type: "SEND_NOW_RESENT", clientMessageId: item.clientMessageId, atVersion, connection })
         send(item.clientMessageId, item.text)
       }
       if (!insert.inFlight && insert.retryAt !== undefined) {
-        if (insert.retryAt <= now) {
-          applyMessageQueue({
-            type: "SEND_NOW_RESENT",
-            clientMessageId: item.clientMessageId,
-            atVersion: insert.resentAt,
-            connection,
-          })
-          send(item.clientMessageId, item.text)
-        }
+        if (insert.retryAt <= now) resend(insert.resentAt)
       } else if (insert.inFlight) {
-        if (insert.connection !== connection) resend()
+        if (insert.connection !== connection) resend(observed.version)
         else if (sendNowLostOnRef.current.get(item.clientMessageId) !== connection) send(item.clientMessageId, item.text)
-      } else if (
-        insert.confirmed
-        && insert.resentAt !== observed.version
-        && readTurn(observed, insert.since) !== "unseen"
-        && readTurn(observed, insert.since) !== "running"
-      ) {
-        resend()
+      } else if (insert.confirmed && insert.resentAt !== observed.version) {
+        const reading = readTurn(observed, insert.since)
+        if (reading !== "unseen" && reading !== "running") resend(observed.version)
       }
     }
   }

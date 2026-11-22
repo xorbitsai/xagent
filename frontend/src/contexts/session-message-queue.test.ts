@@ -18,6 +18,7 @@ import {
   type MessageQueuePhase,
   type MessageQueueState,
   type QueuedMessage,
+  type SendNowVerdict,
 } from "./session-message-queue"
 
 const item = (id: string, seq: number, status: QueuedMessage["status"] = "waiting"): QueuedMessage =>
@@ -267,7 +268,7 @@ describe("sending a queued message into the running turn", () => {
   const NOW = 10_000
   const requested = (id: string, canInsert = true): MessageQueueEvent =>
     ({ type: "SEND_NOW_REQUESTED", clientMessageId: id, sinceVersion: 1, connection: "c1", canInsert })
-  const failedWith = (id: string, verdict: "next" | "hold" | "unknown" | "retry" | "later", extra: { newClientMessageId?: string } = {}): MessageQueueEvent =>
+  const failedWith = (id: string, verdict: SendNowVerdict, extra: { newClientMessageId?: string } = {}): MessageQueueEvent =>
     ({ type: "SEND_NOW_FAILED", clientMessageId: id, verdict, now: NOW, ...extra })
   const returned = (id: string, reason: LiveInputReturnReason, extra: { newClientMessageId?: string } = {}): MessageQueueEvent =>
     ({ type: "LIVE_INPUT_RETURNED", clientMessageId: id, reason, now: NOW, ...extra })

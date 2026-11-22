@@ -18,13 +18,13 @@ const HELD_KEYS = {
   turn_paused: "messageQueue.held.turnInterrupted",
   send_failed: "messageQueue.held.sendFailed",
   earlier_send_failed: "messageQueue.held.earlierSendFailed",
-  send_now_unknown: "messageQueue.held.sendNowUnknown",
+  send_now_unknown: "clientErrors.liveInputOutcomeUnknown",
 } as const
 
 const NOTICE_CLASS =
   "rounded-md border border-amber-300 bg-amber-50 px-3 py-2 text-sm text-amber-900 dark:bg-amber-950 dark:text-amber-100"
 
-export type SendNowControl = "hidden" | "enabled" | "disabled"
+type SendNowControl = "hidden" | "enabled" | "disabled"
 
 // What the send-now button of a row does. A message that already goes first on
 // the next turn has nothing left to ask for, except in a stopped queue, where

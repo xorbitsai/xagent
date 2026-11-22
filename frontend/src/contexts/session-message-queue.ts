@@ -9,8 +9,8 @@ export const MESSAGE_QUEUE_LIMIT = 5
 
 // How long a "not started yet" refusal waits before the same message is sent
 // into the running turn again, and how many such retries one message gets.
-export const SEND_NOW_RETRY_DELAY_MS = 1000
-export const SEND_NOW_RETRY_LIMIT = 5
+const SEND_NOW_RETRY_DELAY_MS = 1000
+const SEND_NOW_RETRY_LIMIT = 5
 
 // The bookkeeping of a message being sent into the turn in progress.
 export interface InsertState {
@@ -113,15 +113,17 @@ export type QueuedSendVerdict = "wait" | "answer_first" | "hold"
 // stops the queue, "unknown" stops it because the message may have arrived.
 export type SendNowVerdict = "next" | "hold" | "unknown" | "retry" | "later"
 
-export type LiveInputReturnReason =
-  | "run_ended"
-  | "not_started"
-  | "not_applied"
-  | "unavailable"
-  | "taken"
-  | "refused"
-  | "conflict"
-  | "outcome_unknown"
+const LIVE_INPUT_RETURN_REASONS = [
+  "run_ended", "not_started", "not_applied", "unavailable", "taken", "refused", "conflict", "outcome_unknown",
+] as const
+
+export type LiveInputReturnReason = (typeof LIVE_INPUT_RETURN_REASONS)[number]
+
+const KNOWN_RETURN_REASONS: ReadonlySet<string> = new Set(LIVE_INPUT_RETURN_REASONS)
+
+// Whether a reason read from a frame is one this client knows.
+export const isLiveInputReturnReason = (reason: string): reason is LiveInputReturnReason =>
+  KNOWN_RETURN_REASONS.has(reason)
 
 export type MessageQueueEvent =
   // `snapshot`: the frame is a periodic reconciliation snapshot.
@@ -451,19 +453,16 @@ export function transitionMessageQueue(
     case "SEND_NOW_REQUESTED": {
       const target = items.find(item => item.clientMessageId === event.clientMessageId)
       if (phase.kind === "idle" || !target) return to(state)
+      const marked = items.map(item => (item === target ? { ...item, next: true } : item))
       if (phase.kind === "held") {
         if (target.status !== "waiting" && target.status !== "failed") return to(state)
-        const marked = items.map(item => (item === target ? { ...item, next: true } : item))
         return transitionMessageQueue(
           { ...state, items: placeFirst(marked, event.clientMessageId) },
           { type: "CONTINUE" },
         )
       }
       if (target.status !== "waiting") return to(state)
-      if (phase.kind === "ready") {
-        const marked = items.map(item => (item === target ? { ...item, next: true } : item))
-        return to({ ...state, items: placeFirst(marked, event.clientMessageId) })
-      }
+      if (phase.kind === "ready") return to({ ...state, items: placeFirst(marked, event.clientMessageId) })
       if (!event.canInsert) return to(state)
       const insert: InsertState = {
         confirmed: false,
@@ -474,8 +473,8 @@ export function transitionMessageQueue(
         retries: 0,
         retryAt: undefined,
       }
-      const marked = items.map(item => (item === target ? { ...item, status: "inserting" as const, insert } : item))
-      return to({ ...state, items: placeFirst(marked, event.clientMessageId) })
+      const inserted = items.map(item => (item === target ? { ...item, status: "inserting" as const, insert } : item))
+      return to({ ...state, items: placeFirst(inserted, event.clientMessageId) })
     }
     case "SEND_NOW_ACCEPTED": {
       const target = inserting(event.clientMessageId)

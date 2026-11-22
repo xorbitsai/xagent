@@ -345,7 +345,7 @@ describe("sending a queued message into the running turn", () => {
       expect(ids(next), name).toEqual(expectedIds)
       expect(actual, name).toBe(effect ?? null)
     }
-    expect(rows).toHaveLength(44)
+    expect(rows).toHaveLength(47)
   })
 
   it("ignores every new event while idle", () => {

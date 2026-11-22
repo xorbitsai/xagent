@@ -917,7 +917,7 @@ def _reconcile_finalized_turn_delivery(
     settlement_error: str | None,
     execution_started: bool,
 ) -> None:
-    """Close a terminally settled turn's delivery row (xorbitsai/xagent-saas#332).
+    """Close a terminally settled turn's delivery row.
 
     A user-message delivery row is written ``pending`` with the turn claim and
     projected to ``dispatched`` right after scheduling. That projection is
@@ -967,11 +967,13 @@ def _reconcile_finalized_turn_delivery(
       ``execute_task_background`` was never invoked (setup failed, or the run
       was cancelled first), so the message was provably never consumed and a
       fresh-id retry is safe. The accepted cost is that the ``failed`` row
-      remains visible in the transcript (no history-loading path filters on
-      ``delivery_status``), so a fresh-id resend can show the user's message
-      twice — a pre-existing property of every ``failed`` writer, tracked in
-      xorbitsai/xagent-saas#417, and strictly better than wedging the client
-      on a ``pending`` row forever.
+      stays in the chat history the user sees: no history replay path filters
+      on ``delivery_status``, so after a fresh-id resend the user sees the
+      message twice, as with every other ``failed`` writer. The model sees it
+      once: the storage-version-1 transcript loader skips ``failed`` user rows,
+      and the event-backed context only includes inputs that a run applied.
+      That is strictly better than wedging the client on a ``pending`` row
+      forever.
 
     The transition is monotonic — it never regresses — but only ``completed``
     and ``failed`` are terminal: ``dispatched`` still has an outgoing edge to

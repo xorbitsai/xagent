@@ -345,6 +345,7 @@ export default defineConfig({
       "src/hooks/widget-voice-call.test.tsx",
       "src/lib/api-wrapper.test.ts",
       "src/lib/api-wrapper-idle.test.ts",
+      "src/lib/browser-location.test.ts",
       "src/lib/auth-cache.test.ts",
       "src/lib/idle-session.test.ts",
       "src/lib/idle-activity.test.ts",

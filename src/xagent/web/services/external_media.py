@@ -170,24 +170,6 @@ def _normalized_file_id(value: str) -> str:
         raise ExternalMediaNotFound("Registered image was not found") from None
 
 
-def _image_media_type(record: Any) -> str:
-    filename = str(getattr(record, "filename", "") or "").strip().lower()
-    media_type = _IMAGE_MEDIA_TYPES.get(Path(filename).suffix)
-    if media_type is None:
-        raise ExternalMediaUnsupportedImage("Only PNG or JPEG images can be delivered")
-    return media_type
-
-
-def _connector_image_media_type(record: Any) -> str:
-    filename = str(getattr(record, "filename", "") or "").strip().lower()
-    media_type = _CONNECTOR_IMAGE_MEDIA_TYPES.get(Path(filename).suffix)
-    if media_type is None:
-        raise ExternalMediaUnsupportedImage(
-            "Only PNG, JPEG or WebP images can be delivered"
-        )
-    return media_type
-
-
 def _is_webp_signature(content: bytes) -> bool:
     return content[:4] == b"RIFF" and content[8:12] == b"WEBP"
 
@@ -263,10 +245,22 @@ def _load_record(
 
 
 def _registered_media_type(record: Any, purpose: ExternalMediaPurpose) -> str:
-    """The media type a registered file's name declares, for ``purpose``."""
+    """The media type a registered file's name declares, for ``purpose``.
+
+    The connector-image purpose also takes WebP; Instagram and Facebook take
+    PNG or JPEG only, each with its own message.
+    """
     if purpose is ExternalMediaPurpose.CONNECTOR_IMAGE:
-        return _connector_image_media_type(record)
-    return _image_media_type(record)
+        media_types = _CONNECTOR_IMAGE_MEDIA_TYPES
+        message = "Only PNG, JPEG or WebP images can be delivered"
+    else:
+        media_types = _IMAGE_MEDIA_TYPES
+        message = "Only PNG or JPEG images can be delivered"
+    filename = str(getattr(record, "filename", "") or "").strip().lower()
+    media_type = media_types.get(Path(filename).suffix)
+    if media_type is None:
+        raise ExternalMediaUnsupportedImage(message)
+    return media_type
 
 
 def _encode_ticket(
@@ -705,48 +699,43 @@ def _validate_facebook_record(record: UploadedFile) -> None:
     is the wrong type, too large or does not decode is an unsupported image,
     which a connector able to upload the bytes itself may still take.
     """
-
-    _image_media_type(record)
-    path = _materialize_record(record)
-    try:
-        # Pin the opened file and bound the read even if a sandbox writer grows it.
-        with open_delivery_file(record, path) as source:
-            content = source.read(FACEBOOK_MAX_IMAGE_BYTES + 1)
-    except OSError as exc:
-        raise ExternalMediaUnavailable(
-            "Registered image could not be read for external delivery"
-        ) from exc
-    if len(content) > FACEBOOK_MAX_IMAGE_BYTES:
-        raise ExternalMediaUnsupportedImage("Registered image exceeds the 10 MB limit")
-    try:
-        # Neither check decodes pixels. PNG's verify() reads every chunk and
-        # checks its CRC, so a truncated or damaged PNG fails. JPEG's verify()
-        # only parses the header, so the main image must also be seen to end;
-        # a JPEG damaged in the middle still passes. The bytes are in memory,
-        # so any error is a decode error.
-        with Image.open(BytesIO(content), formats=_INSTAGRAM_IMAGE_FORMATS) as image:
-            is_jpeg = image.format in {"JPEG", "MPO"}
-            image.verify()
-        if is_jpeg and not _jpeg_main_image_ends(content):
-            raise SyntaxError("JPEG ends before its main image does")
-    except Exception as exc:
-        raise ExternalMediaUnsupportedImage(
-            "Registered image could not be decoded as PNG or JPEG"
-        ) from exc
+    _validate_fetched_image_record(
+        record,
+        purpose=ExternalMediaPurpose.FACEBOOK_PUBLISH,
+        formats=_INSTAGRAM_IMAGE_FORMATS,
+        format_error="Registered image could not be decoded as PNG or JPEG",
+    )
 
 
 def _validate_connector_image_record(record: UploadedFile) -> None:
     """A connector fetches the image as stored: a whole PNG, JPEG or WebP within 10 MB.
 
-    The rule is the Facebook one with WebP added, and fails the same way: an
-    unreadable file is a storage problem (base ``ExternalMediaUnavailable``); a
-    file that reads but is the wrong type, too large or does not decode is an
-    unsupported image.  A WebP is checked by its RIFF header, which must name
-    a WebP and a length that matches the bytes held, so a file cut short or
-    padded after its end is refused without decoding any pixels.
+    The rule is the Facebook one with WebP added, and fails the same way.
     """
+    _validate_fetched_image_record(
+        record,
+        purpose=ExternalMediaPurpose.CONNECTOR_IMAGE,
+        formats=_CONNECTOR_IMAGE_FORMATS,
+        format_error="Registered image could not be decoded as PNG, JPEG or WebP",
+    )
 
-    _connector_image_media_type(record)
+
+def _validate_fetched_image_record(
+    record: UploadedFile,
+    *,
+    purpose: ExternalMediaPurpose,
+    formats: list[str],
+    format_error: str,
+) -> None:
+    """Check an image a provider fetches as stored, for ``purpose``.
+
+    Shared by the Facebook and connector-image purposes, so a later hardening
+    applies to both. An unreadable file is a storage problem (base
+    ``ExternalMediaUnavailable``); a file that reads but has the wrong type,
+    is over 10 MB or fails the format check below is an unsupported image
+    (``format_error``).
+    """
+    _registered_media_type(record, purpose)
     path = _materialize_record(record)
     try:
         # Pin the opened file and bound the read even if a sandbox writer grows it.
@@ -759,11 +748,16 @@ def _validate_connector_image_record(record: UploadedFile) -> None:
     if len(content) > FACEBOOK_MAX_IMAGE_BYTES:
         raise ExternalMediaUnsupportedImage("Registered image exceeds the 10 MB limit")
     try:
-        # PNG's verify() reads every chunk and checks its CRC; JPEG's only
-        # parses the header, so the main image must also be seen to end; for
-        # WebP the RIFF length is the check.  The bytes are in memory, so any
-        # error is a decode error.
-        with Image.open(BytesIO(content), formats=_CONNECTOR_IMAGE_FORMATS) as image:
+        # No check here decodes pixels. PNG's verify() reads every chunk and
+        # checks its CRC, so a truncated or damaged PNG fails. JPEG's verify()
+        # only parses the header, so the main image must also be seen to end;
+        # a JPEG damaged in the middle still passes. A WebP, opened only when
+        # ``formats`` names it, is checked by its RIFF header alone: it must
+        # name a WebP and a length equal to the bytes held. Its VP8/VP8L
+        # bitstream is not decoded, so a WebP of the right length with damaged
+        # image data passes. The bytes are in memory, so any error here is a
+        # format error, not a storage one.
+        with Image.open(BytesIO(content), formats=formats) as image:
             image_format = image.format
             image.verify()
         if image_format in {"JPEG", "MPO"} and not _jpeg_main_image_ends(content):
@@ -771,9 +765,7 @@ def _validate_connector_image_record(record: UploadedFile) -> None:
         if image_format == "WEBP" and not _webp_length_matches(content):
             raise SyntaxError("WebP length does not match its RIFF header")
     except Exception as exc:
-        raise ExternalMediaUnsupportedImage(
-            "Registered image could not be decoded as PNG, JPEG or WebP"
-        ) from exc
+        raise ExternalMediaUnsupportedImage(format_error) from exc
 
 
 def _webp_length_matches(content: bytes) -> bool:

@@ -535,7 +535,7 @@ describe("link session Worker renew", () => {
   })
 })
 
-describe("link session Worker renew stays inside the server's 30 second grace", () => {
+describe("link session Worker renew stays inside the server's minimum 30 second grace", () => {
   // Drives the renew backoff up past 30 s with rejected fetches, then makes the
   // next attempt fail in the given way and measures when the attempt after that
   // is sent.

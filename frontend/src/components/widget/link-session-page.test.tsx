@@ -4,6 +4,12 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 
 vi.mock("@/contexts/i18n-context", () => ({ useI18n: () => ({ t: (key: string) => key }) }))
 
+vi.mock("@/lib/browser-location", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@/lib/browser-location")>()),
+  replaceBrowserLocation: vi.fn(),
+}))
+
+import { replaceBrowserLocation } from "@/lib/browser-location"
 import { LinkSessionPage } from "./link-session-page"
 import type { LinkWorkerLike } from "./link-session-host"
 
@@ -132,6 +138,15 @@ describe("link session page", () => {
     const m = mount()
     expect(m.createWorker).not.toHaveBeenCalled()
     expect(m.navigate).toHaveBeenCalledWith("/widget/chat/link/ended?reason=link_invalid")
+  })
+
+  it("leaves the page with a history-replacing navigation by default", () => {
+    const worker = new FakeWorker()
+    render(<LinkSessionPage environment={{ createWorker: () => worker }} />)
+    act(() => {
+      worker.emit("message", { type: "terminal", reason: "network" })
+    })
+    expect(replaceBrowserLocation).toHaveBeenCalledWith("/widget/chat/link/ended?reason=network")
   })
 
   it("builds the chat iframe with the timezone, no voice and only clipboard-write", () => {

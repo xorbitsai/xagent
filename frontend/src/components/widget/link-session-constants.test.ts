@@ -94,7 +94,6 @@ describe("link session end reasons", () => {
     ["session_expired", "session_ended"],
     ["reconnect_invalid", "session_ended"],
     ["identity_mismatch", "session_ended"],
-    ["rate_limited", "network"],
     ["agent_not_available", "unavailable"],
     ["widget_disabled", "unavailable"],
     ["invalid_input", "unavailable"],

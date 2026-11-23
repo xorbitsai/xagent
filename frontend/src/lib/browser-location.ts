@@ -57,3 +57,13 @@ export function getBrowserLocationSearch(): string {
     return ""
   }
 }
+
+// Navigates without adding a history entry, so Back does not return to the
+// page being left.
+export function replaceBrowserLocation(url: string): void {
+  if (typeof window === "undefined") {
+    return
+  }
+
+  window.location.replace(url)
+}

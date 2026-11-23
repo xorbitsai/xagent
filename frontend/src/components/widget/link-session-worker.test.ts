@@ -346,6 +346,22 @@ describe("link session Worker redeem", () => {
     expect(terminals(h)).toEqual([{ type: "terminal", reason: "unavailable" }])
   })
 
+  it("ends with unavailable for a 4xx whose error code is not a known server code", async () => {
+    const h = makeHarness(() => errorResponse(400, "unexpected_error"))
+    await startAndSettle(h)
+    await vi.advanceTimersByTimeAsync(5 * MINUTE)
+    expect(h.fetchSpy).toHaveBeenCalledTimes(1)
+    expect(terminals(h)).toEqual([{ type: "terminal", reason: "unavailable" }])
+  })
+
+  it("ends with unavailable for a 3xx without retrying", async () => {
+    const h = makeHarness(() => jsonResponse(302, {}))
+    await startAndSettle(h)
+    await vi.advanceTimersByTimeAsync(5 * MINUTE)
+    expect(h.fetchSpy).toHaveBeenCalledTimes(1)
+    expect(terminals(h)).toEqual([{ type: "terminal", reason: "unavailable" }])
+  })
+
   it("ends with unavailable when a 200 response lacks required fields", async () => {
     const h = makeHarness(() => jsonResponse(200, { session_token: "st", reconnect_token: "rt_1" }))
     await startAndSettle(h)
@@ -362,7 +378,6 @@ describe("link session Worker end reasons for server error codes", () => {
     ["identity_mismatch", 401, "session_ended"],
     ["agent_not_available", 403, "unavailable"],
     ["widget_disabled", 403, "unavailable"],
-    ["unexpected_error", 400, "unavailable"],
     ["grant_malformed", 400, "unavailable"],
     ["signature_invalid", 401, "unavailable"],
     ["grant_expired", 401, "unavailable"],

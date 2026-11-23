@@ -109,8 +109,6 @@ export function reasonForKnownCode(code: string): WorkerTerminalReason {
     case "reconnect_invalid":
     case "identity_mismatch":
       return "session_ended"
-    case "rate_limited":
-      return "network"
     default:
       return "unavailable"
   }

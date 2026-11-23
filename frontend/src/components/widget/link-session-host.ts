@@ -72,6 +72,8 @@ export interface LinkHostState {
   recoverableCode: "network_unavailable" | null
   rapidRecoveries: number
   deliverySequence: number
+  // The id of the session currently held; every new session gets one id.
+  currentDeliveryId: string | null
   awaitedDeliveryId: string | null
   invalidatedDeliveryId: string | null
   stableDeliveryId: string | null
@@ -100,15 +102,7 @@ export function extractLinkCode(hash: string): string | null {
 export function buildIframeSrc(search: string): string {
   const timezone = new URLSearchParams(search).get("timezone")?.trim()
   if (!timezone) return SESSION_IFRAME_PATH
-  let encoded: string
-  try {
-    // A lone UTF-16 surrogate survives trim() and makes encodeURIComponent
-    // throw; the override then degrades to "no timezone".
-    encoded = encodeURIComponent(timezone)
-  } catch {
-    return SESSION_IFRAME_PATH
-  }
-  return `${SESSION_IFRAME_PATH}?timezone=${encoded}`
+  return `${SESSION_IFRAME_PATH}?timezone=${encodeURIComponent(timezone)}`
 }
 
 function parseSessionFields(value: unknown): LinkSessionFields | null {
@@ -141,6 +135,7 @@ export function createLinkSessionHost(deps: LinkSessionHostDeps): LinkSessionHos
     recoverableCode: null,
     rapidRecoveries: 0,
     deliverySequence: 0,
+    currentDeliveryId: null,
     awaitedDeliveryId: null,
     invalidatedDeliveryId: null,
     stableDeliveryId: null,
@@ -236,7 +231,8 @@ export function createLinkSessionHost(deps: LinkSessionHostDeps): LinkSessionHos
     }
     // A renew is already on its way; the new session is delivered when it lands.
     if (state.renewInFlight) return
-    const deliveryId = mintDeliveryId()
+    const deliveryId = state.currentDeliveryId
+    if (!deliveryId) return
     if (deliveryId !== state.stableDeliveryId && deliveryId !== state.invalidatedDeliveryId) {
       state.awaitedDeliveryId = deliveryId
     }
@@ -264,8 +260,9 @@ export function createLinkSessionHost(deps: LinkSessionHostDeps): LinkSessionHos
     if (deliveryId !== state.awaitedDeliveryId || deliveryId === state.invalidatedDeliveryId) return
     if (stabilityTimer !== null || state.stableDeliveryId === deliveryId) return
     const timer = deps.setTimer(() => {
-      if (stabilityTimer !== timer || state.awaitedDeliveryId !== deliveryId) return
+      if (stabilityTimer !== timer) return
       stabilityTimer = null
+      if (state.awaitedDeliveryId !== deliveryId) return
       state.awaitedDeliveryId = null
       state.stableDeliveryId = deliveryId
       state.rapidRecoveries = 0
@@ -313,6 +310,10 @@ export function createLinkSessionHost(deps: LinkSessionHostDeps): LinkSessionHos
     }
     clearWatchdogs()
     const first = iframeSrc === null
+    // A new session replaces the delivery being timed; a repeated ready from
+    // the iframe re-sends this same id.
+    invalidateStability()
+    state.currentDeliveryId = mintDeliveryId()
     state.session = fields
     state.renewInFlight = false
     state.recoverableCode = null
@@ -360,7 +361,8 @@ export function createLinkSessionHost(deps: LinkSessionHostDeps): LinkSessionHos
   function start(): void {
     search = deps.readSearch()
     const code = extractLinkCode(deps.readHash())
-    // Whatever was in the fragment, it must be gone before anything else runs.
+    // The fragment is removed before the Worker is created; a failing
+    // replaceState does not stop the redeem, since a code can be used only once.
     deps.replaceState(deps.readPathname() + search)
     if (code === null) {
       terminate("link_invalid")

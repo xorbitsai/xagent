@@ -8,6 +8,7 @@ import {
   getBrowserLocationOrigin,
   getBrowserLocationPathname,
   getBrowserLocationSearch,
+  replaceBrowserLocation,
 } from "@/lib/browser-location"
 import {
   createLinkSessionHost,
@@ -74,7 +75,7 @@ export function LinkSessionPage({ environment }: { environment?: LinkSessionPage
         navigate: (url) => {
           const navigate = environmentRef.current?.navigate
           if (navigate) navigate(url)
-          else window.location.replace(url)
+          else replaceBrowserLocation(url)
         },
         createWorker: () => (environmentRef.current?.createWorker ?? createLinkWorker)(),
         getIframeWindow: () => iframeRef.current?.contentWindow ?? null,

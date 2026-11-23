@@ -213,6 +213,7 @@ describe("link session host state", () => {
     expect(Object.keys(state).sort()).toEqual([
       "awaitedDeliveryId",
       "chromeReady",
+      "currentDeliveryId",
       "deliverySequence",
       "iframeReady",
       "invalidatedDeliveryId",
@@ -455,13 +456,16 @@ describe("link session host iframe protocol", () => {
     expect(typeof (update as { session_delivery_id: unknown }).session_delivery_id).toBe("string")
   })
 
-  it("mints a fresh delivery id for every update", () => {
+  it("re-sends the same delivery id on a repeated ready and mints a new one for each new session", () => {
     const h = makeHost()
-    connect(h)
+    const worker = connect(h)
     iframeSays(h, "ready")
     iframeSays(h, "ready")
     const ids = updates(h).map((m) => m.session_delivery_id)
-    expect(new Set(ids).size).toBe(2)
+    expect(ids[0]).toBe(ids[1])
+    renewCycle(h, worker)
+    const next = (lastUpdate(h) as { session_delivery_id: string }).session_delivery_id
+    expect(next).not.toBe(ids[0])
   })
 
   it("leaves capabilities out of the update when the session has none", () => {
@@ -701,6 +705,45 @@ describe("link session host renew accounting", () => {
     vi.advanceTimersByTime(5 * MINUTE)
     renewCycle(h, worker)
     renewCycle(h, worker)
+    iframeSays(h, "reconnect_request")
+    expect(worker.count("renew")).toBe(3)
+    expect(h.navs).toEqual(["/widget/chat/link/ended?reason=network"])
+  })
+
+  it("lets a repeated ready inside the stability window still reset the count", () => {
+    const h = makeHost()
+    const worker = connect(h)
+    iframeSays(h, "ready")
+    renewCycle(h, worker)
+    renewCycle(h, worker)
+    renewCycle(h, worker)
+    expect(h.host.getState().rapidRecoveries).toBe(3)
+    const id = (lastUpdate(h) as { session_delivery_id: string }).session_delivery_id
+    iframeSays(h, "session_connection_open", { session_delivery_id: id })
+    vi.advanceTimersByTime(10_000)
+    iframeSays(h, "ready")
+    const again = (lastUpdate(h) as { session_delivery_id: string }).session_delivery_id
+    expect(again).toBe(id)
+    iframeSays(h, "session_connection_open", { session_delivery_id: again })
+    vi.advanceTimersByTime(HOUR)
+    expect(h.host.getState().rapidRecoveries).toBe(0)
+  })
+
+  it("does not let a stability timer that started before a renew reset the count after it", () => {
+    const h = makeHost()
+    const worker = connect(h)
+    iframeSays(h, "ready")
+    const id = (lastUpdate(h) as { session_delivery_id: string }).session_delivery_id
+    iframeSays(h, "session_connection_open", { session_delivery_id: id })
+    vi.advanceTimersByTime(30_000)
+    iframeSays(h, "reconnect_request")
+    expect(h.host.getState().rapidRecoveries).toBe(1)
+    worker.emit("message", { type: "degraded", code: "network_unavailable" })
+    vi.advanceTimersByTime(40_000)
+    worker.emit("message", { type: "session", session: sessionFields() })
+    renewCycle(h, worker)
+    renewCycle(h, worker)
+    expect(worker.count("renew")).toBe(3)
     iframeSays(h, "reconnect_request")
     expect(worker.count("renew")).toBe(3)
     expect(h.navs).toEqual(["/widget/chat/link/ended?reason=network"])

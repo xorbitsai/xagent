@@ -284,11 +284,14 @@ async def test_a_value_that_is_not_a_workspace_image_is_passed_through(
 ) -> None:
     caplog.set_level(logging.DEBUG)
     options = {"workspace": workspace, **setup}
+    adapter_workspace = options.pop("workspace")
 
-    result = await _adapter(options.pop("workspace"), **options).run_json_async(args)
+    result = await _adapter(adapter_workspace, **options).run_json_async(args)
 
     assert result["is_error"] is False
-    assert workspace.issued == []
+    if adapter_workspace is not None:
+        # Without a workspace there is nothing that could issue a link.
+        assert workspace.issued == []
     assert server.calls == [args]
     assert _link_logs(caplog, logging.INFO) == []
     assert _link_logs(caplog, logging.WARNING) == []

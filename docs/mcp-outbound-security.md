@@ -134,8 +134,10 @@ exactly these keys:
 
 When the model passes `file:<id>` in `link_argument` and that file is a PNG,
 JPEG or WebP image of at most 10 MB, the host replaces the value with an HTTPS
-download link that is valid for 10 minutes, and the connector's own server
-fetches the image from it. Any other value in that argument is passed through
+download link that is valid for the external media URL lifetime (10 minutes by
+default), and the connector's own server fetches the image from it. The legacy
+`file://<id>` form, and a bare file id when the call has a workspace, are
+treated the same way. Any other value in that argument is passed through
 unchanged. If the link cannot be made, because the file does not exist, is not
 such an image or is too large, the tool is not called and the model gets a fixed
 refusal. A link entry needs no upload hosts, because the host uploads nothing.

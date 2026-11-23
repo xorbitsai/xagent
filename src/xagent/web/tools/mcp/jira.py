@@ -3,7 +3,7 @@ import logging
 import os
 import time
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, NamedTuple
 from urllib.parse import quote
 
 from mcp.server.fastmcp import FastMCP
@@ -509,6 +509,102 @@ def jira_list_projects(
         return _error(safe_message)
 
 
+def _summarize_field(field: dict[str, Any]) -> dict[str, Any]:
+    """Slim one entry of Jira's field table down to what a caller needs to
+    name the field: its id, its human name, whether it is a custom field,
+    its schema type, the names JQL can use for it, and whether it is
+    searchable at all.
+
+    clause_names matters as much as id: JQL does not accept
+    "customfield_10050" as a field name, only the cf[10050] form or the
+    quoted display name, both of which Jira lists in clauseNames -- so a
+    field summary without it would tell a caller what to store values in
+    but not how to query by them.
+    """
+    schema = _as_dict(field.get("schema"))
+    clause_names = field.get("clauseNames")
+    searchable = field.get("searchable")
+    return {
+        "id": field.get("id"),
+        "name": field.get("name"),
+        "custom": bool(field.get("custom")),
+        "type": schema.get("type"),
+        "clause_names": clause_names if isinstance(clause_names, list) else [],
+        "searchable": searchable if isinstance(searchable, bool) else None,
+    }
+
+
+@mcp.tool()
+def jira_list_fields(query: str = "", cloud_id: str = "") -> str:
+    """
+    List the fields this connection can see on a Jira site -- its system
+    fields and its custom fields (customfield_*), each with an id, a name,
+    whether it is custom, its schema type, the names JQL can use for it
+    (clause_names) and whether it is searchable. Use a field's id (e.g.
+    "customfield_10050") or its name as jira_get_issue's /
+    jira_search_issues' extra_fields to get that field's value back; use
+    clause_names to filter by a custom field in JQL, e.g.
+    'cf[10050] = 139325' or '"Freshdesk ticket" ~ "139325"' (use ~ for text
+    fields, and = or a comparison operator for number, option and date
+    fields). clause_names gives each name as Jira spells it, so a name
+    with spaces or special characters has to be written in double quotes
+    to use it in JQL, e.g. '"Freshdesk ticket" ~ "139325"'. A field whose
+    searchable is false cannot be used to filter in JQL.
+    query: optional substring, matched case-insensitively against a
+    field's name and id, to narrow a long list.
+    cloud_id: optional site id from jira_list_accessible_sites; omit when
+    the account has only one accessible site.
+    """
+    try:
+        max_output_length = get_tool_max_output_length()
+        result = _request("GET", cloud_id, "/rest/api/2/field")
+        if not isinstance(result, list):
+            return _error("Unexpected response format from Jira fields API")
+        fields = [
+            _summarize_field(field) for field in result if isinstance(field, dict)
+        ]
+        needle = query.strip().casefold()
+        if needle:
+            fields = [
+                field
+                for field in fields
+                if needle in str(field.get("name") or "").casefold()
+                or needle in str(field.get("id") or "").casefold()
+            ]
+
+        def response_for(count: int) -> str:
+            payload: dict[str, Any] = {
+                "total_count": len(fields),
+                "truncated": count < len(fields),
+            }
+            if count < len(fields):
+                payload["note"] = (
+                    f"Only {count} of {len(fields)} fields fit the output "
+                    "limit; pass query to narrow the list."
+                )
+            payload["fields"] = fields[:count]
+            return _success(**payload)
+
+        # A site can have hundreds of fields (every installed app adds
+        # more), so like jira_list_projects' raw page this halves the list
+        # until it fits rather than returning a response the output filter
+        # would cut mid-JSON.
+        count = len(fields)
+        response = response_for(count)
+        while len(response) > max_output_length and count > 0:
+            count //= 2
+            response = response_for(count)
+        if len(response) > max_output_length:
+            return _error(
+                "The Jira field list exceeds the tool output limit even when empty"
+            )
+        return response
+    except Exception as e:
+        safe_message = _safe_text(e)
+        logger.error(f"Error listing Jira fields: {safe_message}")
+        return _error(safe_message)
+
+
 def _as_dict(value: Any) -> dict[str, Any]:
     """Return value if it's a dict, else {}.
 
@@ -621,6 +717,197 @@ _SEARCH_ISSUE_FIELDS = (
     "updated,created,resolution,labels,parent"
 )
 
+#: The same default projection as a set of field ids, for
+#: jira_search_issues' extra_fields dedup -- a caller naming one of these
+#: must not fetch or project it a second time, for the same reasons
+#: _GET_ISSUE_FIELD_NAMES exists below for jira_get_issue.
+_SEARCH_ISSUE_FIELD_NAMES = frozenset(_SEARCH_ISSUE_FIELDS.split(","))
+
+#: Per-field cap on a search page's extra_field_values. A page can hold
+#: MAX_LIMIT (100) issues, so the cap jira_get_issue applies to its single
+#: issue (_ISSUE_DESCRIPTION_MAX_CHARS) would let one requested field's
+#: values alone run to megabytes across a page. A value still too large
+#: for this is bounded further by the page-size fallback in
+#: jira_search_issues.
+_SEARCH_EXTRA_FIELD_MAX_CHARS = 1_000
+
+
+def _cf_field_id(token: str) -> str | None:
+    """The field id a token already spells, or None when it can only be a
+    field name that the site's field table has to map.
+
+    Two spellings name a field id directly: "customfield_10050" itself,
+    and JQL's "cf[10050]" form for the same field.
+    """
+    if token.lower().startswith("customfield_"):
+        return token
+    if token[:3].lower() == "cf[" and token.endswith("]"):
+        number = token[3:-1]
+        if number.isascii() and number.isdigit():
+            return f"customfield_{number}"
+    return None
+
+
+def _field_table_matches(
+    table: list[dict[str, Any]], token: str
+) -> list[dict[str, Any]]:
+    """The field-table entries a token names: an id match first, then a
+    name match.
+
+    Both are case-insensitive -- a caller writing "fixversions" names
+    Jira's "fixVersions" id the same way "Summary" names "summary" -- and
+    the matched entry itself is returned, so the id a caller ends up
+    requesting is always the field table's own spelling.
+    """
+    folded = token.casefold()
+    by_id = [
+        field
+        for field in table
+        if isinstance(field.get("id"), str) and field["id"].casefold() == folded
+    ]
+    if by_id:
+        return by_id
+    return [
+        field
+        for field in table
+        if isinstance(field.get("name"), str) and field["name"].casefold() == folded
+    ]
+
+
+def _unquote_field_token(token: str) -> str:
+    """The text a token names once one pair of surrounding double quotes is
+    taken off, so a token can also be written the way JQL spells a field
+    name ('"Freshdesk ticket"') and name the field between the quotes.
+
+    Only one pair, and only double quotes: JQL quotes a field name with
+    double quotes, and a name that itself contains a quote character keeps
+    its inner ones.
+    """
+    if len(token) > 1 and token.startswith('"') and token.endswith('"'):
+        return token[1:-1]
+    return token
+
+
+class _ResolvedExtraFields(NamedTuple):
+    """What one call's extra_fields resolved to, in the shape both tools
+    need: the token -> id map to fetch and report values for, the tokens
+    that named no single field, the suffix (",id1,id2", or "" when nothing
+    resolved) that appends the requested ids to the tool's own default
+    projection, and the token -> id entries worth reporting back.
+    """
+
+    ids_by_token: dict[str, str]
+    unresolved: list[dict[str, Any]]
+    fields_suffix: str
+    id_map: dict[str, str]
+
+
+def _resolve_extra_fields(
+    cloud_id: str, extra_fields: str, default_names: frozenset[str]
+) -> _ResolvedExtraFields:
+    """Map each extra_fields token to the Jira field id it names.
+
+    A token is a field id when it already looks like one (see
+    _cf_field_id); every other token is a field's name, which Jira's API
+    does not accept as a field id, so it is looked up in the site's field
+    table -- fetched at most once per call, and only when such a token
+    actually needs it. A token may also be written the way JQL spells a
+    name, in double quotes (e.g. '"Freshdesk ticket"'), and names the text
+    between them. A name that matches exactly one field takes that field's
+    id; one that matches none, or several (Jira allows two fields to share
+    a name), is left unfetched and reported back with the ids it did match
+    so the caller can pick by id.
+
+    Tokens are dropped the same way for both tools: empty entries, repeats
+    (order-preserving, so "a,a,b" fetches "a" once), anything whose field
+    is already in the caller tool's own default projection (`default_names`,
+    lowercased ids), and Jira's `fields` selector syntax -- a leading "-"
+    means "exclude this field" and "*" is a wildcard (e.g. "*all"), either
+    of which could override the tool's guaranteed default field set rather
+    than name a field of its own. The default-set filter is applied twice
+    on purpose: once to the token as written (the common case, which then
+    costs no field-table request at all) and once to the id a name resolved
+    to, so naming a default field by its human name ("Due date" ->
+    "duedate") is dropped too.
+
+    If the field table request fails (an exception, or a body that isn't a
+    list), the lookup is skipped rather than failing the whole tool call:
+    every token that needed it is passed through as the field id it was
+    written as, which is what this parameter did before it accepted names.
+
+    Two tokens naming the same field share one id, so the tool requests
+    that field only once and reports each token's value.
+    """
+    tokens = list(
+        dict.fromkeys(
+            unquoted
+            for name in extra_fields.split(",")
+            if (unquoted := _unquote_field_token(name.strip()))
+            and unquoted.lower() not in default_names
+            and not unquoted.startswith(("-", "*"))
+        )
+    )
+    ids_by_token: dict[str, str] = {}
+    unresolved: list[dict[str, Any]] = []
+    field_table: list[dict[str, Any]] | None = None
+    if any(_cf_field_id(token) is None for token in tokens):
+        try:
+            result = _request("GET", cloud_id, "/rest/api/2/field")
+            if not isinstance(result, list):
+                raise ValueError("Unexpected response format from Jira fields API")
+            field_table = [field for field in result if isinstance(field, dict)]
+        except Exception as e:
+            _log_metadata_only(
+                logger.warning,
+                "Could not fetch the Jira field table; treating extra_fields "
+                "tokens as field ids",
+                e,
+            )
+    for token in tokens:
+        field_id = _cf_field_id(token)
+        candidates: list[str] = []
+        if field_id is None:
+            if field_table is None:
+                # The field table could not be fetched: pass the token
+                # through as the id it was written as instead of failing
+                # the whole call over what may well be a valid field id.
+                field_id = token
+            else:
+                matches = _field_table_matches(field_table, token)
+                candidates = [
+                    str(field["id"])
+                    for field in matches
+                    if isinstance(field.get("id"), str)
+                ]
+                if len(matches) == 1 and candidates:
+                    field_id = candidates[0]
+        if field_id is None:
+            unresolved.append({"field": token, "candidates": candidates})
+            continue
+        if field_id.lower() in default_names:
+            continue
+        ids_by_token[token] = field_id
+    return _ResolvedExtraFields(
+        ids_by_token=ids_by_token,
+        unresolved=unresolved,
+        fields_suffix=(
+            f",{','.join(dict.fromkeys(ids_by_token.values()))}" if ids_by_token else ""
+        ),
+        id_map=_extra_field_id_map(ids_by_token),
+    )
+
+
+def _extra_field_id_map(ids_by_token: dict[str, str]) -> dict[str, str]:
+    """The token -> id entries worth reporting back to the caller: a token
+    that already spelled its field's id needs no mapping (its own key in
+    extra_field_values is that id), while a name or cf[N] token only ever
+    shows up under the name the caller wrote, so the id it resolved to is
+    reported alongside.
+    """
+    return {
+        token: field_id for token, field_id in ids_by_token.items() if field_id != token
+    }
+
 
 def _page_size_candidates(max_results: int) -> tuple[int, ...]:
     """Descending, deduplicated page sizes to try in jira_search_issues:
@@ -711,18 +998,65 @@ def _approximate_count(cloud_id: str, jql: str) -> int | None:
     return None
 
 
+def _summarize_search_hit(
+    issue: dict[str, Any], extra_field_ids: dict[str, str]
+) -> dict[str, Any]:
+    """_summarize_issue plus, when the caller named extra_fields, the values
+    it asked for under this issue's own extra_field_values.
+
+    A search page is a list of issues, so a value is keyed under each
+    issue rather than in one top-level dict keyed by field id (which is
+    jira_get_issue's shape, where there is only ever one issue to key it
+    for) -- the top-level extra_field_values would otherwise have to nest
+    a second level keyed by issue key, which callers would have to join
+    back to `issues` themselves.
+
+    An issue with at least one value that _cap_extra_field_value had to cut
+    also gets extra_field_values_truncated: true, so a value that reads as
+    a short string is not mistaken for the field's whole content. An issue
+    with nothing truncated does not carry the key at all -- a page can hold
+    a hundred issues, and a per-issue flag that is almost always false would
+    cost more than it says.
+    """
+    summary = _summarize_issue(issue)
+    if not extra_field_ids:
+        return summary
+    fields = _as_dict(issue.get("fields"))
+    extra_field_values: dict[str, Any] = {}
+    truncated = False
+    for token, field_id in extra_field_ids.items():
+        value, was_truncated = _cap_extra_field_value(
+            fields.get(field_id), _SEARCH_EXTRA_FIELD_MAX_CHARS
+        )
+        extra_field_values[token] = value
+        truncated = truncated or was_truncated
+    summary["extra_field_values"] = extra_field_values
+    if truncated:
+        summary["extra_field_values_truncated"] = True
+    return summary
+
+
 def _fetch_and_summarize_page(
     cloud_id: str,
     jql: str,
     max_results: int,
     next_page_token: str,
     *,
+    fields_param: str = _SEARCH_ISSUE_FIELDS,
+    extra_field_ids: dict[str, str] | None = None,
     timeout: int = DEFAULT_TIMEOUT_SECONDS,
     allow_retry: bool = True,
     raw_fields: bool = False,
 ) -> tuple[list[dict[str, Any]], str | None]:
     """One search/jql call, projected through _summarize_issue unless
     raw_fields is set (see jira_search_issues' raw_fields param).
+
+    fields_param and extra_field_ids carry the caller's extra_fields,
+    already resolved to field ids: the ids are appended to the same fixed
+    projection on every call (so every page-size attempt requests the
+    same fields), and in the summarized mode each issue's requested values
+    are added to its projection. A raw issue already has them in its own
+    "fields" object.
 
     Raises on any request/shape failure; callers run this inside their
     own try/except (jira_search_issues' outer one already does).
@@ -733,7 +1067,7 @@ def _fetch_and_summarize_page(
     params: dict[str, Any] = {
         "jql": jql,
         "maxResults": max_results,
-        "fields": _SEARCH_ISSUE_FIELDS,
+        "fields": fields_param,
     }
     if next_page_token:
         params["nextPageToken"] = next_page_token
@@ -761,7 +1095,9 @@ def _fetch_and_summarize_page(
         [issue for issue in raw_issues if isinstance(issue, dict)]
         if raw_fields
         else [
-            _summarize_issue(issue) for issue in raw_issues if isinstance(issue, dict)
+            _summarize_search_hit(issue, extra_field_ids or {})
+            for issue in raw_issues
+            if isinstance(issue, dict)
         ]
     )
     # The enhanced-search endpoint signals "more pages" by including
@@ -850,6 +1186,8 @@ def _build_search_response(
     next_token: str | None,
     limit: int,
     page_size: int,
+    extra_field_ids: dict[str, str] | None = None,
+    unresolved_extra_fields: list[dict[str, Any]] | None = None,
 ) -> str:
     # `limit` is the caller's page size after clamping (max_results) and
     # `page_size` the one this page was actually fetched at; they only feed
@@ -895,6 +1233,16 @@ def _build_search_response(
             page_size=page_size,
             approximate_total_count=approximate_total_count,
         )
+    # extra_fields bookkeeping (a name token's resolved id, a token that
+    # named no single field) is small and pages-independent, and it is
+    # about the whole page rather than any one issue -- so it sits here
+    # with the counts, ahead of `issues`, for the same
+    # downstream-truncation reason. Both are omitted rather than sent as
+    # null/{} when the caller named no extra fields.
+    if extra_field_ids:
+        payload["extra_field_ids"] = extra_field_ids
+    if unresolved_extra_fields:
+        payload["unresolved_extra_fields"] = unresolved_extra_fields
     payload["issues"] = issues
     return _success(**payload)
 
@@ -976,6 +1324,7 @@ def jira_search_issues(
     limit: int = 50,
     next_page_token: str = "",
     raw_fields: bool = True,
+    extra_fields: str = "",
 ) -> str:
     """
     Search issues with JQL (Jira Query Language) -- the recommended way to
@@ -984,14 +1333,23 @@ def jira_search_issues(
     issue["fields"]["status"]["id"]), restricted to a fixed field subset
     (summary, status, assignee, priority, issuetype, project, updated,
     created, resolution, labels, parent) -- not the full issue. Use
-    jira_get_issue for a description, dependencies (issue_links/subtasks),
-    or any other field not in that list.
+    jira_get_issue for a description or dependencies
+    (issue_links/subtasks); pass extra_fields for any other field not in
+    that list.
     jql: a JQL query, e.g. 'project = ENG AND status = "In Progress"
-    ORDER BY updated DESC' or 'text ~ "login bug"'.
+    ORDER BY updated DESC' or 'text ~ "login bug"'. To search by a custom
+    field, write it the way jira_list_fields' clause_names spells it --
+    cf[10050] or the field's name in double quotes, e.g.
+    'cf[10050] = 139325' or '"Freshdesk ticket" ~ "139325"' (use ~ for text
+    fields, and = or a comparison operator for number, option and date
+    fields); jira_list_fields also gives the id or the name to pass as
+    extra_fields below.
     limit: max issues to return per page (default 50, capped at 100).
     next_page_token: pass the previous response's next_page_token to fetch
     the next page -- always check `truncated` and re-call with it instead
-    of assuming one page is everything.
+    of assuming one page is everything. Like limit and raw_fields,
+    extra_fields belongs to the call, not to the cursor: re-pass the same
+    value on every page, or the later pages won't carry those fields.
     raw_fields: defaults to True (Jira's own nested shape, matching what
     this tool has always returned -- callers that don't pass this
     parameter keep getting the same field layout they always have,
@@ -1001,9 +1359,29 @@ def jira_search_issues(
     parent_key, resolution, created, updated) recommended for new
     integrations -- roughly 10x smaller per issue, so a page is far less
     likely to need a fallback retry at a smaller size to fit the output
-    budget. Either way, only the same fixed field subset above is
-    fetched; this changes how those fields are shaped, not which ones --
-    use jira_get_issue for a field not in that list either way.
+    budget. Either way, only the same fixed field subset above (plus any
+    extra_fields) is fetched; this changes how those fields are shaped,
+    not which ones.
+    extra_fields: optional comma-separated fields to fetch on top of the
+    fixed subset above, named either by field id (e.g. "customfield_10050")
+    or by name (case-insensitive, e.g. "Freshdesk ticket"; JQL's
+    "cf[10050]" form is accepted too, and so is a name written in double
+    quotes exactly as JQL spells it) -- see jira_list_fields for the ids
+    and names a site has. A name that contains a comma cannot be passed as
+    a name; give its id or cf[N] form instead. A field already in the
+    fixed subset is ignored, since it is already returned. With raw_fields
+    each issue's value is in its own fields["<field id>"]; with
+    raw_fields=False each issue carries an extra_field_values {name you
+    wrote: value} entry instead (ADF rich text flattened to plain text,
+    and a long value cut to a truncated string), and an issue with any
+    such value cut also carries extra_field_values_truncated: true (absent
+    otherwise). A name or cf[N] token is also reported in a top-level
+    extra_field_ids {token: field id} (a name is resolved through the
+    site's field table; cf[N] needs no lookup, and if the field table
+    can't be fetched the name is passed through as an id instead), so you
+    can read the raw value by id; a name that matches no single field is
+    not fetched and is listed in a top-level unresolved_extra_fields
+    [{field, candidates}] instead -- the search itself still runs.
     A search error (invalid JQL, a page too big even at minimal size, a
     stuck pagination cursor) always has a "message" key describing it,
     except under an extremely small configured output cap where even
@@ -1043,6 +1421,15 @@ def jira_search_issues(
         resolved_cloud_id = _resolve_cloud_id(cloud_id)
         max_results = clamp_limit(limit, max_limit=MAX_LIMIT)
         max_output_length = get_tool_max_output_length()
+        # Resolved once, outside the page-size retry loop below: the site's
+        # field table is a per-site constant, and every attempt has to
+        # request the same extra fields anyway. A token naming no single
+        # field is not an error here -- JQL is independent of it, so the
+        # search runs and reports the token back instead.
+        resolved_fields = _resolve_extra_fields(
+            resolved_cloud_id, extra_fields, _SEARCH_ISSUE_FIELD_NAMES
+        )
+        fields_param = f"{_SEARCH_ISSUE_FIELDS}{resolved_fields.fields_suffix}"
     except Exception as e:
         # None of this setup touches jql, so the full exception detail
         # is safe to log here -- unlike the try block below, which does
@@ -1076,6 +1463,8 @@ def jira_search_issues(
                 jql,
                 size,
                 next_page_token,
+                fields_param=fields_param,
+                extra_field_ids=resolved_fields.ids_by_token,
                 timeout=(
                     DEFAULT_TIMEOUT_SECONDS
                     if is_first_attempt
@@ -1088,7 +1477,12 @@ def jira_search_issues(
             # measured here too (without the count, which is only fetched
             # after a page has fit).
             response = _build_search_response(
-                issues, next_token=next_token, limit=max_results, page_size=size
+                issues,
+                next_token=next_token,
+                limit=max_results,
+                page_size=size,
+                extra_field_ids=resolved_fields.id_map,
+                unresolved_extra_fields=resolved_fields.unresolved,
             )
             if len(response) <= max_output_length:
                 fit = True
@@ -1096,15 +1490,25 @@ def jira_search_issues(
 
         if not fit:
             # Even a minimal page doesn't fit -- a single issue's summary
-            # and/or labels alone exceed the budget. Fail safely rather
-            # than return invalid (cut-mid-JSON) output or a token that
-            # would skip rows.
+            # and/or labels alone exceed the budget, or (in raw mode) a
+            # requested extra field's value is too large to cut. Fail safely
+            # rather than return invalid (cut-mid-JSON) output or a token
+            # that would skip rows. The extra_fields hints are only added
+            # when this call actually resolved some: with none, the message
+            # is the same one it has always been.
             logger.warning(
                 "jira_search_issues: minimal page still exceeds the output limit"
             )
+            hints = ""
+            if resolved_fields.ids_by_token:
+                hints = ", or ask for fewer extra_fields"
+                if raw_fields:
+                    hints += (
+                        ", or pass raw_fields=False (it caps each extra field's value)"
+                    )
             return _bounded_search_error(
                 "A Jira search result page exceeds the tool output limit "
-                "even at a minimal page size; narrow the JQL query",
+                f"even at a minimal page size; narrow the JQL query{hints}",
                 max_output_length,
             )
 
@@ -1159,6 +1563,8 @@ def jira_search_issues(
                 next_token=next_token,
                 limit=max_results,
                 page_size=size,
+                extra_field_ids=resolved_fields.id_map,
+                unresolved_extra_fields=resolved_fields.unresolved,
             )
             if len(with_count) <= max_output_length:
                 response = with_count
@@ -1520,6 +1926,42 @@ def _cap_extra_field_value(value: Any, max_chars: int) -> tuple[Any, bool]:
     return value, False
 
 
+def _restore_extra_field_bookkeeping(
+    response: str, resolved_extras: dict[str, Any]
+) -> str:
+    """Put extra_field_ids/unresolved_extra_fields back the way the caller
+    requested them after success_with_capped_dict bounded the response.
+
+    That helper's last resort can degrade a non-boolean top-level extra to
+    a bare `true` placeholder (or drop it outright) to fit a small output
+    budget, which leaves a caller unable to tell which field a token named,
+    or that a token resolved to nothing. Both keys are restored to their
+    real values whenever that still fits; when it doesn't, they are dropped
+    instead, because a missing key reads as "not returned" while a `true`
+    placeholder can be mistaken for the value itself -- and deleting keys
+    from the already-fitting response can only make it smaller.
+
+    `resolved_extras` holds only those two keys, and only as far as the
+    caller actually asked for them.
+    """
+    if not resolved_extras:
+        return response
+    parsed = json.loads(response)
+    degraded = [
+        key for key, value in resolved_extras.items() if parsed.get(key) != value
+    ]
+    if not degraded:
+        return response
+    for key in degraded:
+        parsed[key] = resolved_extras[key]
+    restored = json.dumps(parsed, ensure_ascii=False)
+    if len(restored) <= get_tool_max_output_length():
+        return restored
+    for key in degraded:
+        del parsed[key]
+    return json.dumps(parsed, ensure_ascii=False)
+
+
 @mcp.tool()
 def jira_get_issue(
     issue_key: str,
@@ -1537,12 +1979,21 @@ def jira_get_issue(
     custom fields) are not requested and will not appear in the result
     unless named via extra_fields.
     issue_key: an issue key (e.g. "ENG-123") or its numeric id.
-    extra_fields: optional comma-separated Jira field ids not in the
-    default set above -- standard (e.g. "votes") or custom (e.g.
-    "customfield_10010", found via your Jira admin's field
-    configuration); a name already in the default set is ignored, since
-    it's already visible under its own summarized key. Returned as
-    {field_id: raw_value} under a top-level extra_field_values (a
+    extra_fields: optional comma-separated Jira fields not in the default
+    set above -- standard or custom, named either by field id (e.g.
+    "customfield_10010") or by name (e.g. "Freshdesk ticket",
+    case-insensitive; JQL's "cf[10010]" form is accepted too, and so is
+    the name written in double quotes exactly as JQL spells it). A
+    customfield_* or cf[N] token is the field id already, so it costs no
+    extra request; a name, or a standard field id outside the default
+    set, is resolved through the site's field table first (at most one
+    such request per call; if that request fails, the token is passed
+    through as an id instead). A name that contains a comma cannot be
+    passed as a name: give its id or cf[N] form instead. Use
+    jira_list_fields to find a field's id, its name and the JQL name to
+    filter by. A field already in the default set is ignored, since it's
+    already visible under its own summarized key. Returned as
+    {name you wrote: raw_value} under a top-level extra_field_values (a
     sibling of "issue", not nested inside it), so you can reach any
     field this tool doesn't summarize by name. An ADF-shaped (rich
     text) value is flattened to plain text first, matching description;
@@ -1551,7 +2002,12 @@ def jira_get_issue(
     field can come back as a string once it's cut, not its original
     shape. extra_field_values_truncated is set to true if any entry was
     cut, including one entirely omitted because too many fields were
-    requested to fit even a fair share of the output budget.
+    requested to fit even a fair share of the output budget. A field
+    named by name or as cf[N] also gets its id in a top-level
+    extra_field_ids {name you wrote: field id}, so you can read the raw
+    value under that id; a name that matches no single field is not
+    fetched and is listed in a top-level unresolved_extra_fields
+    [{field, candidates}] instead.
     Use this, not jira_search_issues, when you need an issue's
     dependencies or full description: issue_links/subtasks/description
     are only returned here. A description longer than
@@ -1565,12 +2021,13 @@ def jira_get_issue(
     this tool returned before summarization was added, or to reach a
     nested sub-field (e.g. status.id, not just status.name) the summary
     doesn't expose. extra_fields still controls which fields beyond the
-    default set are fetched; extra_field_values/description_truncated
-    are not produced in this mode since the raw "fields" object already
-    contains everything requested. Bigger per-issue payload than the
-    default projection, so a raw response can shrink further under a
-    small output budget (see success_with_capped_dict) than the same
-    request would at the default setting.
+    default set are fetched, and each requested value is already in the
+    raw "fields" object -- by the id extra_field_ids gives for a name
+    token; extra_field_values/description_truncated are not produced in
+    this mode. Bigger per-issue payload than the default projection, so a
+    raw response can shrink further under a small output budget (see
+    success_with_capped_dict) than the same request would at the default
+    setting.
     """
     try:
         issue_path = _issue_path(issue_key)
@@ -1584,45 +2041,36 @@ def jira_get_issue(
         return _error(str(exc))
 
     try:
-        # Jira's `fields` query param treats a leading "-" as "exclude
-        # this field" and "*" as a wildcard selector (e.g. "*all"), not
-        # just a literal field id -- passed through unfiltered, either
-        # could override the tool's own guaranteed default field set
-        # (e.g. extra_fields="-description" would suppress the very
-        # field this tool's docstring promises is always returned).
-        # Rejected the same way an already-default name is: silently
-        # dropped rather than erroring, since a caller only ever loses
-        # an invalid/malicious token, never a legitimate field id.
-        # The default-set check is case-insensitive (Jira field ids are
-        # conventionally lowercase, e.g. "summary") so a caller writing
-        # extra_fields="Summary" is still recognized as the same field
-        # already visible under "issue.summary" -- otherwise it would
-        # both waste part of the extra-fields budget on a request Jira
-        # already answered and, if Jira's own response doesn't echo
-        # back that exact casing, end up in extra_field_values as a
-        # spurious null entry for a field the caller does have. Deduped
-        # via dict.fromkeys (order-preserving) so "a,a,b" doesn't charge
-        # the budget for "a" twice.
-        requested_extra = list(
-            dict.fromkeys(
-                stripped
-                for name in extra_fields.split(",")
-                if (stripped := name.strip())
-                and stripped.lower() not in _GET_ISSUE_FIELD_NAMES
-                and not stripped.startswith(("-", "*"))
-            )
+        # The token rules (split on commas, dedupe, drop an empty entry, a
+        # field already in the default set, and Jira's own `fields`
+        # selector syntax) live in _resolve_extra_fields, which this tool
+        # now shares with jira_search_issues; it also turns a field name
+        # into the id Jira's API actually takes, since this tool's
+        # extra_fields accepts either.
+        resolved_cloud_id = _resolve_cloud_id(cloud_id)
+        resolved_fields = _resolve_extra_fields(
+            resolved_cloud_id, extra_fields, _GET_ISSUE_FIELD_NAMES
         )
-        fields_param = _GET_ISSUE_FIELDS
-        if requested_extra:
-            fields_param = f"{fields_param},{','.join(requested_extra)}"
+        extra_field_ids = resolved_fields.ids_by_token
+        requested_extra = list(extra_field_ids)
+        fields_param = f"{_GET_ISSUE_FIELDS}{resolved_fields.fields_suffix}"
         result = _request(
             "GET",
-            cloud_id,
+            resolved_cloud_id,
             issue_path,
             params={"fields": fields_param},
         )
         if not isinstance(result, dict):
             return _error("Unexpected response format from Jira issue API")
+        # Bookkeeping about how the caller named a field, not the field's
+        # own value: a token that already spelled its id needs none of
+        # this (its extra_field_values key is the id), while a name or
+        # cf[N] token is only echoed back under the text the caller wrote.
+        resolved_extras: dict[str, Any] = {}
+        if resolved_fields.id_map:
+            resolved_extras["extra_field_ids"] = resolved_fields.id_map
+        if resolved_fields.unresolved:
+            resolved_extras["unresolved_extra_fields"] = resolved_fields.unresolved
         if raw_fields:
             # The raw "fields" object already contains every field this
             # request fetched (default set plus any requested_extra), so
@@ -1630,8 +2078,13 @@ def jira_get_issue(
             # exist to work around the summary's flattening -- don't
             # apply here. success_with_capped_dict still bounds the
             # whole thing the same way the summarized path is bounded,
-            # just without a protected top-level extra to carve out.
-            return success_with_capped_dict("issue", result)
+            # with the same protected top-level extras for how the
+            # caller named its fields, and the same restore-or-drop of
+            # that bookkeeping once it has been bounded.
+            return _restore_extra_field_bookkeeping(
+                success_with_capped_dict("issue", result, extra_fields=resolved_extras),
+                resolved_extras,
+            )
         issue = _summarize_full_issue(result)
         description_truncated = _cap_text_field(
             issue, "description", _ISSUE_DESCRIPTION_MAX_CHARS
@@ -1684,7 +2137,7 @@ def jira_get_issue(
                     extra_field_values_truncated = True
                     break
                 value, was_truncated = _cap_extra_field_value(
-                    response_fields.get(name),
+                    response_fields.get(extra_field_ids[name]),
                     min(_ISSUE_DESCRIPTION_MAX_CHARS, remaining_budget),
                 )
                 extra_field_values[name] = value
@@ -1696,6 +2149,7 @@ def jira_get_issue(
             top_level_extra["extra_field_values_truncated"] = (
                 extra_field_values_truncated
             )
+        top_level_extra.update(resolved_extras)
         # success_with_capped_dict already tries the full response first
         # and only shrinks `issue` if that doesn't fit -- no need to
         # separately build and measure a plain response here first.
@@ -1714,16 +2168,21 @@ def jira_get_issue(
         # that. Separately, when `issue` plus extra_field_values still
         # doesn't fit even with `issue` shrunk to nothing,
         # success_with_capped_dict's last-resort with_extras=False
-        # fallback drops the WHOLE extras dict -- extra_field_values and
-        # its own _truncated flag included -- reporting a plain
-        # "success" with no sign either was ever requested. Re-check the
-        # actual serialized result so neither flag can report "not
-        # truncated" -- or simply vanish along with its own data -- while
-        # the underlying field is silently gone. Reparsing only happens
-        # on this otherwise-rare path (both flags were already true and
-        # no extra fields were requested, or the response fit without
+        # fallback drops the WHOLE extras dict -- extra_field_values,
+        # its own _truncated flag, and the extra_field_ids/
+        # unresolved_extra_fields bookkeeping alongside it -- reporting a
+        # plain "success" with no sign any of it was ever requested.
+        # Re-check the actual serialized result so the flag cannot report
+        # "not truncated" -- or simply vanish along with its own data --
+        # while the underlying field is silently gone, and so the small
+        # bookkeeping (a name's id, a token that resolved to nothing) is
+        # put back when it still fits: it is a few dozen bytes next to
+        # the values that were just dropped, and without it a caller
+        # cannot even tell which field it lost. Reparsing only happens on
+        # this otherwise-rare path (both flags were already true and no
+        # extra fields were requested, or the response fit without
         # shrinking at all, in the common case).
-        if not description_truncated or requested_extra:
+        if not description_truncated or requested_extra or resolved_extras:
             parsed = json.loads(response)
             patched = False
             if not description_truncated and "description" not in parsed.get(
@@ -1734,6 +2193,10 @@ def jira_get_issue(
             if requested_extra and "extra_field_values" not in parsed:
                 parsed["extra_field_values_truncated"] = True
                 patched = True
+            for key, value in resolved_extras.items():
+                if key not in parsed:
+                    parsed[key] = value
+                    patched = True
             if patched:
                 patched_response = json.dumps(parsed, ensure_ascii=False)
                 # `response` was already measured to fit max_output_length
@@ -1747,7 +2210,7 @@ def jira_get_issue(
                 # happens.
                 if len(patched_response) <= get_tool_max_output_length():
                     response = patched_response
-        return response
+        return _restore_extra_field_bookkeeping(response, resolved_extras)
     except Exception as e:
         safe_message = _safe_text(e)
         logger.error(f"Error fetching Jira issue {issue_key}: {safe_message}")

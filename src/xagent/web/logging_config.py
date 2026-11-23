@@ -338,6 +338,27 @@ def _install_transport_log_filters() -> None:
             logger.addFilter(_TRANSPORT_FILTER)
 
 
+def install_log_redaction() -> None:
+    """Install record redaction and the transport filter, and nothing else.
+
+    A record factory is process-wide and a logger filter travels with its
+    logger, so neither is undone by another ``dictConfig`` or by a library
+    that replaces the root handlers. That is what a process that configures
+    its own logging needs: Celery builds the worker and beat log configuration
+    itself (its ``worker_hijack_root_logger`` setting replaces the root
+    handlers) and never calls ``setup_logging``, so those processes call this
+    from Celery's ``worker_init``, ``after_setup_logger``,
+    ``worker_process_init`` and ``beat_init`` signals. The order does not
+    matter: reconfiguring logging cannot drop a record factory or a logger
+    filter.
+
+    Handlers, levels and the logging configuration are left untouched, so this
+    is safe to call at any point after a process starts. Idempotent.
+    """
+    _install_record_redaction()
+    _install_transport_log_filters()
+
+
 def setup_logging(level: LogLevel | None = None, force: bool = False) -> None:
     """Configure logging for the entire application.
 
@@ -417,12 +438,11 @@ def setup_logging(level: LogLevel | None = None, force: bool = False) -> None:
         }
     )
 
-    # Redact every record at creation: this also covers loggers that do not
-    # propagate and handlers a library attaches after this call.
-    _install_record_redaction()
-    # Keep httpx/httpcore request lines (full URL, query included) out of INFO
-    # even when a library lowers those loggers' levels.
-    _install_transport_log_filters()
+    # Redact every record at creation (this also covers loggers that do not
+    # propagate and handlers a library attaches after this call) and keep
+    # httpx/httpcore request lines (full URL, query included) out of INFO even
+    # when a library lowers those loggers' levels.
+    install_log_redaction()
     # Server access and WebSocket handshake lines carry the raw request
     # target; mask credential-like query values before they reach a handler.
     install_request_log_redaction()

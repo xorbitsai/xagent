@@ -1785,7 +1785,7 @@ def test_issue_with_a_purpose_that_has_no_branch_fails_closed(monkeypatch, tmp_p
 )
 def test_every_purpose_has_an_explicit_branch_at_issue(monkeypatch, tmp_path, purpose):
     # Why: a purpose added to the enum without a branch would fall into one of
-    # the existing validators; this fails until the new purpose is handled.
+    # the existing validators; this fails until that purpose is handled.
     monkeypatch.setenv("XAGENT_PUBLIC_API_BASE_URL", "https://api.example.test")
     _, _, issue = _facebook_issue(monkeypatch, tmp_path, purpose=purpose)
 

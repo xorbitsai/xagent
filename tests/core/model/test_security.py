@@ -13,6 +13,8 @@ from xagent.core.utils.security import (
     _NON_CREDENTIAL_TOKEN_QUALIFIERS,
     PrivateNetworkHostError,
     fetch_public_http_bytes,
+    redact_log_text,
+    redact_log_text_pattern_only,
     redact_sensitive_text,
     redact_url_credentials_for_logging,
     reject_private_network_host,
@@ -292,6 +294,315 @@ def test_redact_url_credentials_for_logging_does_not_leak_on_parse_failure() -> 
     redacted = redact_url_credentials_for_logging(url)
 
     assert "s3cret-pass" not in redacted
+
+
+@pytest.mark.parametrize(
+    "redact", [redact_sensitive_text, redact_log_text], ids=["text", "log"]
+)
+@pytest.mark.parametrize(
+    ("text", "secret"),
+    [
+        ('wss://e.com/ws?X-Api-Key sk-FUZZ-0123456789"}', "sk-FUZZ-0123456789"),
+        (
+            "https://e.com/x?MCP_API_KEY'tok-FUZZ-abcdef123456>",
+            "tok-FUZZ-abcdef123456",
+        ),
+        ('https://e.com/x?access_token"sk-FUZZ-0123456789}', "sk-FUZZ-0123456789"),
+        ("/cb?X-Api-Key: sk-FUZZ-0123456789", "sk-FUZZ-0123456789"),
+        ("/cb?X-Api-Key = sk-FUZZ-0123456789", "sk-FUZZ-0123456789"),
+    ],
+    ids=["space", "single-quote", "double-quote", "relative-colon", "relative-space"],
+)
+def test_a_malformed_query_without_an_equals_sign_is_still_masked(
+    redact, text: str, secret: str
+) -> None:
+    # The URL redactor accepts a query it cannot parse as ``name=value`` by
+    # rebuilding it with ``=``; the header and assignment rules that run
+    # afterwards then mask the tail (``?X-Api-Key sk-...``,
+    # ``?MCP_API_KEY'tok-...``). A "nothing to mask" return that only looks
+    # at values skips that chain for exactly these shapes.
+    redacted = redact(text)
+
+    assert secret not in redacted
+    assert redacted != text
+
+
+# A rebuilt query holds one sensitive name without a value plus one
+# header-shaped value (``X-Api-Key:sk-...``) in either order. The URL
+# rebuild used to percent-encode the header's ``:`` before the header rule
+# ran, and the ``=`` it appended to the valueless name then moved the real
+# value away from the separator. Every combination must still drop the
+# secret.
+_REBUILT_QUERY_SECRET = "sk-LEAK-0123456789"
+_REBUILT_QUERY_BASES = ("/cb?", "GET /cb?", "https://e.com/cb?")
+_REBUILT_QUERY_VALUELESS_NAMES = ("token", "token=", "access_token", "page_token")
+_REBUILT_QUERY_HEADER_NAMES = (
+    "X-Api-Key:",
+    "X-Api-Key: ",
+    "X-Api-Key:  ",
+    "X-Api-Key = ",
+    "x-goog-api-key:",
+    "x-shopify-access-token:",
+)
+
+
+@pytest.mark.parametrize(
+    "redact", [redact_sensitive_text, redact_log_text], ids=["text", "log"]
+)
+@pytest.mark.parametrize("base", _REBUILT_QUERY_BASES)
+@pytest.mark.parametrize("valueless", _REBUILT_QUERY_VALUELESS_NAMES)
+@pytest.mark.parametrize("header_name", _REBUILT_QUERY_HEADER_NAMES)
+@pytest.mark.parametrize("order", ["header-first", "valueless-first"])
+def test_a_header_shaped_value_beside_a_valueless_credential_is_masked(
+    redact, base: str, valueless: str, header_name: str, order: str
+) -> None:
+    header = f"{header_name}{_REBUILT_QUERY_SECRET}"
+    query = (
+        f"{header}&{valueless}" if order == "header-first" else f"{valueless}&{header}"
+    )
+    text = f"{base}{query}"
+
+    redacted = redact(text)
+
+    assert _REBUILT_QUERY_SECRET not in redacted, (text, redacted)
+    assert redacted != text, text
+
+
+# Two header-shaped values can sit directly beside each other in one malformed
+# query (``...&X-Api-Key: a&Authorization: Bearer sk-...``). The first value
+# used to consume the ``&`` and the next header's name, so the second header's
+# real value was no longer next to a header name and stayed readable. Only a
+# known header name ends the value now; a plain ``&`` inside a value is still
+# masked as part of that value.
+_ADJACENT_HEADER_SECRET = "sk-LEAK-0123456789"
+_ADJACENT_HEADER_PAIRS = (
+    ("Authorization", "Authorization"),
+    ("x-goog-api-key", "X-Api-Key"),
+    ("x-api-key", "x-shopify-access-token"),
+)
+_ADJACENT_HEADER_BASES = ("https://e.com/p?api_key=v&", "/cb?api_key=v&")
+_ADJACENT_HEADER_SEPARATORS = (":", ": ", "=", " = ")
+
+
+def _header_with_value(name: str, value: str, separator: str) -> str:
+    scheme = "Bearer " if name.lower().endswith("authorization") else ""
+    return f"{name}{separator}{scheme}{value}"
+
+
+@pytest.mark.parametrize(
+    "redact", [redact_sensitive_text, redact_log_text], ids=["text", "log"]
+)
+@pytest.mark.parametrize(("first_name", "second_name"), _ADJACENT_HEADER_PAIRS)
+@pytest.mark.parametrize("base", _ADJACENT_HEADER_BASES)
+@pytest.mark.parametrize("separator", _ADJACENT_HEADER_SEPARATORS)
+@pytest.mark.parametrize("secret_first", [True, False])
+def test_two_adjacent_header_values_are_both_masked(
+    redact,
+    first_name: str,
+    second_name: str,
+    base: str,
+    separator: str,
+    secret_first: bool,
+) -> None:
+    other = "plain"
+    if secret_first:
+        first = _header_with_value(first_name, _ADJACENT_HEADER_SECRET, separator)
+        second = _header_with_value(second_name, other, separator)
+    else:
+        first = _header_with_value(first_name, other, separator)
+        second = _header_with_value(second_name, _ADJACENT_HEADER_SECRET, separator)
+    text = f"{base}{first}&{second}"
+
+    redacted = redact(text)
+
+    assert _ADJACENT_HEADER_SECRET not in redacted, (text, redacted)
+    assert other not in redacted, (text, redacted)
+
+
+@pytest.mark.parametrize(
+    ("redact", "expected"),
+    [
+        (redact_sensitive_text, "x-api-key: ***ef"),
+        (redact_log_text, "x-api-key: [REDACTED]"),
+    ],
+    ids=["text", "log"],
+)
+def test_a_header_value_containing_an_ampersand_is_still_masked(
+    redact, expected: str
+) -> None:
+    # The value only stops at ``&<known header name>[:=]``. An ordinary ``&``
+    # does not split it, so the whole value is masked as one secret.
+    assert redact("x-api-key: abc&def") == expected
+
+
+_QUOTED_CREDENTIAL_SECRET = "sk-LEAK-0123456789"
+_QUOTED_CREDENTIAL_TEXTS = (
+    '{"x-api-key": "sk-LEAK-0123456789"}',
+    "{'api_key': 'sk-LEAK-0123456789'}",
+    '"access_token": "sk-LEAK-0123456789"',
+    '{"nested": {"refresh_token": "sk-LEAK-0123456789"}}',
+    '{"X-Api-Key":"sk-LEAK-0123456789"}',
+)
+
+
+@pytest.mark.parametrize("text", _QUOTED_CREDENTIAL_TEXTS)
+def test_quoted_credential_names_are_masked(text: str) -> None:
+    # A JSON object or Python dict repr puts quotes between the credential
+    # name and the separator. All three passes share the same header rules, so
+    # the shape must be masked by each of them.
+    for redact in (
+        redact_sensitive_text,
+        redact_log_text,
+        redact_log_text_pattern_only,
+    ):
+        redacted = redact(text)
+
+        assert _QUOTED_CREDENTIAL_SECRET not in redacted, (text, redacted)
+        assert redacted != text, text
+
+
+@pytest.mark.parametrize(
+    ("redact", "masked"),
+    [(redact_sensitive_text, "***6789"), (redact_log_text, "[REDACTED]")],
+    ids=["text", "log"],
+)
+def test_a_quoted_credential_value_keeps_its_quotes(redact, masked: str) -> None:
+    assert redact('{"api_key": "sk-LEAK-0123456789"}') == (f'{{"api_key": "{masked}"}}')
+    assert redact("{'api_key': 'sk-LEAK-0123456789'}") == (f"{{'api_key': '{masked}'}}")
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        '{"guest_id": "g1", "page_size": "50"}',
+        '{"code": "400"}',
+        'plain "hello": world',
+    ],
+    ids=["non-secret-names", "code-is-not-a-credential-key", "ordinary-prose"],
+)
+def test_quoted_non_credential_names_stay_readable(text: str) -> None:
+    assert redact_sensitive_text(text) == text
+    assert redact_log_text(text) == text
+
+
+@pytest.mark.parametrize("text", _QUOTED_CREDENTIAL_TEXTS)
+def test_quoted_credential_masking_is_idempotent(text: str) -> None:
+    once = redact_log_text(text)
+
+    assert redact_log_text(once) == once
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        '"x-api-key": "plain"&"api_key": "sk-LEAK-0123456789"',
+        'x-api-key: "plain"&"api_key": "sk-LEAK-0123456789"',
+        '{"x-api-key": "sk-LEAK-0123456789", "api_key": "plain"}',
+    ],
+    ids=["two-quoted-fields", "header-then-quoted", "one-object"],
+)
+def test_two_adjacent_quoted_fields_are_both_masked(text: str) -> None:
+    # The first field's value must stop before the next quoted field name,
+    # exactly as the unquoted header rule stops before the next header name.
+    # Otherwise ``"plain"&"api_key":`` is swallowed by the first value and the
+    # second value is never examined.
+    for redact in (
+        redact_sensitive_text,
+        redact_log_text,
+        redact_log_text_pattern_only,
+    ):
+        redacted = redact(text)
+
+        assert _QUOTED_CREDENTIAL_SECRET not in redacted, (text, redacted)
+        assert "plain" not in redacted, (text, redacted)
+
+
+@pytest.mark.parametrize(
+    ("text", "secret"),
+    [
+        (f"https://e.com/x?code={_REBUILT_QUERY_SECRET}", _REBUILT_QUERY_SECRET),
+        (f"https://e.com/x?ticket={_REBUILT_QUERY_SECRET}", _REBUILT_QUERY_SECRET),
+        (f"https://e.com/x?state={_REBUILT_QUERY_SECRET}", _REBUILT_QUERY_SECRET),
+        (f"https://e.com/x?jwt={_REBUILT_QUERY_SECRET}", _REBUILT_QUERY_SECRET),
+        (f"https://e.com/x?session={_REBUILT_QUERY_SECRET}", _REBUILT_QUERY_SECRET),
+        (
+            f"callback?page=1&code={_REBUILT_QUERY_SECRET}&state=ok",
+            _REBUILT_QUERY_SECRET,
+        ),
+        (f"xagent-auth-token.v1.{_REBUILT_QUERY_SECRET}", _REBUILT_QUERY_SECRET),
+    ],
+    ids=[
+        "code",
+        "ticket",
+        "state",
+        "jwt",
+        "session",
+        "ampersand-query",
+        "websocket",
+    ],
+)
+def test_pattern_only_fallback_masks_url_query_names_and_websocket_credentials(
+    text: str, secret: str
+) -> None:
+    # The pattern-only fallback does not parse a URL, so it also needs the
+    # coarse ``?name=value`` / ``&name=value`` rule for names that are only
+    # credentials in a query, plus the websocket credential marker.
+    redacted = redact_log_text_pattern_only(text)
+
+    assert secret not in redacted, (text, redacted)
+    assert redacted != text, text
+
+
+def test_pattern_only_fallback_leaves_a_non_secret_query_value_alone() -> None:
+    text = "https://e.com/x?page_size=50&sort=name"
+
+    assert redact_log_text_pattern_only(text) == text
+
+
+def test_pattern_only_fallback_keeps_an_existing_marker() -> None:
+    text = "https://e.com/x?code=[REDACTED]"
+
+    assert redact_log_text_pattern_only(text) == text
+
+
+@pytest.mark.parametrize(
+    ("redact", "masked"),
+    [(redact_sensitive_text, "***6789"), (redact_log_text, "[REDACTED]")],
+    ids=["text", "log"],
+)
+def test_an_unpaired_surrogate_does_not_skip_the_rest_of_the_redaction(
+    redact, masked: str
+) -> None:
+    # A request target that went through ``surrogateescape`` can hold an
+    # unpaired surrogate. The URL rebuild used to raise from ``quote_plus``,
+    # and the record factory then emitted the whole line -- including the
+    # Authorization value -- unredacted.
+    text = "Authorization: Bearer sk-LEAK-0123456789 https://e.com/x?token&bad=\ud800"
+
+    redacted = redact(text)
+
+    assert "sk-LEAK-0123456789" not in redacted
+    assert f"Bearer {masked}" in redacted
+    assert "\ud800" not in redacted
+
+
+def test_a_value_that_only_starts_with_a_short_mask_is_still_masked() -> None:
+    # ``***`` plus at most four characters is the short marker
+    # ``_mask_secret`` emits. A longer value that happens to begin with the
+    # same characters is a real secret, not an outer layer's marker.
+    secret = "***QWERTYUIOPASDFGZ"
+    for text in (
+        f"password={secret}",
+        f"Authorization: Bearer {secret}",
+        f"GET https://h.example/x?token={secret}",
+        f"GET /cb?token={secret}",
+    ):
+        redacted = redact_sensitive_text(text)
+
+        assert "QWERTYUIOPASDFGZ" not in redacted, text
+
+    # A marker the redactor itself emits is still left alone.
+    assert redact_sensitive_text("MCP_API_KEY=***c123") == "MCP_API_KEY=***c123"
 
 
 def test_redact_sensitive_text_does_not_leak_malformed_proxy_url() -> None:
@@ -614,6 +925,53 @@ def test_redact_sensitive_text_is_linear_on_hostile_assignment_runs(
     started = time.perf_counter()
     redact_sensitive_text(hostile)
     assert time.perf_counter() - started < 1.0
+
+
+_HOSTILE_LOG_PAYLOADS = {
+    "authorization-whitespace": (
+        "Authorization: " + " " * (100_000 - len("Authorization: "))
+    ),
+    # ``eyJ`` is a word start before every hyphen, and the token character
+    # class includes the hyphen: the old ``\b`` began a quadratic scan at each
+    # one.
+    "dense-jwt-prefix": "eyJ-" * 25_000,
+    # The same dense run followed by the two dots a JWT needs: the scanner
+    # must find the one candidate header in the run without rescanning it
+    # from every ``eyJ``.
+    "dense-jwt-prefix-with-dots": "eyJ-" * 20_000 + ".a.b",
+    # Many short dotted runs, each holding a header that is inside a larger
+    # token (so no match): every run is examined once.
+    "dotted-jwt-lookalikes": "aeyJ." * 20_000,
+    # Whitespace-free punctuation stresses the assignment, URL and relative
+    # target scans without giving any of them a token boundary to stop at.
+    "equals-ampersands-quotes": (
+        "=" * 25_000 + "&" * 25_000 + '"' * 25_000 + "'" * 25_000
+    ),
+    "nested-json": '{"a":' * 17_000 + "1" + "}" * 17_000,
+    # A quoted identifier run: the quoted-key rule must test each opening
+    # quote once and never backtrack through the name run.
+    "quoted-name-runs": '"a":' * 25_000,
+    # Quote characters with no closing partner: the possessive name run fails
+    # at the first character instead of retrying every suffix of the run.
+    "unpaired-quotes": '"' * 100_000,
+}
+
+
+@pytest.mark.parametrize(
+    "label, payload", _HOSTILE_LOG_PAYLOADS.items(), ids=_HOSTILE_LOG_PAYLOADS.keys()
+)
+def test_redact_log_text_is_linear_on_hostile_input(label: str, payload: str) -> None:
+    # Every record is scanned at creation, and a tool result or an LLM
+    # context can carry 100 kB of text a remote service controls. Warm the
+    # caches once, then measure. The budget is loose on purpose so a slow CI
+    # worker cannot trip it, while a quadratic pattern (seconds here) still
+    # does; the other linear-time checks in this file use the same budget.
+    redact_log_text(payload)
+    started = time.perf_counter()
+    redact_log_text(payload)
+    elapsed = time.perf_counter() - started
+
+    assert elapsed < 1.0
 
 
 def test_redact_sensitive_text_leaves_a_credential_without_a_value() -> None:

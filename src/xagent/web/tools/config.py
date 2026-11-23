@@ -1293,12 +1293,13 @@ async def build_oauth_refresh_request(
         # secret-exposure anti-pattern (it can end up in proxy/server
         # access logs a form body wouldn't) -- accepted here as a
         # residual risk forced by Employment Hero's documented contract,
-        # not a choice this codebase would otherwise make. No httpx/
-        # httpcore request-logging middleware exists in this codebase
-        # today (those loggers are pinned to WARNING) and the
-        # explicitly trusted (XAGENT_TRUSTED_EGRESS_PROXY) proxy sees a
-        # CONNECT tunnel for HTTPS, never this URL's query string --
-        # reassess this note if either changes.
+        # not a choice this codebase would otherwise make. Log exposure
+        # relies on the unified log redaction (every record is masked at
+        # creation) and on the httpx/httpcore loggers dropping records
+        # below WARNING; the explicitly trusted
+        # (XAGENT_TRUSTED_EGRESS_PROXY) proxy sees a CONNECT tunnel for
+        # HTTPS, never this URL's query string -- reassess this note if
+        # either changes.
         post_kwargs["params"] = {
             "grant_type": data.pop("grant_type"),
             "refresh_token": data.pop("refresh_token"),

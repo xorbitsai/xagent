@@ -48,6 +48,7 @@ VIDEO_DOWNLOAD_MAX_BYTES = "XAGENT_VIDEO_DOWNLOAD_MAX_BYTES"
 REMOTE_JSON_DOWNLOAD_MAX_BYTES = "XAGENT_REMOTE_JSON_DOWNLOAD_MAX_BYTES"
 EXTERNAL_UPLOAD_DIRS = "XAGENT_EXTERNAL_UPLOAD_DIRS"
 EXTERNAL_SKILLS_LIBRARY_DIRS = "XAGENT_EXTERNAL_SKILLS_LIBRARY_DIRS"
+LOG_TRANSPORT_REQUEST_LINES = "XAGENT_LOG_TRANSPORT_REQUEST_LINES"
 AGENT_RUNTIME = "XAGENT_AGENT_RUNTIME"
 INTERACTION_PROTOCOL_MODE = "XAGENT_INTERACTION_PROTOCOL_MODE"
 INTERACTION_NATIVE_SOURCES = "XAGENT_INTERACTION_NATIVE_SOURCES"
@@ -712,6 +713,24 @@ def get_task_auto_resume_enabled() -> bool:
     """
 
     return _get_strict_bool_env(TASK_AUTO_RESUME_ENABLED, True)
+
+
+def get_log_transport_request_lines() -> bool:
+    """Whether httpx/httpcore request lines below WARNING stay in the log.
+
+    Off, the logging setup attaches a below-WARNING filter to those loggers,
+    so a third-party SDK that lowers ``httpx`` to DEBUG still cannot put a
+    full request URL into INFO. On, the filter is not attached and those
+    lines are emitted; the record factory still redacts their query values.
+    Use it only while diagnosing a client that misbehaves before the
+    credential is attached.
+
+    Priority:
+        1. XAGENT_LOG_TRANSPORT_REQUEST_LINES environment variable
+        2. False
+    """
+
+    return _get_strict_bool_env(LOG_TRANSPORT_REQUEST_LINES, False)
 
 
 def get_refuse_search_result_fetch_enabled() -> bool:

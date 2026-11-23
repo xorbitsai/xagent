@@ -1,5 +1,6 @@
 import inspect
 import json
+import logging
 import os
 
 # Fix pathlib.Path compatibility issue for pytest
@@ -82,6 +83,22 @@ def local_execution_unless_selected(monkeypatch):
     monkeypatch.setenv("XAGENT_SHARED_TASK_EXECUTION_ENABLED", "false")
     monkeypatch.setenv("XAGENT_TASK_EXECUTION_ROLE", "combined")
     monkeypatch.delenv("XAGENT_CHANNEL_INGRESS_ENABLED", raising=False)
+
+
+@pytest.fixture(autouse=True)
+def isolate_log_record_factory():
+    """Every test starts and ends with logging's stock ``LogRecord`` factory.
+
+    Importing ``xagent.web.app`` calls ``setup_logging()``, which installs a
+    process-wide redacting record factory. Left installed, that factory masks a
+    value at every record regardless of whether the production call site did,
+    so an existing ``secret not in caplog.text`` assertion can no longer catch
+    a call-site regression. Tests that exercise the factory install it
+    explicitly with ``setup_logging(force=True)``.
+    """
+    logging.setLogRecordFactory(logging.LogRecord)
+    yield
+    logging.setLogRecordFactory(logging.LogRecord)
 
 
 _DATABASE_MODULE = "xagent.web.models.database"

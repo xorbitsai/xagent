@@ -206,7 +206,7 @@ Parameters:
 - reference_image_urls / reference_video_urls / reference_audio_urls (optional): public URLs used as references. Audio references require at least one image or video reference.
 - poll_interval (optional): polling interval in seconds while waiting. Defaults to 30.
 - timeout (optional): maximum wait time in seconds.
-- model_id (optional): model ID from the list above. Omit to use the default model marked with ⭐[DEFAULT].
+- model_id (optional): model ID from the list above. Omit to use the default model marked with ⭐[DEFAULT]. Models marked "text-to-video only" reject image input; when model_id is omitted and the request has image input, an image-capable model is used automatically.
 
 Provider notes:
 - For Volcengine/BytePlus Ark Seedance models, prefer resolution + ratio instead of arbitrary size. Valid ratios are "16:9", "4:3", "1:1", "3:4", "9:16", "21:9", and "adaptive".
@@ -250,6 +250,8 @@ The generated video URL is temporary on the provider side, so completed videos a
             description = self._model_descriptions.get(model_id, "")
             is_default = model_id == default_video_id
             default_marker = " ⭐[DEFAULT]" if is_default else ""
+            if not self._accepts_image_input(model):
+                default_marker = f" (text-to-video only){default_marker}"
 
             if description:
                 line = f"- {model_id}: {description}{default_marker}"
@@ -286,6 +288,21 @@ The generated video URL is temporary on the provider side, so completed videos a
             if hasattr(model, "has_ability") and model.has_ability("generate"):
                 return model
 
+        return None
+
+    @staticmethod
+    def _accepts_image_input(model: BaseVideoModel) -> bool:
+        check = getattr(model, "supports_image_input", None)
+        return bool(check()) if callable(check) else True
+
+    def _image_capable_fallback(
+        self, current: BaseVideoModel
+    ) -> Optional[tuple[str, BaseVideoModel]]:
+        """Pick, by sorted id, a generate-capable model that accepts images."""
+        for candidate_id in sorted(self._available_generate_model_ids()):
+            candidate = self._video_models[candidate_id]
+            if candidate is not current and self._accepts_image_input(candidate):
+                return candidate_id, candidate
         return None
 
     def _available_generate_model_ids(self) -> list[str]:
@@ -729,6 +746,30 @@ The generated video URL is temporary on the provider side, so completed videos a
                     "video_path": None,
                     "model_used": actual_model_id,
                 }
+            if (
+                not model_id
+                and not self._accepts_image_input(video_model)
+                and any(
+                    _has_value(value)
+                    for value in (
+                        input_reference,
+                        image_url,
+                        image,
+                        first_frame_image_url,
+                        last_frame_image_url,
+                        self._normalize_url_list(reference_image_urls),
+                    )
+                )
+            ):
+                fallback = self._image_capable_fallback(video_model)
+                if fallback:
+                    logger.info(
+                        "Video model %s is text-to-video only; using %s for "
+                        "image input",
+                        self._model_id_for_model(video_model),
+                        fallback[0],
+                    )
+                    video_model = fallback[1]
             actual_model_id = self._model_id_for_model(video_model)
             inner_video_model = getattr(video_model, "_inner", video_model)
             effective_ratio = ratio or "16:9"

@@ -395,6 +395,11 @@ class XinferenceVideoModel(BaseVideoModel):
     def abilities(self) -> List[str]:
         return self._abilities
 
+    def supports_image_input(self) -> bool:
+        # The xinference-saas video API is text-to-video only;
+        # _generate_saas_video refuses any image input.
+        return not self.saas_api
+
     def validate_configuration(self) -> None:
         if not self.base_url:
             raise ValueError("Xinference base_url cannot be empty")

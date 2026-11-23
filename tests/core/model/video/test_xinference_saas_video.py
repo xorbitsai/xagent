@@ -275,3 +275,14 @@ def test_observation_omits_inline_data_urls():
     )
     assert "AAAA" not in text and "QQ==" not in text
     assert "inline video/mp4 data omitted" in text
+
+
+async def test_saas_video_model_reports_text_to_video_only():
+    assert _build().supports_image_input() is False
+
+
+async def test_self_hosted_xinference_video_accepts_image_input():
+    model = XinferenceVideoModel(
+        model_name="m", base_url="http://localhost:9997", saas_api=False
+    )
+    assert model.supports_image_input() is True

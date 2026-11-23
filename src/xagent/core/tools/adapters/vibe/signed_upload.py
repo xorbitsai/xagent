@@ -20,11 +20,14 @@ the address a name resolves to.  The upload request must therefore be sent
 through ``PublicHttpTransport`` (``xagent.core.utils.public_http_transport``),
 which resolves the host and refuses any address that is not public.
 
-A settings entry takes one of two forms.  A binding replaces one scalar string
+A settings entry takes one of three forms.  A binding replaces one scalar string
 argument of one tool, and a list value in that argument is passed through
 unchanged.  An issuer takes over one issuing tool: the host offers the model a
 tool of the same name that stages a file, runs the issuing call itself and
-returns only the connector's file id.
+returns only the connector's file id.  A link names one scalar string argument
+of one tool that takes a download URL: when the model passes a workspace image
+there, the host replaces it with a short-lived HTTPS link the connector's own
+server fetches, and any other value is passed through unchanged.
 """
 
 from __future__ import annotations
@@ -68,6 +71,7 @@ _ISSUER_ENTRY_KEYS = frozenset(
         "content_types",
     }
 )
+_LINK_ENTRY_KEYS = frozenset({"tool_name", "link_argument"})
 _UNREADABLE_SETTINGS_MESSAGE = "Upload settings could not be read."
 _HOST_FORBIDDEN_CHARS = frozenset("*/:@")
 _REMOTE_FILE_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{8,128}$")
@@ -112,6 +116,16 @@ class SignedUploadIssuer:
     content_types: Mapping[str, str]  # lower-case one-dot suffix -> MIME
 
 
+@dataclass(frozen=True)
+class SignedUploadLink:
+    """A tool argument the host fills with a short-lived download link."""
+
+    # Same meaning and same rule as SignedUploadBinding.connection_host.
+    connection_host: str
+    tool_name: str  # tool whose argument may carry file:<id>
+    link_argument: str  # scalar string argument that receives the link
+
+
 def _validate_hostname(host: Any, label: str) -> None:
     if not isinstance(host, str) or not host:
         raise ValueError(f"{label} must be a non-empty string")
@@ -141,11 +155,12 @@ def _validate_string(value: Any, label: str) -> str:
 
 def _validate_entry(
     entry: Any, position: int, connection_host: str
-) -> SignedUploadBinding | SignedUploadIssuer:
+) -> SignedUploadBinding | SignedUploadIssuer | SignedUploadLink:
     """Validate one stored settings entry; ``position`` only labels errors.
 
-    An entry with exactly the keys of a binding is a binding, and an entry with
-    exactly the keys of an issuer is an issuer.
+    An entry with exactly the keys of a binding is a binding, an entry with
+    exactly the keys of an issuer is an issuer, and an entry with exactly the
+    keys of a link is a link.
     """
     label = f"signed_uploads[{position}]"
     if not isinstance(entry, dict):
@@ -162,6 +177,14 @@ def _validate_entry(
             allowed_upload_hosts=hosts,
             upload_path_prefix=prefix,
             content_types=content_types,
+        )
+    if keys == _LINK_ENTRY_KEYS:
+        return SignedUploadLink(
+            connection_host=connection_host,
+            tool_name=_validate_string(entry["tool_name"], f"{label}.tool_name"),
+            link_argument=_validate_string(
+                entry["link_argument"], f"{label}.link_argument"
+            ),
         )
     if keys != _SETTINGS_ENTRY_KEYS:
         raise ValueError(f"{label} must have exactly the documented keys")
@@ -256,15 +279,17 @@ def _validate_upload_rules(
 
 
 def _check_entries_together(
-    entries: list[SignedUploadBinding | SignedUploadIssuer],
+    entries: list[SignedUploadBinding | SignedUploadIssuer | SignedUploadLink],
 ) -> None:
     """Reject settings whose entries clash with each other.
 
     ``entries`` is in stored order and every position in an error is the
     entry's position in that order.  The checks run in a fixed order: a
     repeated replaced tool, a repeated issuing tool of two issuers, an issuing
-    tool that an issuer shares with a binding, and a tool that is both an
-    issuing tool and a replaced tool.
+    tool that an issuer shares with a binding, a tool that is both an issuing
+    tool and a replaced tool, a tool with two link entries, a tool argument
+    that is both replaced and linked, and a link on an issuing tool.  An entry
+    of a kind not named here is an error.
     """
     replaced_tools: set[str] = set()
     binding_issuing_tools: set[str] = set()
@@ -272,17 +297,29 @@ def _check_entries_together(
     repeated_replaced_tool: int | None = None
     repeated_issuer_tool: int | None = None
     issuer_positions: list[tuple[int, str]] = []
+    link_tools: set[str] = set()
+    repeated_link_tool: int | None = None
+    replaced_arguments: set[tuple[str, str]] = set()
+    links: list[SignedUploadLink] = []
     for position, entry in enumerate(entries):
         if isinstance(entry, SignedUploadBinding):
             if entry.tool_name in replaced_tools and repeated_replaced_tool is None:
                 repeated_replaced_tool = position
             replaced_tools.add(entry.tool_name)
             binding_issuing_tools.add(entry.issuing_tool_name)
-        else:
+            replaced_arguments.add((entry.tool_name, entry.file_argument))
+        elif isinstance(entry, SignedUploadIssuer):
             if entry.issuing_tool_name in issuer_tools and repeated_issuer_tool is None:
                 repeated_issuer_tool = position
             issuer_tools.add(entry.issuing_tool_name)
             issuer_positions.append((position, entry.issuing_tool_name))
+        elif isinstance(entry, SignedUploadLink):
+            if entry.tool_name in link_tools and repeated_link_tool is None:
+                repeated_link_tool = position
+            link_tools.add(entry.tool_name)
+            links.append(entry)
+        else:
+            raise ValueError("signed_uploads entry has an unknown kind")
     if repeated_replaced_tool is not None:
         raise ValueError(
             f"signed_uploads[{repeated_replaced_tool}].tool_name "
@@ -303,16 +340,28 @@ def _check_entries_together(
             )
     if replaced_tools & (binding_issuing_tools | issuer_tools):
         raise ValueError("a tool cannot be both an issuing tool and a replaced tool")
+    if repeated_link_tool is not None:
+        raise ValueError(
+            f"signed_uploads[{repeated_link_tool}].tool_name has another link entry"
+        )
+    if any(
+        (link.tool_name, link.link_argument) in replaced_arguments for link in links
+    ):
+        raise ValueError("a tool argument cannot be both uploaded and linked")
+    # The host takes over an issuing tool, so the model never sees its own
+    # arguments and a link on one could never be filled.
+    if link_tools & (binding_issuing_tools | issuer_tools):
+        raise ValueError("an issuing tool cannot take a link argument")
 
 
 def parse_signed_upload_settings(
     raw: Any, *, connection_host: str | None
-) -> tuple[SignedUploadBinding | SignedUploadIssuer, ...]:
+) -> tuple[SignedUploadBinding | SignedUploadIssuer | SignedUploadLink, ...]:
     """Validate a connector's stored signed_uploads value; raise ValueError.
 
     ``None`` and an empty list mean no settings and give an empty tuple.  Any
     other value must be a list of entries, each with exactly the keys of a
-    binding or exactly the keys of an issuer, and the connection needs a
+    binding, an issuer or a link, and the connection needs a
     hostname (``connection_host``, the lower-case hostname of the connection
     URL, taken as given; ``None`` and an empty string both mean it has none).
     The result has one object per entry, in stored order.  The error text is
@@ -361,7 +410,7 @@ def signed_upload_settings_error(raw: Any, *, transport: Any, url: Any) -> str |
 
 def connection_signed_uploads(
     connection: Any,
-) -> tuple[SignedUploadBinding | SignedUploadIssuer, ...]:
+) -> tuple[SignedUploadBinding | SignedUploadIssuer | SignedUploadLink, ...]:
     """Read and validate the settings carried by ``connection``.
 
     A connection that is not a mapping, or whose transport does not take part,

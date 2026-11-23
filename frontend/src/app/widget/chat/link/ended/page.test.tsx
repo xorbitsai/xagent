@@ -34,11 +34,17 @@ describe("link end page", () => {
     expect(screen.getByText(copy.description)).toBeInTheDocument()
   })
 
+  it.each([
+    "link_invalid", "session_ended", "unavailable", "network", "closed", "generic",
+  ] as const)("sends the user back to the app for reason %s", (key) => {
+    expect(translations.en.widgetLink.ended[key].description).toMatch(/\bapp\b/i)
+    expect(translations.zh.widgetLink.ended[key].description).toContain("应用")
+  })
+
   it.each([["unknown_x"], [""], [null], ["CLOSED"]])("shows the generic copy for reason %s", (value) => {
     reason = value
     render(<LinkEndedPage />)
     expect(screen.getByRole("heading")).toHaveTextContent(en.generic.title)
     expect(screen.getByText(en.generic.description)).toBeInTheDocument()
   })
-
 })

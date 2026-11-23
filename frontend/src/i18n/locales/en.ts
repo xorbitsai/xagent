@@ -896,7 +896,7 @@ Build when you need.`,
       },
       unavailable: {
         title: "Chat unavailable",
-        description: "This chat cannot be opened right now. Please try again later.",
+        description: "Go back to the app and try again later.",
       },
       network: {
         title: "Network problem",

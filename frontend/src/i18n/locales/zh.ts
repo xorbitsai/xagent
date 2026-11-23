@@ -894,7 +894,7 @@ const zh = {
       },
       unavailable: {
         title: "聊天暂不可用",
-        description: "目前无法打开此聊天，请稍后重试。",
+        description: "请返回应用，稍后再试。",
       },
       network: {
         title: "网络出现问题",

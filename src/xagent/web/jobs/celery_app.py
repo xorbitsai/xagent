@@ -9,7 +9,13 @@ from importlib import import_module
 from typing import Any
 
 from celery import Celery
-from celery.signals import beat_init, worker_init
+from celery.signals import (
+    after_setup_logger,
+    after_setup_task_logger,
+    beat_init,
+    worker_init,
+    worker_process_init,
+)
 
 from ...config import (
     get_background_job_sweep_interval_seconds,
@@ -19,6 +25,7 @@ from ...config import (
     get_kb_milvus_cleanup_interval_seconds,
     validate_encryption_config,
 )
+from ..logging_config import install_log_redaction
 
 logger = logging.getLogger(__name__)
 
@@ -75,6 +82,21 @@ def create_celery_app() -> Any:
 
 
 celery_app = create_celery_app()
+
+
+# Celery configures logging itself and never calls ``setup_logging``. These
+# signals fire after that configuration: ``after_setup_logger`` for the worker
+# main process and for beat, ``beat_init`` for beat, and ``worker_process_init``
+# in every prefork child. ``worker_init`` would run before Celery replaces the
+# root handlers. The record factory and the httpx/httpcore filters installed
+# here are the parts Celery's log configuration never resets, so this is
+# independent of ``validate_worker_encryption`` below.
+@after_setup_logger.connect
+@after_setup_task_logger.connect
+@worker_process_init.connect
+@beat_init.connect
+def install_celery_log_redaction(**_: Any) -> None:
+    install_log_redaction()
 
 
 @worker_init.connect

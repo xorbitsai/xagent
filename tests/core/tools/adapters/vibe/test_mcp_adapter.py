@@ -4031,14 +4031,16 @@ async def test_real_mcp_session_retries_nested_resolver_401_once(monkeypatch, ca
     nested_failures = []
     retry = adapter._retry_after_authorization_failure
 
-    async def _observe_nested_failure(exc, attempted_args, attempted_meta):
+    async def _observe_nested_failure(
+        exc, attempted_args, attempted_meta, **retry_options
+    ):
         nested_failures.append(exc)
         responses = list(mcp_adapter_module._strict_http_401_responses(exc))
         assert len(responses) == 1
         assert responses[0].headers.get_list("WWW-Authenticate") == [
             'Bearer error="invalid_token", scope="records.read"'
         ]
-        return await retry(exc, attempted_args, attempted_meta)
+        return await retry(exc, attempted_args, attempted_meta, **retry_options)
 
     monkeypatch.setattr(
         adapter, "_retry_after_authorization_failure", _observe_nested_failure

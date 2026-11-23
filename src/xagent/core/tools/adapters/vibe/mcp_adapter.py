@@ -105,6 +105,7 @@ from .sandboxed_tool.sandboxed_mcp_tool_helper import (
 from .signed_upload import (
     SignedUploadBinding,
     SignedUploadIssuer,
+    SignedUploadLink,
     SignedUploadResponseError,
     SignedUploadTicket,
     SignedUploadURLRejected,
@@ -778,6 +779,18 @@ _SIGNED_UPLOAD_ISSUER_ARGUMENT_MESSAGE = (
 _SIGNED_UPLOAD_ISSUER_FILE_UNAVAILABLE_MESSAGE = (
     "The workspace file is no longer available."
 )
+# Fixed texts for a tool argument that takes a download link. None carries a
+# stored or environment value.
+_LINK_FILE_UNAVAILABLE_MESSAGE = (
+    "The file cannot be sent to this tool here; pass an https URL instead."
+)
+_LINK_FILE_NOT_FOUND_MESSAGE = "file_id not found or not accessible."
+_LINK_PREPARATION_FAILED_MESSAGE = "The image could not be prepared for this tool."
+_LINK_TOO_LONG_MESSAGE = (
+    "The download link the host created is longer than this tool's argument "
+    "allows, so the tool was not called."
+)
+_LINK_EXTERNAL_MEDIA_PURPOSE = "connector-image"
 # What the model is told about a tool the host runs in place of an issuing tool.
 # The connector's own description of that tool is not used: it tells the caller
 # to fetch an upload URL and send the bytes itself.
@@ -842,10 +855,13 @@ class _SignedUploadRefused(Exception):
 
 def _check_signed_upload_connection(
     connection: Any,
-    binding: SignedUploadBinding | SignedUploadIssuer,
+    binding: SignedUploadBinding | SignedUploadIssuer | SignedUploadLink,
     tool_name: str,
 ) -> None:
-    """Refuse a signed upload over a connection to another host than the settings'."""
+    """Refuse a signed upload or a download link over a connection to another host.
+
+    "Another" means other than the host the settings were read from.
+    """
     url = connection.get("url") if isinstance(connection, Mapping) else None
     try:
         host = urlsplit(url).hostname if isinstance(url, str) else None
@@ -2346,6 +2362,7 @@ class MCPToolAdapter(AbstractBaseTool):
         concurrent_tools: Optional[List[str]] = None,
         raw_annotations: Optional[Mapping[str, Any]] = None,
         signed_upload: SignedUploadBinding | None = None,
+        signed_upload_link: SignedUploadLink | None = None,
     ):
         """Initialize MCP tool adapter.
 
@@ -2390,6 +2407,14 @@ class MCPToolAdapter(AbstractBaseTool):
                 ``signed_upload.file_argument`` before this tool runs. A
                 binding whose ``file_argument`` the model cannot fill is
                 ignored with a warning (see ``_usable_signed_upload``).
+            signed_upload_link: Link entry from this connection's signed-upload
+                settings, for a connector tool whose scalar string argument
+                takes a download URL. When set and a workspace is present, the
+                host replaces a workspace image the model passes for
+                ``signed_upload_link.link_argument`` with a short-lived
+                download link before this tool runs. An entry whose argument
+                the model cannot fill is ignored with a warning (see
+                ``_usable_signed_upload_link``).
         """
         self.mcp_tool = mcp_tool
         self._raw_annotations = raw_annotations
@@ -2446,6 +2471,7 @@ class MCPToolAdapter(AbstractBaseTool):
         # server, which are not billed to Composio.
         self._composio_backed = runtime_config.get("composio") is True
         self._signed_upload = self._usable_signed_upload(signed_upload)
+        self._signed_upload_link = self._usable_signed_upload_link(signed_upload_link)
         from .base import ToolCategory
 
         self.category = ToolCategory.MCP
@@ -2535,6 +2561,15 @@ class MCPToolAdapter(AbstractBaseTool):
                 " A registered workspace file (file:<id>) may be supplied for "
                 f"`{self._signed_upload.file_argument}`; the host uploads it to "
                 "the connector before this tool runs."
+            )
+        if self._workspace is not None and self._signed_upload_link is not None:
+            description += (
+                " A registered workspace image (file:<id>) may be supplied for "
+                f"`{self._signed_upload_link.link_argument}`; the host replaces it "
+                "with a short-lived HTTPS download link that expires within "
+                "minutes, so the tool must download the image during the call and "
+                "must not store the link. A plain https URL is passed through "
+                "unchanged."
             )
         if self._workspace is not None and self._workspace_download_field is not None:
             description += (
@@ -3736,6 +3771,17 @@ class MCPToolAdapter(AbstractBaseTool):
                             )
                         except _SignedUploadRefused as refused:
                             return refused.result
+                    link_replacements: dict[str, str] = {}
+                    if self._signed_upload_link is not None:
+                        try:
+                            (
+                                tool_args,
+                                link_replacements,
+                            ) = await self._substitute_signed_upload_link_args(
+                                invocation_connection, tool_args
+                            )
+                        except _SignedUploadRefused as refused:
+                            return refused.result
                     try:
                         result = await self._execute_mcp_call(
                             invocation_connection, tool_args, tool_meta
@@ -3747,7 +3793,12 @@ class MCPToolAdapter(AbstractBaseTool):
                         if was_refreshed:
                             raise
                         retry_result = await self._retry_after_authorization_failure(
-                            exc, tool_args, tool_meta
+                            exc,
+                            tool_args,
+                            tool_meta,
+                            host_link=(
+                                self._signed_upload_link if link_replacements else None
+                            ),
                         )
                         if retry_result is None:
                             raise
@@ -3794,6 +3845,7 @@ class MCPToolAdapter(AbstractBaseTool):
                             {
                                 **staged_upload_sources,
                                 **external_media_replacements,
+                                **link_replacements,
                             },
                         ),
                         replacements,
@@ -3929,11 +3981,21 @@ class MCPToolAdapter(AbstractBaseTool):
         exc: BaseException,
         tool_args: Mapping[str, Any],
         tool_meta: Mapping[str, Any],
+        *,
+        host_link: SignedUploadLink | None = None,
     ) -> dict[str, Any] | None:
+        """Retry once over a refreshed connection after a 401, or return ``None``.
+
+        ``host_link`` is the link entry of a call whose arguments carry a
+        download link; the refreshed connection must be to its host (see
+        ``_retry_connection_refusal``).
+        """
         if isinstance(self.connection, Mapping) and (
             _OAUTH_TOKEN_RESOLVER_REFRESH_KEY in self.connection
         ):
-            return await self._retry_resolver_401(exc, tool_args, tool_meta)
+            return await self._retry_resolver_401(
+                exc, tool_args, tool_meta, host_link=host_link
+            )
 
         if not _exception_indicates_http_401(exc):
             return None
@@ -3960,6 +4022,9 @@ class MCPToolAdapter(AbstractBaseTool):
             return _delegated_authorization_failed_result()
         if not isinstance(refreshed, dict):
             return _delegated_authorization_failed_result()
+        refusal = self._retry_connection_refusal(refreshed, host_link)
+        if refusal is not None:
+            return refusal
         try:
             return await self._execute_mcp_call(
                 cast(Connection, refreshed), tool_args, tool_meta
@@ -3979,6 +4044,8 @@ class MCPToolAdapter(AbstractBaseTool):
         exc: BaseException,
         tool_args: Mapping[str, Any],
         tool_meta: Mapping[str, Any],
+        *,
+        host_link: SignedUploadLink | None = None,
     ) -> dict[str, Any] | None:
         challenge, initial_response_ids = _resolver_401_evidence(exc)
         if not initial_response_ids:
@@ -4013,6 +4080,10 @@ class MCPToolAdapter(AbstractBaseTool):
 
         if not _is_executable_remote_connection(refreshed):
             return _delegated_authorization_failed_result()
+
+        refusal = self._retry_connection_refusal(refreshed, host_link)
+        if refusal is not None:
+            return refusal
 
         try:
             return await self._execute_mcp_call(
@@ -4307,6 +4378,153 @@ class MCPToolAdapter(AbstractBaseTool):
         finally:
             await self._discard_external_upload_args([staged])
 
+    def _refused_link(
+        self, reason: str, message: str, *, error_type: str | None = None
+    ) -> _SignedUploadRefused:
+        """Log one refused download link and build the refusal to raise.
+
+        ``reason`` is a bounded label and ``error_type`` an exception class
+        name; neither the link nor any text of an error is logged.
+        """
+        if error_type is None:
+            logger.warning(
+                "MCP tool %s refused a download link reason=%s",
+                self.mcp_tool.name,
+                reason,
+            )
+        else:
+            logger.warning(
+                "MCP tool %s refused a download link reason=%s error_type=%s",
+                self.mcp_tool.name,
+                reason,
+                error_type,
+            )
+        return _SignedUploadRefused(message)
+
+    def _retry_connection_refusal(
+        self, connection: Any, host_link: SignedUploadLink | None
+    ) -> dict[str, Any] | None:
+        """The result that ends a retry over ``connection``, or ``None`` to go on.
+
+        A call that carries a download link may only be sent to the host the
+        link settings belong to, and a refresh can hand back a connection to
+        another one.  Without a link in the call there is nothing to check.
+        """
+        if host_link is None:
+            return None
+        try:
+            _check_signed_upload_connection(connection, host_link, self.mcp_tool.name)
+        except _SignedUploadRefused as refused:
+            logger.warning(
+                "MCP tool %s refused a download link reason=untrusted_connector",
+                self.mcp_tool.name,
+            )
+            return refused.result
+        return None
+
+    async def _substitute_signed_upload_link_args(
+        self,
+        invocation_connection: Connection,
+        tool_args: dict[str, Any],
+    ) -> tuple[dict[str, Any], dict[str, str]]:
+        """Give the connector a download link for the workspace image the model passed.
+
+        Returns ``(tool_args, replacements)``.  When the link argument holds a
+        workspace image reference, it now holds a short-lived HTTPS download
+        link and ``replacements`` maps that link, and its form with escaped
+        slashes, back to ``file:<id>`` for the result the model sees.  Any
+        other value, or no link entry, leaves the arguments unchanged with no
+        replacements: a plain URL the model wrote itself is the connector's to
+        fetch.
+
+        ``file:<id>`` always names a workspace file, so without a workspace it
+        is refused.  A bare UUID names one only when there is a workspace to
+        ask; without one it is taken as an ordinary string.  The per-call
+        connection's host is checked before the workspace is asked.
+
+        When a step refuses, ``_SignedUploadRefused`` carries the result to
+        return and the tool is not called.  The link names only the file, never
+        the user's file name.  The link is a credential: it is not logged and
+        no error text of its issue reaches the model.
+        """
+        link = self._signed_upload_link
+        if link is None:
+            return tool_args, {}
+        value = tool_args.get(link.link_argument)
+        if not isinstance(value, str):
+            return tool_args, {}
+        file_id = _file_ref_value(value)
+        if file_id is None:
+            return tool_args, {}
+        workspace = self._workspace
+        if workspace is None:
+            if parse_file_id_ref(value) is None:
+                return tool_args, {}
+            raise self._refused_link("no_workspace", _LINK_FILE_UNAVAILABLE_MESSAGE)
+
+        try:
+            _check_signed_upload_connection(
+                invocation_connection, link, self.mcp_tool.name
+            )
+        except _SignedUploadRefused as refused:
+            logger.warning(
+                "MCP tool %s refused a download link reason=untrusted_connector",
+                self.mcp_tool.name,
+            )
+            raise refused
+
+        from ....workspace import ExternalMediaNotIssuableError
+
+        try:
+            url = await self._run_upload_staging_operation(
+                workspace.issue_external_media_url_detached,
+                file_id,
+                _LINK_EXTERNAL_MEDIA_PURPOSE,
+            )
+        except ExternalMediaNotIssuableError as exc:
+            # The text comes from the external media service's own fixed
+            # messages, none of which carries a stored or environment value.
+            raise self._refused_link("not_issuable", str(exc)) from None
+        except FileNotFoundError:
+            raise self._refused_link(
+                "not_found", _LINK_FILE_NOT_FOUND_MESSAGE
+            ) from None
+        except ValueError as exc:
+            raise self._refused_link(
+                "preparation_failed",
+                _LINK_PREPARATION_FAILED_MESSAGE,
+                error_type=type(exc).__name__,
+            ) from None
+
+        argument_schema = self._input_schema_properties().get(link.link_argument)
+        max_length = (
+            argument_schema.get("maxLength")
+            if isinstance(argument_schema, Mapping)
+            else None
+        )
+        if (
+            isinstance(max_length, int)
+            and not isinstance(max_length, bool)
+            and max_length >= 0
+            and len(url) > max_length
+        ):
+            raise self._refused_link("too_long", _LINK_TOO_LONG_MESSAGE)
+
+        logger.info(
+            "MCP tool %s received a download link task_id=%s file_id=%s",
+            self.mcp_tool.name,
+            getattr(workspace, "db_task_id", None),
+            file_id,
+        )
+        substituted = dict(tool_args)
+        substituted[link.link_argument] = url
+        replacement = f"file:{file_id}"
+        replacements = {url: replacement}
+        escaped_url = url.replace("/", r"\/")
+        if escaped_url != url:
+            replacements[escaped_url] = replacement
+        return substituted, replacements
+
     async def _issue_and_upload_staged_file(
         self,
         target: SignedUploadBinding | SignedUploadIssuer,
@@ -4510,6 +4728,34 @@ class MCPToolAdapter(AbstractBaseTool):
             )
             return None
         return binding
+
+    def _usable_signed_upload_link(
+        self, link: SignedUploadLink | None
+    ) -> SignedUploadLink | None:
+        """``link``, or ``None`` when the model cannot fill its argument with a string.
+
+        The argument must be a top-level inputSchema property whose ``type`` is
+        exactly ``"string"``, and no runtime binding may fill it: a runtime
+        value comes from the host page, not from the model, and must never be
+        turned into a download link.
+        """
+        if link is None:
+            return None
+        properties = self._input_schema_properties()
+        argument = properties.get(link.link_argument)
+        if (
+            not isinstance(argument, Mapping)
+            or argument.get("type") != "string"
+            or link.link_argument in self._runtime_bound_tool_argument_names(properties)
+        ):
+            logger.warning(
+                "MCP tool %s ignores its link settings: the model cannot fill "
+                "the `%s` argument",
+                self.mcp_tool.name,
+                link.link_argument,
+            )
+            return None
+        return link
 
     def _runtime_tool_arguments(
         self, *, redact_sensitive: bool = False, log_skipped: bool = True
@@ -4997,6 +5243,7 @@ def _build_mcp_tool_adapter(
     concurrency_safe: bool = False,
     concurrent_tools: Optional[List[str]] = None,
     signed_upload: SignedUploadBinding | None = None,
+    signed_upload_link: SignedUploadLink | None = None,
 ) -> MCPToolAdapter:
     """Create MCP tool adapter."""
     tool_prefix, source_server = _mcp_tool_identity(server_name, name_prefix)
@@ -5022,6 +5269,7 @@ def _build_mcp_tool_adapter(
         # neither can quietly lose the evidence the other keeps.
         raw_annotations=raw_annotations_for(mcp_tool),
         signed_upload=signed_upload,
+        signed_upload_link=signed_upload_link,
     )
 
 
@@ -5406,6 +5654,11 @@ async def _load_direct_mcp_tools(
     ]
     issuing_tool_names = {binding.issuing_tool_name for binding in bindings}
     bindings_by_tool = {binding.tool_name: binding for binding in bindings}
+    links_by_tool = {
+        entry.tool_name: entry
+        for entry in signed_uploads
+        if isinstance(entry, SignedUploadLink)
+    }
 
     agent_tools: list[AbstractBaseTool] = []
     mcp_tools: list[MCPTool] = []
@@ -5569,6 +5822,7 @@ async def _load_direct_mcp_tools(
                     concurrency_safe=concurrency_safe,
                     concurrent_tools=concurrent_tools,
                     signed_upload=bindings_by_tool.get(mcp_tool.name),
+                    signed_upload_link=links_by_tool.get(mcp_tool.name),
                 )
 
             agent_tools.append(adapter)

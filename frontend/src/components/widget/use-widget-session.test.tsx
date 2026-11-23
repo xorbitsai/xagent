@@ -1403,6 +1403,19 @@ describe("useWidgetSession terminal report to the parent", () => {
       PARENT_ORIGIN,
     ]])
   })
+
+  it("does not report a terminal state after unmount", () => {
+    const postMessage = vi.spyOn(window, "postMessage")
+    const { result, unmount } = renderHook(() => useWidgetSession())
+    dispatchFromParent(updateMessage())
+    const expire = result.current.handleSessionExpired
+    unmount()
+    postMessage.mockClear()
+
+    act(() => expire())
+
+    expect(terminalReports(postMessage)).toEqual([])
+  })
 })
 
 describe("useWidgetSession handleSessionExpired", () => {

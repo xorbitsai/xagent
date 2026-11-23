@@ -306,9 +306,12 @@ export function createLinkSessionWorkerCore(deps: LinkSessionWorkerDeps): LinkSe
         let delay = retryDelayMs(retries, deps.random())
         // The server keeps the previous reconnect token usable for a grace
         // window of at least 30 s after a rotation. A request that timed out (or
-        // answered 504) may already have rotated it, so the next attempt must
-        // still land inside that grace: 5 s timeout + at most 10 s wait + 5 s
-        // request = 20 s.
+        // answered 504) may already have rotated it, so the attempt right after
+        // it must still land inside that grace: 5 s timeout + at most 10 s wait +
+        // 5 s request = 20 s. Only that attempt is bounded. If it fails again or
+        // is rate limited, a later attempt may arrive after the grace; the server
+        // then answers reconnect_invalid and the session ends as session_ended,
+        // as it does in widget.js.
         if (verdict.mayHaveReachedServer) delay = Math.min(delay, RETRY_MAX_DELAY_AFTER_TIMEOUT_MS)
         await wait(delay)
         if (terminated) return

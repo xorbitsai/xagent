@@ -20,25 +20,35 @@ interface SignedUploadContentTypeRow {
 /**
  * How the host uses one entry. "replacement" uploads the file before a call to
  * the tool that takes it and replaces that tool's file argument; "issuer" runs
- * the issuing tool for the model and returns only the connector's file ID.
+ * the issuing tool for the model and returns only the connector's file ID;
+ * "link" replaces a workspace image in a URL argument with a short-lived
+ * download link. "unrecognized" is an entry whose keys match none of these:
+ * it is shown read-only and written back exactly as it was stored.
  */
-export type SignedUploadMode = "replacement" | "issuer"
+export type SignedUploadMode = "replacement" | "issuer" | "link" | "unrecognized"
 
-// An entry with exactly these keys is an issuer entry; any other entry is read
-// as a replacement entry.
+// Each entry form is identified by its exact key set, never by a subset: an
+// entry with any other keys is unrecognized and is neither edited nor altered.
 const ISSUER_ENTRY_KEYS = [
   "issuing_tool_name",
   "allowed_upload_hosts",
   "upload_path_prefix",
   "content_types",
 ] as const
+const REPLACEMENT_ENTRY_KEYS = ["tool_name", "file_argument", ...ISSUER_ENTRY_KEYS] as const
+const LINK_ENTRY_KEYS = ["tool_name", "link_argument"] as const
 
 export interface SignedUploadRow {
   id: string
   mode: SignedUploadMode
-  // toolName and fileArgument are always empty in an issuer row.
+  // toolName is empty in an issuer row. fileArgument is empty in an issuer and
+  // a link row; linkArgument is empty in every row but a link row; the issuer
+  // and file fields are empty in a link row.
   toolName: string
   fileArgument: string
+  linkArgument: string
+  // The stored entry of an unrecognized row, which is the only row that has one.
+  raw?: unknown
   issuingToolName: string
   hostsText: string // one hostname per line, exactly as typed
   uploadPathPrefix: string
@@ -59,17 +69,25 @@ function textOrEmpty(value: unknown): string {
   return typeof value === "string" ? value : ""
 }
 
-function isIssuerEntry(item: Record<string, unknown>): boolean {
+function hasExactKeys(item: Record<string, unknown>, expected: readonly string[]): boolean {
   const keys = Object.keys(item)
-  return keys.length === ISSUER_ENTRY_KEYS.length
-    && ISSUER_ENTRY_KEYS.every((key) => keys.includes(key))
+  return keys.length === expected.length && expected.every((key) => keys.includes(key))
+}
+
+function entryMode(entry: unknown): SignedUploadMode {
+  if (!isRecord(entry)) return "unrecognized"
+  if (hasExactKeys(entry, REPLACEMENT_ENTRY_KEYS)) return "replacement"
+  if (hasExactKeys(entry, ISSUER_ENTRY_KEYS)) return "issuer"
+  if (hasExactKeys(entry, LINK_ENTRY_KEYS)) return "link"
+  return "unrecognized"
 }
 
 /**
- * Turn a stored signed_uploads value into editable rows, showing as much of a
- * stored entry as possible: a missing or mistyped field reads as empty and an
- * entry that is not an object reads as an empty row. An entry with exactly the
- * issuer keys reads as an issuer row and every other entry as a replacement row.
+ * Turn a stored signed_uploads value into editable rows. An entry whose keys
+ * are exactly the replacement, issuer or link keys reads as that kind of row,
+ * with a mistyped field read as empty. Any other entry, including one that is
+ * not an object, reads as an unrecognized row that keeps a copy of the stored
+ * value.
  */
 export function signedUploadRowsFromValue(
   value: unknown,
@@ -77,7 +95,22 @@ export function signedUploadRowsFromValue(
 ): SignedUploadRow[] {
   if (!Array.isArray(value)) return []
   return value.map((entry) => {
-    const item = isRecord(entry) ? entry : {}
+    const mode = entryMode(entry)
+    if (mode === "unrecognized") {
+      return {
+        id: nextId(),
+        mode,
+        toolName: "",
+        fileArgument: "",
+        linkArgument: "",
+        issuingToolName: "",
+        hostsText: "",
+        uploadPathPrefix: "",
+        contentTypes: [],
+        raw: structuredClone(entry),
+      }
+    }
+    const item = entry as Record<string, unknown>
     const hosts = Array.isArray(item.allowed_upload_hosts)
       ? item.allowed_upload_hosts.filter((host): host is string => typeof host === "string")
       : []
@@ -88,9 +121,10 @@ export function signedUploadRowsFromValue(
       : []
     return {
       id: nextId(),
-      mode: isIssuerEntry(item) ? "issuer" : "replacement",
+      mode,
       toolName: textOrEmpty(item.tool_name),
       fileArgument: textOrEmpty(item.file_argument),
+      linkArgument: textOrEmpty(item.link_argument),
       issuingToolName: textOrEmpty(item.issuing_tool_name),
       hostsText: hosts.join("\n"),
       uploadPathPrefix: textOrEmpty(item.upload_path_prefix),
@@ -103,13 +137,25 @@ export function signedUploadRowsFromValue(
  * Turn editable rows into the signed_uploads request value. Names and the path
  * prefix are trimmed, host lines are trimmed and blank ones dropped, file type
  * rows with both cells blank are dropped, and a row with nothing left is
- * dropped. An issuer row writes only the issuer keys and a replacement row
- * writes all six keys. Every other rule is left to the server.
+ * dropped. An issuer row writes only the issuer keys, a replacement row writes
+ * all six keys and a link row writes its two keys. An unrecognized row writes
+ * its stored entry unchanged. Every other rule is left to the server.
  */
 export function signedUploadsFromRows(rows: SignedUploadRow[]): Record<string, unknown>[] {
   const entries: Record<string, unknown>[] = []
   for (const row of rows) {
+    if (row.mode === "unrecognized") {
+      entries.push(row.raw as Record<string, unknown>)
+      continue
+    }
     const toolName = row.toolName.trim()
+    if (row.mode === "link") {
+      const linkArgument = row.linkArgument.trim()
+      if (toolName || linkArgument) {
+        entries.push({ tool_name: toolName, link_argument: linkArgument })
+      }
+      continue
+    }
     const fileArgument = row.fileArgument.trim()
     const issuingToolName = row.issuingToolName.trim()
     const uploadPathPrefix = row.uploadPathPrefix.trim()
@@ -188,10 +234,24 @@ export function SignedUploadsForm({
     updateRows(rows.map((row) => (row.id === id ? { ...row, ...patch } : row)))
   }
 
-  // Switching mode drops the fields only a replacement row has.
+  // Switching mode drops the fields the new mode does not have. The tool name
+  // is kept between replacement and link rows, which both have one.
   const updateMode = (row: SignedUploadRow, mode: SignedUploadMode) => {
     if (mode === row.mode) return
-    updateRow(row.id, { mode, toolName: "", fileArgument: "" })
+    if (mode === "link") {
+      updateRow(row.id, {
+        mode,
+        fileArgument: "",
+        issuingToolName: "",
+        hostsText: "",
+        uploadPathPrefix: "",
+        contentTypes: [],
+      })
+    } else if (mode === "issuer") {
+      updateRow(row.id, { mode, toolName: "", fileArgument: "", linkArgument: "" })
+    } else {
+      updateRow(row.id, { mode, linkArgument: "" })
+    }
   }
 
   const updateContentTypes = (
@@ -248,7 +308,9 @@ export function SignedUploadsForm({
                 <div key={row.id} className="space-y-3 rounded-md border bg-white p-3">
                   <div className="flex items-center justify-between gap-2">
                     <span className="text-sm font-medium text-slate-700">
-                      {(row.mode === "issuer" ? row.issuingToolName : row.toolName).trim()
+                      {(row.mode === "unrecognized"
+                        ? ""
+                        : row.mode === "issuer" ? row.issuingToolName : row.toolName).trim()
                         || t("tools.mcp.signedUploads.newTool")}
                     </span>
                     <Button
@@ -264,6 +326,20 @@ export function SignedUploadsForm({
                     </Button>
                   </div>
 
+                  {row.mode === "unrecognized" ? (
+                    <div className="space-y-2">
+                      <p className="text-xs text-slate-500">
+                        {t("tools.mcp.signedUploads.unrecognizedEntry")}
+                      </p>
+                      <Textarea
+                        readOnly
+                        aria-label={t("tools.mcp.signedUploads.unrecognizedEntryValue")}
+                        className="font-mono text-xs"
+                        value={JSON.stringify(row.raw, null, 2) ?? ""}
+                      />
+                    </div>
+                  ) : (
+                  <>
                   <div className="space-y-2">
                     <Label id={fieldId("mode")}>{t("tools.mcp.signedUploads.mode")}</Label>
                     <RadioGroup
@@ -271,7 +347,10 @@ export function SignedUploadsForm({
                       value={row.mode}
                       disabled={disabled}
                       onValueChange={(value) =>
-                        updateMode(row, value === "issuer" ? "issuer" : "replacement")}
+                        updateMode(
+                          row,
+                          value === "issuer" || value === "link" ? value : "replacement",
+                        )}
                     >
                       <div className="flex items-center space-x-2">
                         <RadioGroupItem value="replacement" id={fieldId("modeReplacement")} />
@@ -288,14 +367,53 @@ export function SignedUploadsForm({
                           {t("tools.mcp.signedUploads.modeIssuer")}
                         </Label>
                       </div>
+                      <div className="flex items-center space-x-2">
+                        <RadioGroupItem value="link" id={fieldId("modeLink")} />
+                        <Label htmlFor={fieldId("modeLink")} className="font-normal cursor-pointer">
+                          {t("tools.mcp.signedUploads.modeLink")}
+                        </Label>
+                      </div>
                     </RadioGroup>
                     <p className="text-xs text-slate-500">
                       {row.mode === "issuer"
                         ? t("tools.mcp.signedUploads.modeIssuerHint")
-                        : t("tools.mcp.signedUploads.modeReplacementHint")}
+                        : row.mode === "link"
+                          ? t("tools.mcp.signedUploads.modeLinkHint")
+                          : t("tools.mcp.signedUploads.modeReplacementHint")}
                     </p>
                   </div>
 
+                  {row.mode === "link" && (
+                    <>
+                      <div className="space-y-2">
+                        <Label htmlFor={fieldId("toolName")}>
+                          {t("tools.mcp.signedUploads.toolName")}
+                        </Label>
+                        <Input
+                          id={fieldId("toolName")}
+                          value={row.toolName}
+                          onChange={(event) => updateRow(row.id, { toolName: event.target.value })}
+                        />
+                      </div>
+                      <div className="space-y-2">
+                        <Label htmlFor={fieldId("linkArgument")}>
+                          {t("tools.mcp.signedUploads.linkArgument")}
+                        </Label>
+                        <Input
+                          id={fieldId("linkArgument")}
+                          value={row.linkArgument}
+                          onChange={(event) =>
+                            updateRow(row.id, { linkArgument: event.target.value })}
+                        />
+                      </div>
+                      <p className="text-xs text-slate-500">
+                        {t("tools.mcp.signedUploads.namesNotCheckedHint")}
+                      </p>
+                    </>
+                  )}
+
+                  {row.mode !== "link" && (
+                  <>
                   {row.mode === "replacement" && (
                     <>
                       <div className="space-y-2">
@@ -430,6 +548,10 @@ export function SignedUploadsForm({
                       {t("tools.mcp.signedUploads.addContentType")}
                     </Button>
                   </div>
+                  </>
+                  )}
+                  </>
+                  )}
                 </div>
               )
             })}
@@ -449,6 +571,7 @@ export function SignedUploadsForm({
                 mode: "replacement",
                 toolName: "",
                 fileArgument: "",
+                linkArgument: "",
                 issuingToolName: "",
                 hostsText: "",
                 uploadPathPrefix: "",

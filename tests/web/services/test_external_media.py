@@ -242,16 +242,22 @@ def test_issue_rejects_invalid_s2s_value(monkeypatch):
     assert calls == []
 
 
-def test_issue_rejects_cross_task_record():
+@pytest.mark.parametrize(
+    ("user_id", "task_id"), [(7, 12), (8, 11)], ids=["other-task", "other-user"]
+)
+@pytest.mark.parametrize(
+    "purpose", ["instagram-publish", "facebook-publish", "connector-image"]
+)
+def test_issue_rejects_cross_task_record(purpose, user_id, task_id):
     file_id = str(uuid4())
 
     with pytest.raises(external_media.ExternalMediaNotFound):
         external_media.issue_external_media_url(
             _DB(_record(file_id)),
             file_id=file_id,
-            user_id=7,
-            task_id=12,
-            purpose=external_media.ExternalMediaPurpose.INSTAGRAM_PUBLISH,
+            user_id=user_id,
+            task_id=task_id,
+            purpose=_purpose(purpose),
         )
 
 
@@ -974,7 +980,17 @@ def test_issue_instagram_reads_the_jpeg_scan_layout_from_its_markers(
         assert issue().url.startswith("https://api.example.test/")
 
 
-def _facebook_issue(monkeypatch, tmp_path, *, name="post.png", write=None):
+# Both purposes deliver the stored bytes as they are, under the same image rules.
+BYTE_PURPOSES = ["facebook-publish", "connector-image"]
+
+
+def _purpose(value):
+    return external_media.ExternalMediaPurpose(value)
+
+
+def _facebook_issue(
+    monkeypatch, tmp_path, *, name="post.png", write=None, purpose="facebook-publish"
+):
     uploads_dir = tmp_path / "uploads"
     source = uploads_dir / "user_7" / "web_task_11" / name
     source.parent.mkdir(parents=True)
@@ -997,23 +1013,24 @@ def _facebook_issue(monkeypatch, tmp_path, *, name="post.png", write=None):
         file_id=file_id,
         user_id=7,
         task_id=11,
-        purpose=external_media.ExternalMediaPurpose.FACEBOOK_PUBLISH,
+        purpose=_purpose(purpose),
     )
     return db, file_id, issued
 
 
-def test_issue_facebook_ticket_names_its_purpose(monkeypatch, tmp_path):
+@pytest.mark.parametrize("purpose", BYTE_PURPOSES)
+def test_issue_facebook_ticket_names_its_purpose(monkeypatch, tmp_path, purpose):
     # Why: the delivery route decides whether to normalize by the ticket's
     # purpose, so a Facebook ticket must carry the Facebook purpose.
     monkeypatch.setenv("XAGENT_PUBLIC_API_BASE_URL", "https://api.example.test")
-    db, file_id, issue = _facebook_issue(monkeypatch, tmp_path)
+    db, file_id, issue = _facebook_issue(monkeypatch, tmp_path, purpose=purpose)
 
     ticket = parse_qs(urlsplit(issue().url).query)["ticket"][0]
     redeemed = external_media.redeem_external_media_ticket(
         db, file_id=file_id, ticket=ticket
     )
 
-    assert redeemed.purpose is external_media.ExternalMediaPurpose.FACEBOOK_PUBLISH
+    assert redeemed.purpose is _purpose(purpose)
     assert redeemed.media_type == "image/png"
 
 
@@ -1026,26 +1043,40 @@ def test_issue_facebook_ticket_names_its_purpose(monkeypatch, tmp_path):
             lambda path: Image.new("RGB", (8, 8)).save(path, "GIF"),
             "PNG or JPEG",
         ),
+        (
+            "post.png",
+            lambda path: Image.new("RGB", (8, 8)).save(path, "GIF"),
+            "PNG or JPEG",
+        ),
         ("post.png", lambda path: path.write_bytes(b"x" * 64), "10 MB"),
     ],
 )
+@pytest.mark.parametrize("purpose", BYTE_PURPOSES)
 def test_issue_facebook_rejects_what_the_page_cannot_take(
-    monkeypatch, tmp_path, name, write, message
+    monkeypatch, tmp_path, name, write, message, purpose
 ):
     # Why: an image the URL path cannot deliver must fail at issue, before a
     # ticket exists, as its own error so native grants can fall back to the
     # connector's upload; the size cap matches the connector's.
     monkeypatch.setenv("XAGENT_PUBLIC_API_BASE_URL", "https://api.example.test")
+    if purpose == "connector-image":
+        # The connector-image purpose also delivers WebP, and says so.
+        message = message.replace("PNG or JPEG", "PNG, JPEG or WebP")
     if message == "10 MB":
         monkeypatch.setattr(external_media, "FACEBOOK_MAX_IMAGE_BYTES", 32)
-    _, _, issue = _facebook_issue(monkeypatch, tmp_path, name=name, write=write)
+    _, _, issue = _facebook_issue(
+        monkeypatch, tmp_path, name=name, write=write, purpose=purpose
+    )
 
     with pytest.raises(external_media.ExternalMediaUnsupportedImage, match=message):
         issue()
 
 
+@pytest.mark.parametrize("purpose", BYTE_PURPOSES)
 @pytest.mark.parametrize("base", [None, "http://api.example.test"])
-def test_issue_without_a_public_https_base_is_not_configured(monkeypatch, base):
+def test_issue_without_a_public_https_base_is_not_configured(
+    monkeypatch, base, purpose
+):
     # Why: the adapter falls back to a native upload only for this case, so it
     # must be its own error, distinct from an image that cannot be delivered.
     monkeypatch.delenv("XAGENT_PUBLIC_API_BASE_URL", raising=False)
@@ -1059,11 +1090,12 @@ def test_issue_without_a_public_https_base_is_not_configured(monkeypatch, base):
             file_id=file_id,
             user_id=7,
             task_id=11,
-            purpose=external_media.ExternalMediaPurpose.FACEBOOK_PUBLISH,
+            purpose=_purpose(purpose),
         )
 
 
-def test_issue_facebook_rejects_a_truncated_image(monkeypatch, tmp_path):
+@pytest.mark.parametrize("purpose", BYTE_PURPOSES)
+def test_issue_facebook_rejects_a_truncated_image(monkeypatch, tmp_path, purpose):
     # Why: a header that parses is not enough; Meta would fail to fetch a
     # truncated body, and it must fall back while the native upload still can.
     monkeypatch.setenv("XAGENT_PUBLIC_API_BASE_URL", "https://api.example.test")
@@ -1072,7 +1104,9 @@ def test_issue_facebook_rejects_a_truncated_image(monkeypatch, tmp_path):
         Image.new("RGB", (640, 640), "blue").save(path)
         path.write_bytes(path.read_bytes()[:-40])
 
-    _, _, issue = _facebook_issue(monkeypatch, tmp_path, write=truncated_png)
+    _, _, issue = _facebook_issue(
+        monkeypatch, tmp_path, write=truncated_png, purpose=purpose
+    )
 
     with pytest.raises(external_media.ExternalMediaUnsupportedImage, match="decoded"):
         issue()
@@ -1127,7 +1161,8 @@ def _jpeg(kind: str) -> bytes:
 @pytest.mark.parametrize(
     "kind", ["plain", "exif thumbnail", "MPO with an EXIF thumbnail"]
 )
-def test_issue_facebook_rejects_a_truncated_jpeg(monkeypatch, tmp_path, kind):
+@pytest.mark.parametrize("purpose", BYTE_PURPOSES)
+def test_issue_facebook_rejects_a_truncated_jpeg(monkeypatch, tmp_path, kind, purpose):
     # Why: JPEG's verify() parses only the header, so a JPEG cut short by an
     # interrupted write would get a URL that Meta then fails to fetch, and a
     # native grant would lose its upload fallback. An EXIF thumbnail ends with
@@ -1146,6 +1181,7 @@ def test_issue_facebook_rejects_a_truncated_jpeg(monkeypatch, tmp_path, kind):
         tmp_path,
         name="post.jpg",
         write=lambda path: path.write_bytes(truncated),
+        purpose=purpose,
     )
 
     with pytest.raises(external_media.ExternalMediaUnsupportedImage, match="decoded"):
@@ -1162,7 +1198,8 @@ def test_issue_facebook_rejects_a_truncated_jpeg(monkeypatch, tmp_path, kind):
         "trailing data",
     ],
 )
-def test_issue_facebook_accepts_a_complete_jpeg(monkeypatch, tmp_path, kind):
+@pytest.mark.parametrize("purpose", BYTE_PURPOSES)
+def test_issue_facebook_accepts_a_complete_jpeg(monkeypatch, tmp_path, kind, purpose):
     # Why: the end-marker check must not refuse whole JPEGs: progressive ones
     # with several scans, ones carrying an EXIF thumbnail, MPO files whose
     # extra images follow the main image's end marker, and files with other
@@ -1176,6 +1213,7 @@ def test_issue_facebook_accepts_a_complete_jpeg(monkeypatch, tmp_path, kind):
         tmp_path,
         name="post.jpg",
         write=lambda path: path.write_bytes(content),
+        purpose=purpose,
     )
 
     assert issue().url.startswith("https://api.example.test/")
@@ -1197,11 +1235,14 @@ def test_delivered_image_type_keeps_the_registered_type_for_other_bytes(
     )
 
 
-def test_issue_facebook_read_failure_is_not_an_unsupported_image(monkeypatch, tmp_path):
+@pytest.mark.parametrize("purpose", BYTE_PURPOSES)
+def test_issue_facebook_read_failure_is_not_an_unsupported_image(
+    monkeypatch, tmp_path, purpose
+):
     # Why: an IO failure is a storage problem, not the image's fault; it must
     # stay base ExternalMediaUnavailable so the adapter does not fall back.
     monkeypatch.setenv("XAGENT_PUBLIC_API_BASE_URL", "https://api.example.test")
-    _, _, issue = _facebook_issue(monkeypatch, tmp_path)
+    _, _, issue = _facebook_issue(monkeypatch, tmp_path, purpose=purpose)
 
     reader = MagicMock()
     reader.__enter__.return_value.read.side_effect = OSError("Input/output error")
@@ -1214,13 +1255,14 @@ def test_issue_facebook_read_failure_is_not_an_unsupported_image(monkeypatch, tm
 
 @pytest.mark.timeout(5)
 @pytest.mark.parametrize("swapped", ["file", "directory", "fifo"])
+@pytest.mark.parametrize("purpose", BYTE_PURPOSES)
 def test_issue_facebook_refuses_a_path_swapped_after_materialization(
-    monkeypatch, tmp_path, swapped
+    monkeypatch, tmp_path, swapped, purpose
 ):
     # The sandbox can replace an output after materialization. Signing must
     # neither follow the new link nor block on a FIFO, before any ticket exists.
     monkeypatch.setenv("XAGENT_PUBLIC_API_BASE_URL", "https://api.example.test")
-    db, _, issue = _facebook_issue(monkeypatch, tmp_path)
+    db, _, issue = _facebook_issue(monkeypatch, tmp_path, purpose=purpose)
     source = Path(db.record.storage_path)
     other = tmp_path / "other" / source.name
     other.parent.mkdir()
@@ -1337,11 +1379,12 @@ def test_issue_instagram_refuses_a_path_swapped_after_materialization(
     assert tickets == []
 
 
-def test_issue_facebook_bounds_read_when_file_grows(monkeypatch, tmp_path):
+@pytest.mark.parametrize("purpose", BYTE_PURPOSES)
+def test_issue_facebook_bounds_read_when_file_grows(monkeypatch, tmp_path, purpose):
     # Grow a real, initially valid image immediately before reading. Count the
     # bytes actually returned: checking len() after an unbounded read is too late.
     monkeypatch.setenv("XAGENT_PUBLIC_API_BASE_URL", "https://api.example.test")
-    db, _, issue = _facebook_issue(monkeypatch, tmp_path)
+    db, _, issue = _facebook_issue(monkeypatch, tmp_path, purpose=purpose)
     source = Path(db.record.storage_path)
     source_inode = source.stat().st_ino
     limit = source.stat().st_size
@@ -1477,3 +1520,164 @@ def test_issue_local_only_copy_outside_uploads_is_out_of_scope(monkeypatch, tmp_
             task_id=11,
             purpose=external_media.ExternalMediaPurpose.FACEBOOK_PUBLISH,
         )
+
+
+# ---------------------------------------------------------------------------
+# connector-image purpose
+# ---------------------------------------------------------------------------
+
+
+def _image_bytes(image_format: str, **save) -> bytes:
+    output = BytesIO()
+    Image.effect_noise((96, 64), 64).convert("RGB").save(output, image_format, **save)
+    return output.getvalue()
+
+
+WEBP = _image_bytes("WEBP", lossless=True)
+
+
+def _connector_issue(monkeypatch, tmp_path, name, content, purpose="connector-image"):
+    monkeypatch.setenv("XAGENT_PUBLIC_API_BASE_URL", "https://api.example.test")
+    return _facebook_issue(
+        monkeypatch,
+        tmp_path,
+        name=name,
+        write=lambda path: path.write_bytes(content),
+        purpose=purpose,
+    )
+
+
+@pytest.mark.parametrize(
+    ("name", "content", "media_type"),
+    [
+        ("logo.png", _image_bytes("PNG"), "image/png"),
+        ("logo.jpg", _image_bytes("JPEG"), "image/jpeg"),
+        ("logo.webp", WEBP, "image/webp"),
+        ("logo.webp", _image_bytes("WEBP", quality=80), "image/webp"),
+        ("LOGO.WEBP", WEBP, "image/webp"),
+    ],
+)
+def test_issue_connector_image_accepts_png_jpeg_and_webp(
+    monkeypatch, tmp_path, name, content, media_type
+):
+    db, file_id, issue = _connector_issue(monkeypatch, tmp_path, name, content)
+
+    ticket = parse_qs(urlsplit(issue().url).query)["ticket"][0]
+    redeemed = external_media.redeem_external_media_ticket(
+        db, file_id=file_id, ticket=ticket
+    )
+
+    assert redeemed.purpose is external_media.ExternalMediaPurpose.CONNECTOR_IMAGE
+    assert redeemed.media_type == media_type
+
+
+@pytest.mark.parametrize(
+    ("content", "valid"),
+    [
+        pytest.param(WEBP, True, id="whole-file"),
+        pytest.param(WEBP[:-20], False, id="cut-short"),
+        pytest.param(WEBP + b"\x00\x00\x00\x00", False, id="extra-trailing-bytes"),
+        pytest.param(WEBP[:8], False, id="riff-header-only"),
+        pytest.param(WEBP[:8] + b"WAVE" + WEBP[12:], False, id="not-a-webp-form"),
+    ],
+)
+def test_issue_connector_image_checks_the_webp_riff_header(
+    monkeypatch, tmp_path, content, valid
+):
+    # Why: the RIFF length field says how many bytes the file holds, so a WebP
+    # cut short by an interrupted write, or carrying bytes past its end, is
+    # refused before a ticket exists.
+    tickets = _count_encode_calls(monkeypatch)
+    _, _, issue = _connector_issue(monkeypatch, tmp_path, "logo.webp", content)
+
+    if valid:
+        assert issue().url.startswith("https://api.example.test/")
+        return
+    with pytest.raises(
+        external_media.ExternalMediaUnsupportedImage,
+        match="^Registered image could not be decoded as PNG, JPEG or WebP$",
+    ):
+        issue()
+    assert tickets == []
+
+
+ONLY_CONNECTOR = "Only PNG, JPEG or WebP images can be delivered"
+ONLY_IG_FB = "Only PNG or JPEG images can be delivered"
+
+
+@pytest.mark.parametrize(
+    ("purpose", "name", "message"),
+    [
+        ("connector-image", "logo.gif", ONLY_CONNECTOR),
+        ("connector-image", "logo.svg", ONLY_CONNECTOR),
+        ("connector-image", "logo", ONLY_CONNECTOR),
+        # WebP is accepted for the connector-image purpose only.
+        ("instagram-publish", "logo.webp", ONLY_IG_FB),
+        ("facebook-publish", "logo.webp", ONLY_IG_FB),
+        (
+            "facebook-publish",
+            "post.png",
+            "Registered image could not be decoded as PNG or JPEG",
+        ),
+    ],
+)
+def test_issue_refuses_an_image_outside_the_purpose_types(
+    monkeypatch, tmp_path, purpose, name, message
+):
+    tickets = _count_encode_calls(monkeypatch)
+    _, _, issue = _connector_issue(monkeypatch, tmp_path, name, WEBP, purpose)
+
+    with pytest.raises(external_media.ExternalMediaUnsupportedImage) as raised:
+        issue()
+    assert str(raised.value) == message
+    assert tickets == []
+
+
+def test_issue_with_a_purpose_that_has_no_branch_fails_closed(monkeypatch, tmp_path):
+    monkeypatch.setenv("XAGENT_PUBLIC_API_BASE_URL", "https://api.example.test")
+    tickets = _count_encode_calls(monkeypatch)
+    db, file_id, _ = _facebook_issue(monkeypatch, tmp_path)
+
+    with pytest.raises(
+        external_media.ExternalMediaUnavailable,
+        match="^External media purpose is not supported$",
+    ):
+        external_media.issue_external_media_url(
+            db,
+            file_id=file_id,
+            user_id=7,
+            task_id=11,
+            purpose="not-a-purpose",  # type: ignore[arg-type]
+        )
+    assert tickets == []
+
+
+@pytest.mark.parametrize(
+    "purpose", [member.value for member in external_media.ExternalMediaPurpose]
+)
+def test_every_purpose_has_an_explicit_branch_at_issue(monkeypatch, tmp_path, purpose):
+    # Why: a purpose added to the enum without a branch fails closed at issue,
+    # so this fails until that purpose is handled.
+    monkeypatch.setenv("XAGENT_PUBLIC_API_BASE_URL", "https://api.example.test")
+    _, _, issue = _facebook_issue(monkeypatch, tmp_path, purpose=purpose)
+
+    assert issue().url.startswith("https://api.example.test/")
+
+
+@pytest.mark.parametrize(
+    ("content", "registered", "expected"),
+    [
+        (WEBP, "image/png", "image/webp"),
+        (_image_bytes("PNG"), "image/webp", "image/png"),
+        (_image_bytes("JPEG"), "image/webp", "image/jpeg"),
+        (_image_bytes("GIF"), "image/webp", "image/webp"),
+        (b"RIFF\x04\x00\x00\x00WAVE", "image/png", "image/png"),
+    ],
+)
+def test_delivered_connector_image_type_is_read_from_the_signature(
+    content, registered, expected
+):
+    assert (
+        external_media.delivered_connector_image_media_type(content, registered)
+        == expected
+    )

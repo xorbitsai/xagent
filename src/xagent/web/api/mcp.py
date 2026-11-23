@@ -162,7 +162,7 @@ MCP_OAUTH_TOKEN_ENDPOINT_AUTH_METHODS = frozenset(
     {"none", "client_secret_post", "client_secret_basic"}
 )
 _SIGNED_UPLOADS_FIELD_DESCRIPTION = (
-    "Signed-upload settings: a list of objects of two forms, told apart by "
+    "Signed-upload settings: a list of objects of three forms, told apart by "
     "their keys. A replacement entry names a tool that takes a workspace file "
     "and has exactly the keys tool_name, file_argument, issuing_tool_name, "
     "allowed_upload_hosts, upload_path_prefix and content_types; when the model "
@@ -173,8 +173,20 @@ _SIGNED_UPLOADS_FIELD_DESCRIPTION = (
     "same name that takes a file:<id> reference, uploads that file when it is "
     "called, before any later tool call, and returns the connector's file_id "
     "(never the upload URL), which the model passes to the tool that takes the "
-    "file. In both forms the URL must be HTTPS on one of allowed_upload_hosts "
-    "under upload_path_prefix. One issuing tool cannot be used by both forms. "
+    "file. A link entry has exactly the keys tool_name and link_argument and "
+    "names a tool that takes a download URL; link_argument must be a top-level "
+    'property of type "string", of type ["string", "null"], or an anyOf of one '
+    'string branch and one {"type": "null"} branch, or the entry is not used. '
+    "When the model passes a file:<id> "
+    "reference to a PNG, JPEG or WebP image of at most 10 MB in link_argument, "
+    "the host replaces it with an HTTPS download link valid for the external "
+    "media URL lifetime (10 minutes by default); the legacy file://<id> form "
+    "and, when the call has a workspace, a bare file id are treated the same, "
+    "and any other value is passed through unchanged. If the link cannot be "
+    "made, the tool is not called. In the first two forms the URL must be "
+    "HTTPS on one of allowed_upload_hosts under upload_path_prefix. One "
+    "issuing tool cannot be used by both of those forms. A tool has at most "
+    "one link entry, and one argument cannot be both replaced and linked. "
     "Used only on sse and streamable_http connectors; null and [] mean none. "
     "Only the connector's owner or a platform administrator can change it. "
     "Stored settings that cannot be used make the connector unavailable with "

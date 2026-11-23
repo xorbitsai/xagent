@@ -739,3 +739,49 @@ def test_non_owner_cannot_change_issuer_entries() -> None:
     assert resp.status_code == 403, resp.text
     assert resp.json()["detail"] == OWNER_ONLY_DETAIL
     assert _row(server_id) == before
+
+
+LINK_ENTRY = {"tool_name": "set_logo", "link_argument": "image_url"}
+
+
+@pytest.mark.parametrize("transport", ["streamable_http", "sse"])
+def test_api_accepts_link_entries_beside_a_replacement_entry(transport: str) -> None:
+    _admin_headers()
+    owner = _register_second_user("bob", "bobpass1")
+    entries = [SIGNED_UPLOADS[0], LINK_ENTRY]
+
+    resp = _create(owner, transport=transport, signed_uploads=entries)
+
+    assert resp.status_code == 201, resp.text
+    assert resp.json()["signed_uploads"] == entries
+    assert resp.json()["signed_uploads_error"] is None
+    server_id = int(resp.json()["id"])
+    assert _row(server_id)["signed_uploads"] == entries
+    detail = client.get(f"/api/mcp/servers/{server_id}", headers=owner)
+    assert detail.json()["signed_uploads"] == entries
+    assert detail.json()["signed_uploads_error"] is None
+
+
+@pytest.mark.parametrize("mode", ["create", "update"])
+def test_save_rejects_clashing_link_entries(mode: str) -> None:
+    _admin_headers()
+    owner = _register_second_user("bob", "bobpass1")
+    clashing = [LINK_ENTRY, {**LINK_ENTRY, "link_argument": "other_url"}]
+    if mode == "create":
+        resp = _create(owner, signed_uploads=clashing)
+        server_id = None
+    else:
+        server_id = _create_ok(owner, signed_uploads=[LINK_ENTRY])
+        before = _row(server_id)
+        resp = client.put(
+            f"/api/mcp/servers/{server_id}",
+            json={"signed_uploads": clashing},
+            headers=owner,
+        )
+
+    assert resp.status_code == 400, resp.text
+    assert resp.json()["detail"] == _invalid_detail(
+        "signed_uploads[1].tool_name has another link entry"
+    )
+    if server_id is not None:
+        assert _row(server_id) == before

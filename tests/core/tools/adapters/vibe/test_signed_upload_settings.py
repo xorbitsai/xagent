@@ -26,6 +26,7 @@ from xagent.core.tools.adapters.vibe.selection_spec import (
 from xagent.core.tools.adapters.vibe.signed_upload import (
     SignedUploadBinding,
     SignedUploadIssuer,
+    SignedUploadLink,
     connection_signed_uploads,
     parse_signed_upload_response,
     parse_signed_upload_settings,
@@ -1615,3 +1616,148 @@ async def test_hide_only_entry_hides_the_issuing_tool_without_a_wrapper(
     assert _gated_targets(result)["mcp_docs_other"]._signed_upload is None
     assert result.failures == ()
     assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+
+
+# ---------------------------------------------------------------------------
+# Link entries
+# ---------------------------------------------------------------------------
+
+
+def _link_entry(**overrides: Any) -> dict[str, Any]:
+    return {"tool_name": "set_logo", "link_argument": "image_url", **overrides}
+
+
+def _link(**overrides: Any) -> SignedUploadLink:
+    return SignedUploadLink(
+        **{"connection_host": CONNECTION_HOST, **_link_entry(**overrides)}
+    )
+
+
+@pytest.mark.parametrize("transport", ["streamable_http", "sse"])
+def test_link_entries_are_read_in_stored_order_among_other_entries(
+    transport: str,
+) -> None:
+    raw = [_link_entry(), _entry(), _issuer_entry(issuing_tool_name="issue")]
+
+    parsed = connection_signed_uploads(_connection(transport, signed_uploads=raw))
+
+    assert parsed[0] == _link()
+    assert [type(entry) for entry in parsed[1:]] == [
+        SignedUploadBinding,
+        SignedUploadIssuer,
+    ]
+
+
+@pytest.mark.parametrize(
+    ("entry", "message"),
+    [
+        pytest.param({"tool_name": "set_logo"}, _exactly(KEYS), id="tool-name-only"),
+        pytest.param(
+            {**_link_entry(), "file_argument": "document"},
+            _exactly(KEYS),
+            id="plus-file-argument",
+        ),
+        pytest.param(_with_key(_link_entry(), "extra"), _exactly(KEYS), id="extra"),
+        pytest.param(
+            _link_entry(tool_name=""),
+            _exactly("signed_uploads[0].tool_name must be a non-empty string"),
+            id="empty-tool-name",
+        ),
+        pytest.param(
+            _link_entry(link_argument=None),
+            _exactly("signed_uploads[0].link_argument must be a non-empty string"),
+            id="link-argument-not-a-string",
+        ),
+        pytest.param(
+            _link_entry(link_argument="a" * 256),
+            _exactly("signed_uploads[0].link_argument must not be longer than 255"),
+            id="link-argument-too-long",
+        ),
+    ],
+)
+def test_link_entry_rejects_wrong_keys_and_invalid_strings(
+    entry: dict[str, Any], message: str
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        _parse([entry])
+
+
+LINK_CLASHES = [
+    pytest.param(
+        [_link_entry(), _link_entry(link_argument="b"), _link_entry()],
+        "signed_uploads[1].tool_name has another link entry",
+        id="two-link-entries-same-tool",
+    ),
+    pytest.param(
+        [_link_entry(), _entry(tool_name="set_logo", file_argument="image_url")],
+        "a tool argument cannot be both uploaded and linked",
+        id="same-tool-same-argument-as-binding",
+    ),
+    pytest.param(
+        [_link_entry(tool_name="request_upload"), _entry()],
+        "an issuing tool cannot take a link argument",
+        id="link-tool-is-a-binding-issuing-tool",
+    ),
+    pytest.param(
+        [_issuer_entry(), _link_entry(tool_name="request_upload")],
+        "an issuing tool cannot take a link argument",
+        id="link-tool-is-an-issuer-tool",
+    ),
+]
+
+
+@pytest.mark.parametrize(("raw", "message"), LINK_CLASHES)
+def test_link_entries_clash(raw: Any, message: str) -> None:
+    with pytest.raises(ValueError, match=_exactly(message)):
+        _parse(raw)
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        pytest.param(
+            [_entry(tool_name="set_logo", file_argument="document"), _link_entry()],
+            id="same-tool-different-argument-as-binding",
+        ),
+        pytest.param(
+            [_link_entry(), _link_entry(tool_name="set_banner")],
+            id="two-link-entries-different-tools",
+        ),
+        pytest.param(
+            [_link_entry(tool_name="set_banner"), _issuer_entry()],
+            id="link-beside-an-issuer",
+        ),
+    ],
+)
+def test_link_entries_accept_compatible_entries(raw: Any) -> None:
+    assert len(_parse(raw)) == len(raw)
+
+
+def test_an_entry_of_an_unknown_kind_is_an_error() -> None:
+    # The pairwise checks must name every entry kind; a kind they do not know
+    # is an error, never read as one of the others.
+    with pytest.raises(
+        ValueError, match=_exactly("signed_uploads entry has an unknown kind")
+    ):
+        signed_upload._check_entries_together([object()])  # type: ignore[list-item]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("raw", "message"), LINK_CLASHES)
+async def test_invalid_link_settings_fail_the_whole_server(
+    monkeypatch: pytest.MonkeyPatch, raw: Any, message: str
+) -> None:
+    opened = _serve_tools(monkeypatch, *_ALL_TOOLS)
+
+    result = await _load({"A": _connection(signed_uploads=raw), "B": _connection()})
+
+    assert [f for f in result.failures if f.server_name == "A"] == [
+        MCPServerLoadFailure(
+            server_name="A",
+            phase=MCPFailurePhase.INVALID_CONFIGURATION,
+            error_type="ValueError",
+            attempts=0,
+        )
+    ]
+    assert not [tool for tool in result.tools if tool.name.startswith("mcp_A_")]
+    assert len(opened) == 1  # only B was contacted

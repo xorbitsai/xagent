@@ -83,7 +83,7 @@ by these application-client changes alone.
 An `sse` or `streamable_http` connector can carry `signed_uploads`, set with
 `POST /api/mcp/servers` or `PUT /api/mcp/servers/{server_id}`. The value is a
 list of at most 20 objects; `null` and `[]` mean none. An object takes one of
-two forms, told apart by its keys, and the two can share a list.
+three forms, told apart by its keys, and the three can share a list.
 
 A replacement entry is for a tool that takes a workspace file. It has exactly
 these keys:
@@ -125,18 +125,47 @@ An approval gate that pauses the tool which takes the file does not hold the
 upload back, because the bytes leave when the file id is requested; a gate
 decides on the upload tool by its own name.
 
-One issuing tool cannot be used by both forms, and two issuer entries cannot
-name the same issuing tool.
+A link entry is for a tool that takes a download URL instead of a file. It has
+exactly these keys:
+
+```json
+[{"tool_name": "attach_picture", "link_argument": "image_url"}]
+```
+
+When the model passes `file:<id>` in `link_argument` and that file is a PNG,
+JPEG or WebP image of at most 10 MB, the host replaces the value with an HTTPS
+download link that is valid for the external media URL lifetime (10 minutes by
+default), and the connector's own server fetches the image from it. The legacy
+`file://<id>` form, and a bare file id when the call has a workspace, are
+treated the same way. Any other value in that argument is passed through
+unchanged. If the link cannot be made, because the file does not exist, is not
+such an image or is too large, the tool is not called and the model gets a fixed
+refusal. A link entry needs no upload hosts, because the host uploads nothing.
+A tool has at most one link entry, one argument cannot be both replaced and
+linked, and an issuing tool cannot take a link argument.
+
+The tool's input schema must declare `link_argument` as a top-level property
+that takes a string: `{"type": "string"}`, `{"type": ["string", "null"]}`, or
+an `anyOf` of exactly one `{"type": "string"}` branch and one `{"type": "null"}`
+branch, which is how Pydantic and FastMCP describe an optional string. A
+`maxLength` is read from the property, or from the string branch of such an
+`anyOf`. With any other schema, or when a runtime binding fills that argument,
+the entry is not used: the tool loads without it and the host logs a warning.
+
+One issuing tool cannot be used by both of the first two forms, and two issuer
+entries cannot name the same issuing tool.
 
 The setting decides which outside hosts receive task files, so only the
-connector's owner or a platform administrator can change it. The URL must be
-HTTPS without a port or user info, on one of `allowed_upload_hosts`, under
-`upload_path_prefix`, and the request uses the public-address egress policy of
-remote MCP sessions.
+connector's owner or a platform administrator can change it. In the first two
+forms, the URL must be HTTPS without a port or user info, on one of
+`allowed_upload_hosts`, under `upload_path_prefix`, and the request uses the
+public-address egress policy of remote MCP sessions.
 
-Both forms have the host call the issuing tool itself. At log level DEBUG the
-MCP SDK can log server messages in full, which includes the issuing tool's
-reply and so its signed URL. The default level, INFO, does not. And if the
+At log level DEBUG the MCP SDK can log the messages it sends to and receives
+from the connector in full. In the first two forms the host calls the issuing
+tool itself, so such a log includes the issuing tool's reply and so its signed
+URL. With a link entry it includes the tool call that carries the download
+link and its ticket. The default level, INFO, logs neither. And if the
 connector also accepts its issuing tool through a dispatcher tool (for example
 `call_tool(name="request_upload", ...)`), the model can still reach the issuing
 tool that way and see its reply, because the host does not know the
@@ -154,6 +183,35 @@ the issuing tool, while an issuer entry would make it mark the connector
 unavailable. Do not clear the settings instead: without them the older version
 offers the issuing tool to the model again. After rolling forward, restore the
 issuer entry.
+
+Save a link entry only after every instance of the deployment runs this
+version. A version that does not know link entries reads the connector's
+settings as invalid and makes the connector unavailable with
+`invalid_configuration`.
+
+Before rolling a deployment back to a version that does not know link entries,
+remove the link entries; the connector then only stops replacing images with
+links. On PostgreSQL, run in each database:
+
+```sql
+-- Connectors with a link entry
+SELECT id, name FROM mcp_servers
+WHERE signed_uploads IS NOT NULL
+  AND json_typeof(signed_uploads) = 'array'
+  AND EXISTS (SELECT 1 FROM json_array_elements(signed_uploads) e WHERE e::jsonb ? 'link_argument');
+-- Remove only the link entries, keeping the other entries in order
+UPDATE mcp_servers SET signed_uploads = (
+  SELECT COALESCE(json_agg(t.e ORDER BY t.n), '[]'::json)
+  FROM json_array_elements(signed_uploads) WITH ORDINALITY AS t(e, n)
+  WHERE NOT (t.e::jsonb ? 'link_argument'))
+WHERE id IN (<ids from the first query>) AND json_typeof(signed_uploads) = 'array';
+```
+
+The column is `json`, so each element is cast to `jsonb` for `?`. On another
+database, such as the default SQLite, update each affected connector through
+`PUT /api/mcp/servers/{server_id}` with its `signed_uploads` minus the link
+entries, as the connector's owner or a platform administrator connected to it.
+After rolling forward, add the link entries again.
 
 Settings that cannot be used fail closed: the web runtime marks the whole
 connector unavailable with reason `invalid_configuration`, and

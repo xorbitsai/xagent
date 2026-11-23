@@ -80,6 +80,8 @@ from ..services.external_media import (
     ExternalMediaPurpose,
     ExternalMediaTicketRejected,
     ExternalMediaUnavailable,
+    connector_image_filename,
+    delivered_connector_image_media_type,
     delivered_image_media_type,
     instagram_image_requires_normalization,
     instagram_jpeg_bytes,
@@ -1794,13 +1796,28 @@ def external_media_file(
             file_id=file_id,
             ticket=ticket,
         )
-    except ExternalMediaTicketRejected:
+    except ExternalMediaTicketRejected as exc:
+        if exc.purpose is ExternalMediaPurpose.CONNECTOR_IMAGE:
+            _log_connector_image_refusal(exc.file_id, exc.reason)
         raise HTTPException(
             status_code=401,
             detail="Invalid or expired external media ticket",
         ) from None
 
     record = redeemed.record
+    instagram = redeemed.purpose is ExternalMediaPurpose.INSTAGRAM_PUBLISH
+    connector_image = redeemed.purpose is ExternalMediaPurpose.CONNECTOR_IMAGE
+    if not (
+        instagram
+        or connector_image
+        or redeemed.purpose is ExternalMediaPurpose.FACEBOOK_PUBLISH
+    ):
+        # A purpose with no delivery branch is refused like an invalid ticket,
+        # so the set of purposes is not revealed.
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid or expired external media ticket",
+        )
     file_ref = ManagedFileRef(record)
     try:
         path = file_ref.materialize(
@@ -1809,10 +1826,16 @@ def external_media_file(
             )
         )
     except DurableObjectIntegrityError as exc:
+        if connector_image:
+            _log_connector_image_refusal(str(record.file_id), "integrity_failed")
         raise _file_integrity_failed() from exc
     except (DurableObjectMissingError, FilePublicationUnavailable) as exc:
+        if connector_image:
+            _log_connector_image_refusal(str(record.file_id), "file_unavailable")
         raise HTTPException(status_code=404, detail="File not found") from exc
     except DurableStorageOperationError as exc:
+        if connector_image:
+            _log_connector_image_refusal(str(record.file_id), "storage_unavailable")
         _raise_durable_storage_unavailable(
             exc,
             "external media delivery",
@@ -1824,12 +1847,13 @@ def external_media_file(
         "Referrer-Policy": "no-referrer",
         "X-Content-Type-Options": "nosniff",
     }
-    instagram = redeemed.purpose is ExternalMediaPurpose.INSTAGRAM_PUBLISH
     # Everything sent comes from this one descriptor, opened without following
     # links, so a path replaced after the checks above cannot change the bytes.
     try:
         delivered = open_delivery_file(record, path)
     except OSError:
+        if connector_image:
+            _log_connector_image_refusal(str(record.file_id), "file_unavailable")
         raise HTTPException(status_code=404, detail="File not found") from None
     normalize_for_instagram = False
     with delivered:
@@ -1854,24 +1878,41 @@ def external_media_file(
                         "Registered image exceeds the delivery size limit"
                     )
         except ExternalMediaUnavailable as exc:
+            if connector_image:
+                _log_connector_image_refusal(str(record.file_id), "unprocessable")
             raise HTTPException(status_code=422, detail=str(exc)) from None
         except OSError:
+            if connector_image:
+                _log_connector_image_refusal(str(record.file_id), "file_unavailable")
             raise HTTPException(status_code=404, detail="File not found") from None
 
     filename = str(record.filename)
     if normalize_for_instagram:
         filename = f"{Path(filename).stem}.jpg"
+    if instagram:
+        media_type = "image/jpeg"
+    elif connector_image:
+        media_type = delivered_connector_image_media_type(content, redeemed.media_type)
+        filename = connector_image_filename(str(record.file_id), media_type)
+    else:
+        media_type = delivered_image_media_type(content, redeemed.media_type)
     return Response(
         content=content,
-        media_type=(
-            "image/jpeg"
-            if instagram
-            else delivered_image_media_type(content, redeemed.media_type)
-        ),
+        media_type=media_type,
         headers={
             **response_headers,
             "Content-Disposition": _content_disposition_header("inline", filename),
         },
+    )
+
+
+def _log_connector_image_refusal(file_id: str | None, reason: str) -> None:
+    """Record a refused connector-image delivery; ``reason`` is a bounded label."""
+    logger.warning(
+        "External media delivery refused purpose=%s file_id=%s reason=%s",
+        ExternalMediaPurpose.CONNECTOR_IMAGE.value,
+        file_id,
+        reason,
     )
 
 

@@ -1,8 +1,11 @@
 import { afterEach, describe, expect, it, vi } from "vitest"
 
 import {
+  getBrowserLocationHash,
   getBrowserLocationHostname,
   getBrowserLocationOrigin,
+  getBrowserLocationPathname,
+  getBrowserLocationSearch,
   replaceBrowserLocation,
 } from "./browser-location"
 
@@ -21,6 +24,9 @@ describe("browser location helpers", () => {
 
     expect(getBrowserLocationOrigin()).toBe("")
     expect(getBrowserLocationHostname()).toBe("")
+    expect(getBrowserLocationHash()).toBe("")
+    expect(getBrowserLocationPathname()).toBe("")
+    expect(getBrowserLocationSearch()).toBe("")
   })
 
   it("returns empty strings when location access throws", () => {
@@ -32,6 +38,9 @@ describe("browser location helpers", () => {
 
     expect(getBrowserLocationOrigin()).toBe("")
     expect(getBrowserLocationHostname()).toBe("")
+    expect(getBrowserLocationHash()).toBe("")
+    expect(getBrowserLocationPathname()).toBe("")
+    expect(getBrowserLocationSearch()).toBe("")
   })
 
   it("replaces the current history entry instead of assigning", () => {

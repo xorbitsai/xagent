@@ -197,6 +197,7 @@ _STANDARD_OTEL_EXPORTER_OTLP_ENDPOINT = "OTEL_EXPORTER_OTLP_ENDPOINT"
 _STANDARD_OTEL_METRIC_EXPORT_INTERVAL = "OTEL_METRIC_EXPORT_INTERVAL"
 _STANDARD_OTEL_SERVICE_NAME = "OTEL_SERVICE_NAME"
 MCP_TOOL_INIT_TIMEOUT_SECONDS = "XAGENT_MCP_TOOL_INIT_TIMEOUT_SECONDS"
+MCP_TOOL_DISCOVERY_CACHE_SECONDS = "XAGENT_MCP_TOOL_DISCOVERY_CACHE_SECONDS"
 CONNECTOR_PROBE_USERS = "XAGENT_CONNECTOR_PROBE_USERS"
 CONNECTOR_SMOKE_WRITE_APPS = "XAGENT_CONNECTOR_SMOKE_WRITE_APPS"
 LLM_RETRY_DEADLINE_SECONDS = "XAGENT_LLM_RETRY_DEADLINE_SECONDS"
@@ -4355,6 +4356,25 @@ def get_mcp_tool_init_timeout_seconds() -> int:
         Seconds allowed per MCP server; 0 disables the timeout.
     """
     return _get_positive_int_env(MCP_TOOL_INIT_TIMEOUT_SECONDS, 60, minimum=0)
+
+
+def get_mcp_tool_discovery_cache_seconds() -> int:
+    """Get how long a stdio MCP server's tool listing is reused across builds.
+
+    An agent build learns a stdio server's tools by spawning it and running
+    ``initialize`` + ``tools/list``. A later build that launches the server
+    the same way (same command, args, working directory, encoding and env,
+    credentials included) reuses that listing for this long instead of
+    spawning it again.
+
+    Priority:
+        1. XAGENT_MCP_TOOL_DISCOVERY_CACHE_SECONDS environment variable
+        2. 600
+
+    Returns:
+        Seconds a listing stays reusable; 0 disables the cache.
+    """
+    return _get_positive_int_env(MCP_TOOL_DISCOVERY_CACHE_SECONDS, 600, minimum=0)
 
 
 def get_connector_probe_users() -> frozenset[str]:

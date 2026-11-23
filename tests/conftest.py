@@ -460,6 +460,25 @@ def isolate_task_keyed_process_state() -> Iterator[None]:
     _reset_task_keyed_process_state()
 
 
+def _clear_mcp_discovery_cache() -> None:
+    # Only a test that imported the loader can have filled it.
+    cache = sys.modules.get("xagent.core.tools.adapters.vibe.mcp_discovery_cache")
+    if cache is not None:
+        cache.clear_discovery_cache()
+
+
+@pytest.fixture(autouse=True, scope="function")
+def isolate_mcp_discovery_cache() -> Iterator[None]:
+    """Forget stdio MCP listings remembered across agent builds around every test.
+
+    The cache is process-wide, so a listing one test's fake server returned
+    would otherwise answer a later test that launches a server the same way.
+    """
+    _clear_mcp_discovery_cache()
+    yield
+    _clear_mcp_discovery_cache()
+
+
 @pytest.fixture(autouse=True, scope="function")
 def check_task_extension_registry_leaks() -> Iterator[None]:
     """Fail the test that leaves the task-extension registry changed.

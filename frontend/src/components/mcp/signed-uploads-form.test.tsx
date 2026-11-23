@@ -181,7 +181,8 @@ describe("SignedUploadsForm link entries", () => {
 
   it("shows only the tool name and link argument for a link entry", () => {
     renderForm([LINK])
-    expect(screen.getByLabelText(`${KEY}.toolName`)).toHaveValue("attach_picture")
+    expect(screen.getByLabelText(`${KEY}.linkToolName`)).toHaveValue("attach_picture")
+    expect(screen.queryByLabelText(`${KEY}.toolName`)).not.toBeInTheDocument()
     expect(screen.getByLabelText(`${KEY}.linkArgument`)).toHaveValue("image_url")
     expect(screen.queryByLabelText(`${KEY}.fileArgument`)).not.toBeInTheDocument()
     expect(screen.queryByLabelText(`${KEY}.issuingToolName`)).not.toBeInTheDocument()

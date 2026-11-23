@@ -1515,6 +1515,7 @@ const zh = {
         toolName: "接收文件的工具",
         fileArgument: "文件参数",
         linkArgument: "链接参数",
+        linkToolName: "接收链接的工具",
         issuingToolName: "签发工具",
         toolNamesHint: "请使用连接器提供方文档中的工具名称。",
         linkNamesNotCheckedHint: "保存时不会向连接器核对这些名称。名称不匹配时，该工具的图片不会被换成下载链接。",

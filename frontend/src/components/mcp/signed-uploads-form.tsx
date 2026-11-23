@@ -401,7 +401,7 @@ export function SignedUploadsForm({
                     <>
                       <div className="space-y-2">
                         <Label htmlFor={fieldId("toolName")}>
-                          {t("tools.mcp.signedUploads.toolName")}
+                          {t("tools.mcp.signedUploads.linkToolName")}
                         </Label>
                         <Input
                           id={fieldId("toolName")}

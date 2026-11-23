@@ -100,7 +100,10 @@ class ExternalMediaTicketRejected(ExternalMediaError):
 
     ``purpose`` and ``file_id`` are what the ticket names and the normalized id
     of the requested file, set only when the ticket was read far enough to know
-    the purpose; a ticket that does not decode has neither.
+    the purpose; a ticket that does not decode has neither. ``reason`` is a
+    bounded label for the rejection, ``"expired"`` only for a connector-image
+    ticket whose signature, type, purpose and file verified and whose only
+    defect is its expiry.
     """
 
     def __init__(
@@ -109,10 +112,12 @@ class ExternalMediaTicketRejected(ExternalMediaError):
         *,
         purpose: ExternalMediaPurpose | None = None,
         file_id: str | None = None,
+        reason: str = "ticket_rejected",
     ) -> None:
         super().__init__(message)
         self.purpose = purpose
         self.file_id = file_id
+        self.reason = reason
 
 
 @dataclass(frozen=True)
@@ -340,6 +345,39 @@ def issue_external_media_url(
     )
 
 
+def _expired_ticket_rejection(
+    ticket: str, normalized_file_id: str
+) -> ExternalMediaTicketRejected:
+    """The rejection for an expired ticket, attributed only when it is verified.
+
+    The signature is still checked; only the expiry is waived. The rejection
+    carries the purpose and file only for a connector-image ticket naming the
+    requested file, so a ticket of another purpose or file stays unattributed.
+    """
+    rejected = ExternalMediaTicketRejected("Invalid or expired external media ticket")
+    try:
+        claims = jwt.decode(
+            ticket,
+            JWT_SECRET_KEY,
+            algorithms=[JWT_ALGORITHM],
+            options={"verify_exp": False, "verify_sub": False},
+        )
+    except JWTError:
+        return rejected
+    if (
+        claims.get("type") == EXTERNAL_MEDIA_TICKET_TYPE
+        and claims.get("purpose") == ExternalMediaPurpose.CONNECTOR_IMAGE.value
+        and claims.get("file_id") == normalized_file_id
+    ):
+        return ExternalMediaTicketRejected(
+            "Invalid or expired external media ticket",
+            purpose=ExternalMediaPurpose.CONNECTOR_IMAGE,
+            file_id=normalized_file_id,
+            reason="expired",
+        )
+    return rejected
+
+
 def redeem_external_media_ticket(
     db: Session,
     *,
@@ -356,6 +394,8 @@ def redeem_external_media_ticket(
             algorithms=[JWT_ALGORITHM],
             options={"verify_sub": False},
         )
+    except jwt.ExpiredSignatureError:
+        raise _expired_ticket_rejection(ticket, normalized_file_id) from None
     except (ExternalMediaNotFound, JWTError):
         raise ExternalMediaTicketRejected(
             "Invalid or expired external media ticket"

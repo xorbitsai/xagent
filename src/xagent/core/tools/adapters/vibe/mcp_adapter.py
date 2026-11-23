@@ -3755,6 +3755,23 @@ class MCPToolAdapter(AbstractBaseTool):
                     ) = await self._invocation_connection()
                     if invocation_connection is None:
                         return _delegated_authorization_failed_result()
+                    # A link has no effect outside this host, so it is made
+                    # first: a refused link then ends the call before any
+                    # signed upload sends bytes out. Every entry is bound to
+                    # the host the settings were read from, and a signed upload
+                    # checks any connection it hands back against that host, so
+                    # the link stays valid for the connection used below.
+                    link_replacements: dict[str, str] = {}
+                    if self._signed_upload_link is not None:
+                        try:
+                            (
+                                tool_args,
+                                link_replacements,
+                            ) = await self._substitute_signed_upload_link_args(
+                                invocation_connection, tool_args
+                            )
+                        except _SignedUploadRefused as refused:
+                            return refused.result
                     replacements: dict[str, str] = {}
                     if self._signed_upload is not None:
                         try:
@@ -3768,17 +3785,6 @@ class MCPToolAdapter(AbstractBaseTool):
                                 tool_args,
                                 tool_meta,
                                 was_refreshed=was_refreshed,
-                            )
-                        except _SignedUploadRefused as refused:
-                            return refused.result
-                    link_replacements: dict[str, str] = {}
-                    if self._signed_upload_link is not None:
-                        try:
-                            (
-                                tool_args,
-                                link_replacements,
-                            ) = await self._substitute_signed_upload_link_args(
-                                invocation_connection, tool_args
                             )
                         except _SignedUploadRefused as refused:
                             return refused.result

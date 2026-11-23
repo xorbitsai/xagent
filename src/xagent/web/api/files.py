@@ -1798,7 +1798,7 @@ def external_media_file(
         )
     except ExternalMediaTicketRejected as exc:
         if exc.purpose is ExternalMediaPurpose.CONNECTOR_IMAGE:
-            _log_connector_image_refusal(exc.file_id, "ticket_rejected")
+            _log_connector_image_refusal(exc.file_id, exc.reason)
         raise HTTPException(
             status_code=401,
             detail="Invalid or expired external media ticket",

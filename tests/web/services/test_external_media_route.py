@@ -1077,6 +1077,7 @@ def _delivery_logs(caplog: pytest.LogCaptureFixture) -> list[str]:
         ("bytes-gone", 404, "file_unavailable"),
         ("record-gone", 401, "ticket_rejected"),
         ("wrong-scope", 401, "ticket_rejected"),
+        ("expired", 401, "expired"),
     ],
 )
 def test_route_logs_a_refused_connector_image_by_category(
@@ -1089,10 +1090,15 @@ def test_route_logs_a_refused_connector_image_by_category(
     status: int,
     reason: str,
 ):
-    if case in {"record-gone", "wrong-scope"}:
-        # The ticket decodes and names the purpose, but no record matches it.
+    if case in {"record-gone", "wrong-scope", "expired"}:
+        # The ticket decodes and names the purpose, but no record matches it,
+        # or it is past its expiry.
         file_id = str(uuid4())
-        claims = {"user_id": "7"} if case == "wrong-scope" else {}
+        claims: dict[str, object] = {}
+        if case == "wrong-scope":
+            claims = {"user_id": "7"}
+        elif case == "expired":
+            claims = {"exp": datetime.now(timezone.utc) - timedelta(minutes=1)}
         ticket = _ticket(file_id, purpose="connector-image", **claims)
         path = f"/api/files/external-media/{file_id}?ticket={ticket}"
     else:
@@ -1116,6 +1122,55 @@ def test_route_logs_a_refused_connector_image_by_category(
         f"External media delivery refused purpose=connector-image "
         f"file_id={file_id} reason={reason}"
     ]
+    if case == "expired":
+        assert response.json() == INVALID_TICKET
+        assert ticket_text_absent(caplog, path)
+
+
+def ticket_text_absent(caplog: pytest.LogCaptureFixture, path: str) -> bool:
+    ticket = path.split("ticket=", 1)[1]
+    return all(ticket not in record.getMessage() for record in caplog.records)
+
+
+@pytest.mark.parametrize(
+    "case",
+    ["instagram", "facebook", "forged-signature", "other-file"],
+)
+def test_route_does_not_log_an_expired_ticket_that_is_not_a_connector_image(
+    client: TestClient,
+    caplog: pytest.LogCaptureFixture,
+    case: str,
+) -> None:
+    # Why: only an expired ticket whose verified signature, type, purpose and
+    # file match the request may be attributed to a connector image.
+    file_id = str(uuid4())
+    expired = {"exp": datetime.now(timezone.utc) - timedelta(minutes=1)}
+    if case == "instagram":
+        ticket = _ticket(file_id, **expired)
+    elif case == "facebook":
+        ticket = _ticket(file_id, purpose="facebook-publish", **expired)
+    elif case == "forged-signature":
+        ticket = external_media.jwt.encode(
+            {
+                "type": external_media.EXTERNAL_MEDIA_TICKET_TYPE,
+                "purpose": "connector-image",
+                "file_id": file_id,
+                "user_id": 7,
+                "task_id": 11,
+                **expired,
+            },
+            "not-the-signing-key" * 3,
+            algorithm=external_media.JWT_ALGORITHM,
+        )
+    else:
+        ticket = _ticket(str(uuid4()), purpose="connector-image", **expired)
+    caplog.set_level(logging.DEBUG, logger=ROUTE_LOGGER)
+
+    response = client.get(f"/api/files/external-media/{file_id}?ticket={ticket}")
+
+    assert response.status_code == 401
+    assert response.json() == INVALID_TICKET
+    assert _delivery_logs(caplog) == []
 
 
 @pytest.mark.parametrize("purpose", ["instagram-publish", "facebook-publish"])

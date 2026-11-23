@@ -83,7 +83,7 @@ by these application-client changes alone.
 An `sse` or `streamable_http` connector can carry `signed_uploads`, set with
 `POST /api/mcp/servers` or `PUT /api/mcp/servers/{server_id}`. The value is a
 list of at most 20 objects; `null` and `[]` mean none. An object takes one of
-two forms, told apart by its keys, and the two can share a list.
+three forms, told apart by its keys, and the three can share a list.
 
 A replacement entry is for a tool that takes a workspace file. It has exactly
 these keys:
@@ -125,8 +125,25 @@ An approval gate that pauses the tool which takes the file does not hold the
 upload back, because the bytes leave when the file id is requested; a gate
 decides on the upload tool by its own name.
 
-One issuing tool cannot be used by both forms, and two issuer entries cannot
-name the same issuing tool.
+A link entry is for a tool that takes a download URL instead of a file. It has
+exactly these keys:
+
+```json
+[{"tool_name": "attach_picture", "link_argument": "image_url"}]
+```
+
+When the model passes `file:<id>` in `link_argument` and that file is a PNG,
+JPEG or WebP image of at most 10 MB, the host replaces the value with an HTTPS
+download link that is valid for 10 minutes, and the connector's own server
+fetches the image from it. Any other value in that argument is passed through
+unchanged. If the link cannot be made, because the file does not exist, is not
+such an image or is too large, the tool is not called and the model gets a fixed
+refusal. A link entry needs no upload hosts, because the host uploads nothing.
+A tool has at most one link entry, one argument cannot be both replaced and
+linked, and an issuing tool cannot take a link argument.
+
+One issuing tool cannot be used by both of the first two forms, and two issuer
+entries cannot name the same issuing tool.
 
 The setting decides which outside hosts receive task files, so only the
 connector's owner or a platform administrator can change it. The URL must be
@@ -134,7 +151,7 @@ HTTPS without a port or user info, on one of `allowed_upload_hosts`, under
 `upload_path_prefix`, and the request uses the public-address egress policy of
 remote MCP sessions.
 
-Both forms have the host call the issuing tool itself. At log level DEBUG the
+The first two forms have the host call the issuing tool itself. At log level DEBUG the
 MCP SDK can log server messages in full, which includes the issuing tool's
 reply and so its signed URL. The default level, INFO, does not. And if the
 connector also accepts its issuing tool through a dispatcher tool (for example

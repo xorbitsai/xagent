@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import logging
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -23,7 +24,10 @@ from xagent.core.tools.adapters.vibe.mcp_adapter import (
     MCPToolAdapter,
     load_mcp_tools_as_agent_tools,
 )
-from xagent.core.tools.adapters.vibe.signed_upload import SignedUploadLink
+from xagent.core.tools.adapters.vibe.signed_upload import (
+    SignedUploadBinding,
+    SignedUploadLink,
+)
 from xagent.core.workspace import TaskWorkspace
 
 HOST = "mcp.example.test"
@@ -563,6 +567,72 @@ async def test_a_retry_carries_a_link_only_to_the_settings_host(
     assert server.calls == [{ARGUMENT: sent}, {ARGUMENT: sent}]
     assert len(workspace.issued) == (1 if value == REF else 0)
     assert result["structured_content"]["image_url"] == value
+
+
+async def test_a_refused_link_ends_the_call_before_any_signed_upload(
+    server: _Server,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    # Why: the upload sends bytes to an outside host, so a link that will be
+    # refused must be found first.
+    other_argument = "document"
+    binding = SignedUploadBinding(
+        connection_host=HOST,
+        tool_name=TOOL,
+        file_argument=other_argument,
+        issuing_tool_name="request_upload",
+        allowed_upload_hosts=frozenset({"uploads.example.test"}),
+        upload_path_prefix="/staged/",
+        content_types={".pdf": "application/pdf"},
+    )
+    staged = tmp_path / "report.pdf"
+    staged.write_bytes(b"%PDF-1.4")
+    puts: list[httpx.Request] = []
+
+    def put(request: httpx.Request) -> httpx.Response:
+        puts.append(request)
+        return httpx.Response(200, request=request)
+
+    async def stage(file_id: str) -> Path:
+        return staged
+
+    ticket = {
+        "file_id": "rf_abcdefgh",
+        "upload_url": "https://uploads.example.test/staged/abc?sig=s",
+        "method": "PUT",
+        "headers": {"Content-Type": "application/pdf"},
+        "url_expires_at": "2030-01-01T00:00:00+00:00",
+    }
+    server.respond = lambda args: CallToolResult(
+        content=[TextContent(type="text", text=json.dumps(ticket))],
+        structuredContent=ticket,
+        isError=False,
+    )
+    monkeypatch.setattr(
+        mcp_adapter_module,
+        "_signed_upload_transport",
+        lambda: httpx.MockTransport(put),
+    )
+    monkeypatch.setattr(
+        mcp_adapter_module,
+        "_utcnow",
+        lambda: datetime(2029, 12, 31, tzinfo=timezone.utc),
+    )
+    schema = _schema()
+    schema["properties"][other_argument] = {"type": "string"}
+    adapter = _adapter(_Workspace(FileNotFoundError("gone")), schema=schema)
+    adapter._signed_upload = binding
+    monkeypatch.setattr(adapter, "_stage_external_upload_file", stage)
+
+    result = await adapter.run_json_async(
+        {ARGUMENT: REF, other_argument: f"file:{FILE_ID}"}
+    )
+
+    assert result["is_error"] is True
+    assert _text(result) == FILE_NOT_FOUND
+    assert server.calls == []
+    assert puts == []
 
 
 # --------------------------------------------------------------------------

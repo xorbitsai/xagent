@@ -49,7 +49,9 @@ export interface LinkWorkerLike {
 export interface LinkHostSnapshot {
   phase: "starting" | "active" | "terminated"
   // Set once the first session arrived; the page creates the iframe from it.
+  // Null again once the session has ended.
   iframeSrc: string | null
+  // False once the session has ended: closing again would do nothing.
   closeButtonVisible: boolean
 }
 
@@ -173,7 +175,7 @@ export function createLinkSessionHost(deps: LinkSessionHostDeps): LinkSessionHos
     deps.onChange({
       phase: state.phase,
       iframeSrc: state.phase === "terminated" ? null : iframeSrc,
-      closeButtonVisible: !state.chromeReady,
+      closeButtonVisible: state.phase !== "terminated" && !state.chromeReady,
     })
   }
 

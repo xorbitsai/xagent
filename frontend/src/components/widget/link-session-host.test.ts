@@ -598,6 +598,15 @@ describe("link session host iframe protocol", () => {
     expect(h.iframePosts).toEqual([{ xagent: true, v: 1, type: "widget_expand_rejected" }])
   })
 
+  it.each([
+    ["before a session", (h: Harness) => { h.host.start(); h.host.close() }],
+    ["after a session", (h: Harness) => connect(h).emit("message", { type: "terminal", reason: "network" })],
+  ])("removes the close button once the session has ended (%s)", (_name, end) => {
+    const h = makeHost()
+    end(h)
+    expect(h.snapshots[h.snapshots.length - 1]).toEqual({ phase: "terminated", iframeSrc: null, closeButtonVisible: false })
+  })
+
   it("answers widget_chrome_ready with a collapsed state and hides the page's own close button", () => {
     const h = makeHost()
     connect(h)

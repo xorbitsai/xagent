@@ -125,7 +125,12 @@ export function LinkSessionPage({ environment }: { environment?: LinkSessionPage
 
   return (
     <div className="fixed inset-0 bg-background text-foreground">
-      {snapshot.iframeSrc ? (
+      {snapshot.phase === "terminated" ? (
+        <div role="status" className="flex h-full flex-col items-center justify-center gap-2 p-6 text-center">
+          <p className="text-base font-medium">{t("widgetLink.ended.generic.title")}</p>
+          <p className="text-sm text-muted-foreground">{t("widgetLink.ended.generic.description")}</p>
+        </div>
+      ) : snapshot.iframeSrc ? (
         <iframe
           ref={iframeRef}
           src={snapshot.iframeSrc}

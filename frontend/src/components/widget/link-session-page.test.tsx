@@ -296,6 +296,42 @@ describe("link session page close button", () => {
   })
 })
 
+describe("link session page after the session ended", () => {
+  it.each([
+    ["no link code", () => {
+      setLocation("/widget/chat/link", "")
+      mount()
+    }],
+    ["Worker terminal before a session", () => {
+      const m = mount()
+      act(() => m.worker.emit("message", { type: "terminal", reason: "network" }))
+    }],
+    ["Worker terminal after a session", () => {
+      const m = mount()
+      activate(m)
+      act(() => m.worker.emit("message", { type: "terminal", reason: "network" }))
+    }],
+  ])("shows the ended text without a spinner or a close button (%s)", (_name, end) => {
+    end()
+    expect(iframeEl()).toBeNull()
+    expect(screen.queryByText("widgetLink.loading")).toBeNull()
+    const status = screen.getByRole("status")
+    expect(status).toHaveTextContent("widgetLink.ended.generic.title")
+    expect(status).toHaveTextContent("widgetLink.ended.generic.description")
+    expect(screen.queryByRole("button", { name: "widgetLink.close" })).toBeNull()
+  })
+
+  it("replaces the close button with the ended text once it is clicked", () => {
+    const m = mount()
+    activate(m)
+    fireEvent.click(screen.getByRole("button", { name: "widgetLink.close" }))
+    expect(m.navigate).toHaveBeenCalledTimes(1)
+    expect(m.navigate).toHaveBeenCalledWith("/widget/chat/link/ended?reason=closed")
+    expect(screen.queryByRole("button", { name: "widgetLink.close" })).toBeNull()
+    expect(screen.getByRole("status")).toHaveTextContent("widgetLink.ended.generic.title")
+  })
+})
+
 describe("link session page browser storage", () => {
   it("does not read or write storage while connecting, renewing and ending", () => {
     const localSet = vi.spyOn(Storage.prototype, "setItem")

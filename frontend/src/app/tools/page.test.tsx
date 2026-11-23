@@ -631,7 +631,7 @@ describe("ToolsPage signed upload settings", () => {
     const dialog = await openUploadsEditor()
 
     if (stored === BAD_SIGNED_UPLOADS) {
-      expect(dialog.getByText(`${KEY}.unrecognizedEntry`)).toBeInTheDocument()
+      expect(dialog.getByLabelText(`${KEY}.toolName`)).toHaveValue("attach_document")
     }
     fireEvent.click(dialog.getByRole("button", { name: "common.clear" }))
     fireEvent.click(saveButton(dialog))
@@ -786,22 +786,20 @@ describe("ToolsPage signed upload settings", () => {
     ["exactly the issuer keys", ISSUER_ENTRY, "issuer"],
     ["the issuer keys with values of the wrong type", { ...ISSUER_ENTRY, allowed_upload_hosts: "uploads.example.test" }, "issuer"],
     ["the six replacement keys", SIGNED_UPLOADS[0], "replacement"],
-    ["the link keys", { tool_name: "attach_picture", link_argument: "image_url" }, "link"],
-    ["the issuer keys and tool_name", { ...ISSUER_ENTRY, tool_name: "attach_document" }, "unrecognized"],
-    ["the issuer keys and file_argument", { ...ISSUER_ENTRY, file_argument: "document_file_id" }, "unrecognized"],
+    ["the issuer keys and tool_name", { ...ISSUER_ENTRY, tool_name: "attach_document" }, "replacement"],
+    ["the issuer keys and file_argument", { ...ISSUER_ENTRY, file_argument: "document_file_id" }, "replacement"],
     ["the issuer keys and an unknown key", { ...ISSUER_ENTRY, note: "x" }, "unrecognized"],
-    ["the link keys and an unknown key", { tool_name: "attach_picture", link_argument: "image_url", note: "x" }, "unrecognized"],
     ...ISSUER_KEY_NAMES.map((key): [string, unknown, SignedUploadMode] => {
       const entry: Record<string, unknown> = { ...ISSUER_ENTRY }
       delete entry[key]
-      return [`the issuer keys without ${key}`, entry, "unrecognized"]
+      return [`the issuer keys without ${key}`, entry, "replacement"]
     }),
-    ["four keys that are not the issuer keys", { tool_name: "attach_document", allowed_upload_hosts: ["uploads.example.test"], upload_path_prefix: "/staged/", content_types: { ".pdf": "application/pdf" } }, "unrecognized"],
-    ["an empty object", {}, "unrecognized"],
-    ["a value that is not an object", "request_upload", "unrecognized"],
+    ["four keys that are not the issuer keys", { tool_name: "attach_document", allowed_upload_hosts: ["uploads.example.test"], upload_path_prefix: "/staged/", content_types: { ".pdf": "application/pdf" } }, "replacement"],
+    ["an empty object", {}, "replacement"],
+    ["a value that is not an object", "request_upload", "replacement"],
   ]
 
-  it.each(KEY_SET_CASES)("reads an entry as a row kind only when it has exactly that kind's keys: %s", (_name, entry, mode) => {
+  it.each(KEY_SET_CASES)("reads an entry as an issuer row only when it has exactly the issuer keys: %s", (_name, entry, mode) => {
     expect(signedUploadRowsFromValue([entry], rowIds())[0].mode).toBe(mode)
   })
 

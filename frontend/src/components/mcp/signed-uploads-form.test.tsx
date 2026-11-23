@@ -51,27 +51,28 @@ describe("signedUploadRowsFromValue", () => {
     ["replacement keys", REPLACEMENT, "replacement"],
     ["issuer keys", ISSUER, "issuer"],
     ["link keys", LINK, "link"],
-    [
-      "replacement missing content_types",
-      without(REPLACEMENT, "content_types"),
-      "unrecognized",
-    ],
-    [
-      "replacement missing the file argument",
-      without(REPLACEMENT, "file_argument"),
-      "unrecognized",
-    ],
+    ["replacement missing content_types", without(REPLACEMENT, "content_types"), "replacement"],
+    ["replacement missing the file argument", without(REPLACEMENT, "file_argument"), "replacement"],
+    ["issuer keys plus tool_name", { ...ISSUER, tool_name: "attach_document" }, "replacement"],
+    ["an empty object", {}, "replacement"],
+    ["tool_name alone", { tool_name: "attach_picture" }, "replacement"],
+    ["a string", "attach", "replacement"],
+    ["null", null, "replacement"],
+    ["a number", 3, "replacement"],
+    ["an array", [LINK], "replacement"],
     ["link with an extra key", { ...LINK, extra: "x" }, "unrecognized"],
-    ["link missing the argument", { tool_name: "attach_picture" }, "unrecognized"],
-    ["link keys mixed with issuer keys", { ...ISSUER, link_argument: "image_url" }, "unrecognized"],
-    ["replacement plus link argument", { ...REPLACEMENT, link_argument: "image_url" }, "unrecognized"],
-    ["empty object", {}, "unrecognized"],
-    ["a string", "attach", "unrecognized"],
-    ["null", null, "unrecognized"],
-    ["a number", 3, "unrecognized"],
-    ["an array", [LINK], "unrecognized"],
-  ])("reads %s as %s", (_name, entry, mode) => {
+    ["an unknown key", { ...ISSUER, note: "x" }, "unrecognized"],
+    ["issuer keys plus link_argument", { ...ISSUER, link_argument: "image_url" }, "unrecognized"],
+    ["replacement keys plus link_argument", { ...REPLACEMENT, link_argument: "image_url" }, "unrecognized"],
+    ["file_argument with link_argument", { file_argument: "f", link_argument: "u" }, "unrecognized"],
+  ])("reads $0", (_name, entry, mode) => {
     expect(modes([entry])).toEqual([mode])
+  })
+
+  it("reads a non-object entry as an empty row that is dropped on save", () => {
+    const rows = signedUploadRowsFromValue(["x", null, 3, []], counter())
+    expect(rows.map((row) => row.toolName + row.fileArgument)).toEqual(["", "", "", ""])
+    expect(signedUploadsFromRows(rows)).toEqual([])
   })
 
   it("reads a link row's fields and empties non-strings", () => {
@@ -119,7 +120,7 @@ describe("signedUploadsFromRows", () => {
     ["link first", [LINK, REPLACEMENT]],
     [
       "unrecognized entries in between",
-      [LINK, { tool_name: " spaced ", extra: true }, "text", null, REPLACEMENT, {}, ISSUER],
+      [LINK, { tool_name: " spaced ", extra: true }, { note: [1, { a: 2 }] }, REPLACEMENT, ISSUER],
     ],
     ["an empty list", []],
   ])("round-trips %s exactly", (_name, value) => {

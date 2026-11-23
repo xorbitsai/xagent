@@ -902,7 +902,7 @@ describe("CustomMcpForm file uploads", () => {
       )
     }
     if (stored === BAD_SIGNED_UPLOADS) {
-      expect(screen.getByText(`${UPLOAD_KEY}.unrecognizedEntry`)).toBeInTheDocument()
+      expect(screen.getByLabelText(`${UPLOAD_KEY}.toolName`)).toHaveValue("attach_document")
     }
   })
 
@@ -932,7 +932,7 @@ describe("CustomMcpForm file uploads", () => {
 
     expect(screen.getByRole("button", { name: "common.clear" })).toBeDisabled()
     expect(screen.getByRole("button", { name: `${UPLOAD_KEY}.addTool` })).toBeDisabled()
-    expect(screen.getByLabelText(`${UPLOAD_KEY}.unrecognizedEntryValue`)).toBeDisabled()
+    expect(screen.getByLabelText(`${UPLOAD_KEY}.toolName`)).toBeDisabled()
   })
 
   it.each([
@@ -947,7 +947,7 @@ describe("CustomMcpForm file uploads", () => {
     if (stored === null) {
       expect(screen.getByText(`${UPLOAD_KEY}.empty`)).toBeInTheDocument()
     } else {
-      expect(screen.getByText(`${UPLOAD_KEY}.unrecognizedEntry`)).toBeInTheDocument()
+      expect(screen.getByLabelText(`${UPLOAD_KEY}.toolName`)).toHaveValue("attach_document")
     }
     expect(screen.getByText(`${UPLOAD_KEY}.invalid`)).toBeInTheDocument()
     expect(translateMock).toHaveBeenCalledWith(`${UPLOAD_KEY}.invalid`, { error })
@@ -961,18 +961,30 @@ describe("CustomMcpForm file uploads", () => {
     expect(screen.queryByLabelText(`${UPLOAD_KEY}.toolName`)).not.toBeInTheDocument()
   })
 
-  it("keeps an entry the form does not recognize as stored until it is removed", () => {
+  it("lets the owner complete an invalid entry in place", () => {
     const { latest } = renderUploadsForm({
       signed_uploads: BAD_SIGNED_UPLOADS,
       signed_uploads_error: SETTINGS_ERROR,
     })
 
-    expect(screen.queryByLabelText(`${UPLOAD_KEY}.issuingToolName`)).not.toBeInTheDocument()
-    fireEvent.click(screen.getByRole("button", { name: `${UPLOAD_KEY}.addTool` }))
-    expect(latest().signed_uploads).toEqual(BAD_SIGNED_UPLOADS)
+    fireEvent.change(screen.getByLabelText(`${UPLOAD_KEY}.issuingToolName`), {
+      target: { value: "request_upload" },
+    })
+    fireEvent.change(screen.getByLabelText(`${UPLOAD_KEY}.allowedUploadHosts`), {
+      target: { value: "uploads.example.test" },
+    })
+    fireEvent.change(screen.getByLabelText(`${UPLOAD_KEY}.uploadPathPrefix`), {
+      target: { value: "/staged/" },
+    })
+    fireEvent.click(screen.getByRole("button", { name: `${UPLOAD_KEY}.addContentType` }))
+    fireEvent.change(screen.getByLabelText(`${UPLOAD_KEY}.extension`), {
+      target: { value: ".pdf" },
+    })
+    fireEvent.change(screen.getByLabelText(`${UPLOAD_KEY}.contentType`), {
+      target: { value: "application/pdf" },
+    })
 
-    fireEvent.click(screen.getAllByRole("button", { name: `${UPLOAD_KEY}.removeTool` })[0])
-    expect(latest().signed_uploads).toEqual([])
+    expect(latest().signed_uploads).toEqual(SIGNED_UPLOADS)
   })
 
   it.each([

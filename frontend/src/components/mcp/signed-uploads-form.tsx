@@ -27,8 +27,10 @@ interface SignedUploadContentTypeRow {
  */
 export type SignedUploadMode = "replacement" | "issuer" | "link" | "unrecognized"
 
-// Each entry form is identified by its exact key set, never by a subset: an
-// entry with any other keys is unrecognized and is neither edited nor altered.
+// An entry is read-only only when it carries a key the form does not know.
+// Exactly the issuer keys is an issuer entry and exactly the link keys is a
+// link entry; any other entry whose keys are all replacement keys (a complete
+// one, or one with keys missing) is a replacement entry.
 const ISSUER_ENTRY_KEYS = [
   "issuing_tool_name",
   "allowed_upload_hosts",
@@ -75,19 +77,25 @@ function hasExactKeys(item: Record<string, unknown>, expected: readonly string[]
 }
 
 function entryMode(entry: unknown): SignedUploadMode {
-  if (!isRecord(entry)) return "unrecognized"
-  if (hasExactKeys(entry, REPLACEMENT_ENTRY_KEYS)) return "replacement"
+  // An entry that is not an object reads as an empty replacement row, which
+  // is dropped on save.
+  if (!isRecord(entry)) return "replacement"
   if (hasExactKeys(entry, ISSUER_ENTRY_KEYS)) return "issuer"
   if (hasExactKeys(entry, LINK_ENTRY_KEYS)) return "link"
-  return "unrecognized"
+  const keys = Object.keys(entry)
+  return keys.every((key) => (REPLACEMENT_ENTRY_KEYS as readonly string[]).includes(key))
+    ? "replacement"
+    : "unrecognized"
 }
 
 /**
- * Turn a stored signed_uploads value into editable rows. An entry whose keys
- * are exactly the replacement, issuer or link keys reads as that kind of row,
- * with a mistyped field read as empty. Any other entry, including one that is
- * not an object, reads as an unrecognized row that keeps a copy of the stored
- * value.
+ * Turn a stored signed_uploads value into editable rows, showing as much of a
+ * stored entry as possible: a missing or mistyped field reads as empty and an
+ * entry that is not an object reads as an empty row. An entry with exactly the
+ * issuer keys reads as an issuer row, exactly the link keys as a link row, and
+ * any other entry whose keys are all replacement keys as a replacement row. An
+ * entry is read-only only when it has a key the form does not know: it reads
+ * as an unrecognized row that keeps a copy of the stored value.
  */
 export function signedUploadRowsFromValue(
   value: unknown,
@@ -110,7 +118,7 @@ export function signedUploadRowsFromValue(
         raw: structuredClone(entry),
       }
     }
-    const item = entry as Record<string, unknown>
+    const item = isRecord(entry) ? entry : {}
     const hosts = Array.isArray(item.allowed_upload_hosts)
       ? item.allowed_upload_hosts.filter((host): host is string => typeof host === "string")
       : []

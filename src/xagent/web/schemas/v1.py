@@ -359,6 +359,27 @@ class V1AgentResponse(BaseModel):
     share_updated_at: Optional[str]
 
 
+class V1AgentDetail(V1AgentResponse):
+    """One agent's full configuration, as the key holder reads it."""
+
+    team_id: Optional[int] = Field(
+        description="The team the agent belongs to, or null for a personal agent."
+    )
+    visibility: str = Field(
+        description="'team' (every team member can manage the agent) or 'admins' "
+        "(only team admins can). A team agent set to admins-only is hidden from "
+        "its own creator unless they are a team admin."
+    )
+    unresolved_models: list[str] = Field(
+        description="Computed for the key holder: a task the holder starts "
+        "falls back to another model in these slots. A task started with the "
+        "agent's runtime key runs as the agent's owner and can differ. A slot "
+        "whose stored value is not an integer id is always listed; set it "
+        "again with an integer id. This only checks whether the slot's model "
+        "can be used; it does not check an Auto model's own candidates."
+    )
+
+
 class V1AgentCreateResponse(BaseModel):
     agent: V1AgentResponse
     api_key: Optional[RuntimeKeyResponse] = None

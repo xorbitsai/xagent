@@ -312,6 +312,14 @@ class AgentResponseSnapshot:
 
 
 @dataclass(frozen=True)
+class AgentDetailSnapshot:
+    """Detached full configuration of one agent plus the holder's model check."""
+
+    agent: AgentResponseSnapshot
+    unresolved_models: tuple[str, ...]
+
+
+@dataclass(frozen=True)
 class RuntimeKeySnapshot:
     """One-shot runtime key returned after its write transaction commits."""
 
@@ -1021,6 +1029,59 @@ class AgentManagementService:
         return normalized
 
 
+# Order in which unresolved slots are reported. The runtime resolves the same
+# four slots.
+_MODEL_SLOT_ORDER = ("general", "small_fast", "visual", "compact")
+_MAX_MODEL_PK = 2**31 - 1
+
+
+def unresolved_models(db: Session, agent: Agent, user_id: int) -> tuple[str, ...]:
+    """Slots of *agent* whose model *user_id* cannot be confirmed to resolve.
+
+    A slot holding null, ``""``, integer 0 or ``false`` is unset: slot
+    resolution returns nothing for it without a query, so it is not listed.
+    A slot holding a canonical integer id (an ``int``, not a ``bool``, from 1
+    to 2**31 - 1) is listed unless the id is one of the models *user_id* can
+    put in a slot. Any other stored value is listed: how slot resolution
+    treats it depends on the database dialect and driver, so it is always
+    reported as needing a rewrite with an integer id. Keys other than the four
+    slots are ignored, and a stored value that is not a dict lists nothing.
+    """
+    from .model_service import slot_assignable_models
+
+    stored = agent.models
+    if not isinstance(stored, dict):
+        return ()
+
+    def is_unset(value: Any) -> bool:
+        return (
+            value is None
+            or value is False
+            or (isinstance(value, str) and value == "")
+            or (type(value) is int and value == 0)
+        )
+
+    def is_canonical(value: Any) -> bool:
+        return type(value) is int and 1 <= value <= _MAX_MODEL_PK
+
+    set_slots = {
+        slot: stored[slot]
+        for slot in _MODEL_SLOT_ORDER
+        if slot in stored and not is_unset(stored[slot])
+    }
+    ids = sorted({value for value in set_slots.values() if is_canonical(value)})
+    assignable = (
+        {model.id for model in slot_assignable_models(db, user_id, among_ids=ids)}
+        if ids
+        else set()
+    )
+    return tuple(
+        slot
+        for slot, value in set_slots.items()
+        if not is_canonical(value) or value not in assignable
+    )
+
+
 def _agent_summary_snapshot(payload: dict[str, Any]) -> AgentSummarySnapshot:
     return AgentSummarySnapshot(
         id=int(payload["id"]),
@@ -1213,6 +1274,39 @@ class AgentManagementRuntime:
         with SessionLocal() as db:
             payloads = AgentManagementService(db).list_agents_for_user(user_id)
             return tuple(_agent_summary_snapshot(payload) for payload in payloads)
+
+    async def get_agent_detail(
+        self,
+        *,
+        user_id: int,
+        agent_id: int,
+    ) -> AgentDetailSnapshot | None:
+        """The full configuration of an agent the user can see, else ``None``.
+
+        Always read from the database, never from the agent cache, so a write
+        is visible to the next read. ``unresolved_models`` is computed for
+        ``user_id``. A database failure propagates; it is never reported as
+        an empty or fully resolved configuration.
+        """
+        return await run_db_io_cancellation_safe(
+            lambda: self._get_agent_detail_sync(user_id=user_id, agent_id=agent_id)
+        )
+
+    @staticmethod
+    def _get_agent_detail_sync(
+        *, user_id: int, agent_id: int
+    ) -> AgentDetailSnapshot | None:
+        SessionLocal = get_session_local()
+        with SessionLocal() as db:
+            team_scope = get_agent_team_scope(db, user_id)
+            store = AgentStore(db)
+            agent = store.get_owned_agent(user_id, agent_id, team_scope)
+            if agent is None:
+                return None
+            return AgentDetailSnapshot(
+                agent=_agent_response_snapshot(store.agent_to_response_dict(agent)),
+                unresolved_models=unresolved_models(db, agent, user_id),
+            )
 
     async def get_agent_skills(
         self,

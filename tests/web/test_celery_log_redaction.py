@@ -1,11 +1,10 @@
 """The Celery worker and beat processes redact records and drop transport INFO.
 
 Celery configures logging itself and never calls ``setup_logging``, so the app
-installs the record factory and the httpx/httpcore filter from the signals that
-fire after Celery's own log configuration. Every test bootstraps the real
-Celery logging entry point in a child interpreter and reads what reaches
-stderr: a process-global factory and a logger filter can only be trusted from a
-process that did not inherit them from a previous test.
+installs the record factory and the httpx/httpcore filter from Celery's own
+signals. Every test bootstraps a real Celery entry point in a child interpreter
+and reads what reaches stderr: a process-global factory and a logger filter can
+only be trusted from a process that did not inherit them from a previous test.
 """
 
 from __future__ import annotations
@@ -47,14 +46,48 @@ logging.getLogger("httpx").info(
 logging.getLogger("httpx").warning("transport failed with status 503")
 """
 
-# What ``celery worker`` does before a task exists: ``Worker.setup_logging``
-# calls ``app.log.setup``, which emits ``setup_logging``/``after_setup_logger``/
-# ``after_setup_task_logger`` after Celery replaced the root handlers.
+# ``Worker.setup_logging`` calls ``app.log.setup``, which emits
+# ``setup_logging``/``after_setup_logger``/``after_setup_task_logger`` after
+# Celery replaced the root handlers. A worker that sets up its logging without
+# going through ``worker_init`` first (``celery.contrib.testing.worker`` does)
+# is covered by ``after_setup_logger`` alone.
 _WORKER_LOG_SETUP = """\
 import logging
 
 from xagent.web.jobs.celery_app import celery_app
 
+celery_app.log.setup(
+    logging.INFO,
+    None,
+    redirect_stdouts=False,
+    colorize=False,
+    hostname="probe@worker",
+)
+"""
+
+# The same worker after a ``setup_logging`` receiver took the log
+# configuration over: any receiver, whatever it returns, makes Celery skip its
+# own configuration and never emit ``after_setup_logger``, so only
+# ``worker_init`` can cover the main process.
+_HIJACKED_WORKER_LOG_SETUP = """\
+import logging
+import sys
+
+from celery.signals import setup_logging, worker_init
+
+from xagent.web.jobs.celery_app import celery_app
+
+
+@setup_logging.connect
+def configure_logging(**_: object) -> None:
+    handler = logging.StreamHandler(sys.stderr)
+    handler.setFormatter(logging.Formatter("%(levelname)s %(message)s"))
+    root = logging.getLogger()
+    root.handlers = [handler]
+    root.setLevel(logging.INFO)
+
+
+worker_init.send(sender=None)
 celery_app.log.setup(
     logging.INFO,
     None,
@@ -178,15 +211,28 @@ def test_install_log_redaction_is_idempotent_and_keeps_handlers(
 
 
 def test_worker_logging_bootstrap_redacts_records(tmp_path: Path) -> None:
+    # The ``after_setup_logger`` path: ``app.log.setup`` and nothing else.
     output = _run_script(_WORKER_LOG_SETUP + _LOG_CALLS, tmp_path)
     _assert_redacted(output)
 
 
+def test_worker_init_redacts_records_when_setup_logging_is_hijacked(
+    tmp_path: Path,
+) -> None:
+    # A ``setup_logging`` receiver makes Celery skip its own log configuration,
+    # so ``after_setup_logger`` never fires; ``worker_init`` has to cover the
+    # worker main process on its own. The receiver below is the shape a real
+    # one has: it configures logging itself and returns None.
+    output = _run_script(_HIJACKED_WORKER_LOG_SETUP + _LOG_CALLS, tmp_path)
+    _assert_redacted(output)
+
+
 def test_prefork_child_init_redacts_records(tmp_path: Path) -> None:
-    # ``process_initializer`` in a pool child sends ``worker_process_init``.
-    # The child starts from stock logging state on purpose: a child started
-    # with execv does not inherit the parent's factory, and the signal must
-    # install it there too.
+    # ``process_initializer`` is the real pool child entry: it re-runs
+    # ``app.log.setup`` (a no-op unless the logfile has ``%i``) and then sends
+    # ``worker_process_init``. The child starts from stock logging state on
+    # purpose: a child started with execv does not inherit the parent's
+    # factory, and the signal must install it there too.
     script = (
         _WORKER_LOG_SETUP
         + "\n"
@@ -194,12 +240,12 @@ def test_prefork_child_init_redacts_records(tmp_path: Path) -> None:
         + "\n"
         + "\n"
         + "def child() -> None:\n"
-        + "    from celery.signals import worker_process_init\n"
+        + "    from celery.concurrency.prefork import process_initializer\n"
         + "\n"
         + "    logging.setLogRecordFactory(logging.LogRecord)\n"
         + '    for name in ("httpx", "httpcore"):\n'
         + "        logging.getLogger(name).filters.clear()\n"
-        + "    worker_process_init.send(sender=None)\n"
+        + '    process_initializer(celery_app, "probe@worker")\n'
         + textwrap.indent(_LOG_CALLS, "    ")
         + "\n"
         + 'process = multiprocessing.get_context("fork").Process(target=child)\n'
@@ -286,7 +332,8 @@ def test_a_real_solo_worker_redacts_task_output(tmp_path: Path) -> None:
         capture_output=True,
         text=True,
         env=env,
-        timeout=300,
+        # Below the 300s pytest timeout, so a hang keeps the captured output.
+        timeout=120,
     )
     output = completed.stdout + completed.stderr
     assert completed.returncode == 0, output

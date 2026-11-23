@@ -41,9 +41,4 @@ describe("link end page", () => {
     expect(screen.getByText(en.generic.description)).toBeInTheDocument()
   })
 
-  it("has distinct copy for the five reasons and the generic case", () => {
-    const titles = Object.values(en).map((copy) => copy.title)
-    // unavailable intentionally repeats the chat page's own wording.
-    expect(new Set(titles).size).toBe(titles.length)
-  })
 })

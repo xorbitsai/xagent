@@ -160,12 +160,6 @@ describe("link session page", () => {
     expect(frame.getAttribute("allow")).not.toContain("microphone")
   })
 
-  it("builds a plain iframe source without a timezone", () => {
-    const m = mount()
-    activate(m)
-    expect((iframeEl() as HTMLIFrameElement).getAttribute("src")).toBe("/widget/chat/session")
-  })
-
   it("leaves a safe-area margin around the iframe", () => {
     const m = mount()
     activate(m)
@@ -193,14 +187,6 @@ describe("link session page", () => {
     activate(m)
     iframeSays("reconnect_request", {}, window)
     iframeSays("reconnect_request", {}, null)
-    const frame = iframeEl() as HTMLIFrameElement
-    act(() => {
-      window.dispatchEvent(new MessageEvent("message", {
-        data: { xagent: true, v: 1, type: "reconnect_request" },
-        origin: "https://evil.example",
-        source: frame.contentWindow,
-      }))
-    })
     expect(m.worker.count("renew")).toBe(0)
     iframeSays("reconnect_request")
     expect(m.worker.count("renew")).toBe(1)

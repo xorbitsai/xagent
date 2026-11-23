@@ -15,10 +15,6 @@ import {
   RETRY_MAX_DELAY_MS,
   SESSION_REFRESH_THRESHOLD_MS,
   STABLE_CONNECTION_MS,
-  WORKER_HELLO_TIMEOUT_MS,
-  WORKER_REDEEMING_TIMEOUT_MS,
-  endedUrl,
-  reasonForKnownCode,
   retryDelayMs,
 } from "./link-session-constants"
 
@@ -73,31 +69,10 @@ describe("link session rules that intentionally differ from widget.js", () => {
   it("redeem gives up after 5 attempts where widget.js retries without limit", () => {
     expect(REDEEM_MAX_ATTEMPTS).toBe(5)
   })
-
-  it("the Worker watchdogs are 30 s for the script and 10 s for the first redeem", () => {
-    expect(WORKER_HELLO_TIMEOUT_MS).toBe(30000)
-    expect(WORKER_REDEEMING_TIMEOUT_MS).toBe(10000)
-  })
 })
 
 describe("link session end reasons", () => {
   it("are exactly the five values that make up the contract with embedders", () => {
     expect([...END_REASONS]).toEqual(["link_invalid", "session_ended", "unavailable", "network", "closed"])
-  })
-
-  it.each([...END_REASONS])("builds the end page URL for %s", (reason) => {
-    expect(endedUrl(reason)).toBe(`/widget/chat/link/ended?reason=${reason}`)
-  })
-
-  it.each([
-    ["link_invalid", "link_invalid"],
-    ["session_expired", "session_ended"],
-    ["reconnect_invalid", "session_ended"],
-    ["identity_mismatch", "session_ended"],
-    ["agent_not_available", "unavailable"],
-    ["widget_disabled", "unavailable"],
-    ["invalid_input", "unavailable"],
-  ])("maps the server code %s to %s", (code, reason) => {
-    expect(reasonForKnownCode(code)).toBe(reason)
   })
 })

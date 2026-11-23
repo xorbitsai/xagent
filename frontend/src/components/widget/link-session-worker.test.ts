@@ -378,6 +378,7 @@ describe("link session Worker end reasons for server error codes", () => {
     ["identity_mismatch", 401, "session_ended"],
     ["agent_not_available", 403, "unavailable"],
     ["widget_disabled", 403, "unavailable"],
+    ["invalid_input", 400, "unavailable"],
     ["grant_malformed", 400, "unavailable"],
     ["signature_invalid", 401, "unavailable"],
     ["grant_expired", 401, "unavailable"],
@@ -717,15 +718,15 @@ describe("link session Worker browser storage", () => {
   }
 
   it.each([
-    ["redeem and renew success", (h: Harness) => { h.core.handleMessage({ type: "renew" }) }],
-    ["a terminal", (h: Harness) => { h.setHandler(() => errorResponse(401, "reconnect_invalid")); h.core.handleMessage({ type: "renew" }) }],
-  ])("does not read or write storage on %s", async (_label, act) => {
+    ["redeem and renew success", undefined, async (h: Harness) => { h.core.handleMessage({ type: "renew" }); await settle() }],
+    ["a terminal", undefined, async (h: Harness) => { h.setHandler(() => errorResponse(401, "reconnect_invalid")); h.core.handleMessage({ type: "renew" }); await settle() }],
+    ["a retry", ({ n }: { n: number }) => (n < 2 ? Promise.reject(new TypeError("offline")) : jsonResponse(200, tokenResponse("rt_1"))), async (h: Harness) => { await advanceUntilFetchCount(h, 2); await settle() }],
+  ])("does not read or write storage on %s", async (_label, handler, act) => {
     const { spies, restore } = installStorageSpies()
     try {
-      const h = makeHarness(() => jsonResponse(200, tokenResponse("rt_1")))
+      const h = makeHarness(handler ?? (() => jsonResponse(200, tokenResponse("rt_1"))))
       await startAndSettle(h)
-      act(h)
-      await settle()
+      await act(h)
       expect(spies.localSet).not.toHaveBeenCalled()
       expect(spies.localGet).not.toHaveBeenCalled()
       expect(spies.cookieSet).not.toHaveBeenCalled()
@@ -736,19 +737,4 @@ describe("link session Worker browser storage", () => {
     }
   })
 
-  it("does not touch storage while retrying", async () => {
-    const { spies, restore } = installStorageSpies()
-    try {
-      const h = makeHarness(({ n }) => (n < 2 ? Promise.reject(new TypeError("offline")) : jsonResponse(200, tokenResponse("rt_1"))))
-      await startAndSettle(h)
-      await advanceUntilFetchCount(h, 2)
-      await settle()
-      expect(spies.localSet).not.toHaveBeenCalled()
-      expect(spies.cookieSet).not.toHaveBeenCalled()
-      expect(spies.idbOpen).not.toHaveBeenCalled()
-      expect(spies.cachesOpen).not.toHaveBeenCalled()
-    } finally {
-      restore()
-    }
-  })
 })

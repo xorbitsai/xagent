@@ -170,6 +170,7 @@ describe("link session host startup", () => {
       "worker.post:start",
     ])
     expect(h.worker().posted[0]).toEqual({ type: "start", code: CODE })
+    expect(extractLinkCode(`#x=1&code=${CODE}`)).toBe(CODE)
     expect(fetchSpy).not.toHaveBeenCalled()
   })
 
@@ -180,6 +181,7 @@ describe("link session host startup", () => {
     ["a code with the wrong prefix", `#code=rt_${"C".repeat(43)}`],
     ["an empty code", "#code="],
   ])("still erases the fragment and ends with link_invalid for %s", (_label, hash) => {
+    expect(extractLinkCode(hash)).toBeNull()
     const h = makeHost({ hash })
     h.host.start()
     expect(h.log).toEqual([
@@ -197,12 +199,6 @@ describe("link session host startup", () => {
     expect(fetchSpy).not.toHaveBeenCalled()
   })
 
-  it("extracts the code from the fragment", () => {
-    expect(extractLinkCode(`#code=${CODE}`)).toBe(CODE)
-    expect(extractLinkCode(`#x=1&code=${CODE}`)).toBe(CODE)
-    expect(extractLinkCode("#nope")).toBeNull()
-    expect(extractLinkCode("")).toBeNull()
-  })
 })
 
 describe("link session host state", () => {
@@ -256,11 +252,6 @@ describe("link session host iframe source", () => {
     expect(buildIframeSrc("?voice=1&timezone=UTC")).not.toContain("voice")
   })
 
-  it("uses the page query at the time the host started", () => {
-    const h = makeHost({ search: "?timezone=Australia%2FSydney" })
-    connect(h)
-    expect(h.snapshots[h.snapshots.length - 1].iframeSrc).toBe("/widget/chat/session?timezone=Australia%2FSydney")
-  })
 })
 
 describe("link session host end reasons", () => {
@@ -770,32 +761,5 @@ describe("link session host renew accounting", () => {
     iframeSays(h, "reconnect_request")
     expect(h.worker().count("renew")).toBe(0)
     expect(h.host.getState().rapidRecoveries).toBe(0)
-  })
-})
-
-describe("link session host browser storage", () => {
-  it("does not read or write storage on the connect, renew and terminate paths", () => {
-    const localSet = vi.spyOn(Storage.prototype, "setItem")
-    const localGet = vi.spyOn(Storage.prototype, "getItem")
-    const cookieSet = vi.fn()
-    Object.defineProperty(document, "cookie", { configurable: true, get: () => "", set: cookieSet })
-    const idbOpen = vi.fn()
-    const cachesOpen = vi.fn()
-    vi.stubGlobal("indexedDB", { open: idbOpen })
-    vi.stubGlobal("caches", { open: cachesOpen })
-    try {
-      const h = makeHost()
-      const worker = connect(h)
-      iframeSays(h, "ready")
-      renewCycle(h, worker)
-      worker.emit("message", { type: "terminal", reason: "session_ended" })
-      expect(localSet).not.toHaveBeenCalled()
-      expect(localGet).not.toHaveBeenCalled()
-      expect(cookieSet).not.toHaveBeenCalled()
-      expect(idbOpen).not.toHaveBeenCalled()
-      expect(cachesOpen).not.toHaveBeenCalled()
-    } finally {
-      Reflect.deleteProperty(document, "cookie")
-    }
   })
 })

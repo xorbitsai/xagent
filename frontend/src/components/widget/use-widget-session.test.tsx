@@ -47,6 +47,12 @@ function dispatchFromParent(
   })
 }
 
+function terminalReports(postMessage: { mock: { calls: unknown[][] } }) {
+  return postMessage.mock.calls.filter(
+    ([message]) => (message as { type?: string } | null)?.type === "session_terminal_reached",
+  )
+}
+
 beforeEach(() => {
   Object.defineProperty(window, "parent", {
     configurable: true,
@@ -196,6 +202,15 @@ describe("useWidgetSession", () => {
     expect(result.current.session?.token).toBe("st_session_token")
   })
 
+  it("keeps a rate_limited parent failure nonterminal", () => {
+    const { result } = renderHook(() => useWidgetSession())
+
+    dispatchFromParent({ xagent: true, v: 1, type: "session_degraded", code: "rate_limited" })
+
+    expect(result.current.status).toBe("degraded")
+    expect(result.current.terminalCode).toBeNull()
+  })
+
   it.each([undefined, "future_recovery_code"])(
     "fails closed on an invalid session_degraded code %s",
     (code) => {
@@ -312,7 +327,7 @@ describe("useWidgetSession", () => {
       expect(result.current.terminalCode).toBe("unexpected_error")
       expect(result.current.session).toBeNull()
       expect(result.current.agent).toBeNull()
-      expect(postMessage).not.toHaveBeenCalled()
+      expect(postMessage.mock.calls.filter((call) => call[0]?.type === "reconnect_request")).toHaveLength(0)
     },
   )
 
@@ -364,7 +379,7 @@ describe("useWidgetSession", () => {
       expect(result.current.terminalCode).toBe(terminalCode)
       expect(result.current.session).toBeNull()
       expect(result.current.agent).toBeNull()
-      expect(postMessage).not.toHaveBeenCalled()
+      expect(postMessage.mock.calls.filter((call) => call[0]?.type === "reconnect_request")).toHaveLength(0)
     },
   )
 
@@ -1307,6 +1322,99 @@ describe("useWidgetSession upload coordination", () => {
 
       expect((await waiting).error).toMatchObject({ errorCode: "connection_not_ready" })
     })
+  })
+})
+
+describe("useWidgetSession terminal report to the parent", () => {
+  beforeEach(() => cleanup())
+  afterEach(() => cleanup())
+
+  const closeWith = (code: number) => (hook: ReturnType<typeof useWidgetSession>) => {
+    hook.handleConnectionClose(new CloseEvent("close", { code }))
+  }
+  const rows: Array<[string, string, (hook: ReturnType<typeof useWidgetSession>) => void]> = [
+    ["chat socket closed with 1000", "unexpected_error", closeWith(1000)],
+    ["chat socket closed with 1001", "unexpected_error", closeWith(1001)],
+    ["chat socket closed with 4403", "ws_4403", closeWith(4403)],
+    ["chat socket closed with 4408", "ws_4408", closeWith(4408)],
+    ["an unrecoverable connection failure", "unexpected_error", (hook) => {
+      hook.handleConnectionFailure({ recoverable: false, error: new Error("sanitized failure") })
+    }],
+    ["the voice socket's expiry report", "ws_4408", (hook) => hook.handleSessionExpired()],
+  ]
+
+  it.each(rows)(
+    "reports a terminal transition to the parent once, with its code: %s",
+    (_name, terminalCode, trigger) => {
+      const postMessage = vi.spyOn(window, "postMessage")
+      const { result } = renderHook(() => useWidgetSession())
+      dispatchFromParent(updateMessage())
+      postMessage.mockClear()
+
+      act(() => trigger(result.current))
+
+      expect(result.current.status).toBe("terminal")
+      expect(terminalReports(postMessage)).toEqual([[
+        { xagent: true, v: 1, type: "session_terminal_reached", code: terminalCode },
+        PARENT_ORIGIN,
+      ]])
+    },
+  )
+
+  it.each([
+    ["a parent session_terminal", { type: "session_terminal", code: "session_expired" }, "session_expired"],
+    ["an unknown session_degraded code", { type: "session_degraded", code: "future_recovery_code" }, "unexpected_error"],
+    ["a session_update without an agent", updateMessage({ agent: null }), "unexpected_error"],
+    [
+      "a session_update that is already past its absolute expiry",
+      updateMessage({ absolute_expires_at: new Date(Date.now() - 1000).toISOString() }),
+      "session_expired",
+    ],
+  ])(
+    "reports the terminal state a parent message causes, with its code: %s",
+    (_name, message, terminalCode) => {
+      const postMessage = vi.spyOn(window, "postMessage")
+      const { result } = renderHook(() => useWidgetSession())
+      if (message.type === "session_terminal") dispatchFromParent(updateMessage())
+      postMessage.mockClear()
+
+      dispatchFromParent({ xagent: true, v: 1, ...message })
+
+      expect(result.current.status).toBe("terminal")
+      expect(terminalReports(postMessage)).toEqual([[
+        { xagent: true, v: 1, type: "session_terminal_reached", code: terminalCode },
+        PARENT_ORIGIN,
+      ]])
+    },
+  )
+
+  it("reports a terminal state only once", () => {
+    const postMessage = vi.spyOn(window, "postMessage")
+    const { result } = renderHook(() => useWidgetSession())
+    dispatchFromParent(updateMessage())
+    postMessage.mockClear()
+
+    act(() => { result.current.handleConnectionClose(new CloseEvent("close", { code: 4403 })) })
+    act(() => { result.current.handleConnectionClose(new CloseEvent("close", { code: 1000 })) })
+    act(() => result.current.handleSessionExpired())
+
+    expect(terminalReports(postMessage)).toEqual([[
+      { xagent: true, v: 1, type: "session_terminal_reached", code: "ws_4403" },
+      PARENT_ORIGIN,
+    ]])
+  })
+
+  it("does not report a terminal state after unmount", () => {
+    const postMessage = vi.spyOn(window, "postMessage")
+    const { result, unmount } = renderHook(() => useWidgetSession())
+    dispatchFromParent(updateMessage())
+    const expire = result.current.handleSessionExpired
+    unmount()
+    postMessage.mockClear()
+
+    act(() => expire())
+
+    expect(terminalReports(postMessage)).toEqual([])
   })
 })
 

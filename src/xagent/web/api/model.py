@@ -202,13 +202,18 @@ def _resolve_accessible_model(
     2. If not, check if any visible user shares this model.
     """
 
-    from ..services.model_service import _get_visible_user_ids
+    from ..services.model_service import (
+        _get_visible_user_ids,
+        _passes_model_visibility_hook,
+    )
 
     decoded_model_id = _decode_model_identifier(model_id)
     model_storage = CoreStorage(db, DBModel)
     db_model = model_storage.get_db_model(decoded_model_id)
     if not db_model:
         raise HTTPException(status_code=404, detail="Model not found")
+    if not _passes_model_visibility_hook(db, int(user.id), db_model):
+        raise HTTPException(status_code=404, detail="Model not found or access denied")
 
     # Step 1: own UserModel
     user_model = (
@@ -861,7 +866,10 @@ async def get_user_default_models(
     try:
         return ModelStore(db).get_user_default_models(user)
     except Exception as e:
-        logger.error(f"Error getting user default models: {e}")
+        # Log the exception itself: the record factory masks its credential
+        # shapes with the full [REDACTED] marker. safe_error is for the
+        # response only.
+        logger.error("Error getting user default models: %s", e)
         # Return an empty list even if an error occurs, instead of 404
         return []
 
@@ -1220,9 +1228,11 @@ async def test_model_connection(
             ),
         )
     except Exception as e:
-        logger.error(f"Model connection test failed: {e}")
-        response_time = time.time() - start_time
+        # The response keeps the short ***suffix mask; the log line goes
+        # through the record factory, which writes [REDACTED].
         safe_error = redact_sensitive_text(str(e))
+        logger.error("Model connection test failed: %s", e)
+        response_time = time.time() - start_time
         return ModelTestResponse(
             model_id=request.model_name,
             status="failed",
@@ -1334,9 +1344,7 @@ async def transcribe_speech_input(
     except Exception as exc:
         safe_error = redact_sensitive_text(str(exc))
         logger.error(
-            "Speech transcription failed for model %s: %s",
-            db_model.model_id,
-            safe_error,
+            "Speech transcription failed for model %s: %s", db_model.model_id, exc
         )
         raise HTTPException(
             status_code=500,
@@ -1367,6 +1375,7 @@ async def test_models(
 
     from ..services.model_service import (
         _get_visible_user_ids,
+        _passes_model_visibility_hook,
         build_user_model_visibility_filter,
     )
 
@@ -1399,6 +1408,12 @@ async def test_models(
             .all()
         )
 
+    # A model the visibility hook hides from this user is never called on their behalf.
+    models = [
+        model
+        for model in models
+        if _passes_model_visibility_hook(db, int(user.id), model)
+    ]
     if not models:
         return []
 
@@ -1445,11 +1460,7 @@ async def test_models(
         except Exception as e:
             response_time = time.time() - start_time
             safe_error = redact_sensitive_text(str(e))
-            logger.error(
-                "Error testing model %s: %s",
-                model.model_id,
-                safe_error,
-            )
+            logger.error("Error testing model %s: %s", model.model_id, e)
             test_results.append(
                 ModelTestResponse(
                     model_id=model.model_id,
@@ -2547,9 +2558,7 @@ async def fetch_provider_models(
             }
         if isinstance(e, AnthropicAuthenticationError):
             safe_error = redact_sensitive_text(str(e))
-            logger.warning(
-                "Provider %s rejected its credentials: %s", provider, safe_error
-            )
+            logger.warning("Provider %s rejected its credentials: %s", provider, e)
             raise HTTPException(
                 status_code=422,
                 detail={
@@ -2559,11 +2568,7 @@ async def fetch_provider_models(
                 },
             ) from e
         safe_error = redact_sensitive_text(str(e))
-        logger.error(
-            "Error fetching models from %s: %s",
-            provider,
-            safe_error,
-        )
+        logger.error("Error fetching models from %s: %s", provider, e)
         raise HTTPException(
             status_code=502,
             detail=f"Failed to fetch models from {provider}: {safe_error}",
@@ -2641,11 +2646,7 @@ async def fetch_multiple_providers_models(
             }
         except Exception as e:
             safe_error = redact_sensitive_text(str(e))
-            logger.error(
-                "Error fetching from %s: %s",
-                provider,
-                safe_error,
-            )
+            logger.error("Error fetching from %s: %s", provider, e)
             results[provider] = {
                 "error": safe_error,
                 "models": [],

@@ -702,6 +702,15 @@ class UserAwareModelStorage:
                 logger.info(
                     f"Checking user access: user_id={user_id}, model_id={db_model.id}"
                 )
+                # A model the visibility hook hides from this user cannot be
+                # resolved by id either, however it is owned or shared.
+                from .model_service import _passes_model_visibility_hook
+
+                if not _passes_model_visibility_hook(self.db, user_id, db_model):
+                    logger.warning(
+                        f"Model '{model_name}' (db_model.id={db_model.id}) is hidden from user {user_id}"
+                    )
+                    return None
                 # Step 1: own UserModel (must be owner)
                 user_model = (
                     self.db.query(UserModel)

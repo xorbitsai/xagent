@@ -368,6 +368,60 @@ class TestModeBAccessVerification:
         assert data["can_delete"] is False
 
 
+class TestModelVisibilityHookOnIdResolution:
+    """A model the visibility hook hides cannot be resolved by id, however it is shared."""
+
+    @pytest.fixture(autouse=True)
+    def _reset_visibility_hook(self):
+        from xagent.web.services import model_service
+
+        previous = model_service._model_visibility_hook
+        yield
+        model_service.set_model_visibility_hook(previous)
+
+    def _shared_model(self, admin_headers, sample_model_data):
+        sample_model_data["share_with_users"] = True
+        response = client.post(
+            "/api/models/", json=sample_model_data, headers=admin_headers
+        )
+        assert response.status_code == 200
+        return response.json()["model_id"]
+
+    def _resolve(self, model_id, user_id):
+        from xagent.web.services.llm_utils import UserAwareModelStorage
+
+        db = next(get_db())
+        try:
+            return UserAwareModelStorage(db).get_llm_by_name_with_access(
+                model_id, user_id
+            )
+        finally:
+            db.close()
+
+    def test_without_a_hook_a_shared_model_resolves(
+        self, test_db, admin_headers, regular_user, sample_model_data
+    ):
+        model_id = self._shared_model(admin_headers, sample_model_data)
+        assert self._resolve(model_id, regular_user["id"]) is not None
+
+    def test_a_hidden_model_does_not_resolve_for_the_user_it_is_hidden_from(
+        self, test_db, admin_headers, admin_user, regular_user, sample_model_data
+    ):
+        from xagent.web.services.model_service import set_model_visibility_hook
+
+        model_id = self._shared_model(admin_headers, sample_model_data)
+        hidden_from = regular_user["id"]
+        set_model_visibility_hook(
+            lambda db, user_id, db_model: (
+                not (user_id == hidden_from and db_model.model_id == model_id)
+            )
+        )
+
+        assert self._resolve(model_id, hidden_from) is None
+        # Other users, and the owner, still resolve it.
+        assert self._resolve(model_id, admin_user["id"]) is not None
+
+
 # ===========================================================================
 # 4. Mode C — Model Listing
 # ===========================================================================

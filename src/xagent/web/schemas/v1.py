@@ -378,13 +378,13 @@ class V1AgentDetail(V1AgentResponse):
         "agent's runtime key runs as the agent's owner and can differ. A slot "
         "whose stored value is not an integer id is always listed; set it "
         "again with an integer id. This only checks whether the slot's model "
-        "can be used; it does not check an Auto model's own candidates. A chat "
-        "model the holder owns or that is shared with them is listed when a "
-        "model visibility hook registered by the deployment hides it from the "
-        "holder, although a task the holder starts still uses it. The check "
-        "does not build the model, so a slot is not listed when building its "
-        "model fails as the task starts, although the task then falls back to "
-        "another model."
+        "can be used; it does not check an Auto model's own candidates. An "
+        "active chat model the holder owns or that is shared with them is "
+        "listed when a model visibility hook registered by the deployment hides "
+        "it from the holder, although a task the holder starts still uses it. "
+        "The check does not build the model, so a slot whose model the check "
+        "accepts is not listed even when building that model fails as the task "
+        "starts, and the task then falls back to another model."
     )
 
 

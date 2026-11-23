@@ -592,8 +592,9 @@ def test_runtime_skips_the_hook_so_a_hidden_model_is_listed_yet_still_resolves()
     """Documents current run-time behavior; it is not asserted as intended.
 
     Slot resolution at run time does not apply the model visibility hook, so
-    a chat model the hook hides is listed in ``unresolved_models`` although a
-    task still resolves it. Tracked in https://github.com/xorbitsai/xagent/issues/3932.
+    an active chat model the hook hides is listed in ``unresolved_models``
+    although a task still resolves it.
+    Tracked in https://github.com/xorbitsai/xagent/issues/3932.
     Once run time applies the hook, the first assertion fails: change it to
     ``is False`` and keep the second one.
     """

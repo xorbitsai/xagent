@@ -27,6 +27,7 @@ from xagent.core.tools.adapters.vibe.mcp_discovery_cache import (
     discovery_key,
     remember_discovery,
 )
+from xagent.core.tools.core.mcp import sessions as sessions_module
 from xagent.core.tools.core.mcp.tools import (
     attach_raw_annotations,
     raw_annotations_for,
@@ -90,6 +91,52 @@ def test_credentials_are_part_of_the_key() -> None:
 )
 def test_every_launch_field_is_part_of_the_key(overrides: dict[str, Any]) -> None:
     assert discovery_key(_stdio(**overrides)) != discovery_key(_stdio())
+
+
+def test_an_env_without_path_keys_like_one_naming_the_process_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The launcher adds the process PATH when the env names none, so the child
+    # gets the same env either way.
+    monkeypatch.setenv("PATH", "/fixed/bin")
+    bare = {"EXAMPLE_ACCESS_TOKEN": "tok-a"}
+    assert _key(_stdio(env=bare)) == _key(_stdio(env={**bare, "PATH": "/fixed/bin"}))
+
+
+def test_an_empty_or_missing_env_keys_like_the_process_path_alone(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("PATH", "/fixed/bin")
+    named = _key(_stdio(env={"PATH": "/fixed/bin"}))
+    assert _key(_stdio(env={})) == named
+    assert _key(_stdio(env=None)) == named
+
+
+def test_an_explicit_empty_path_keys_differently_from_an_absent_one(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("PATH", "/fixed/bin")
+    bare = {"EXAMPLE_ACCESS_TOKEN": "tok-a"}
+    assert _key(_stdio(env={**bare, "PATH": ""})) != _key(_stdio(env=bare))
+
+
+def test_the_process_path_is_part_of_the_key_of_an_env_without_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bare = {"EXAMPLE_ACCESS_TOKEN": "tok-a"}
+    monkeypatch.setenv("PATH", "/fixed/bin")
+    first = _key(_stdio(env=bare))
+    monkeypatch.setenv("PATH", "/other/bin")
+    assert _key(_stdio(env=bare)) != first
+
+
+def test_computing_the_key_leaves_the_callers_env_alone(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("PATH", "/fixed/bin")
+    env = {"EXAMPLE_ACCESS_TOKEN": "tok-a"}
+    _key(_stdio(env=env))
+    assert env == {"EXAMPLE_ACCESS_TOKEN": "tok-a"}
 
 
 def test_a_non_task_env_value_is_part_of_the_key() -> None:
@@ -437,6 +484,49 @@ async def test_the_public_loader_does_not_cache_unless_asked(
     await load_mcp_tools_as_agent_tools({"example": _stdio()}, discovery_cache=True)
     await load_mcp_tools_as_agent_tools({"example": _stdio()}, discovery_cache=True)
     assert len(sessions.opened) == 3
+
+
+@pytest.mark.asyncio
+async def test_the_launchers_path_write_does_not_change_the_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The real launcher writes PATH into the caller's env after the key was
+    # computed; a second build with the same mapping must still hit the cache.
+    spawned: list[dict[str, str]] = []
+
+    @asynccontextmanager
+    async def fake_stdio_client(server_params: Any):
+        spawned.append(dict(server_params.env or {}))
+        yield None, None
+
+    class _FakeClientSession:
+        def __init__(self, read: Any, write: Any, **kwargs: Any) -> None:
+            pass
+
+        async def __aenter__(self) -> "_FakeClientSession":
+            return self
+
+        async def __aexit__(self, *exc_info: Any) -> None:
+            return None
+
+        async def initialize(self) -> None:
+            return None
+
+    async def fake_load_mcp_tools(session: Any) -> list[MCPTool]:
+        return [_tool("search")]
+
+    monkeypatch.setattr(sessions_module, "stdio_client", fake_stdio_client)
+    monkeypatch.setattr(sessions_module, "ClientSession", _FakeClientSession)
+    monkeypatch.setattr(mcp_adapter_module, "load_mcp_tools", fake_load_mcp_tools)
+
+    connection = _stdio()
+    assert "PATH" not in connection["env"]
+
+    await load_mcp_tools_as_agent_tools({"example": connection}, discovery_cache=True)
+    assert "PATH" in connection["env"]
+    await load_mcp_tools_as_agent_tools({"example": connection}, discovery_cache=True)
+
+    assert len(spawned) == 1
 
 
 @pytest.mark.asyncio

@@ -14,7 +14,8 @@ uploads, adapters, approval gating) still runs on every build against the
 live connection.
 
 The key is a digest of what the child is launched with: ``command``,
-``args``, ``cwd``, the encoding settings and ``env``. Credentials stay in the
+``args``, ``cwd``, the encoding settings and ``env``, including the process
+``PATH`` the launcher adds when the env names none. Credentials stay in the
 key, so a listing is never shared across tokens or accounts. Only the task
 file directories the host writes into the env for every task (the
 ``XAGENT_*_ALLOWED_DIRS`` and ``XAGENT_*_OUTPUT_DIR`` names it sets) enter it
@@ -119,6 +120,12 @@ def _launch_digest(connection: Mapping[str, Any]) -> str | None:
     env = connection.get("env") or {}
     if not isinstance(env, Mapping):
         return None
+    # Key on the env the child gets. The launcher adds the process PATH when
+    # the env has none, and writes it into the caller's mapping, so the key
+    # must not change once that has happened.
+    env = dict(env)
+    if "PATH" not in env:
+        env["PATH"] = os.environ.get("PATH", "")
     launch: dict[str, Any] = {field: connection.get(field) for field in _LAUNCH_FIELDS}
     launch["env"] = {
         str(name): (

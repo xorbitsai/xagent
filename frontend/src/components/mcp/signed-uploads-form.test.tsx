@@ -1,5 +1,5 @@
 import React from "react"
-import { cleanup, fireEvent, render, screen } from "@testing-library/react"
+import { cleanup, fireEvent, render, screen, within } from "@testing-library/react"
 import { afterEach, describe, expect, it, vi } from "vitest"
 
 import type { MCPServerFormData } from "./custom-api-form"
@@ -230,6 +230,11 @@ describe("SignedUploadsForm link entries", () => {
     const shown = screen.getByLabelText(`${KEY}.unrecognizedEntryValue`)
     expect(shown).toHaveAttribute("readonly")
     expect((shown as HTMLTextAreaElement).value).toBe(JSON.stringify(odd, null, 2))
+    // The read-only row has no mode radios and no editable name inputs.
+    const row = shown.closest("div.rounded-md") as HTMLElement
+    expect(within(row).queryAllByRole("radio")).toEqual([])
+    expect(within(row).queryByLabelText(`${KEY}.issuingToolName`)).not.toBeInTheDocument()
+    expect(within(row).queryByLabelText(`${KEY}.toolName`)).not.toBeInTheDocument()
     // Editing the other row keeps the unrecognized one as stored.
     fireEvent.change(screen.getByLabelText(`${KEY}.linkArgument`), {
       target: { value: "picture_url" },
@@ -238,6 +243,19 @@ describe("SignedUploadsForm link entries", () => {
       { tool_name: "attach_picture", link_argument: "picture_url" },
       odd,
     ])
+  })
+
+  it("titles an unrecognized row by its tool name, else by a generic label", () => {
+    renderForm([{ tool_name: " attach ", extra: 1 }, { extra: 1 }, { tool_name: 3, extra: 1 }])
+    expect(screen.getByText("attach")).toBeInTheDocument()
+    expect(screen.getAllByText(`${KEY}.unrecognizedEntryTitle`)).toHaveLength(2)
+    expect(screen.queryByText(`${KEY}.newTool`)).not.toBeInTheDocument()
+  })
+
+  it("explains in the link row that an unmatched name means no link", () => {
+    renderForm([LINK])
+    expect(screen.getByText(`${KEY}.linkNamesNotCheckedHint`)).toBeInTheDocument()
+    expect(screen.queryByText(`${KEY}.namesNotCheckedHint`)).not.toBeInTheDocument()
   })
 
   it("removes an unrecognized entry", () => {

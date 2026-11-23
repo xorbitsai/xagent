@@ -22,8 +22,8 @@ interface SignedUploadContentTypeRow {
  * the tool that takes it and replaces that tool's file argument; "issuer" runs
  * the issuing tool for the model and returns only the connector's file ID;
  * "link" replaces a workspace image in a URL argument with a short-lived
- * download link. "unrecognized" is an entry whose keys match none of these:
- * it is shown read-only and written back exactly as it was stored.
+ * download link. "unrecognized" is an entry that carries a key the form does
+ * not know: it is shown read-only and written back exactly as it was stored.
  */
 export type SignedUploadMode = "replacement" | "issuer" | "link" | "unrecognized"
 
@@ -69,6 +69,11 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function textOrEmpty(value: unknown): string {
   return typeof value === "string" ? value : ""
+}
+
+// The tool name of an unrecognized entry, when it has a usable one.
+function unrecognizedTitle(raw: unknown): string {
+  return isRecord(raw) && typeof raw.tool_name === "string" ? raw.tool_name.trim() : ""
 }
 
 function hasExactKeys(item: Record<string, unknown>, expected: readonly string[]): boolean {
@@ -316,10 +321,11 @@ export function SignedUploadsForm({
                 <div key={row.id} className="space-y-3 rounded-md border bg-white p-3">
                   <div className="flex items-center justify-between gap-2">
                     <span className="text-sm font-medium text-slate-700">
-                      {(row.mode === "unrecognized"
-                        ? ""
-                        : row.mode === "issuer" ? row.issuingToolName : row.toolName).trim()
-                        || t("tools.mcp.signedUploads.newTool")}
+                      {row.mode === "unrecognized"
+                        ? unrecognizedTitle(row.raw)
+                          || t("tools.mcp.signedUploads.unrecognizedEntryTitle")
+                        : (row.mode === "issuer" ? row.issuingToolName : row.toolName).trim()
+                          || t("tools.mcp.signedUploads.newTool")}
                     </span>
                     <Button
                       type="button"
@@ -415,7 +421,7 @@ export function SignedUploadsForm({
                         />
                       </div>
                       <p className="text-xs text-slate-500">
-                        {t("tools.mcp.signedUploads.namesNotCheckedHint")}
+                        {t("tools.mcp.signedUploads.linkNamesNotCheckedHint")}
                       </p>
                     </>
                   )}

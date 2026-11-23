@@ -51,6 +51,8 @@ _IMAGE_MEDIA_TYPES = {
     ".jpg": "image/jpeg",
     ".png": "image/png",
 }
+# The connector-image purpose also delivers WebP; Instagram and Facebook do not.
+_CONNECTOR_IMAGE_MEDIA_TYPES = {**_IMAGE_MEDIA_TYPES, ".webp": "image/webp"}
 _PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 _JPEG_SIGNATURE = b"\xff\xd8\xff"
 _JPEG_END_OF_IMAGE = b"\xff\xd9"
@@ -61,6 +63,7 @@ class ExternalMediaPurpose(str, Enum):
 
     INSTAGRAM_PUBLISH = "instagram-publish"
     FACEBOOK_PUBLISH = "facebook-publish"
+    CONNECTOR_IMAGE = "connector-image"
 
 
 class ExternalMediaError(RuntimeError):
@@ -93,7 +96,23 @@ class ExternalMediaOutOfScope(ExternalMediaUnavailable):
 
 
 class ExternalMediaTicketRejected(ExternalMediaError):
-    """A public delivery ticket is invalid, expired, or scope-mismatched."""
+    """A public delivery ticket is invalid, expired, or scope-mismatched.
+
+    ``purpose`` and ``file_id`` are what the ticket names and the normalized id
+    of the requested file, set only when the ticket was read far enough to know
+    the purpose; a ticket that does not decode has neither.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        purpose: ExternalMediaPurpose | None = None,
+        file_id: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.purpose = purpose
+        self.file_id = file_id
 
 
 @dataclass(frozen=True)
@@ -125,6 +144,7 @@ INSTAGRAM_MAX_WIDTH = 1440
 INSTAGRAM_MAX_SOURCE_PIXELS = 25_000_000
 INSTAGRAM_MAX_JPEG_SOURCE_PIXELS = 100_000_000
 _INSTAGRAM_IMAGE_FORMATS = ["PNG", "JPEG"]
+_CONNECTOR_IMAGE_FORMATS = ["PNG", "JPEG", "WEBP"]
 _INSTAGRAM_PROCESSING_ERRORS = (
     OSError,
     UnidentifiedImageError,
@@ -153,6 +173,20 @@ def _image_media_type(record: Any) -> str:
     return media_type
 
 
+def _connector_image_media_type(record: Any) -> str:
+    filename = str(getattr(record, "filename", "") or "").strip().lower()
+    media_type = _CONNECTOR_IMAGE_MEDIA_TYPES.get(Path(filename).suffix)
+    if media_type is None:
+        raise ExternalMediaUnsupportedImage(
+            "Only PNG, JPEG or WebP images can be delivered"
+        )
+    return media_type
+
+
+def _is_webp_signature(content: bytes) -> bool:
+    return content[:4] == b"RIFF" and content[8:12] == b"WEBP"
+
+
 def delivered_image_media_type(content: bytes, registered_type: str) -> str:
     """The type of the image bytes being delivered, read from their signature.
 
@@ -168,12 +202,40 @@ def delivered_image_media_type(content: bytes, registered_type: str) -> str:
     return registered_type
 
 
+def delivered_connector_image_media_type(content: bytes, registered_type: str) -> str:
+    """The type of the connector-image bytes being delivered, from their signature.
+
+    Reads the WebP signature, then falls back to ``delivered_image_media_type``
+    for PNG and JPEG, so bytes with no known signature keep the registered type.
+    """
+    if _is_webp_signature(content):
+        return "image/webp"
+    return delivered_image_media_type(content, registered_type)
+
+
+_CONNECTOR_IMAGE_EXTENSIONS = {
+    "image/png": "png",
+    "image/jpeg": "jpg",
+    "image/webp": "webp",
+}
+
+
+def connector_image_filename(file_id: str, media_type: str) -> str:
+    """The file name a connector-image delivery carries: the id and a type suffix.
+
+    The name the user uploaded the file under is never sent to the connector.
+    ``media_type`` is one ``delivered_connector_image_media_type`` returns.
+    """
+    return f"{file_id}.{_CONNECTOR_IMAGE_EXTENSIONS[media_type]}"
+
+
 def _load_record(
     db: Session,
     *,
     file_id: str,
     user_id: int,
     task_id: int,
+    purpose: ExternalMediaPurpose,
 ) -> UploadedFile:
     record = (
         db.query(UploadedFile)
@@ -191,8 +253,15 @@ def _load_record(
         or record.storage_status not in {"available", "legacy"}
     ):
         raise ExternalMediaNotFound("Registered image was not found")
-    _image_media_type(record)
+    _registered_media_type(record, purpose)
     return record
+
+
+def _registered_media_type(record: Any, purpose: ExternalMediaPurpose) -> str:
+    """The media type a registered file's name declares, for ``purpose``."""
+    if purpose is ExternalMediaPurpose.CONNECTOR_IMAGE:
+        return _connector_image_media_type(record)
+    return _image_media_type(record)
 
 
 def _encode_ticket(
@@ -234,6 +303,7 @@ def issue_external_media_url(
         file_id=normalized_file_id,
         user_id=int(user_id),
         task_id=int(task_id),
+        purpose=purpose,
     )
     ttl = get_external_media_url_ttl_seconds()
     base_url = get_s2s_api_base_url()
@@ -247,10 +317,14 @@ def issue_external_media_url(
             "XAGENT_S2S_API_BASE_URL (or XAGENT_PUBLIC_API_BASE_URL when S2S is "
             "unset) must be HTTPS for external media delivery"
         )
-    if purpose is ExternalMediaPurpose.FACEBOOK_PUBLISH:
-        _validate_facebook_record(record)
-    else:
+    if purpose is ExternalMediaPurpose.INSTAGRAM_PUBLISH:
         _validate_instagram_record(record)
+    elif purpose is ExternalMediaPurpose.FACEBOOK_PUBLISH:
+        _validate_facebook_record(record)
+    elif purpose is ExternalMediaPurpose.CONNECTOR_IMAGE:
+        _validate_connector_image_record(record)
+    else:
+        raise ExternalMediaUnavailable("External media purpose is not supported")
     ticket = _encode_ticket(
         file_id=normalized_file_id,
         user_id=int(user_id),
@@ -300,7 +374,11 @@ def redeem_external_media_ticket(
         or type(user_id) is not int
         or type(task_id) is not int
     ):
-        raise ExternalMediaTicketRejected("Invalid or expired external media ticket")
+        raise ExternalMediaTicketRejected(
+            "Invalid or expired external media ticket",
+            purpose=purpose,
+            file_id=normalized_file_id,
+        )
 
     try:
         record = _load_record(
@@ -308,15 +386,18 @@ def redeem_external_media_ticket(
             file_id=normalized_file_id,
             user_id=user_id,
             task_id=task_id,
+            purpose=purpose,
         )
     except ExternalMediaNotFound:
         raise ExternalMediaTicketRejected(
-            "Invalid or expired external media ticket"
+            "Invalid or expired external media ticket",
+            purpose=purpose,
+            file_id=normalized_file_id,
         ) from None
     return RedeemedExternalMedia(
         record=record,
         purpose=purpose,
-        media_type=_image_media_type(record),
+        media_type=_registered_media_type(record, purpose),
     )
 
 
@@ -612,6 +693,56 @@ def _validate_facebook_record(record: UploadedFile) -> None:
         raise ExternalMediaUnsupportedImage(
             "Registered image could not be decoded as PNG or JPEG"
         ) from exc
+
+
+def _validate_connector_image_record(record: UploadedFile) -> None:
+    """A connector fetches the image as stored: a whole PNG, JPEG or WebP within 10 MB.
+
+    The rule is the Facebook one with WebP added, and fails the same way: an
+    unreadable file is a storage problem (base ``ExternalMediaUnavailable``); a
+    file that reads but is the wrong type, too large or does not decode is an
+    unsupported image.  A WebP is checked by its RIFF header, which must name
+    a WebP and a length that matches the bytes held, so a file cut short or
+    padded after its end is refused without decoding any pixels.
+    """
+
+    _connector_image_media_type(record)
+    path = _materialize_record(record)
+    try:
+        # Pin the opened file and bound the read even if a sandbox writer grows it.
+        with open_delivery_file(record, path) as source:
+            content = source.read(FACEBOOK_MAX_IMAGE_BYTES + 1)
+    except OSError as exc:
+        raise ExternalMediaUnavailable(
+            "Registered image could not be read for external delivery"
+        ) from exc
+    if len(content) > FACEBOOK_MAX_IMAGE_BYTES:
+        raise ExternalMediaUnsupportedImage("Registered image exceeds the 10 MB limit")
+    try:
+        # PNG's verify() reads every chunk and checks its CRC; JPEG's only
+        # parses the header, so the main image must also be seen to end; for
+        # WebP the RIFF length is the check.  The bytes are in memory, so any
+        # error is a decode error.
+        with Image.open(BytesIO(content), formats=_CONNECTOR_IMAGE_FORMATS) as image:
+            image_format = image.format
+            image.verify()
+        if image_format in {"JPEG", "MPO"} and not _jpeg_main_image_ends(content):
+            raise SyntaxError("JPEG ends before its main image does")
+        if image_format == "WEBP" and not _webp_length_matches(content):
+            raise SyntaxError("WebP length does not match its RIFF header")
+    except Exception as exc:
+        raise ExternalMediaUnsupportedImage(
+            "Registered image could not be decoded as PNG, JPEG or WebP"
+        ) from exc
+
+
+def _webp_length_matches(content: bytes) -> bool:
+    """Whether ``content`` is a RIFF WebP whose length field matches its size."""
+    return (
+        len(content) >= 12
+        and _is_webp_signature(content)
+        and int.from_bytes(content[4:8], "little") + 8 == len(content)
+    )
 
 
 def _jpeg_main_image_ends(content: bytes) -> bool:

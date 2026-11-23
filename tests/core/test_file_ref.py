@@ -255,8 +255,16 @@ def test_internal_workspace_file_ref_fails_closed(tmp_path: Path) -> None:
     assert workspace.register_calls == 0
 
 
+@pytest.mark.parametrize(
+    ("purpose", "expected"),
+    [
+        ("instagram-publish", "INSTAGRAM_PUBLISH"),
+        ("facebook-publish", "FACEBOOK_PUBLISH"),
+        ("connector-image", "CONNECTOR_IMAGE"),
+    ],
+)
 def test_workspace_issues_scoped_instagram_media_url(
-    monkeypatch, tmp_path: Path
+    monkeypatch, tmp_path: Path, purpose: str, expected: str
 ) -> None:
     from xagent.core.storage import manager
     from xagent.web.services import external_media
@@ -287,7 +295,7 @@ def test_workspace_issues_scoped_instagram_media_url(
 
     result = workspace.issue_external_media_url_detached(
         "31218a9f-1497-4216-9f75-1fc8d51368c4",
-        "instagram-publish",
+        purpose,
     )
 
     assert result == "https://api.example.test/media?ticket=short-lived"
@@ -295,7 +303,7 @@ def test_workspace_issues_scoped_instagram_media_url(
         "file_id": "31218a9f-1497-4216-9f75-1fc8d51368c4",
         "user_id": 7,
         "task_id": 11,
-        "purpose": external_media.ExternalMediaPurpose.INSTAGRAM_PUBLISH,
+        "purpose": external_media.ExternalMediaPurpose[expected],
     }
     assert db.closed is True
 

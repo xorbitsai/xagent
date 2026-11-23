@@ -2,9 +2,10 @@
 
 Celery configures logging itself and never calls ``setup_logging``, so the app
 installs the record factory and the httpx/httpcore filter from Celery's own
-signals. Every test bootstraps a real Celery entry point in a child interpreter
-and reads what reaches stderr: a process-global factory and a logger filter can
-only be trusted from a process that did not inherit them from a previous test.
+signals. Every process-level test bootstraps a real Celery entry point in a
+child interpreter and reads what reaches stderr: a process-global factory and a
+logger filter can only be trusted from a process that did not inherit them from
+a previous test.
 """
 
 from __future__ import annotations
@@ -31,7 +32,8 @@ _BEARER_SECRET = "SECRET-BEARER-VALUE"
 # The loggers ``install_log_redaction`` attaches the below-WARNING filter to.
 _TRANSPORT_LOGGERS = ("httpx", "httpcore")
 
-# Below the 300s pytest timeout, so a hang keeps the captured output.
+# Below the 300s pytest timeout. A child that overruns fails the test with its
+# captured stdout and stderr in the failure message.
 _SUBPROCESS_TIMEOUT_SECONDS = 120
 
 # The same records every process must mask: a request target with two
@@ -82,10 +84,12 @@ celery_app.log.setup(
 )
 """
 
-# ``Worker.setup_logging`` calls ``app.log.setup``, which emits
-# ``setup_logging``/``after_setup_logger``/``after_setup_task_logger`` after
-# Celery replaced the root handlers. With no ``setup_logging`` receiver, the
-# worker main process is covered by ``after_setup_logger``.
+# ``Worker.setup_logging`` calls ``app.log.setup``, which sends
+# ``setup_logging`` before it replaces the root handlers: Celery configures the
+# root logger itself only when nothing receives that signal, and then emits
+# ``after_setup_logger``/``after_setup_task_logger`` after the replacement.
+# With no ``setup_logging`` receiver, the worker main process is covered by
+# ``after_setup_logger``.
 _WORKER_LOG_SETUP = (
     """\
 import logging
@@ -98,8 +102,8 @@ from xagent.web.jobs.celery_app import celery_app
 
 # The same worker once ``_SETUP_LOGGING_RECEIVER`` took the log configuration
 # over: Celery never emits ``after_setup_logger``, so ``worker_init``, which
-# ``Worker.init_worker`` sends before ``app.log.setup``, has to cover the main
-# process on its own.
+# ``WorkController.setup_instance`` sends before ``Worker.on_init_blueprint``
+# calls ``app.log.setup``, has to cover the main process on its own.
 _HIJACKED_WORKER_LOG_SETUP = (
     _SETUP_LOGGING_RECEIVER
     + textwrap.dedent(
@@ -115,10 +119,10 @@ _HIJACKED_WORKER_LOG_SETUP = (
 )
 
 # ``process_initializer`` is the real pool child entry: it re-runs
-# ``app.log.setup`` (a no-op unless the logfile has ``%i``) and then sends
-# ``worker_process_init``. The child starts from stock logging state on
-# purpose: a child started with execv does not inherit the parent's factory,
-# and the signal must install it there too.
+# ``app.log.setup``, which is a no-op in a forked child because ``already_setup``
+# was inherited from the parent unless the logfile has ``%i``, and then sends
+# ``worker_process_init``. The child resets the factory and the filters first,
+# so only ``worker_process_init`` can reinstall them.
 _PREFORK_CHILD_INIT = (
     _WORKER_LOG_SETUP
     + textwrap.dedent(
@@ -147,8 +151,8 @@ _PREFORK_CHILD_INIT = (
 )
 
 # ``Beat.start_scheduler`` calls ``setup_logging()`` and then
-# ``Service.start()``, whose first statement is
-# ``signals.beat_init.send(sender=self)``; the ticking loop is not entered.
+# ``Service.start()``, which logs ``beat: Starting...``, builds the scheduler
+# and sends ``beat_init`` before its tick loop; the loop is not entered here.
 # ``_SETUP_LOGGING_RECEIVER`` takes the log configuration over first, so
 # ``Beat.setup_logging`` never emits ``after_setup_logger`` and only
 # ``beat_init`` can install redaction here.
@@ -263,18 +267,43 @@ def _child_env(tmp_path: Path) -> dict[str, str]:
     return env
 
 
-def _run_script(script: str, tmp_path: Path) -> str:
-    completed = subprocess.run(
-        [sys.executable, "-c", script],
-        cwd=REPO_ROOT,
-        capture_output=True,
-        text=True,
-        env=_child_env(tmp_path),
-        timeout=_SUBPROCESS_TIMEOUT_SECONDS,
-    )
+def _decode_output(stream: bytes | str | None) -> str:
+    """Decode one of a child's captured streams, which may hold bytes."""
+    if isinstance(stream, bytes):
+        return stream.decode(errors="replace")
+    return stream or ""
+
+
+def _run_child_process(args: list[str], env: dict[str, str]) -> str:
+    """Run a child interpreter and return its output, or fail with it.
+
+    ``TimeoutExpired`` keeps the partial output only on its ``stdout`` and
+    ``stderr`` attributes, as bytes even under ``text=True``, and ``str()`` of
+    the exception has none of it; decoding both into the failure message puts
+    the child's own lines into the pytest report.
+    """
+    try:
+        completed = subprocess.run(
+            args,
+            cwd=REPO_ROOT,
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=_SUBPROCESS_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired as exc:
+        pytest.fail(
+            f"child timed out after {_SUBPROCESS_TIMEOUT_SECONDS}s:\n"
+            f"{_decode_output(exc.stdout)}{_decode_output(exc.stderr)}",
+            pytrace=False,
+        )
     output = completed.stdout + completed.stderr
     assert completed.returncode == 0, output
     return output
+
+
+def _run_script(script: str, tmp_path: Path) -> str:
+    return _run_child_process([sys.executable, "-c", script], _child_env(tmp_path))
 
 
 def _assert_redacted(output: str) -> None:
@@ -355,7 +384,7 @@ def test_a_real_solo_worker_redacts_task_output(tmp_path: Path) -> None:
 
     env = _child_env(tmp_path)
     env["PYTHONPATH"] = str(tmp_path)
-    completed = subprocess.run(
+    output = _run_child_process(
         [
             sys.executable,
             "-m",
@@ -370,12 +399,6 @@ def test_a_real_solo_worker_redacts_task_output(tmp_path: Path) -> None:
             "--include",
             "celery_log_redaction_probe",
         ],
-        cwd=REPO_ROOT,
-        capture_output=True,
-        text=True,
-        env=env,
-        timeout=_SUBPROCESS_TIMEOUT_SECONDS,
+        env,
     )
-    output = completed.stdout + completed.stderr
-    assert completed.returncode == 0, output
     _assert_redacted(output)

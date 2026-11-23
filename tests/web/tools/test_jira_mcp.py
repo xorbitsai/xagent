@@ -5303,6 +5303,13 @@ def test_search_issues_projects_a_custom_field_into_each_summary(monkeypatch):
             "customfield_10060": "x" * (jira._SEARCH_EXTRA_FIELD_MAX_CHARS + 500),
         },
     }
+    second_issue = {
+        "key": "DW-572",
+        "fields": {
+            "summary": "Freshdesk import, second batch",
+            "customfield_10050": "139326",
+        },
+    }
     monkeypatch.setattr(
         jira.requests,
         "request",
@@ -5310,7 +5317,7 @@ def test_search_issues_projects_a_custom_field_into_each_summary(monkeypatch):
             side_effect=[
                 MockResponse(json_data=[_SITE_A]),
                 MockResponse(json_data=_FIELD_TABLE),
-                MockResponse(json_data={"issues": [raw_issue]}),
+                MockResponse(json_data={"issues": [raw_issue, second_issue]}),
             ]
         ),
     )
@@ -5331,6 +5338,11 @@ def test_search_issues_projects_a_custom_field_into_each_summary(monkeypatch):
     assert len(values["cf[10060]"]) <= (
         jira._SEARCH_EXTRA_FIELD_MAX_CHARS + len("... [truncated]")
     )
+    # Every issue in the page carries its own values for the fields asked
+    # for, not just the first one.
+    assert [
+        issue["extra_field_values"]["Freshdesk ticket"] for issue in result["issues"]
+    ] == ["139325", "139326"]
 
 
 def test_search_issues_keeps_its_extra_fields_across_page_size_retries(

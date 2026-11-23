@@ -537,16 +537,19 @@ def _summarize_field(field: dict[str, Any]) -> dict[str, Any]:
 @mcp.tool()
 def jira_list_fields(query: str = "", cloud_id: str = "") -> str:
     """
-    List the fields a Jira site has -- its system fields and its custom
-    fields (customfield_*), each with an id, a name, whether it is custom,
-    its schema type, the names JQL can use for it (clause_names) and
-    whether it is searchable. Use a field's id (e.g. "customfield_10050")
-    or its name as jira_get_issue's / jira_search_issues' extra_fields to
-    get that field's value back; use clause_names to filter or sort by a
-    custom field in JQL, e.g. 'cf[10050] = 139325' or
-    '"Freshdesk ticket" ~ "139325"' (use ~ for text fields, and = or a
-    comparison operator for number, option and date fields). A field whose
-    searchable is false cannot appear in a JQL clause at all.
+    List the fields this connection can see on a Jira site -- its system
+    fields and its custom fields (customfield_*), each with an id, a name,
+    whether it is custom, its schema type, the names JQL can use for it
+    (clause_names) and whether it is searchable. Use a field's id (e.g.
+    "customfield_10050") or its name as jira_get_issue's /
+    jira_search_issues' extra_fields to get that field's value back; use
+    clause_names to filter by a custom field in JQL, e.g.
+    'cf[10050] = 139325' or '"Freshdesk ticket" ~ "139325"' (use ~ for text
+    fields, and = or a comparison operator for number, option and date
+    fields). clause_names gives each name as Jira spells it, so a name
+    with spaces or special characters has to be written in double quotes
+    to use it in JQL, e.g. '"Freshdesk ticket" ~ "139325"'. A field whose
+    searchable is false cannot be used to filter in JQL.
     query: optional substring, matched case-insensitively against a
     field's name and id, to narrow a long list.
     cloud_id: optional site id from jira_list_accessible_sites; omit when
@@ -1255,8 +1258,9 @@ def jira_search_issues(
     issue["fields"]["status"]["id"]), restricted to a fixed field subset
     (summary, status, assignee, priority, issuetype, project, updated,
     created, resolution, labels, parent) -- not the full issue. Use
-    jira_get_issue for a description, dependencies (issue_links/subtasks),
-    or extra_fields for any other field not in that list.
+    jira_get_issue for a description or dependencies
+    (issue_links/subtasks); pass extra_fields for any other field not in
+    that list.
     jql: a JQL query, e.g. 'project = ENG AND status = "In Progress"
     ORDER BY updated DESC' or 'text ~ "login bug"'. To search by a custom
     field, write it the way jira_list_fields' clause_names spells it --
@@ -1268,7 +1272,9 @@ def jira_search_issues(
     limit: max issues to return per page (default 50, capped at 100).
     next_page_token: pass the previous response's next_page_token to fetch
     the next page -- always check `truncated` and re-call with it instead
-    of assuming one page is everything.
+    of assuming one page is everything. Like limit and raw_fields,
+    extra_fields belongs to the call, not to the cursor: re-pass the same
+    value on every page, or the later pages won't carry those fields.
     raw_fields: defaults to True (Jira's own nested shape, matching what
     this tool has always returned -- callers that don't pass this
     parameter keep getting the same field layout they always have,
@@ -1290,10 +1296,11 @@ def jira_search_issues(
     fields["<field id>"]; with raw_fields=False each issue carries an
     extra_field_values {name you wrote: value} entry instead (ADF rich
     text flattened to plain text, and a long value cut to a truncated
-    string). A name (or cf[N]) resolved through the site's field table is
-    also reported in a top-level extra_field_ids {name: field id}, so you
-    can read the raw value by id; a name that matches no single field is
-    not fetched and is listed in a top-level unresolved_extra_fields
+    string). A name or cf[N] token is also reported in a top-level
+    extra_field_ids {token: field id} (a name is resolved through the
+    site's field table; cf[N] needs no lookup), so you can read the raw
+    value by id; a name that matches no single field is not fetched and
+    is listed in a top-level unresolved_extra_fields
     [{field, candidates}] instead -- the search itself still runs.
     A search error (invalid JQL, a page too big even at minimal size, a
     stuck pagination cursor) always has a "message" key describing it,
@@ -1852,12 +1859,16 @@ def jira_get_issue(
     unless named via extra_fields.
     issue_key: an issue key (e.g. "ENG-123") or its numeric id.
     extra_fields: optional comma-separated Jira fields not in the default
-    set above -- standard (e.g. "votes") or custom, named either by field
-    id (e.g. "customfield_10010") or by name (e.g. "Freshdesk ticket",
-    case-insensitive; JQL's "cf[10010]" form is accepted too). Use
-    jira_list_fields to find a field's id, its name and the JQL name to
-    filter by. A field already in the default set is ignored, since it's
-    already visible under its own summarized key. Returned as
+    set above -- standard or custom, named either by field id (e.g.
+    "customfield_10010") or by name (e.g. "Freshdesk ticket",
+    case-insensitive; JQL's "cf[10010]" form is accepted too). A
+    customfield_* or cf[N] token is the field id already, so it costs no
+    extra request; a name, or a standard field id outside the default
+    set, is resolved through the site's field table first (at most one
+    such request per call). Use jira_list_fields to find a field's id,
+    its name and the JQL name to filter by. A field already in the
+    default set is ignored, since it's already visible under its own
+    summarized key. Returned as
     {name you wrote: raw_value} under a top-level extra_field_values (a
     sibling of "issue", not nested inside it), so you can reach any
     field this tool doesn't summarize by name. An ADF-shaped (rich

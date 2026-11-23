@@ -187,6 +187,14 @@ describe("link session page", () => {
     activate(m)
     iframeSays("reconnect_request", {}, window)
     iframeSays("reconnect_request", {}, null)
+    const frame = iframeEl() as HTMLIFrameElement
+    act(() => {
+      window.dispatchEvent(new MessageEvent("message", {
+        data: { xagent: true, v: 1, type: "reconnect_request" },
+        origin: "https://evil.example",
+        source: frame.contentWindow,
+      }))
+    })
     expect(m.worker.count("renew")).toBe(0)
     iframeSays("reconnect_request")
     expect(m.worker.count("renew")).toBe(1)

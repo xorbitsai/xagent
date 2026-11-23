@@ -42,6 +42,35 @@ VERDICTS = {"jira_create_issue": "deny", "jira_delete_issue": "deny"}
 NAMED = re.compile(r"xagent-smoke-[0-9]{12}-[0-9a-f]{6}-issue")
 _JQL = re.compile(r"project = (?P<project>[A-Z]+) ORDER BY (key|created) ASC")
 _ISSUE = re.compile(r"/rest/api/2/issue/(?P<key>[^/]+)(?P<comments>/comment)?")
+# The site's field table, in the shape Jira's /rest/api/2/field answers with:
+# one system field and one custom field, the custom one with the JQL names
+# and schema a real custom field carries.
+FIELD_TABLE = [
+    {
+        "id": "summary",
+        "name": "Summary",
+        "custom": False,
+        "orderable": True,
+        "navigable": True,
+        "searchable": True,
+        "clauseNames": ["summary"],
+        "schema": {"type": "string", "system": "summary"},
+    },
+    {
+        "id": "customfield_10050",
+        "name": "Freshdesk ticket",
+        "custom": True,
+        "orderable": True,
+        "navigable": True,
+        "searchable": True,
+        "clauseNames": ["cf[10050]", "Freshdesk ticket"],
+        "schema": {
+            "type": "string",
+            "custom": "com.atlassian.jira.plugin.system.customfieldtypes:textfield",
+            "customId": 10050,
+        },
+    },
+]
 
 
 class Site:
@@ -121,6 +150,8 @@ class Site:
             fields = body["fields"]
             key = self.add(fields["project"]["key"], fields["summary"], "")
             return {"id": self.issues[key]["id"], "key": key, "self": url}
+        if (method, path) == ("GET", "/rest/api/2/field"):
+            return FIELD_TABLE
         match = _ISSUE.fullmatch(path)
         if match is None or match["key"] not in self.issues:
             raise RuntimeError("404 Client Error: Not Found")
@@ -141,6 +172,7 @@ _TOOLS = (
     "jira_list_accessible_sites",
     "jira_get_current_user",
     "jira_list_projects",
+    "jira_list_fields",
     "jira_search_issues",
     "jira_get_issue",
     "jira_create_issue",
@@ -209,6 +241,7 @@ _CHECKS = (
     "jira.search_issues",
     "jira.list_comments",
     "jira.get_issue",
+    "jira.list_fields",
     "jira.current_user",
     "jira.issue_round_trip",
 )
@@ -226,6 +259,7 @@ def test_jira_checks_the_tools_that_carry_its_calls() -> None:
         "jira_search_issues",
         "jira_list_comments",
         "jira_get_issue",
+        "jira_list_fields",
         "jira_get_current_user",
         "jira_create_issue",
         "jira_delete_issue",

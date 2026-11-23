@@ -302,7 +302,9 @@ def _jira_checks() -> ConnectorChecks:
     write project, reads it back and deletes it. Each call that reads or
     writes issues names the test site by ``cloud_id`` instead of relying on
     the tool's single-site auto-detection; the tenant pin still refuses the
-    write when the grant reaches any other site.
+    write when the grant reaches any other site. ``jira_list_fields`` is the
+    one read with nothing seeded behind it: it asserts only the shape of the
+    site's field table, which every tenant has.
     """
     tenant = FixtureRef("jira.tenant_id")
     seeded_issue = FixtureRef("jira.seed.issue_key")
@@ -366,6 +368,16 @@ def _jira_checks() -> ConnectorChecks:
                     ),
                     IsType(("issue", "summary"), "string"),
                     IsType(("issue", "description"), "string"),
+                ),
+            ),
+            ReadCheck(
+                "jira.list_fields",
+                "jira_list_fields",
+                {"cloud_id": tenant},
+                assertions=(
+                    StatusSuccess(),
+                    HasKeys((), ("fields", "total_count", "truncated")),
+                    EachHasKeys(("fields",), ("id", "name", "custom")),
                 ),
             ),
             ReadCheck(

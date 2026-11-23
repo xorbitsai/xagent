@@ -4837,3 +4837,564 @@ def test_delete_issue_site_lookup_failure_gets_no_delete_hint(monkeypatch):
     assert jira_delete.DELETE_MAY_HAVE_COMPLETED not in result["message"]
     assert mock_request.call_count == 1
     assert mock_request.call_args.kwargs["method"] == "GET"
+
+
+# Custom fields: the field table, and extra_fields by name or cf[N]
+
+
+# A Jira field table as /rest/api/2/field answers with it: one system field
+# that is already in jira_get_issue's default projection ("duedate"), and one
+# custom field with the JQL names and schema a real custom field carries.
+_FIELD_TABLE = [
+    {
+        "id": "duedate",
+        "name": "Due date",
+        "custom": False,
+        "searchable": True,
+        "clauseNames": ["duedate", "due", "Due date"],
+        "schema": {"type": "date", "system": "duedate"},
+    },
+    {
+        "id": "customfield_10050",
+        "name": "Freshdesk ticket",
+        "custom": True,
+        "searchable": True,
+        "clauseNames": ["cf[10050]", "Freshdesk ticket"],
+        "schema": {
+            "type": "string",
+            "custom": "com.atlassian.jira.plugin.system.customfieldtypes:textfield",
+        },
+    },
+]
+
+
+def test_list_fields_summarizes_the_field_table(monkeypatch):
+    mock_request = Mock(
+        side_effect=[MockResponse(json_data=[*_FIELD_TABLE, "not-a-dict"])]
+    )
+    monkeypatch.setattr(jira.requests, "request", mock_request)
+
+    result = json.loads(jira.jira_list_fields(cloud_id="site-a"))
+
+    assert result["status"] == "success"
+    assert result["total_count"] == 2
+    assert result["truncated"] is False
+    # clause_names and schema.type are what make the summary usable: the
+    # former is what JQL accepts for the field, the latter tells a caller
+    # whether to filter with ~ or =.
+    assert result["fields"] == [
+        {
+            "id": "duedate",
+            "name": "Due date",
+            "custom": False,
+            "type": "date",
+            "clause_names": ["duedate", "due", "Due date"],
+            "searchable": True,
+        },
+        {
+            "id": "customfield_10050",
+            "name": "Freshdesk ticket",
+            "custom": True,
+            "type": "string",
+            "clause_names": ["cf[10050]", "Freshdesk ticket"],
+            "searchable": True,
+        },
+    ]
+    field_call = mock_request.call_args_list[0]
+    assert field_call.kwargs["method"] == "GET"
+    assert field_call.kwargs["url"] == (
+        "https://api.atlassian.com/ex/jira/site-a/rest/api/2/field"
+    )
+
+
+def test_list_fields_resolves_the_cloud_id_once(monkeypatch):
+    # An empty cloud_id must cost the same single accessible-resources call
+    # every other tool pays for, not one per request.
+    mock_request = Mock(
+        side_effect=[
+            MockResponse(json_data=[_SITE_A]),
+            MockResponse(json_data=_FIELD_TABLE),
+        ]
+    )
+    monkeypatch.setattr(jira.requests, "request", mock_request)
+
+    result = json.loads(jira.jira_list_fields())
+
+    assert result["status"] == "success"
+    assert mock_request.call_count == 2
+    assert mock_request.call_args_list[1].kwargs["url"] == (
+        "https://api.atlassian.com/ex/jira/site-a/rest/api/2/field"
+    )
+
+
+def test_list_fields_filters_by_name_or_id_case_insensitively(monkeypatch):
+    monkeypatch.setattr(
+        jira.requests,
+        "request",
+        Mock(return_value=MockResponse(json_data=_FIELD_TABLE)),
+    )
+
+    by_name = json.loads(jira.jira_list_fields(query="freshdesk", cloud_id="site-a"))
+    by_id = json.loads(
+        jira.jira_list_fields(query="CUSTOMFIELD_1005", cloud_id="site-a")
+    )
+
+    for result in (by_name, by_id):
+        assert [field["id"] for field in result["fields"]] == ["customfield_10050"]
+        # Counted after filtering: it is the size of the list this response
+        # is about, not of the whole site.
+        assert result["total_count"] == 1
+        assert result["truncated"] is False
+
+
+def test_list_fields_shrinks_to_fit_the_output_limit(monkeypatch):
+    fields = [
+        {
+            "id": f"customfield_{i}",
+            "name": f"Field {i}",
+            "custom": True,
+            "searchable": True,
+            "clauseNames": [f"cf[{i}]", f"Field {i}"],
+            "schema": {"type": "string"},
+        }
+        for i in range(1000, 1010)
+    ]
+    monkeypatch.setattr(
+        jira.requests, "request", Mock(return_value=MockResponse(json_data=fields))
+    )
+    monkeypatch.setattr(jira, "get_tool_max_output_length", lambda: 800)
+
+    raw_response = jira.jira_list_fields(cloud_id="site-a")
+    result = json.loads(raw_response)
+
+    assert len(raw_response) <= 800
+    assert result["status"] == "success"
+    assert result["truncated"] is True
+    assert result["total_count"] == 10
+    assert 0 < len(result["fields"]) < 10
+    assert result["note"] == (
+        f"Only {len(result['fields'])} of 10 fields fit the output limit; "
+        "pass query to narrow the list."
+    )
+    # The counts come before the (variable-length) list, so a response cut
+    # downstream still says how much was dropped.
+    assert list(result)[:4] == ["status", "total_count", "truncated", "note"]
+
+
+def test_list_fields_errors_when_the_response_is_not_a_list(monkeypatch):
+    monkeypatch.setattr(
+        jira.requests, "request", Mock(return_value=MockResponse(json_data={}))
+    )
+
+    result = json.loads(jira.jira_list_fields(cloud_id="site-a"))
+
+    assert result["status"] == "error"
+    assert "Unexpected response format" in result["message"]
+
+
+def test_list_fields_errors_when_the_request_fails(monkeypatch):
+    monkeypatch.setattr(
+        jira.requests, "request", Mock(side_effect=requests.ConnectionError("boom"))
+    )
+
+    result = json.loads(jira.jira_list_fields(cloud_id="site-a"))
+
+    assert result["status"] == "error"
+    assert "boom" in result["message"]
+
+
+def test_get_issue_resolves_a_custom_field_name(monkeypatch):
+    raw_issue = {
+        "key": "DW-571",
+        "fields": {"summary": "ok", "customfield_10050": "139325"},
+    }
+    mock_request = Mock(
+        side_effect=[
+            MockResponse(json_data=[_SITE_A]),
+            MockResponse(json_data=_FIELD_TABLE),
+            MockResponse(json_data=raw_issue),
+        ]
+    )
+    monkeypatch.setattr(jira.requests, "request", mock_request)
+
+    result = json.loads(jira.jira_get_issue("DW-571", extra_fields="Freshdesk ticket"))
+
+    assert result["extra_field_values"] == {"Freshdesk ticket": "139325"}
+    assert result["extra_field_ids"] == {"Freshdesk ticket": "customfield_10050"}
+    assert "unresolved_extra_fields" not in result
+    # The field table is what turns the name into the id Jira's API takes;
+    # the issue request then asks for it alongside the default set.
+    field_call, issue_call = mock_request.call_args_list[1:]
+    assert field_call.kwargs["url"] == (
+        "https://api.atlassian.com/ex/jira/site-a/rest/api/2/field"
+    )
+    assert issue_call.kwargs["params"]["fields"] == (
+        f"{jira._GET_ISSUE_FIELDS},customfield_10050"
+    )
+
+
+def test_get_issue_resolves_a_custom_field_name_regardless_of_case(monkeypatch):
+    raw_issue = {
+        "key": "DW-571",
+        "fields": {"summary": "ok", "customfield_10050": "139325"},
+    }
+    monkeypatch.setattr(
+        jira.requests,
+        "request",
+        Mock(
+            side_effect=[
+                MockResponse(json_data=[_SITE_A]),
+                MockResponse(json_data=_FIELD_TABLE),
+                MockResponse(json_data=raw_issue),
+            ]
+        ),
+    )
+
+    result = json.loads(jira.jira_get_issue("DW-571", extra_fields="freshdesk TICKET"))
+
+    assert result["extra_field_values"] == {"freshdesk TICKET": "139325"}
+    assert result["extra_field_ids"] == {"freshdesk TICKET": "customfield_10050"}
+
+
+def test_get_issue_maps_cf_field_syntax_without_a_field_table_request(monkeypatch):
+    raw_issue = {
+        "key": "DW-571",
+        "fields": {"summary": "ok", "customfield_10050": "139325"},
+    }
+    mock_request = Mock(
+        side_effect=[
+            MockResponse(json_data=[_SITE_A]),
+            MockResponse(json_data=raw_issue),
+        ]
+    )
+    monkeypatch.setattr(jira.requests, "request", mock_request)
+
+    result = json.loads(jira.jira_get_issue("DW-571", extra_fields="cf[10050]"))
+
+    assert result["extra_field_values"] == {"cf[10050]": "139325"}
+    assert result["extra_field_ids"] == {"cf[10050]": "customfield_10050"}
+    assert mock_request.call_count == 2
+    issue_call = mock_request.call_args_list[1]
+    assert issue_call.kwargs["params"]["fields"] == (
+        f"{jira._GET_ISSUE_FIELDS},customfield_10050"
+    )
+
+
+def test_get_issue_reports_an_unresolved_field_name(monkeypatch):
+    raw_issue = {"key": "DW-571", "fields": {"summary": "ok"}}
+    mock_request = Mock(
+        side_effect=[
+            MockResponse(json_data=[_SITE_A]),
+            MockResponse(json_data=_FIELD_TABLE),
+            MockResponse(json_data=raw_issue),
+        ]
+    )
+    monkeypatch.setattr(jira.requests, "request", mock_request)
+
+    result = json.loads(jira.jira_get_issue("DW-571", extra_fields="Nonexistent"))
+
+    assert result["unresolved_extra_fields"] == [
+        {"field": "Nonexistent", "candidates": []}
+    ]
+    assert "extra_field_values" not in result
+    assert "extra_field_ids" not in result
+    issue_call = mock_request.call_args_list[2]
+    assert issue_call.kwargs["params"]["fields"] == jira._GET_ISSUE_FIELDS
+
+
+def test_get_issue_reports_a_field_name_shared_by_two_fields(monkeypatch):
+    # Jira lets two fields carry the same name, and picking one of them for
+    # the caller would silently return the wrong field's value.
+    duplicate = [
+        *_FIELD_TABLE,
+        {
+            "id": "customfield_10060",
+            "name": "Freshdesk ticket",
+            "custom": True,
+            "searchable": True,
+            "clauseNames": ["cf[10060]", "Freshdesk ticket"],
+            "schema": {"type": "string"},
+        },
+    ]
+    raw_issue = {"key": "DW-571", "fields": {"summary": "ok"}}
+    mock_request = Mock(
+        side_effect=[
+            MockResponse(json_data=[_SITE_A]),
+            MockResponse(json_data=duplicate),
+            MockResponse(json_data=raw_issue),
+        ]
+    )
+    monkeypatch.setattr(jira.requests, "request", mock_request)
+
+    result = json.loads(jira.jira_get_issue("DW-571", extra_fields="Freshdesk ticket"))
+
+    assert result["unresolved_extra_fields"] == [
+        {
+            "field": "Freshdesk ticket",
+            "candidates": ["customfield_10050", "customfield_10060"],
+        }
+    ]
+    assert "extra_field_values" not in result
+    issue_call = mock_request.call_args_list[2]
+    assert issue_call.kwargs["params"]["fields"] == jira._GET_ISSUE_FIELDS
+
+
+def test_get_issue_drops_a_name_that_resolves_to_a_default_field(monkeypatch):
+    raw_issue = {"key": "DW-571", "fields": {"summary": "ok", "duedate": "2026-01-01"}}
+    mock_request = Mock(
+        side_effect=[
+            MockResponse(json_data=[_SITE_A]),
+            MockResponse(json_data=_FIELD_TABLE),
+            MockResponse(json_data=raw_issue),
+        ]
+    )
+    monkeypatch.setattr(jira.requests, "request", mock_request)
+
+    result = json.loads(jira.jira_get_issue("DW-571", extra_fields="Due date"))
+
+    assert result["issue"]["due_date"] == "2026-01-01"
+    assert "extra_field_values" not in result
+    assert "extra_field_ids" not in result
+    issue_call = mock_request.call_args_list[2]
+    assert issue_call.kwargs["params"]["fields"] == jira._GET_ISSUE_FIELDS
+
+
+def test_get_issue_fetches_a_field_named_both_ways_once(monkeypatch):
+    raw_issue = {
+        "key": "DW-571",
+        "fields": {"summary": "ok", "customfield_10050": "139325"},
+    }
+    mock_request = Mock(
+        side_effect=[
+            MockResponse(json_data=[_SITE_A]),
+            MockResponse(json_data=_FIELD_TABLE),
+            MockResponse(json_data=raw_issue),
+        ]
+    )
+    monkeypatch.setattr(jira.requests, "request", mock_request)
+
+    result = json.loads(
+        jira.jira_get_issue("DW-571", extra_fields="Freshdesk ticket,customfield_10050")
+    )
+
+    assert result["extra_field_values"] == {
+        "Freshdesk ticket": "139325",
+        "customfield_10050": "139325",
+    }
+    # Only the name needed mapping; the id the caller wrote is not echoed
+    # back as a mapping of itself.
+    assert result["extra_field_ids"] == {"Freshdesk ticket": "customfield_10050"}
+    issue_call = mock_request.call_args_list[2]
+    assert issue_call.kwargs["params"]["fields"] == (
+        f"{jira._GET_ISSUE_FIELDS},customfield_10050"
+    )
+
+
+def test_get_issue_raw_fields_carries_the_resolved_id(monkeypatch):
+    raw_issue = {
+        "key": "DW-571",
+        "fields": {
+            "summary": "ok",
+            "customfield_10050": {"type": "doc", "content": []},
+        },
+    }
+    monkeypatch.setattr(
+        jira.requests,
+        "request",
+        Mock(
+            side_effect=[
+                MockResponse(json_data=[_SITE_A]),
+                MockResponse(json_data=_FIELD_TABLE),
+                MockResponse(json_data=raw_issue),
+            ]
+        ),
+    )
+
+    result = json.loads(
+        jira.jira_get_issue("DW-571", extra_fields="Freshdesk ticket", raw_fields=True)
+    )
+
+    # Raw mode fetches the value in the issue's own fields object; the
+    # mapping is what tells a caller which key to read it under.
+    assert result["extra_field_ids"] == {"Freshdesk ticket": "customfield_10050"}
+    assert result["issue"]["fields"]["customfield_10050"] == {
+        "type": "doc",
+        "content": [],
+    }
+    assert "extra_field_values" not in result
+
+
+def test_get_issue_resolves_the_cloud_id_once_when_naming_a_field(monkeypatch):
+    raw_issue = {
+        "key": "DW-571",
+        "fields": {"summary": "ok", "customfield_10050": "139325"},
+    }
+    mock_request = Mock(
+        side_effect=[
+            MockResponse(json_data=[_SITE_A]),
+            MockResponse(json_data=_FIELD_TABLE),
+            MockResponse(json_data=raw_issue),
+        ]
+    )
+    monkeypatch.setattr(jira.requests, "request", mock_request)
+
+    jira.jira_get_issue("DW-571", extra_fields="Freshdesk ticket")
+
+    # One accessible-resources call, then the field table and the issue --
+    # both under the id it resolved, not a second lookup each.
+    assert [call.kwargs["url"] for call in mock_request.call_args_list] == [
+        jira.ACCESSIBLE_RESOURCES_URL,
+        "https://api.atlassian.com/ex/jira/site-a/rest/api/2/field",
+        "https://api.atlassian.com/ex/jira/site-a/rest/api/2/issue/DW-571",
+    ]
+
+
+def test_search_issues_projects_a_custom_field_named_by_name(monkeypatch):
+    raw_issue = {
+        "key": "DW-571",
+        "fields": {
+            "summary": "Freshdesk import",
+            "customfield_10050": "139325",
+        },
+    }
+    mock_request = Mock(
+        side_effect=[
+            MockResponse(json_data=[_SITE_A]),
+            MockResponse(json_data=_FIELD_TABLE),
+            MockResponse(json_data={"issues": [raw_issue]}),
+        ]
+    )
+    monkeypatch.setattr(jira.requests, "request", mock_request)
+
+    raw_response = jira.jira_search_issues(
+        '"Freshdesk ticket" ~ "139325"', extra_fields="Freshdesk ticket"
+    )
+    result = json.loads(raw_response)
+
+    assert result["status"] == "success"
+    assert result["extra_field_ids"] == {"Freshdesk ticket": "customfield_10050"}
+    # Raw mode (the default) leaves the value where Jira put it.
+    assert result["issues"][0]["fields"]["customfield_10050"] == "139325"
+    assert "extra_field_values" not in result["issues"][0]
+    search_call = mock_request.call_args_list[2]
+    assert search_call.kwargs["params"]["jql"] == '"Freshdesk ticket" ~ "139325"'
+    assert search_call.kwargs["params"]["fields"] == (
+        f"{jira._SEARCH_ISSUE_FIELDS},customfield_10050"
+    )
+    # The mapping and any unresolved token are page-level facts, so they sit
+    # with the counts ahead of the (much larger) issues list.
+    assert list(result)[:2] == ["status", "total_count"]
+    assert list(result).index("extra_field_ids") < list(result).index("issues")
+
+
+def test_search_issues_projects_a_custom_field_into_each_summary(monkeypatch):
+    adf_value = {
+        "type": "doc",
+        "version": 1,
+        "content": [
+            {"type": "paragraph", "content": [{"type": "text", "text": "139325"}]}
+        ],
+    }
+    raw_issue = {
+        "key": "DW-571",
+        "fields": {
+            "summary": "Freshdesk import",
+            "customfield_10050": adf_value,
+            "customfield_10060": "x" * (jira._SEARCH_EXTRA_FIELD_MAX_CHARS + 500),
+        },
+    }
+    monkeypatch.setattr(
+        jira.requests,
+        "request",
+        Mock(
+            side_effect=[
+                MockResponse(json_data=[_SITE_A]),
+                MockResponse(json_data=_FIELD_TABLE),
+                MockResponse(json_data={"issues": [raw_issue]}),
+            ]
+        ),
+    )
+
+    result = json.loads(
+        jira.jira_search_issues(
+            "project = DW",
+            raw_fields=False,
+            extra_fields="Freshdesk ticket,cf[10060]",
+        )
+    )
+
+    values = result["issues"][0]["extra_field_values"]
+    # ADF rich text is flattened the same way jira_get_issue flattens it,
+    # and a value too big for a page-sized cap is cut to a truncated string.
+    assert values["Freshdesk ticket"] == "139325"
+    assert values["cf[10060]"].endswith("[truncated]")
+    assert len(values["cf[10060]"]) <= (
+        jira._SEARCH_EXTRA_FIELD_MAX_CHARS + len("... [truncated]")
+    )
+
+
+def test_search_issues_keeps_its_extra_fields_across_page_size_retries(
+    monkeypatch,
+):
+    large_page = {
+        "issues": [_raw_issue_with_summary(f"ENG-{i}", 200) for i in range(20)],
+        "nextPageToken": "orig-next-token",
+    }
+    small_page = {
+        "issues": [_raw_issue_with_summary(f"ENG-{i}", 200) for i in range(3)],
+    }
+    mock_request = Mock(
+        side_effect=[
+            MockResponse(json_data=[_SITE_A]),
+            MockResponse(json_data=_FIELD_TABLE),
+            MockResponse(json_data=large_page),
+            MockResponse(json_data=small_page),
+        ]
+    )
+    monkeypatch.setattr(jira.requests, "request", mock_request)
+    monkeypatch.setattr(jira, "get_tool_max_output_length", lambda: 2000)
+
+    jira.jira_search_issues("project = ENG", extra_fields="Freshdesk ticket")
+
+    # The field table is a per-site constant: one lookup serves every
+    # page-size attempt, and each attempt asks for the same fields.
+    urls = [call.kwargs["url"] for call in mock_request.call_args_list]
+    assert urls.count("https://api.atlassian.com/ex/jira/site-a/rest/api/2/field") == 1
+    search_calls = [
+        call
+        for call in mock_request.call_args_list
+        if call.kwargs["url"].endswith("/rest/api/3/search/jql")
+    ]
+    assert len(search_calls) == 2
+    for call in search_calls:
+        assert call.kwargs["params"]["fields"] == (
+            f"{jira._SEARCH_ISSUE_FIELDS},customfield_10050"
+        )
+
+
+def test_search_issues_reports_an_unresolved_field_name_and_still_searches(
+    monkeypatch,
+):
+    raw_issue = {"key": "DW-571", "fields": {"summary": "Freshdesk import"}}
+    mock_request = Mock(
+        side_effect=[
+            MockResponse(json_data=[_SITE_A]),
+            MockResponse(json_data=_FIELD_TABLE),
+            MockResponse(json_data={"issues": [raw_issue]}),
+        ]
+    )
+    monkeypatch.setattr(jira.requests, "request", mock_request)
+
+    result = json.loads(
+        jira.jira_search_issues("project = DW", extra_fields="Nonexistent")
+    )
+
+    # JQL and extra_fields are independent: a token that resolved to no
+    # field must not fail the search, only be reported.
+    assert result["status"] == "success"
+    assert result["unresolved_extra_fields"] == [
+        {"field": "Nonexistent", "candidates": []}
+    ]
+    assert "extra_field_ids" not in result
+    search_call = mock_request.call_args_list[2]
+    assert search_call.kwargs["params"]["fields"] == jira._SEARCH_ISSUE_FIELDS

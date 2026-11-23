@@ -108,6 +108,7 @@ function classify(
   phase: Phase,
   outcome: RequestOutcome,
   rateLimitedSoFar: number,
+  redeemRetried: boolean,
   now: number,
 ): Verdict {
   if (outcome.kind === "transport") {
@@ -129,7 +130,16 @@ function classify(
   if (status === 429) return { kind: "final", reason: "network" }
   if (status >= 200 && status < 300) return { kind: "ok", data }
   if (phase === "redeem" && status === 422) return { kind: "final", reason: "link_invalid" }
-  if (code !== null) return { kind: "final", reason: reasonForKnownCode(code) }
+  if (code !== null) {
+    const reason = reasonForKnownCode(code)
+    // An earlier attempt of this redeem was retried (a timeout, a transport
+    // failure, a 504 or a 5xx without a known code). Such an attempt may have
+    // reached the server and spent the single-use code, so a later link_invalid
+    // reports that spend: the failure was the network. A 422 is answered above
+    // and stays link_invalid, because it is about the request itself.
+    if (redeemRetried && reason === "link_invalid") return { kind: "final", reason: "network" }
+    return { kind: "final", reason }
+  }
   if (status >= 500) return { kind: "retry", mayHaveReachedServer: status === 504 }
   // A 4xx without a known code (for example a 404 `{"detail": ...}` while the
   // endpoint is switched off) never goes away by retrying.
@@ -237,7 +247,9 @@ export function createLinkSessionWorkerCore(deps: LinkSessionWorkerDeps): LinkSe
       deps.post({ type: "redeeming" })
       const outcome = await send(REDEEM_URL, { code }, REDEEM_TIMEOUT_MS)
       if (terminated) return
-      const verdict = classify("redeem", outcome, rateLimited, deps.now())
+      // `attempt` grows only after a retried attempt (rate-limit waits do not
+      // count), so `attempt > 1` means an earlier attempt of this redeem was retried.
+      const verdict = classify("redeem", outcome, rateLimited, attempt > 1, deps.now())
       if (verdict.kind === "ok") {
         const parsed = parseSessionResponse(verdict.data)
         if (parsed) accept(parsed)
@@ -261,7 +273,8 @@ export function createLinkSessionWorkerCore(deps: LinkSessionWorkerDeps): LinkSe
         return
       }
       // The redeem endpoint has no replay window, so there is no shorter cap
-      // after a timeout here.
+      // after a timeout here. If this attempt did spend the code, the next one
+      // is answered link_invalid, which classify reports as network.
       await wait(retryDelayMs(attempt, deps.random()))
       if (terminated) return
       attempt += 1
@@ -277,7 +290,7 @@ export function createLinkSessionWorkerCore(deps: LinkSessionWorkerDeps): LinkSe
         if (token === null) return
         const outcome = await send(RENEW_URL, { reconnect_token: token }, RENEW_TIMEOUT_MS)
         if (terminated) return
-        const verdict = classify("renew", outcome, rateLimited, deps.now())
+        const verdict = classify("renew", outcome, rateLimited, false, deps.now())
         if (verdict.kind === "ok") {
           const parsed = parseSessionResponse(verdict.data)
           if (

@@ -338,6 +338,51 @@ describe("link session Worker redeem", () => {
     expect(h.fetchSpy).toHaveBeenCalledTimes(1)
   })
 
+  it.each([
+    ["a timeout", (init: RequestInit) => hangingFetch(init)],
+    ["a 504", () => jsonResponse(504, "<html>gateway</html>")],
+    ["an uncoded 503", () => jsonResponse(503, "<html>down</html>")],
+    ["a rejected fetch", () => Promise.reject(new TypeError("Failed to fetch"))],
+  ])("ends with network when link_invalid follows a retried attempt (%s)", async (_name, first) => {
+    const h = makeHarness(({ n, init }) => (n === 1 ? first(init) : errorResponse(401, "link_invalid")))
+    await startAndSettle(h)
+    await advanceUntilFetchCount(h, 2)
+    await settle()
+    expect(h.fetchSpy).toHaveBeenCalledTimes(2)
+    expect(terminals(h)).toEqual([{ type: "terminal", reason: "network" }])
+  })
+
+  it("keeps link_invalid for a 422 after a retried attempt", async () => {
+    const h = makeHarness(({ n }) => (n === 1 ? Promise.reject(new TypeError("Failed to fetch")) : errorResponse(422, "invalid_input")))
+    await startAndSettle(h)
+    await advanceUntilFetchCount(h, 2)
+    await settle()
+    expect(h.fetchSpy).toHaveBeenCalledTimes(2)
+    expect(terminals(h)).toEqual([{ type: "terminal", reason: "link_invalid" }])
+  })
+
+  it("keeps link_invalid when only rate-limit waits came before", async () => {
+    const h = makeHarness(({ n }) => (n === 1 ? errorResponse(429, "rate_limited", { "Retry-After": "1" }) : errorResponse(401, "link_invalid")))
+    await startAndSettle(h)
+    await vi.advanceTimersByTimeAsync(1000)
+    await settle()
+    expect(h.fetchSpy).toHaveBeenCalledTimes(2)
+    expect(terminals(h)).toEqual([{ type: "terminal", reason: "link_invalid" }])
+  })
+
+  it("still ends with network when a rate-limit wait sits between the retry and link_invalid", async () => {
+    const h = makeHarness(({ n }) => {
+      if (n === 1) return Promise.reject(new TypeError("Failed to fetch"))
+      if (n === 2) return errorResponse(429, "rate_limited", { "Retry-After": "1" })
+      return errorResponse(401, "link_invalid")
+    })
+    await startAndSettle(h)
+    await advanceUntilFetchCount(h, 3)
+    await settle()
+    expect(h.fetchSpy).toHaveBeenCalledTimes(3)
+    expect(terminals(h)).toEqual([{ type: "terminal", reason: "network" }])
+  })
+
   it("ends with unavailable for an uncoded 4xx without retrying", async () => {
     const h = makeHarness(() => jsonResponse(404, { detail: "Not Found" }))
     await startAndSettle(h)

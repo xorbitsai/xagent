@@ -10,6 +10,7 @@ from ...schemas.v1 import (
     V1AgentConnectorsUpdateRequest,
     V1AgentCreateRequest,
     V1AgentCreateResponse,
+    V1AgentDetail,
     V1AgentResponse,
     V1AgentSkillsResponse,
     V1AgentSkillsUpdateRequest,
@@ -21,6 +22,7 @@ from ...services.agent_management import (
     AgentConnectorsNotSharedError,
     AgentConnectorsSnapshot,
     AgentCreateSpec,
+    AgentDetailSnapshot,
     AgentManagementRuntime,
     AgentResponseSnapshot,
     AgentSummarySnapshot,
@@ -231,6 +233,33 @@ async def create_agent_from_template(
             else None
         ),
     )
+
+
+def _agent_detail(detail: AgentDetailSnapshot) -> V1AgentDetail:
+    return V1AgentDetail.model_validate(
+        {
+            **detail.agent.to_response_dict(),
+            "unresolved_models": list(detail.unresolved_models),
+        }
+    )
+
+
+@router.get("/{agent_id}", response_model=V1AgentDetail)
+async def get_agent(
+    # ``agents.id`` is a 32-bit integer column.
+    agent_id: int = Path(gt=0, le=2**31 - 1),
+    authed: tuple[UserPrincipalSnapshot, PersonalApiKeySnapshot] = Depends(
+        get_user_from_personal_key
+    ),
+) -> V1AgentDetail:
+    """Read the full configuration of an agent the key holder can see."""
+    user, _key = authed
+    detail = await AgentManagementRuntime().get_agent_detail(
+        user_id=int(user.id), agent_id=agent_id
+    )
+    if detail is None:
+        raise V1ApiError(V1ErrorCode.AGENT_NOT_FOUND, 404)
+    return _agent_detail(detail)
 
 
 @router.post("/{agent_id}/api-key", response_model=RuntimeKeyResponse)

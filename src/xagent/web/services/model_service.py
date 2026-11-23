@@ -233,6 +233,59 @@ def rank_name_matched_models(
     return sorted(visible, key=_rank)
 
 
+def usable_models(
+    db: Session, user_id: int, *, among_ids: Optional[list[int]] = None
+) -> list[DBModel]:
+    """Return the active models *user_id* may use, best match first.
+
+    Same visibility as ``_is_model_visible_to_user`` plus the active check,
+    evaluated for a set of rows. A coarse SQL pass keeps active models that
+    have a link row the user owns or a shared link row from a visible user;
+    it also keeps models the user only has a non-owner link to, so
+    ``rank_name_matched_models`` makes the exact decision and applies the
+    model visibility hook. When *among_ids* is given, only those primary keys
+    are considered, and an empty list considers none.
+
+    The coarse pass selects ``models`` rows through ``IN (subquery)``. It must
+    not join the link table and de-duplicate whole ``models`` rows: that
+    needs an equality operator on the JSON ``abilities`` column, which
+    PostgreSQL does not have. Database errors propagate.
+    """
+    from sqlalchemy import select
+
+    from ..models.user import UserModel
+
+    visible_links = select(UserModel.model_id).where(
+        build_user_model_visibility_filter(user_id, _get_visible_user_ids(db, user_id))
+    )
+    query = db.query(DBModel).filter(
+        DBModel.is_active.is_(True), DBModel.id.in_(visible_links)
+    )
+    if among_ids is not None:
+        query = query.filter(DBModel.id.in_(among_ids))
+    return rank_name_matched_models(db, query.all(), user_id)
+
+
+def slot_assignable_models(
+    db: Session, user_id: int, *, among_ids: Optional[list[int]] = None
+) -> list[DBModel]:
+    """Return the models *user_id* can put in an agent model slot.
+
+    The usable models whose category is ``llm``, because slot resolution at
+    run time only accepts chat models. Code that needs this rule calls this
+    function instead of repeating the category test. It is not applied
+    everywhere: ``POST /v1/agents`` and ``POST /v1/agents/from-template``
+    accept a model of any category, and slot resolution at run time does not
+    call this function. The ``unresolved_models`` field description of
+    ``V1AgentDetail`` lists where run time differs.
+    """
+    return [
+        model
+        for model in usable_models(db, user_id, among_ids=among_ids)
+        if model.category == "llm"
+    ]
+
+
 def _create_default_llm_instance(
     db: Session, db_model: Any, user_id: Optional[int]
 ) -> Optional[BaseLLM]:

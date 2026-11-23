@@ -1826,12 +1826,16 @@ def external_media_file(
             )
         )
     except DurableObjectIntegrityError as exc:
+        if connector_image:
+            _log_connector_image_refusal(str(record.file_id), "integrity_failed")
         raise _file_integrity_failed() from exc
     except (DurableObjectMissingError, FilePublicationUnavailable) as exc:
         if connector_image:
             _log_connector_image_refusal(str(record.file_id), "file_unavailable")
         raise HTTPException(status_code=404, detail="File not found") from exc
     except DurableStorageOperationError as exc:
+        if connector_image:
+            _log_connector_image_refusal(str(record.file_id), "storage_unavailable")
         _raise_durable_storage_unavailable(
             exc,
             "external media delivery",

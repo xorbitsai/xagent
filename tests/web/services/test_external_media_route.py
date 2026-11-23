@@ -569,6 +569,7 @@ def test_route_maps_storage_failures(
     tmp_path: Path,
     db: Session,
     client: TestClient,
+    caplog: pytest.LogCaptureFixture,
     error: Exception,
     expected_status: int,
 ):
@@ -587,10 +588,13 @@ def test_route_maps_storage_failures(
         Mock(side_effect=error),
     )
     target = urlsplit(issued_url)
+    caplog.set_level(logging.WARNING, logger=ROUTE_LOGGER)
 
     response = client.get(f"{target.path}?{target.query}")
 
     assert response.status_code == expected_status
+    # Why: the purpose label is for connector images only.
+    assert _delivery_logs(caplog) == []
 
 
 def test_route_does_not_trust_local_path_outside_uploads(
@@ -1075,6 +1079,8 @@ def _delivery_logs(caplog: pytest.LogCaptureFixture) -> list[str]:
         ("over-the-delivery-cap", 422, "unprocessable"),
         ("cannot-be-opened", 404, "file_unavailable"),
         ("bytes-gone", 404, "file_unavailable"),
+        ("integrity-failed", 409, "integrity_failed"),
+        ("storage-unavailable", 503, "storage_unavailable"),
         ("record-gone", 401, "ticket_rejected"),
         ("wrong-scope", 401, "ticket_rejected"),
         ("expired", 401, "expired"),
@@ -1113,15 +1119,50 @@ def test_route_logs_a_refused_connector_image_by_category(
             "materialize",
             Mock(side_effect=DurableObjectMissingError(Path("missing"))),
         )
+    elif case == "integrity-failed":
+        monkeypatch.setattr(
+            files.ManagedFileRef,
+            "materialize",
+            Mock(
+                side_effect=DurableObjectIntegrityError(
+                    "checksum mismatch", storage_key="users/7/logo.png"
+                )
+            ),
+        )
+    elif case == "storage-unavailable":
+        monkeypatch.setattr(
+            files.ManagedFileRef,
+            "materialize",
+            Mock(
+                side_effect=DurableStorageOperationError(
+                    "storage unavailable", storage_key="users/7/logo.png"
+                )
+            ),
+        )
     caplog.set_level(logging.WARNING, logger=ROUTE_LOGGER)
 
     response = client.get(path)
 
     assert response.status_code == status
-    assert _delivery_logs(caplog) == [
+    refusal = (
         f"External media delivery refused purpose=connector-image "
         f"file_id={file_id} reason={reason}"
+    )
+    assert _delivery_logs(caplog) == [refusal]
+    route_warnings = [
+        r.getMessage()
+        for r in caplog.records
+        if r.name == ROUTE_LOGGER and r.levelno == logging.WARNING
     ]
+    if case == "storage-unavailable":
+        # The storage fault keeps its own record, after the refusal.
+        assert route_warnings[0] == refusal
+        assert route_warnings[1].startswith(
+            "Durable storage unavailable during external media delivery "
+        )
+        assert len(route_warnings) == 2
+    else:
+        assert route_warnings == [refusal]
     if case == "expired":
         assert response.json() == INVALID_TICKET
         assert ticket_text_absent(caplog, path)

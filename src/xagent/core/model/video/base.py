@@ -52,6 +52,14 @@ class BaseVideoModel(ABC):
     def has_ability(self, ability: str) -> bool:
         return ability in self.abilities
 
+    def supports_image_input(self) -> bool:
+        """Whether this model accepts image input.
+
+        Covers a reference image, first/last frames and reference images.
+        Models that only do text-to-video override this to return False.
+        """
+        return True
+
     @abstractmethod
     async def create_video_task(
         self,

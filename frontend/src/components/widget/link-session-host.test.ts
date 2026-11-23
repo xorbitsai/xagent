@@ -71,6 +71,8 @@ interface Harness {
   navs: string[]
   iframePosts: Array<Record<string, unknown>>
   snapshots: LinkHostSnapshot[]
+  // Every delay the host asked its timer for.
+  timerDelays: number[]
   iframeWindow: object
   worker: () => FakeWorker
 }
@@ -80,6 +82,7 @@ function makeHost(options: Options = {}): Harness {
   const navs: string[] = []
   const iframePosts: Array<Record<string, unknown>> = []
   const snapshots: LinkHostSnapshot[] = []
+  const timerDelays: number[] = []
   const iframeWindow = {}
   let created: FakeWorker | null = null
   const host = createLinkSessionHost({
@@ -101,7 +104,10 @@ function makeHost(options: Options = {}): Harness {
     getIframeWindow: () => iframeWindow,
     postToIframe: (message) => iframePosts.push(message),
     now: () => Date.now(),
-    setTimer: (callback, ms) => setTimeout(callback, ms),
+    setTimer: (callback, ms) => {
+      timerDelays.push(ms)
+      return setTimeout(callback, ms)
+    },
     clearTimer: (handle) => clearTimeout(handle as ReturnType<typeof setTimeout>),
     onChange: (snapshot) => snapshots.push(snapshot),
   })
@@ -111,6 +117,7 @@ function makeHost(options: Options = {}): Harness {
     navs,
     iframePosts,
     snapshots,
+    timerDelays,
     iframeWindow,
     worker: () => {
       if (!created) throw new Error("no worker was created")
@@ -315,6 +322,7 @@ describe("link session host end reasons", () => {
     const thirtyDays = 30 * 24 * HOUR
     const maxTimer = 2 ** 31 - 1
     connect(h, { absolute_expires_at: new Date(Date.now() + thirtyDays).toISOString() })
+    expect(Math.max(...h.timerDelays)).toBeLessThanOrEqual(maxTimer)
     vi.advanceTimersByTime(maxTimer)
     expect(h.navs).toEqual([])
     vi.advanceTimersByTime(thirtyDays - maxTimer - 1)

@@ -588,22 +588,14 @@ def test_unset_slot_values_are_not_listed_and_fall_back(value):
     assert _get(world.key, world.agent_id).json()["unresolved_models"] == []
 
 
-def test_runtime_skips_the_hook_so_a_hidden_model_is_listed_yet_still_resolves():
-    """Documents current run-time behavior; it is not asserted as intended.
-
-    Slot resolution at run time does not apply the model visibility hook, so
-    an active chat model the hook hides is listed in ``unresolved_models``
-    although a task still resolves it.
-    Tracked in https://github.com/xorbitsai/xagent/issues/3932.
-    Once run time applies the hook, the first assertion fails: change it to
-    ``is False`` and keep the second one.
-    """
+def test_a_chat_model_hidden_by_the_hook_is_listed_and_not_resolved():
+    """Run time applies the model visibility hook, so the read agrees with it."""
     world = _build_world(False)
     hidden_llm = _add_model("hidden-llm", links=((_user_id("admin"), True, True),))
     world.hidden.append(hidden_llm)
     _set_models(world.agent_id, {"general": hidden_llm})
 
-    assert _resolved_at_run_time(world)["general"] is True
+    assert _resolved_at_run_time(world)["general"] is False
     assert _get(world.key, world.agent_id).json()["unresolved_models"] == ["general"]
 
 

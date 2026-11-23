@@ -174,7 +174,10 @@ _SIGNED_UPLOADS_FIELD_DESCRIPTION = (
     "called, before any later tool call, and returns the connector's file_id "
     "(never the upload URL), which the model passes to the tool that takes the "
     "file. A link entry has exactly the keys tool_name and link_argument and "
-    "names a tool that takes a download URL; when the model passes a file:<id> "
+    "names a tool that takes a download URL; link_argument must be a top-level "
+    'property of type "string", of type ["string", "null"], or an anyOf of one '
+    'string branch and one {"type": "null"} branch, or the entry is not used. '
+    "When the model passes a file:<id> "
     "reference to a PNG, JPEG or WebP image of at most 10 MB in link_argument, "
     "the host replaces it with an HTTPS download link valid for the external "
     "media URL lifetime (10 minutes by default); the legacy file://<id> form "

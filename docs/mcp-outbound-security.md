@@ -144,6 +144,14 @@ refusal. A link entry needs no upload hosts, because the host uploads nothing.
 A tool has at most one link entry, one argument cannot be both replaced and
 linked, and an issuing tool cannot take a link argument.
 
+The tool's input schema must declare `link_argument` as a top-level property
+that takes a string: `{"type": "string"}`, `{"type": ["string", "null"]}`, or
+an `anyOf` of exactly one `{"type": "string"}` branch and one `{"type": "null"}`
+branch, which is how Pydantic and FastMCP describe an optional string. A
+`maxLength` is read from the property, or from the string branch of such an
+`anyOf`. With any other schema, or when a runtime binding fills that argument,
+the entry is not used: the tool loads without it and the host logs a warning.
+
 One issuing tool cannot be used by both of the first two forms, and two issuer
 entries cannot name the same issuing tool.
 

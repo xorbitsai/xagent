@@ -78,6 +78,13 @@ def _schema(**argument: Any) -> dict[str, Any]:
     return {"type": "object", "properties": properties}
 
 
+def _schema_of(argument: dict[str, Any]) -> dict[str, Any]:
+    """The tool's input schema with ``argument`` as the link argument's schema."""
+    schema = _schema(absent=True)
+    schema["properties"][ARGUMENT] = argument
+    return schema
+
+
 def _connection(url: str = CONNECTION_URL, **extra: Any) -> dict[str, Any]:
     return {"transport": "streamable_http", "url": url, **extra}
 
@@ -646,7 +653,43 @@ async def test_a_refused_link_ends_the_call_before_any_signed_upload(
         pytest.param(_schema(absent=True), None, id="parameter-missing"),
         pytest.param(_schema(type="integer"), None, id="integer"),
         pytest.param(_schema(type="array"), None, id="array"),
-        pytest.param(_schema(type=["string", "null"]), None, id="string-or-null"),
+        pytest.param(
+            _schema_of({"type": ["string", "integer"]}), None, id="string-or-integer"
+        ),
+        pytest.param(
+            _schema_of({"type": ["string", "null", "integer"]}),
+            None,
+            id="three-types",
+        ),
+        pytest.param(
+            _schema_of({"anyOf": [{"type": "integer"}, {"type": "null"}]}),
+            None,
+            id="optional-integer",
+        ),
+        pytest.param(
+            _schema_of({"anyOf": [{"type": "string"}, {"type": "integer"}]}),
+            None,
+            id="string-or-integer-anyof",
+        ),
+        pytest.param(
+            _schema_of(
+                {"anyOf": [{"type": "string"}, {"type": "null"}, {"type": "integer"}]}
+            ),
+            None,
+            id="anyof-with-three-branches",
+        ),
+        pytest.param(
+            _schema_of({"oneOf": [{"type": "string"}, {"type": "null"}]}),
+            None,
+            id="oneof",
+        ),
+        pytest.param(
+            _schema_of(
+                {"type": "integer", "anyOf": [{"type": "string"}, {"type": "null"}]}
+            ),
+            None,
+            id="type-beside-anyof",
+        ),
         pytest.param(_schema(), _RUNTIME_BOUND, id="runtime-bound"),
     ],
 )
@@ -668,6 +711,99 @@ def test_a_link_entry_the_model_cannot_fill_is_ignored(
         "MCP tool set_logo ignores its link settings: the model cannot fill "
         f"the `{ARGUMENT}` argument"
     ]
+
+
+@pytest.mark.parametrize(
+    "argument",
+    [
+        pytest.param({"type": "string"}, id="string"),
+        pytest.param({"type": ["string", "null"]}, id="string-or-null"),
+        pytest.param({"type": ["null", "string"]}, id="null-or-string"),
+        pytest.param(
+            {"anyOf": [{"type": "string"}, {"type": "null"}]}, id="optional-string"
+        ),
+        pytest.param(
+            {"anyOf": [{"type": "null"}, {"type": "string"}]}, id="null-branch-first"
+        ),
+    ],
+)
+async def test_a_link_argument_that_takes_a_string_or_null_is_linked(
+    server: _Server, workspace: _Workspace, argument: dict[str, Any]
+) -> None:
+    # Why: Pydantic and FastMCP describe an optional string as an anyOf, so a
+    # link entry on such a tool must still take effect.
+    adapter = _adapter(workspace, schema=_schema_of(argument))
+
+    assert adapter._signed_upload_link == LINK
+    assert adapter.description.endswith(DESCRIPTION_NOTE)
+    result = await adapter.run_json_async({ARGUMENT: REF})
+
+    assert result["is_error"] is False
+    assert workspace.issued == [(FILE_ID, "connector-image")]
+    assert server.calls == [{ARGUMENT: LINK_URL}]
+
+
+async def test_a_null_for_an_optional_link_argument_is_left_out(
+    server: _Server, workspace: _Workspace
+) -> None:
+    schema = _schema_of({"anyOf": [{"type": "string"}, {"type": "null"}]})
+
+    result = await _adapter(workspace, schema=schema).run_json_async({ARGUMENT: None})
+
+    assert result["is_error"] is False
+    assert workspace.issued == []
+    assert server.calls == [{}]
+
+
+@pytest.mark.parametrize(
+    ("max_length", "refused"),
+    [
+        pytest.param(len(LINK_URL), False, id="exactly-long-enough"),
+        pytest.param(len(LINK_URL) - 1, True, id="one-too-short"),
+    ],
+)
+@pytest.mark.parametrize(
+    "shape",
+    [
+        pytest.param(
+            lambda limit: {"type": ["string", "null"], "maxLength": limit},
+            id="string-or-null",
+        ),
+        pytest.param(
+            lambda limit: {
+                "anyOf": [{"type": "string", "maxLength": limit}, {"type": "null"}]
+            },
+            id="optional-string",
+        ),
+    ],
+)
+async def test_the_link_must_fit_the_maxlength_of_an_optional_string(
+    server: _Server,
+    workspace: _Workspace,
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+    shape: Any,
+    max_length: int,
+    refused: bool,
+) -> None:
+    # The caller's user id is read on every call and warned about when absent;
+    # set it so the full warning list below holds only the refusal.
+    monkeypatch.setenv("XAGENT_USER_ID", "7")
+    caplog.set_level(logging.WARNING)
+    adapter = _adapter(workspace, schema=_schema_of(shape(max_length)))
+    caplog.clear()
+
+    result = await adapter.run_json_async({ARGUMENT: REF})
+
+    if refused:
+        assert _text(result) == TOO_LONG
+        assert server.calls == []
+        assert [r.getMessage() for r in caplog.records] == [
+            "MCP tool set_logo refused a download link reason=too_long"
+        ]
+    else:
+        assert result["is_error"] is False
+        assert server.calls == [{ARGUMENT: LINK_URL}]
 
 
 @pytest.mark.parametrize(

@@ -1419,6 +1419,45 @@ def _is_optional_union_options(options: Any) -> bool:
     )
 
 
+def _link_argument_string_schema(argument: Any) -> Mapping[str, Any] | None:
+    """The schema a link argument's string value is held to, or ``None``.
+
+    A link argument must take a string, optionally also ``null``, and nothing
+    else. Three shapes qualify:
+
+    - ``{"type": "string", ...}``, returned as is;
+    - ``{"type": ["string", "null"], ...}``, the two names in either order,
+      returned as is;
+    - an ``anyOf`` of exactly two branches, one null and one whose ``type`` is
+      ``"string"``, with no ``type`` beside the ``anyOf``: the shape Pydantic
+      and FastMCP give an optional string. The string branch is returned.
+
+    The returned mapping is where ``maxLength`` is read. Any other shape,
+    including ``oneOf``, a string-or-integer union or an ``anyOf`` with a
+    third branch, returns ``None``.
+    """
+    if not isinstance(argument, Mapping):
+        return None
+    if "type" in argument:
+        schema_type = argument["type"]
+        # Compared as lists, not as a set: a malformed list may hold
+        # unhashable items.
+        if schema_type == "string" or schema_type in (
+            ["string", "null"],
+            ["null", "string"],
+        ):
+            return argument
+        return None
+    options = argument.get("anyOf")
+    # The isinstance check also narrows the type for the comprehension below.
+    if not isinstance(options, list) or not _is_optional_union_options(options):
+        return None
+    [branch] = [option for option in options if not _schema_is_null_option(option)]
+    if isinstance(branch, Mapping) and branch.get("type") == "string":
+        return branch
+    return None
+
+
 def _remove_schema_keyword(schema: Any, keyword: str) -> Any:
     """Remove a validator keyword without treating property names as keywords."""
     if isinstance(schema, Mapping):
@@ -4502,11 +4541,12 @@ class MCPToolAdapter(AbstractBaseTool):
                 error_type=type(exc).__name__,
             ) from None
 
-        argument_schema = self._input_schema_properties().get(link.link_argument)
+        # For an optional string the limit sits on the string branch.
+        argument_schema = _link_argument_string_schema(
+            self._input_schema_properties().get(link.link_argument)
+        )
         max_length = (
-            argument_schema.get("maxLength")
-            if isinstance(argument_schema, Mapping)
-            else None
+            argument_schema.get("maxLength") if argument_schema is not None else None
         )
         if (
             isinstance(max_length, int)
@@ -4740,19 +4780,19 @@ class MCPToolAdapter(AbstractBaseTool):
     ) -> SignedUploadLink | None:
         """``link``, or ``None`` when the model cannot fill its argument with a string.
 
-        The argument must be a top-level inputSchema property whose ``type`` is
-        exactly ``"string"``, and no runtime binding may fill it: a runtime
+        The argument must be a top-level inputSchema property that takes a
+        string, or a string or null (see ``_link_argument_string_schema``), and
+        no runtime binding may fill it: a runtime
         value comes from the host page, not from the model, and must never be
         turned into a download link.
         """
         if link is None:
             return None
         properties = self._input_schema_properties()
-        argument = properties.get(link.link_argument)
-        if (
-            not isinstance(argument, Mapping)
-            or argument.get("type") != "string"
-            or link.link_argument in self._runtime_bound_tool_argument_names(properties)
+        if _link_argument_string_schema(
+            properties.get(link.link_argument)
+        ) is None or link.link_argument in self._runtime_bound_tool_argument_names(
+            properties
         ):
             logger.warning(
                 "MCP tool %s ignores its link settings: the model cannot fill "

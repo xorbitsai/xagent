@@ -120,9 +120,9 @@ def _launch_digest(connection: Mapping[str, Any]) -> str | None:
     env = connection.get("env") or {}
     if not isinstance(env, Mapping):
         return None
-    # Key on the env the child gets. The launcher adds the process PATH when
-    # the env has none, and writes it into the caller's mapping, so the key
-    # must not change once that has happened.
+    # Key on the env as the launcher sends it: it adds the process PATH when
+    # the env has none, writing it into the caller's mapping when that is
+    # non-empty, so the key must not change once that has happened.
     env = dict(env)
     if "PATH" not in env:
         env["PATH"] = os.environ.get("PATH", "")

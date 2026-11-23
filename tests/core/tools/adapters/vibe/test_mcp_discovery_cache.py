@@ -486,31 +486,29 @@ async def test_the_public_loader_does_not_cache_unless_asked(
     assert len(sessions.opened) == 3
 
 
-@pytest.mark.asyncio
-async def test_the_launchers_path_write_does_not_change_the_key(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    # The real launcher writes PATH into the caller's env after the key was
-    # computed; a second build with the same mapping must still hit the cache.
-    spawned: list[dict[str, str]] = []
+class _FakeClientSession:
+    def __init__(self, read: Any, write: Any, **kwargs: Any) -> None:
+        pass
+
+    async def __aenter__(self) -> _FakeClientSession:
+        return self
+
+    async def __aexit__(self, *exc_info: Any) -> None:
+        return None
+
+    async def initialize(self) -> None:
+        return None
+
+
+@pytest.fixture
+def launched(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, str]]:
+    """The real stdio launcher, minus the process: the envs it hands the SDK."""
+    envs: list[dict[str, str]] = []
 
     @asynccontextmanager
     async def fake_stdio_client(server_params: Any):
-        spawned.append(dict(server_params.env or {}))
+        envs.append(dict(server_params.env or {}))
         yield None, None
-
-    class _FakeClientSession:
-        def __init__(self, read: Any, write: Any, **kwargs: Any) -> None:
-            pass
-
-        async def __aenter__(self) -> "_FakeClientSession":
-            return self
-
-        async def __aexit__(self, *exc_info: Any) -> None:
-            return None
-
-        async def initialize(self) -> None:
-            return None
 
     async def fake_load_mcp_tools(session: Any) -> list[MCPTool]:
         return [_tool("search")]
@@ -518,15 +516,53 @@ async def test_the_launchers_path_write_does_not_change_the_key(
     monkeypatch.setattr(sessions_module, "stdio_client", fake_stdio_client)
     monkeypatch.setattr(sessions_module, "ClientSession", _FakeClientSession)
     monkeypatch.setattr(mcp_adapter_module, "load_mcp_tools", fake_load_mcp_tools)
+    return envs
 
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "env",
+    [
+        None,
+        {},
+        {"EXAMPLE_ACCESS_TOKEN": "tok-a"},
+        {"EXAMPLE_ACCESS_TOKEN": "tok-a", "PATH": ""},
+        {"EXAMPLE_ACCESS_TOKEN": "tok-a", "PATH": "/elsewhere/bin"},
+    ],
+)
+async def test_the_key_is_that_of_the_env_the_launcher_sends(
+    monkeypatch: pytest.MonkeyPatch,
+    launched: list[dict[str, str]],
+    env: dict[str, str] | None,
+) -> None:
+    # The cache repeats the launcher's PATH default; this keeps the two in step.
+    monkeypatch.setenv("PATH", "/fixed/bin")
+    key = _key(_stdio(env=env))
+
+    # A copy: the launcher may write into the mapping it is given.
+    async with sessions_module.create_session(
+        _stdio(env=dict(env) if env is not None else None)
+    ):
+        pass
+
+    assert _key(_stdio(env=launched[0])) == key
+
+
+@pytest.mark.asyncio
+async def test_the_launchers_path_write_does_not_change_the_key(
+    launched: list[dict[str, str]],
+) -> None:
+    # The real launcher writes PATH into the caller's env after the key was
+    # computed; a second build with the same mapping must still hit the cache.
     connection = _stdio()
     assert "PATH" not in connection["env"]
 
     await load_mcp_tools_as_agent_tools({"example": connection}, discovery_cache=True)
+    # The launcher's write into the caller's mapping: the case under test.
     assert "PATH" in connection["env"]
     await load_mcp_tools_as_agent_tools({"example": connection}, discovery_cache=True)
 
-    assert len(spawned) == 1
+    assert len(launched) == 1
 
 
 @pytest.mark.asyncio

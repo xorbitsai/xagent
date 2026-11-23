@@ -2258,6 +2258,38 @@ describe("widget session mode", () => {
     expect(result.current.terminalCode).toBeNull()
   })
 
+  it("ignores the terminal report the chat page sends to its parent", async () => {
+    vi.useFakeTimers()
+    fetchMock.mockResolvedValue(jsonResponse(200, exchangeBody()))
+    runWidget({ "data-encrypted-context": GRANT })
+    const frame = iframeEl()
+    if (!frame) throw new Error("iframe not mounted")
+    const bridge = bridgeWidgetSessionHook(frame)
+    const { result } = renderHook(() => useWidgetSession())
+    await vi.advanceTimersByTimeAsync(0)
+    expect(result.current.status).toBe("active")
+    const requests = fetchMock.mock.calls.length
+    const markup = document.body.innerHTML
+    const toIframe = bridge.postToIframe.mock.calls.length
+
+    act(() => { result.current.handleConnectionClose(new CloseEvent("close", { code: 4403 })) })
+
+    // The report really travelled from the chat page to widget.js.
+    expect(bridge.parent.postMessage.mock.calls.map(([message]) => message).filter(
+      (message) => message.type === "session_terminal_reached",
+    )).toEqual([{ xagent: true, v: 1, type: "session_terminal_reached", code: "ws_4403" }])
+    await vi.advanceTimersByTimeAsync(60_000)
+    expect(fetchMock).toHaveBeenCalledTimes(requests)
+    expect(document.body.innerHTML).toBe(markup)
+    expect(bridge.postToIframe.mock.calls).toHaveLength(toIframe)
+
+    fromIframe("ready")
+    const sent = bridge.postToIframe.mock.calls.slice(toIframe).map(
+      ([message]) => (message as Record<string, unknown>).type,
+    )
+    expect(sent).toEqual(["session_update"])
+  })
+
   it("recovers a widget left open across a two-minute backend restart", async () => {
     vi.useFakeTimers()
     let backendUp = true

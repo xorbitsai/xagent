@@ -3,8 +3,9 @@
 Google revokes a whole grant per Google account and OAuth client. When Alice
 disconnects while Bob connects the same Google account, Bob's code exchange
 may be issued tokens of the very grant Alice's revoke then kills. These tests
-interleave the two for real -- Alice's revoke runs on its own session while
-Bob's callback is inside its token exchange -- with only provider HTTP mocked.
+interleave the two for real -- the credential revocation outbox worker
+revokes Alice's deleted row on its own sessions while Bob's callback is
+inside its token exchange -- with only provider HTTP mocked.
 """
 
 from __future__ import annotations
@@ -19,6 +20,10 @@ import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
 
+from tests.shared.credential_revocations import (
+    credential_revocation_statuses,
+    drain_credential_revocations,
+)
 from tests.shared.oauth_browser_fixture import (
     create_access_token,
     generic_oauth_callback,
@@ -102,15 +107,35 @@ def _connect_google(db: Session, user: User):
     )
 
 
-def _revoke_alices_grant(db: Session) -> None:
-    """Alice's disconnect of the same Google account, after its commit."""
-    auth_api.revoke_builtin_oauth_grant(
-        db,
+def _delete_row(db: Session, username: str) -> None:
+    """``username`` disconnects the same Google account: the row's deletion
+    enqueues its revocation."""
+    user = User(username=username, password_hash="x", is_admin=False)
+    db.add(user)
+    db.flush()
+    row = UserOAuth(
+        user_id=user.id,
+        provider="gmail",
         oauth_provider="google",
-        access_token="alice-access",
         provider_user_id=SUBJECT,
-        refresh_token="alice-refresh",
+        access_token=f"{username}-access",
+        refresh_token=f"{username}-refresh",
     )
+    db.add(row)
+    db.commit()
+    db.delete(row)
+    db.commit()
+
+
+def _drain(db: Session) -> None:
+    asyncio.run(drain_credential_revocations(db))
+
+
+def _revoke_alices_grant(db: Session) -> None:
+    """Alice's disconnect of the same Google account, and the outbox worker
+    revoking it after its commit."""
+    _delete_row(db, "alice")
+    _drain(db)
 
 
 def _provider_http(monkeypatch, *, during_exchange=None) -> list[str]:
@@ -237,6 +262,7 @@ def test_a_revoker_delayed_past_its_fence_skips_the_call(sessions, monkeypatch):
     _revoke_alices_grant(alice_db)
 
     assert revoked == []
+    assert credential_revocation_statuses(alice_db) == ["pending"]
 
 
 def test_a_closed_fence_keeps_refusing_for_the_clock_skew_margin(sessions, monkeypatch):
@@ -257,10 +283,11 @@ def test_a_closed_fence_keeps_refusing_for_the_clock_skew_margin(sessions, monke
 def test_a_second_revoker_cannot_close_the_fence_under_one_in_flight(
     sessions, monkeypatch
 ):
-    """Two disconnects of the same account pass their reference check. While
-    the first one's provider call is in flight the second runs to the end: it
-    must neither revoke nor close the fence, or a reconnect right after it
-    would be accepted and then killed by the first call."""
+    """Two disconnects of the same account. While the first one's provider
+    call is in flight the second is drained: its record waits behind the
+    first (one record per account at a time), so it neither revokes nor
+    closes the fence, and a reconnect right after it is refused rather than
+    accepted and then killed by the first call."""
     bob_db, alice_db = sessions
     carol_db = sessionmaker(bind=alice_db.get_bind(), autoflush=False)()
     bob = _bob(bob_db)
@@ -271,13 +298,8 @@ def test_a_second_revoker_cannot_close_the_fence_under_one_in_flight(
     def post(url, **kwargs):
         if url == REVOKE_URL and not reconnect_status:
             reconnect_status.append(0)  # re-entrancy guard
-            auth_api.revoke_builtin_oauth_grant(
-                carol_db,
-                oauth_provider="google",
-                access_token="carol-access",
-                provider_user_id=SUBJECT,
-                refresh_token="carol-refresh",
-            )
+            _delete_row(carol_db, "carol")
+            _drain(carol_db)
             reconnect_status[0] = _connect_google(bob_db, bob).status_code
         return provider_post(url, **kwargs)
 
@@ -290,26 +312,16 @@ def test_a_second_revoker_cannot_close_the_fence_under_one_in_flight(
 
     assert revoked == ["alice-refresh"]
     assert reconnect_status == [409]
-
-
-def _alices_revocation() -> auth_api.BuiltinOAuthRevocation:
-    return auth_api.BuiltinOAuthRevocation(
-        provider="google",
-        access_token="alice-access",
-        client_id="",
-        client_secret="",
-        provider_user_id=SUBJECT,
-        refresh_token="alice-refresh",
-    )
+    assert credential_revocation_statuses(alice_db) == ["revoked", "pending"]
 
 
 @pytest.mark.asyncio
 async def test_a_cancelled_revoke_closes_its_fence_once_the_call_ended(
     sessions, monkeypatch
 ):
-    """Cancelling the request while the provider call is in flight must not
-    leave the fence open until its deadline, nor close it while the call's
-    thread is still running."""
+    """Cancelling the outbox worker while the provider call is in flight
+    must not leave the fence open until its deadline, nor close it while the
+    call's thread is still running."""
     bob_db, alice_db = sessions
     in_call, finish_call = threading.Event(), threading.Event()
     finished: list[bool] = []
@@ -320,11 +332,8 @@ async def test_a_cancelled_revoke_closes_its_fence_once_the_call_ended(
         finished.append(True)
 
     monkeypatch.setattr(auth_api, "revoke_resolved_builtin_oauth_grant", blocked_revoke)
-    task = asyncio.create_task(
-        auth_api.revoke_builtin_oauth_grants(
-            alice_db, [_alices_revocation()], context="test"
-        )
-    )
+    _delete_row(alice_db, "alice")
+    task = asyncio.create_task(drain_credential_revocations(alice_db))
     assert await asyncio.to_thread(in_call.wait, 10)
 
     task.cancel()

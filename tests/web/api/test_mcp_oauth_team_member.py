@@ -184,15 +184,13 @@ class Env:
                 "scope": "records.read",
             }
 
-        async def record_revoke(snapshot):
+        def record_revoke(_db, snapshot):
             self.revoked.append(snapshot)
 
         monkeypatch.setattr(mcp_api, "discover_mcp_oauth_metadata", fake_discover)
         monkeypatch.setattr(mcp_api, "register_mcp_oauth_public_client", fake_register)
         monkeypatch.setattr(mcp_api, "_exchange_mcp_oauth_code", fake_exchange)
-        monkeypatch.setattr(
-            mcp_api, "_revoke_mcp_oauth_issued_token_externally", record_revoke
-        )
+        monkeypatch.setattr(mcp_api, "_enqueue_mcp_oauth_issued_token", record_revoke)
 
     def _user(self, name: str) -> User:
         user = User(username=name, password_hash="x", is_admin=False)

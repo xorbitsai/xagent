@@ -15,10 +15,11 @@ flight revokes the token pair it was issued, which no row can hold.
 from __future__ import annotations
 
 import logging
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from urllib.parse import parse_qs, urlparse
 
+import httpx
 import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
@@ -28,10 +29,12 @@ from xagent.core.utils.encryption import decrypt_value
 from xagent.web.api import mcp as mcp_api
 from xagent.web.api.mcp import mcp_oauth_callback
 from xagent.web.models import MCPOAuthClient, MCPOAuthFlowState, MCPOAuthGrant
+from xagent.web.models.credential_revocation import CredentialRevocation
 from xagent.web.models.database import Base
 from xagent.web.models.mcp import MCPServer, UserMCPServer
 from xagent.web.models.user import User
 from xagent.web.services import mcp_oauth as mcp_oauth_service
+from xagent.web.services.credential_revocations import run_credential_revocation_batch
 from xagent.web.services.mcp_oauth import (
     resolve_mcp_oauth_runtime_auth,
     select_mcp_oauth_grants,
@@ -75,23 +78,48 @@ def db_session(engine):
 
 
 @pytest.fixture()
-def provider(monkeypatch):
-    """Record every provider-side revocation instead of sending it."""
-    revoked: dict[str, list] = {"issued": [], "grants": []}
+def provider(monkeypatch, engine):
+    """What would reach the provider: a failed callback's compensation is
+    recorded instead of sent (``issued``), and every grant revocation is a
+    credential revocation outbox record (``records()``, oldest first)."""
+    issued: list = []
 
-    async def record_issued(snapshot):
-        revoked["issued"].append(snapshot)
+    def record_issued(_db, snapshot):
+        issued.append(snapshot)
 
-    async def record_grant(snapshot):
-        revoked["grants"].append(snapshot)
+    monkeypatch.setattr(mcp_api, "_enqueue_mcp_oauth_issued_token", record_issued)
 
-    monkeypatch.setattr(
-        mcp_api, "_revoke_mcp_oauth_issued_token_externally", record_issued
-    )
-    monkeypatch.setattr(
-        mcp_api, "_revoke_mcp_oauth_grant_snapshot_externally", record_grant
-    )
-    return revoked
+    def records() -> list[CredentialRevocation]:
+        with sessionmaker(bind=engine)() as db:
+            rows = (
+                db.query(CredentialRevocation).order_by(CredentialRevocation.id).all()
+            )
+            db.expunge_all()
+            return rows
+
+    async def sent() -> list[str]:
+        """Drain the outbox against a fake revocation endpoint; every token
+        that reached a provider, compensation included."""
+        tokens: list[str] = [snapshot.access_token for snapshot in issued]
+        real_client = httpx.AsyncClient
+
+        def endpoint(request: httpx.Request) -> httpx.Response:
+            tokens.append(parse_qs(request.content.decode())["token"][0])
+            return httpx.Response(200)
+
+        monkeypatch.setattr(
+            mcp_oauth_service,
+            "create_mcp_oauth_http_client",
+            lambda **_: real_client(transport=httpx.MockTransport(endpoint)),
+        )
+        await run_credential_revocation_batch(
+            sessionmaker(bind=engine),
+            now=lambda: datetime.now(timezone.utc) + timedelta(seconds=1),
+            limit=1000,
+        )
+        return tokens
+
+    return SimpleNamespace(issued=issued, records=records, sent=sent)
 
 
 def _token_response(monkeypatch, token_data: dict) -> None:
@@ -299,8 +327,10 @@ async def test_reconnect_leaves_one_usable_grant(
     assert decrypt_value(str(grants[0].access_token)) == "issued-access-token"
     assert _selected_ids(db, server, user, auth) == [int(grants[0].id)]
     # The replaced grants share the new grant's client and account at the
-    # provider, so nothing is revoked there.
-    assert provider == {"issued": [], "grants": []}
+    # provider, so nothing is revoked there: their outbox records are
+    # skipped while the new grant is active.
+    assert await provider.sent() == []
+    assert {record.status for record in provider.records()} <= {"skipped"}
     assert f"count={len(earlier_ids)}" in caplog.text
     assert "earlier-access-token" not in caplog.text
     assert "issued-access-token" not in caplog.text
@@ -332,7 +362,7 @@ async def test_reconnect_with_the_same_scope_updates_the_grant_in_place(
     assert decrypt_value(str(grants[0].access_token)) == "issued-access-token"
     # Updated in place: a response without a refresh token keeps the old one.
     assert decrypt_value(str(grants[0].refresh_token)) == "earlier-refresh-token"
-    assert provider == {"issued": [], "grants": []}
+    assert await provider.sent() == []
 
 
 @pytest.mark.asyncio
@@ -412,7 +442,7 @@ async def test_reconnect_keeps_every_grant_outside_the_replaced_set(
     }
     new_grants = [grant for grant in _owner_grants(db, server) if grant.scope == NARROW]
     assert len(new_grants) == 1
-    assert provider == {"issued": [], "grants": []}
+    assert await provider.sent() == []
 
 
 @pytest.mark.asyncio
@@ -488,7 +518,7 @@ async def test_new_grant_that_cannot_be_refreshed_replaces_nothing(
 
     assert runtime_auth.grant_id == earlier_id
     assert runtime_auth.access_token == "earlier-access-token"
-    assert provider == {"issued": [], "grants": []}
+    assert await provider.sent() == []
 
 
 @pytest.mark.asyncio
@@ -561,7 +591,7 @@ async def test_failed_callback_keeps_the_earlier_grant(
         (earlier_id, "active")
     ]
     assert decrypt_value(str(grants[0].access_token)) == "earlier-access-token"
-    assert provider["grants"] == []
+    assert provider.records() == []
 
 
 @pytest.mark.asyncio
@@ -662,13 +692,13 @@ async def test_runtime_refreshing_a_replaced_grant_moves_to_the_new_grant(
     refreshed_tokens: list[str] = []
     authorization = {"alive": True, "revoked": []}
 
-    async def revoke_the_whole_authorization(snapshot):
+    def revoke_the_whole_authorization(_db, snapshot):
         authorization["revoked"].append(snapshot.refresh_token)
         authorization["alive"] = False
 
     monkeypatch.setattr(
         mcp_api,
-        "_revoke_mcp_oauth_issued_token_externally",
+        "_enqueue_mcp_oauth_issued_token",
         revoke_the_whole_authorization,
     )
 
@@ -765,42 +795,46 @@ def _revoke_grant(grant_id: int, session) -> None:
 
 
 @pytest.mark.asyncio
-async def test_a_refresh_whose_grant_is_deleted_meanwhile_revokes_what_it_was_issued(
+async def test_a_refresh_whose_grant_is_deleted_meanwhile_enqueues_what_it_was_issued(
     engine, db_session, monkeypatch, provider
 ):
     """The token endpoint answers after the grant was deleted, so the rotated
-    pair has nowhere to be stored. Revoking only the grant's old tokens at
-    deletion cannot reach it: it is revoked here, and nothing is persisted."""
+    pair has nowhere to be stored. The deletion's outbox record holds only
+    the old tokens: the issued pair gets a record of its own."""
     db, user = db_session
 
     server, _grant_id = await _refresh_expired_grant(
         engine, db, user, monkeypatch, during_refresh=_delete_grant
     )
 
-    [snapshot] = provider["issued"]
-    assert snapshot.access_token == "refreshed-access-token"
-    assert snapshot.refresh_token == "refreshed-refresh-token"
-    assert snapshot.revocation_endpoint == f"{ISSUER}/revoke"
-    assert snapshot.client_id == "client-1"
+    deleted, issued = provider.records()
+    assert decrypt_value(deleted.access_token) == "earlier-access-token"
+    assert decrypt_value(issued.access_token) == "refreshed-access-token"
+    assert decrypt_value(issued.refresh_token) == "refreshed-refresh-token"
+    assert issued.revocation_endpoint == f"{ISSUER}/revoke"
+    assert issued.client_id == "client-1"
+    # Serialised behind the deletion's record of the same grant.
+    assert issued.grant_key == deleted.grant_key
     assert _owner_grants(db, server) == []
 
 
 @pytest.mark.asyncio
-async def test_a_refresh_whose_grant_is_revoked_meanwhile_revokes_what_it_was_issued(
+async def test_a_refresh_whose_grant_is_revoked_meanwhile_enqueues_what_it_was_issued(
     engine, db_session, monkeypatch, provider
 ):
-    """A grant marked revoked locally (a suspension does not call the
-    provider) is not a place to store a refresh either: the row keeps its old
-    tokens and the issued pair is revoked."""
+    """A grant marked revoked locally is not a place to store a refresh
+    either: the row keeps its old tokens (enqueued by the status change) and
+    the issued pair is enqueued too."""
     db, user = db_session
 
     server, grant_id = await _refresh_expired_grant(
         engine, db, user, monkeypatch, during_refresh=_revoke_grant
     )
 
-    [snapshot] = provider["issued"]
-    assert snapshot.access_token == "refreshed-access-token"
-    assert snapshot.refresh_token == "refreshed-refresh-token"
+    revoked, issued = provider.records()
+    assert decrypt_value(revoked.access_token) == "earlier-access-token"
+    assert decrypt_value(issued.access_token) == "refreshed-access-token"
+    assert decrypt_value(issued.refresh_token) == "refreshed-refresh-token"
     [grant] = _owner_grants(db, server)
     assert int(grant.id) == grant_id
     assert grant.status == "revoked"
@@ -832,7 +866,7 @@ async def test_a_refresh_that_is_stored_revokes_nothing(
     )
 
     assert runtime_auth.refreshed is True
-    assert provider["issued"] == []
+    assert provider.records() == []
     [grant] = _owner_grants(db, server)
     assert decrypt_value(grant.refresh_token) == "refreshed-refresh-token"
 

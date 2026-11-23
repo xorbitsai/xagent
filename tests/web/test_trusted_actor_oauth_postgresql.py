@@ -26,6 +26,7 @@ from xagent.web.models.actor_oauth_flow import ActorOAuthFlowState
 from xagent.web.models.database import Base
 from xagent.web.models.mcp import MCPServer, UserMCPServer
 from xagent.web.models.oauth_provider import OAuthProvider
+from xagent.web.models.oauth_revocation_fence import OAuthRevocationFence
 from xagent.web.models.oidc_consumed_token import OidcConsumedToken
 from xagent.web.models.public_mcp import PublicMCPApp
 from xagent.web.models.user import User
@@ -791,6 +792,7 @@ def test_mcp_callback_and_delete_do_not_deadlock(
         MCPOAuthClient.__table__,
         MCPOAuthFlowState.__table__,
         MCPOAuthGrant.__table__,
+        OAuthRevocationFence.__table__,
     ]
     Base.metadata.create_all(postgresql_engine, tables=tables)
     factory = sessionmaker(bind=postgresql_engine, autoflush=False, autocommit=False)

@@ -123,6 +123,16 @@ class UserOAuth(Base):  # type: ignore[no-any-unimported]
     # (20261115_user_oauth_issuer) could not prove. Provider-side revocation
     # treats NULL as "do not revoke" and never guesses.
     oauth_provider = Column(String(50), nullable=True)
+    # The client id of the OAuth app the callback exchanged the code with:
+    # the app that issued this row's tokens, recorded when they are written.
+    # GitHub's grant delete must authenticate as exactly that app, so the
+    # credential revocation outbox refuses to revoke with a configuration
+    # naming another one (an app replaced in the database or in the
+    # environment between the token's issue and its revocation). NULL on rows
+    # written before this column existed, and on rows not written by a
+    # native callback; see ``services.credential_revocations`` for how those
+    # are revoked.
+    oauth_client_id = Column(String(500), nullable=True)
     resource_owner_key = Column(
         String(USER_OAUTH_RESOURCE_OWNER_KEY_MAX_LENGTH), nullable=True
     )

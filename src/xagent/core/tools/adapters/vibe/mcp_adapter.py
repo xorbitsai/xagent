@@ -853,21 +853,29 @@ class _SignedUploadRefused(Exception):
         )
 
 
-def _check_signed_upload_connection(
+def _connection_host_matches(
     connection: Any,
     binding: SignedUploadBinding | SignedUploadIssuer | SignedUploadLink,
-    tool_name: str,
-) -> None:
-    """Refuse a signed upload or a download link over a connection to another host.
+) -> bool:
+    """Whether ``connection`` reaches the host the settings were read from.
 
-    "Another" means other than the host the settings were read from.
+    Logs nothing: each caller logs its own refusal.
     """
     url = connection.get("url") if isinstance(connection, Mapping) else None
     try:
         host = urlsplit(url).hostname if isinstance(url, str) else None
     except ValueError:
         host = None
-    if host != binding.connection_host:
+    return host == binding.connection_host
+
+
+def _check_signed_upload_connection(
+    connection: Any,
+    binding: SignedUploadBinding | SignedUploadIssuer,
+    tool_name: str,
+) -> None:
+    """Refuse a signed upload over a connection to another host than the settings'."""
+    if not _connection_host_matches(connection, binding):
         logger.warning(
             "MCP tool %s refused a signed upload for an untrusted connector",
             tool_name,
@@ -4455,17 +4463,11 @@ class MCPToolAdapter(AbstractBaseTool):
         link settings belong to, and a refresh can hand back a connection to
         another one.  Without a link in the call there is nothing to check.
         """
-        if host_link is None:
+        if host_link is None or _connection_host_matches(connection, host_link):
             return None
-        try:
-            _check_signed_upload_connection(connection, host_link, self.mcp_tool.name)
-        except _SignedUploadRefused as refused:
-            logger.warning(
-                "MCP tool %s refused a download link reason=untrusted_connector",
-                self.mcp_tool.name,
-            )
-            return refused.result
-        return None
+        return self._refused_link(
+            "untrusted_connector", _SIGNED_UPLOAD_UNTRUSTED_CONNECTOR_MESSAGE
+        ).result
 
     async def _substitute_signed_upload_link_args(
         self,
@@ -4507,16 +4509,10 @@ class MCPToolAdapter(AbstractBaseTool):
                 return tool_args, {}
             raise self._refused_link("no_workspace", _LINK_FILE_UNAVAILABLE_MESSAGE)
 
-        try:
-            _check_signed_upload_connection(
-                invocation_connection, link, self.mcp_tool.name
+        if not _connection_host_matches(invocation_connection, link):
+            raise self._refused_link(
+                "untrusted_connector", _SIGNED_UPLOAD_UNTRUSTED_CONNECTOR_MESSAGE
             )
-        except _SignedUploadRefused as refused:
-            logger.warning(
-                "MCP tool %s refused a download link reason=untrusted_connector",
-                self.mcp_tool.name,
-            )
-            raise refused
 
         from ....workspace import ExternalMediaNotIssuableError
 

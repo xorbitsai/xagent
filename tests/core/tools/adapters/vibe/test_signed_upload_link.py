@@ -521,19 +521,25 @@ async def test_a_connection_to_another_host_than_the_settings_is_refused(
     server: _Server,
     workspace: _Workspace,
     caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
     connection: dict[str, Any],
 ) -> None:
+    # The caller's user id is read on every call and warned about when absent;
+    # set it so the full warning list below holds only the refusal.
+    monkeypatch.setenv("XAGENT_USER_ID", "7")
     caplog.set_level(logging.WARNING)
+    adapter = _adapter(workspace, connection=connection)
+    caplog.clear()
 
-    result = await _adapter(workspace, connection=connection).run_json_async(
-        {ARGUMENT: REF}
-    )
+    result = await adapter.run_json_async({ARGUMENT: REF})
 
     assert result["is_error"] is True
     assert _text(result) == UNTRUSTED_CONNECTOR
     assert server.calls == []
     assert workspace.issued == []
-    assert _link_logs(caplog, logging.WARNING) == [
+    # Every warning, not only the ones that name the link: the refusal is
+    # logged once, and never as a signed upload.
+    assert [r.getMessage() for r in caplog.records] == [
         "MCP tool set_logo refused a download link reason=untrusted_connector"
     ]
 
@@ -552,19 +558,28 @@ async def test_a_connection_to_another_host_than_the_settings_is_refused(
 async def test_a_retry_carries_a_link_only_to_the_settings_host(
     server: _Server,
     workspace: _Workspace,
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
     path: str,
     value: str,
     refreshed_url: str,
     refused: bool,
 ) -> None:
     server.fail_first_call_with_401(path)
+    # The caller's user id is read on every call and warned about when absent;
+    # set it so the full warning list below holds only the refusal.
+    monkeypatch.setenv("XAGENT_USER_ID", "7")
+    caplog.set_level(logging.WARNING)
+    adapter = _retrying_adapter(workspace, path, refreshed_url)
+    caplog.clear()
 
-    result = await _retrying_adapter(workspace, path, refreshed_url).run_json_async(
-        {ARGUMENT: value}
-    )
+    result = await adapter.run_json_async({ARGUMENT: value})
 
     if refused:
         assert result == {"content": [{"text": UNTRUSTED_CONNECTOR}], "is_error": True}
+        assert [r.getMessage() for r in caplog.records] == [
+            "MCP tool set_logo refused a download link reason=untrusted_connector"
+        ]
         assert len(server.calls) == 1
         assert [c.get("url") for c in server.connections] == [CONNECTION_URL]
         return
@@ -574,6 +589,36 @@ async def test_a_retry_carries_a_link_only_to_the_settings_host(
     assert server.calls == [{ARGUMENT: sent}, {ARGUMENT: sent}]
     assert len(workspace.issued) == (1 if value == REF else 0)
     assert result["structured_content"]["image_url"] == value
+
+
+def test_a_signed_upload_to_another_host_keeps_its_own_warning(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # Why: the link path shares the host check with signed uploads but logs
+    # its own refusal; the signed-upload warning must stay as it was.
+    binding = SignedUploadBinding(
+        connection_host=HOST,
+        tool_name=TOOL,
+        file_argument="document",
+        issuing_tool_name="request_upload",
+        allowed_upload_hosts=frozenset({"uploads.example.test"}),
+        upload_path_prefix="/staged/",
+        content_types={".pdf": "application/pdf"},
+    )
+    caplog.set_level(logging.WARNING)
+
+    with pytest.raises(mcp_adapter_module._SignedUploadRefused) as refused:
+        mcp_adapter_module._check_signed_upload_connection(
+            _connection(OTHER_CONNECTION_URL), binding, TOOL
+        )
+
+    assert refused.value.result == {
+        "content": [{"text": UNTRUSTED_CONNECTOR}],
+        "is_error": True,
+    }
+    assert [r.getMessage() for r in caplog.records] == [
+        "MCP tool set_logo refused a signed upload for an untrusted connector"
+    ]
 
 
 async def test_a_refused_link_ends_the_call_before_any_signed_upload(

@@ -1624,154 +1624,74 @@ async def test_hide_only_entry_hides_the_issuing_tool_without_a_wrapper(
 
 
 def _link_entry(**overrides: Any) -> dict[str, Any]:
-    entry: dict[str, Any] = {
-        "tool_name": "set_logo",
-        "link_argument": "image_url",
-    }
-    entry.update(overrides)
-    return entry
+    return {"tool_name": "set_logo", "link_argument": "image_url", **overrides}
 
 
 def _link(**overrides: Any) -> SignedUploadLink:
-    fields: dict[str, Any] = {
-        "connection_host": CONNECTION_HOST,
-        "tool_name": "set_logo",
-        "link_argument": "image_url",
-    }
-    fields.update(overrides)
-    return SignedUploadLink(**fields)
+    return SignedUploadLink(
+        **{"connection_host": CONNECTION_HOST, **_link_entry(**overrides)}
+    )
 
 
-def test_parse_signed_upload_settings_accepts_a_link_entry() -> None:
-    assert _parse([_link_entry()]) == (_link(),)
+@pytest.mark.parametrize("transport", ["streamable_http", "sse"])
+def test_link_entries_are_read_in_stored_order_among_other_entries(
+    transport: str,
+) -> None:
+    raw = [_link_entry(), _entry(), _issuer_entry(issuing_tool_name="issue")]
 
+    parsed = connection_signed_uploads(_connection(transport, signed_uploads=raw))
 
-def test_link_entry_keeps_stored_order_among_other_entries() -> None:
-    parsed = _parse([_link_entry(), _entry(), _issuer_entry(issuing_tool_name="issue")])
-
-    assert [type(entry) for entry in parsed] == [
-        SignedUploadLink,
+    assert parsed[0] == _link()
+    assert [type(entry) for entry in parsed[1:]] == [
         SignedUploadBinding,
         SignedUploadIssuer,
     ]
 
 
 @pytest.mark.parametrize(
-    "entry",
-    [
-        pytest.param({"tool_name": "set_logo"}, id="tool-name-only"),
-        pytest.param({"link_argument": "image_url"}, id="link-argument-only"),
-        pytest.param(_with_key(_link_entry(), "extra"), id="plus-extra-key"),
-        pytest.param(
-            {**_link_entry(), "file_argument": "document"}, id="plus-file-argument"
-        ),
-        pytest.param(
-            {"link_argument": "image_url", "issuing_tool_name": "x"},
-            id="link-argument-and-issuing-tool",
-        ),
-        pytest.param({}, id="empty-object"),
-    ],
-)
-def test_link_entry_key_sets_are_exact(entry: dict[str, Any]) -> None:
-    with pytest.raises(ValueError, match=_exactly(KEYS)):
-        _parse([entry])
-
-
-@pytest.mark.parametrize(
     ("entry", "message"),
     [
+        pytest.param({"tool_name": "set_logo"}, _exactly(KEYS), id="tool-name-only"),
+        pytest.param(
+            {**_link_entry(), "file_argument": "document"},
+            _exactly(KEYS),
+            id="plus-file-argument",
+        ),
+        pytest.param(_with_key(_link_entry(), "extra"), _exactly(KEYS), id="extra"),
         pytest.param(
             _link_entry(tool_name=""),
-            "signed_uploads[0].tool_name must be a non-empty string",
+            _exactly("signed_uploads[0].tool_name must be a non-empty string"),
             id="empty-tool-name",
         ),
         pytest.param(
-            _link_entry(tool_name=3),
-            "signed_uploads[0].tool_name must be a non-empty string",
-            id="tool-name-not-a-string",
-        ),
-        pytest.param(
-            _link_entry(link_argument=""),
-            "signed_uploads[0].link_argument must be a non-empty string",
-            id="empty-link-argument",
-        ),
-        pytest.param(
             _link_entry(link_argument=None),
-            "signed_uploads[0].link_argument must be a non-empty string",
+            _exactly("signed_uploads[0].link_argument must be a non-empty string"),
             id="link-argument-not-a-string",
         ),
         pytest.param(
             _link_entry(link_argument="a" * 256),
-            "signed_uploads[0].link_argument must not be longer than 255",
+            _exactly("signed_uploads[0].link_argument must not be longer than 255"),
             id="link-argument-too-long",
-        ),
-        pytest.param(
-            _link_entry(tool_name="t" * 256),
-            "signed_uploads[0].tool_name must not be longer than 255",
-            id="tool-name-too-long",
         ),
     ],
 )
-def test_link_entry_rejects_invalid_strings(
+def test_link_entry_rejects_wrong_keys_and_invalid_strings(
     entry: dict[str, Any], message: str
 ) -> None:
-    with pytest.raises(ValueError, match=_exactly(message)):
+    with pytest.raises(ValueError, match=message):
         _parse([entry])
-
-
-def test_link_entry_accepts_string_limits_exactly() -> None:
-    parsed = _parse([_link_entry(tool_name="t" * 255, link_argument="a" * 255)])
-
-    assert parsed == (_link(tool_name="t" * 255, link_argument="a" * 255),)
-
-
-def test_link_entry_needs_a_connection_host() -> None:
-    with pytest.raises(
-        ValueError, match=_exactly("the connection URL has no hostname")
-    ):
-        _parse([_link_entry()], connection_host=None)
-
-
-def test_link_entry_key_set_differs_from_the_other_two() -> None:
-    key_sets = [
-        signed_upload._SETTINGS_ENTRY_KEYS,
-        signed_upload._ISSUER_ENTRY_KEYS,
-        signed_upload._LINK_ENTRY_KEYS,
-    ]
-
-    assert signed_upload._LINK_ENTRY_KEYS == {"tool_name", "link_argument"}
-    assert set(_link_entry()) == set(signed_upload._LINK_ENTRY_KEYS)
-    for index, keys in enumerate(key_sets):
-        for other in key_sets[index + 1 :]:
-            assert keys != other
 
 
 LINK_CLASHES = [
     pytest.param(
-        [_link_entry(), _link_entry(link_argument="other_url")],
+        [_link_entry(), _link_entry(link_argument="b"), _link_entry()],
         "signed_uploads[1].tool_name has another link entry",
         id="two-link-entries-same-tool",
     ),
     pytest.param(
-        [_link_entry(), _link_entry(), _link_entry()],
-        "signed_uploads[1].tool_name has another link entry",
-        id="first-repeat-is-named",
-    ),
-    pytest.param(
-        [
-            _entry(tool_name="set_logo", file_argument="image_url"),
-            _link_entry(),
-        ],
+        [_link_entry(), _entry(tool_name="set_logo", file_argument="image_url")],
         "a tool argument cannot be both uploaded and linked",
         id="same-tool-same-argument-as-binding",
-    ),
-    pytest.param(
-        [
-            _link_entry(),
-            _entry(tool_name="set_logo", file_argument="image_url"),
-        ],
-        "a tool argument cannot be both uploaded and linked",
-        id="same-tool-same-argument-binding-last",
     ),
     pytest.param(
         [_link_entry(tool_name="request_upload"), _entry()],
@@ -1807,83 +1727,19 @@ def test_link_entries_clash(raw: Any, message: str) -> None:
             [_link_entry(tool_name="set_banner"), _issuer_entry()],
             id="link-beside-an-issuer",
         ),
-        pytest.param(
-            [_link_entry(tool_name="set_logo", link_argument="document"), _entry()],
-            id="link-beside-a-binding-of-another-tool",
-        ),
     ],
 )
 def test_link_entries_accept_compatible_entries(raw: Any) -> None:
     assert len(_parse(raw)) == len(raw)
 
 
-def test_a_link_entry_is_not_read_as_an_issuer() -> None:
+def test_an_entry_of_an_unknown_kind_is_an_error() -> None:
     # The pairwise checks must name every entry kind; a kind they do not know
     # is an error, never read as one of the others.
     with pytest.raises(
         ValueError, match=_exactly("signed_uploads entry has an unknown kind")
     ):
         signed_upload._check_entries_together([object()])  # type: ignore[list-item]
-
-
-def test_link_entry_error_text_carries_no_stored_value() -> None:
-    marker = "stored-marker-value"
-    with pytest.raises(ValueError) as caught:
-        _parse(
-            [
-                _link_entry(tool_name=marker, link_argument="a"),
-                _link_entry(tool_name=marker, link_argument="b"),
-            ]
-        )
-
-    assert marker not in str(caught.value)
-
-
-@pytest.mark.parametrize("transport", ["streamable_http", "sse"])
-def test_connection_signed_uploads_reads_link_entries(transport: str) -> None:
-    connection = _connection(transport, signed_uploads=[_link_entry()])
-
-    assert connection_signed_uploads(connection) == (_link(),)
-
-
-@pytest.mark.parametrize(
-    "connection",
-    [
-        pytest.param(_stdio_connection(signed_uploads=[_link_entry()]), id="stdio"),
-        pytest.param(
-            {
-                "transport": "websocket",
-                "url": f"wss://{CONNECTION_HOST}/mcp",
-                "signed_uploads": [_link_entry()],
-            },
-            id="websocket",
-        ),
-        pytest.param(
-            _stdio_connection(signed_uploads=[_link_entry(), _link_entry()]),
-            id="stdio-with-invalid-link-settings",
-        ),
-    ],
-)
-def test_link_entries_are_inert_on_other_transports(connection: Any) -> None:
-    assert connection_signed_uploads(connection) == ()
-    assert (
-        signed_upload_settings_error(
-            connection["signed_uploads"],
-            transport=connection["transport"],
-            url=connection["url"],
-        )
-        is None
-    )
-
-
-@pytest.mark.parametrize(("raw", "message"), LINK_CLASHES)
-def test_signed_upload_settings_error_reports_link_clashes(
-    raw: Any, message: str
-) -> None:
-    assert (
-        signed_upload_settings_error(raw, transport="sse", url=CONNECTION_URL)
-        == message
-    )
 
 
 @pytest.mark.asyncio

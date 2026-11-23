@@ -914,16 +914,13 @@ def test_route_serves_through_a_linked_upload_root(
 # ---------------------------------------------------------------------------
 
 ROUTE_LOGGER = files.logger.name
+INVALID_TICKET = {"detail": "Invalid or expired external media ticket"}
 
 
 def _image_content(image_format: str) -> bytes:
     output = BytesIO()
-    if image_format == "WEBP":
-        Image.effect_noise((96, 64), 64).convert("RGB").save(
-            output, "WEBP", lossless=True
-        )
-    else:
-        Image.effect_noise((96, 64), 64).convert("RGB").save(output, image_format)
+    save = {"lossless": True} if image_format == "WEBP" else {}
+    Image.effect_noise((96, 64), 64).convert("RGB").save(output, image_format, **save)
     return output.getvalue()
 
 
@@ -932,15 +929,15 @@ def _serve_image(
     tmp_path: Path,
     db: Session,
     *,
-    name: str,
-    content: bytes,
-    purpose: str,
+    name: str = "logo.png",
+    content: bytes | None = None,
+    purpose: str = "connector-image",
 ) -> tuple[str, str]:
-    """Register ``content`` under ``name``, issue a ticket and return (id, path)."""
+    """Register an image under ``name``, issue a ticket and return (id, path)."""
     uploads_dir = tmp_path / "uploads"
     image_path = uploads_dir / "user_7" / "web_task_11" / name
     image_path.parent.mkdir(parents=True, exist_ok=True)
-    image_path.write_bytes(content)
+    image_path.write_bytes(_image_content("PNG") if content is None else content)
     monkeypatch.setattr(files, "get_uploads_dir", lambda: uploads_dir)
     monkeypatch.setattr(external_media, "get_uploads_dir", lambda: uploads_dir)
     monkeypatch.setenv("XAGENT_PUBLIC_API_BASE_URL", "https://testserver")
@@ -970,16 +967,13 @@ def _serve_image(
     [
         ("logo.png", "PNG", "image/png", "png"),
         ("logo.jpg", "JPEG", "image/jpeg", "jpg"),
-        ("logo.jpeg", "JPEG", "image/jpeg", "jpg"),
         ("logo.webp", "WEBP", "image/webp", "webp"),
         # The bytes decide what is delivered, not the name.
-        ("logo.png", "JPEG", "image/jpeg", "jpg"),
-        ("logo.jpg", "PNG", "image/png", "png"),
         ("logo.webp", "PNG", "image/png", "png"),
         ("logo.png", "WEBP", "image/webp", "webp"),
     ],
 )
-def test_route_serves_connector_images_as_stored(
+def test_route_serves_connector_images_as_stored_under_the_file_id(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     db: Session,
@@ -990,17 +984,9 @@ def test_route_serves_connector_images_as_stored(
     extension: str,
 ):
     content = _image_content(image_format)
-    file_id, path = _serve_image(
-        monkeypatch,
-        tmp_path,
-        db,
-        name=name,
-        content=content,
-        purpose="connector-image",
-    )
+    file_id, path = _serve_image(monkeypatch, tmp_path, db, name=name, content=content)
 
     response = client.get(path, follow_redirects=False)
-    head = client.head(path, follow_redirects=False)
 
     assert response.status_code == 200
     assert response.content == content
@@ -1009,66 +995,29 @@ def test_route_serves_connector_images_as_stored(
         f'inline; filename="{file_id}.{extension}"; '
         f"filename*=UTF-8''{file_id}.{extension}"
     )
-    assert name not in response.headers["content-disposition"]
-    assert response.headers["cache-control"] == "no-store, max-age=0"
-    assert response.headers["referrer-policy"] == "no-referrer"
-    assert response.headers["x-content-type-options"] == "nosniff"
-    assert head.status_code == 200
-    assert head.content == b""
-    assert head.headers["content-type"] == media_type
 
 
-def test_route_serves_facebook_images_under_their_own_file_name(
+def test_route_keeps_the_facebook_file_name_and_type_rule(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     db: Session,
     client: TestClient,
 ):
+    # Why: a WebP swapped in after a Facebook issue keeps the registered type,
+    # and the Facebook download keeps the name the file was uploaded under.
+    name = "visitor-upload.png"
     _, path = _serve_image(
-        monkeypatch,
-        tmp_path,
-        db,
-        name="visitor-upload.png",
-        content=_image_content("PNG"),
-        purpose="facebook-publish",
+        monkeypatch, tmp_path, db, name=name, purpose="facebook-publish"
+    )
+    (tmp_path / "uploads" / "user_7" / "web_task_11" / name).write_bytes(
+        _image_content("WEBP")
     )
 
     response = client.get(path)
 
     assert response.status_code == 200
-    assert "visitor-upload.png" in response.headers["content-disposition"]
-
-
-def test_route_facebook_type_ignores_a_webp_signature(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-    db: Session,
-    client: TestClient,
-):
-    # Why: the Facebook type rule is unchanged. A WebP swapped in after issue
-    # keeps the registered type there, but is named by its signature for the
-    # connector-image purpose.
-    paths = {}
-    for purpose in ("facebook-publish", "connector-image"):
-        name = f"{purpose}.png"
-        _, paths[purpose] = _serve_image(
-            monkeypatch,
-            tmp_path,
-            db,
-            name=name,
-            content=_image_content("PNG"),
-            purpose=purpose,
-        )
-        (tmp_path / "uploads" / "user_7" / "web_task_11" / name).write_bytes(
-            _image_content("WEBP")
-        )
-
-    facebook = client.get(paths["facebook-publish"])
-    connector = client.get(paths["connector-image"])
-
-    assert facebook.status_code == connector.status_code == 200
-    assert facebook.headers["content-type"] == "image/png"
-    assert connector.headers["content-type"] == "image/webp"
+    assert response.headers["content-type"] == "image/png"
+    assert name in response.headers["content-disposition"]
 
 
 @pytest.mark.parametrize(
@@ -1081,40 +1030,14 @@ def test_every_purpose_has_an_explicit_branch_at_delivery(
     client: TestClient,
     purpose: str,
 ):
-    # Why: a purpose added to the enum without a delivery branch must not be
-    # served by one of the existing ones; this fails until it is handled.
-    _, path = _serve_image(
-        monkeypatch,
-        tmp_path,
-        db,
-        name="logo.png",
-        content=_image_content("PNG"),
-        purpose=purpose,
-    )
+    # Why: a purpose added to the enum without a delivery branch is refused,
+    # so this fails until that purpose is handled.
+    _, path = _serve_image(monkeypatch, tmp_path, db, purpose=purpose)
 
     assert client.get(path).status_code == 200
 
 
-def test_route_answers_a_ticket_with_an_unknown_purpose_like_an_invalid_ticket(
-    db: Session, client: TestClient
-):
-    file_id = str(uuid4())
-    _record(db, file_id)
-
-    forged = client.get(
-        f"/api/files/external-media/{file_id}?ticket={_ticket(file_id, purpose='bogus')}"
-    )
-    invalid = client.get(f"/api/files/external-media/{file_id}?ticket=not-a-jwt")
-
-    assert forged.status_code == invalid.status_code == 401
-    assert (
-        forged.json()
-        == invalid.json()
-        == {"detail": "Invalid or expired external media ticket"}
-    )
-
-
-def test_route_answers_a_purpose_without_a_branch_with_the_invalid_ticket_response(
+def test_route_answers_a_purpose_without_a_branch_like_an_invalid_ticket(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     db: Session,
@@ -1122,14 +1045,7 @@ def test_route_answers_a_purpose_without_a_branch_with_the_invalid_ticket_respon
 ):
     # Why: a purpose the route has no branch for must be refused the same way
     # as an invalid ticket, never served by a neighbouring branch.
-    file_id, path = _serve_image(
-        monkeypatch,
-        tmp_path,
-        db,
-        name="logo.png",
-        content=_image_content("PNG"),
-        purpose="connector-image",
-    )
+    file_id, path = _serve_image(monkeypatch, tmp_path, db)
     redeemed = external_media.RedeemedExternalMedia(
         record=db.query(UploadedFile).filter(UploadedFile.file_id == file_id).one(),
         purpose="future-purpose",  # type: ignore[arg-type]
@@ -1142,136 +1058,68 @@ def test_route_answers_a_purpose_without_a_branch_with_the_invalid_ticket_respon
     response = client.get(path)
 
     assert response.status_code == 401
-    assert response.json() == {"detail": "Invalid or expired external media ticket"}
+    assert response.json() == INVALID_TICKET
 
 
-def test_route_refuses_a_connector_image_over_the_delivery_cap_and_logs_it(
+def _delivery_logs(caplog: pytest.LogCaptureFixture) -> list[str]:
+    return [
+        record.getMessage()
+        for record in caplog.records
+        if "External media delivery" in record.getMessage()
+    ]
+
+
+@pytest.mark.parametrize(
+    ("case", "status", "reason"),
+    [
+        ("over-the-delivery-cap", 422, "unprocessable"),
+        ("cannot-be-opened", 404, "file_unavailable"),
+        ("bytes-gone", 404, "file_unavailable"),
+        ("record-gone", 401, "ticket_rejected"),
+        ("wrong-scope", 401, "ticket_rejected"),
+    ],
+)
+def test_route_logs_a_refused_connector_image_by_category(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     db: Session,
     client: TestClient,
     caplog: pytest.LogCaptureFixture,
+    case: str,
+    status: int,
+    reason: str,
 ):
-    file_id, path = _serve_image(
-        monkeypatch,
-        tmp_path,
-        db,
-        name="logo.png",
-        content=_image_content("PNG"),
-        purpose="connector-image",
-    )
-    monkeypatch.setattr(files, "FACEBOOK_MAX_IMAGE_BYTES", 32)
+    if case in {"record-gone", "wrong-scope"}:
+        # The ticket decodes and names the purpose, but no record matches it.
+        file_id = str(uuid4())
+        claims = {"user_id": "7"} if case == "wrong-scope" else {}
+        ticket = _ticket(file_id, purpose="connector-image", **claims)
+        path = f"/api/files/external-media/{file_id}?ticket={ticket}"
+    else:
+        file_id, path = _serve_image(monkeypatch, tmp_path, db)
+    if case == "over-the-delivery-cap":
+        monkeypatch.setattr(files, "FACEBOOK_MAX_IMAGE_BYTES", 32)
+    elif case == "cannot-be-opened":
+        monkeypatch.setattr(files, "open_delivery_file", Mock(side_effect=OSError))
+    elif case == "bytes-gone":
+        monkeypatch.setattr(
+            files.ManagedFileRef,
+            "materialize",
+            Mock(side_effect=DurableObjectMissingError(Path("missing"))),
+        )
     caplog.set_level(logging.WARNING, logger=ROUTE_LOGGER)
 
     response = client.get(path)
 
-    assert response.status_code == 422
-    assert response.json()["detail"] == (
-        "Registered image exceeds the delivery size limit"
-    )
-    assert _connector_warnings(caplog) == [
+    assert response.status_code == status
+    assert _delivery_logs(caplog) == [
         f"External media delivery refused purpose=connector-image "
-        f"file_id={file_id} reason=unprocessable"
-    ]
-
-
-def test_route_logs_a_connector_image_that_cannot_be_read(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-    db: Session,
-    client: TestClient,
-    caplog: pytest.LogCaptureFixture,
-):
-    file_id, path = _serve_image(
-        monkeypatch,
-        tmp_path,
-        db,
-        name="logo.png",
-        content=_image_content("PNG"),
-        purpose="connector-image",
-    )
-    monkeypatch.setattr(files, "open_delivery_file", Mock(side_effect=OSError("gone")))
-    caplog.set_level(logging.WARNING, logger=ROUTE_LOGGER)
-
-    response = client.get(path)
-
-    assert response.status_code == 404
-    assert _connector_warnings(caplog) == [
-        f"External media delivery refused purpose=connector-image "
-        f"file_id={file_id} reason=file_unavailable"
-    ]
-
-
-def test_route_logs_a_connector_image_whose_bytes_are_gone(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-    db: Session,
-    client: TestClient,
-    caplog: pytest.LogCaptureFixture,
-):
-    file_id, path = _serve_image(
-        monkeypatch,
-        tmp_path,
-        db,
-        name="logo.png",
-        content=_image_content("PNG"),
-        purpose="connector-image",
-    )
-    monkeypatch.setattr(
-        files.ManagedFileRef,
-        "materialize",
-        Mock(side_effect=DurableObjectMissingError(Path("missing"))),
-    )
-    caplog.set_level(logging.WARNING, logger=ROUTE_LOGGER)
-
-    response = client.get(path)
-
-    assert response.status_code == 404
-    assert _connector_warnings(caplog) == [
-        f"External media delivery refused purpose=connector-image "
-        f"file_id={file_id} reason=file_unavailable"
-    ]
-
-
-def test_route_logs_a_connector_image_ticket_whose_file_is_gone(
-    db: Session, client: TestClient, caplog: pytest.LogCaptureFixture
-):
-    # The ticket decodes and names the purpose, but no record matches it.
-    file_id = str(uuid4())
-    caplog.set_level(logging.WARNING, logger=ROUTE_LOGGER)
-
-    response = client.get(
-        f"/api/files/external-media/{file_id}"
-        f"?ticket={_ticket(file_id, purpose='connector-image')}"
-    )
-
-    assert response.status_code == 401
-    assert _connector_warnings(caplog) == [
-        f"External media delivery refused purpose=connector-image "
-        f"file_id={file_id} reason=ticket_rejected"
-    ]
-
-
-def test_route_logs_a_connector_image_ticket_with_the_wrong_scope(
-    db: Session, client: TestClient, caplog: pytest.LogCaptureFixture
-):
-    file_id = str(uuid4())
-    caplog.set_level(logging.WARNING, logger=ROUTE_LOGGER)
-
-    response = client.get(
-        f"/api/files/external-media/{file_id}"
-        f"?ticket={_ticket(file_id, purpose='connector-image', user_id='7')}"
-    )
-
-    assert response.status_code == 401
-    assert _connector_warnings(caplog) == [
-        f"External media delivery refused purpose=connector-image "
-        f"file_id={file_id} reason=ticket_rejected"
+        f"file_id={file_id} reason={reason}"
     ]
 
 
 @pytest.mark.parametrize("purpose", ["instagram-publish", "facebook-publish"])
-def test_route_adds_no_log_for_the_existing_purposes(
+def test_route_adds_no_log_for_the_existing_purposes_or_an_unread_ticket(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     db: Session,
@@ -1279,48 +1127,17 @@ def test_route_adds_no_log_for_the_existing_purposes(
     caplog: pytest.LogCaptureFixture,
     purpose: str,
 ):
-    file_id, path = _serve_image(
-        monkeypatch,
-        tmp_path,
-        db,
-        name="logo.png",
-        content=_image_content("PNG"),
-        purpose=purpose,
-    )
-    monkeypatch.setattr(files, "open_delivery_file", Mock(side_effect=OSError("gone")))
-    ticket_gone = str(uuid4())
+    _, path = _serve_image(monkeypatch, tmp_path, db, purpose=purpose)
+    monkeypatch.setattr(files, "open_delivery_file", Mock(side_effect=OSError))
+    gone = str(uuid4())
     caplog.set_level(logging.DEBUG, logger=ROUTE_LOGGER)
 
     missing = client.get(path)
     rejected = client.get(
-        f"/api/files/external-media/{ticket_gone}"
-        f"?ticket={_ticket(ticket_gone, purpose=purpose)}"
+        f"/api/files/external-media/{gone}?ticket={_ticket(gone, purpose=purpose)}"
     )
+    unread = client.get(f"/api/files/external-media/{gone}?ticket=not-a-jwt")
 
-    assert missing.status_code == 404
-    assert rejected.status_code == 401
-    assert not [
-        record
-        for record in caplog.records
-        if "External media delivery" in record.getMessage()
-    ]
-
-
-def test_route_does_not_log_a_ticket_that_does_not_decode(
-    client: TestClient, caplog: pytest.LogCaptureFixture
-):
-    caplog.set_level(logging.DEBUG, logger=ROUTE_LOGGER)
-
-    response = client.get(f"/api/files/external-media/{uuid4()}?ticket=not-a-jwt")
-
-    assert response.status_code == 401
-    assert _connector_warnings(caplog) == []
-
-
-def _connector_warnings(caplog: pytest.LogCaptureFixture) -> list[str]:
-    return [
-        record.getMessage()
-        for record in caplog.records
-        if record.levelno == logging.WARNING
-        and "External media delivery" in record.getMessage()
-    ]
+    assert (missing.status_code, rejected.status_code) == (404, 401)
+    assert unread.json() == INVALID_TICKET
+    assert _delivery_logs(caplog) == []

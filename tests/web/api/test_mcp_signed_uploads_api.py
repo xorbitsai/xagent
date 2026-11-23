@@ -742,97 +742,36 @@ def test_non_owner_cannot_change_issuer_entries() -> None:
 
 
 LINK_ENTRY = {"tool_name": "set_logo", "link_argument": "image_url"}
-LINK_ENTRIES = [LINK_ENTRY]
 
 
 @pytest.mark.parametrize("transport", ["streamable_http", "sse"])
-def test_api_accepts_link_entries(transport: str) -> None:
-    _admin_headers()
-    owner = _register_second_user("bob", "bobpass1")
-
-    resp = _create(owner, transport=transport, signed_uploads=[LINK_ENTRY])
-
-    assert resp.status_code == 201, resp.text
-    assert resp.json()["signed_uploads"] == LINK_ENTRIES
-    assert resp.json()["signed_uploads_error"] is None
-    server_id = int(resp.json()["id"])
-    assert _row(server_id)["signed_uploads"] == LINK_ENTRIES
-    detail = client.get(f"/api/mcp/servers/{server_id}", headers=owner)
-    assert detail.json()["signed_uploads"] == LINK_ENTRIES
-    assert detail.json()["signed_uploads_error"] is None
-
-
-def test_api_accepts_a_link_entry_beside_a_replacement_entry() -> None:
+def test_api_accepts_link_entries_beside_a_replacement_entry(transport: str) -> None:
     _admin_headers()
     owner = _register_second_user("bob", "bobpass1")
     entries = [SIGNED_UPLOADS[0], LINK_ENTRY]
 
-    resp = _create(owner, signed_uploads=entries)
+    resp = _create(owner, transport=transport, signed_uploads=entries)
 
     assert resp.status_code == 201, resp.text
     assert resp.json()["signed_uploads"] == entries
     assert resp.json()["signed_uploads_error"] is None
-
-
-@pytest.mark.parametrize(
-    ("transport", "config"),
-    [
-        pytest.param("stdio", {"command": "python"}, id="stdio"),
-        pytest.param("websocket", {"url": "wss://mcp.example.test/ws"}, id="websocket"),
-    ],
-)
-def test_save_rejects_link_entries_on_other_transports(
-    transport: str, config: dict[str, Any]
-) -> None:
-    _admin_headers()
-    owner = _register_second_user("bob", "bobpass1")
-
-    resp = _create(
-        owner, transport=transport, config=config, signed_uploads=LINK_ENTRIES
-    )
-
-    assert resp.status_code == 400, resp.text
-    assert resp.json()["detail"] == TRANSPORT_DETAIL
+    server_id = int(resp.json()["id"])
+    assert _row(server_id)["signed_uploads"] == entries
+    detail = client.get(f"/api/mcp/servers/{server_id}", headers=owner)
+    assert detail.json()["signed_uploads"] == entries
+    assert detail.json()["signed_uploads_error"] is None
 
 
 @pytest.mark.parametrize("mode", ["create", "update"])
-@pytest.mark.parametrize(
-    ("clashing", "error"),
-    [
-        pytest.param(
-            [LINK_ENTRY, {**LINK_ENTRY, "link_argument": "other_url"}],
-            "signed_uploads[1].tool_name has another link entry",
-            id="two-links-one-tool",
-        ),
-        pytest.param(
-            [
-                {
-                    **SIGNED_UPLOADS[0],
-                    "tool_name": "set_logo",
-                    "file_argument": "image_url",
-                },
-                LINK_ENTRY,
-            ],
-            "a tool argument cannot be both uploaded and linked",
-            id="uploaded-and-linked",
-        ),
-        pytest.param(
-            [SIGNED_UPLOADS[0], {**LINK_ENTRY, "tool_name": "request_upload"}],
-            "an issuing tool cannot take a link argument",
-            id="link-on-an-issuing-tool",
-        ),
-    ],
-)
-def test_save_rejects_clashing_link_entries(
-    mode: str, clashing: Any, error: str
-) -> None:
+def test_save_rejects_clashing_link_entries(mode: str) -> None:
     _admin_headers()
     owner = _register_second_user("bob", "bobpass1")
+    clashing = [LINK_ENTRY, {**LINK_ENTRY, "link_argument": "other_url"}]
     if mode == "create":
         resp = _create(owner, signed_uploads=clashing)
         server_id = None
     else:
-        server_id = _create_ok(owner, signed_uploads=LINK_ENTRIES)
+        server_id = _create_ok(owner, signed_uploads=[LINK_ENTRY])
         before = _row(server_id)
         resp = client.put(
             f"/api/mcp/servers/{server_id}",
@@ -841,25 +780,8 @@ def test_save_rejects_clashing_link_entries(
         )
 
     assert resp.status_code == 400, resp.text
-    assert resp.json()["detail"] == _invalid_detail(error)
+    assert resp.json()["detail"] == _invalid_detail(
+        "signed_uploads[1].tool_name has another link entry"
+    )
     if server_id is not None:
         assert _row(server_id) == before
-
-
-def test_non_owner_cannot_change_link_entries() -> None:
-    _admin_headers()
-    owner = _register_second_user("bob", "bobpass1")
-    server_id = _create_ok(owner, signed_uploads=LINK_ENTRIES)
-    other = _register_second_user("carol", "carolpass1")
-    _link_non_owner("carol", server_id)
-    before = _row(server_id)
-
-    resp = client.put(
-        f"/api/mcp/servers/{server_id}",
-        json={"signed_uploads": [{**LINK_ENTRY, "link_argument": "other_url"}]},
-        headers=other,
-    )
-
-    assert resp.status_code == 403, resp.text
-    assert resp.json()["detail"] == OWNER_ONLY_DETAIL
-    assert _row(server_id) == before

@@ -4,6 +4,8 @@ import { afterEach, describe, expect, it, vi } from "vitest"
 
 import {
   END_REASONS,
+  isEndReason,
+  isWorkerTerminalReason,
   KNOWN_ERROR_CODES,
   MAX_RAPID_RECOVERIES,
   MAX_RATE_LIMIT_RETRIES,
@@ -125,5 +127,19 @@ describe("link session rules that intentionally differ from widget.js", () => {
 describe("link session end reasons", () => {
   it("are exactly the five values that make up the contract with embedders", () => {
     expect([...END_REASONS]).toEqual(["link_invalid", "session_ended", "unavailable", "network", "closed"])
+  })
+
+  it.each([...END_REASONS])("isEndReason accepts %s", (reason) => {
+    expect(isEndReason(reason)).toBe(true)
+  })
+
+  it.each([null, undefined, 1, "", "CLOSED", "unknown_x"])("isEndReason rejects %s", (value) => {
+    expect(isEndReason(value)).toBe(false)
+  })
+
+  it("isWorkerTerminalReason accepts every end reason except closed", () => {
+    for (const reason of END_REASONS) expect(isWorkerTerminalReason(reason)).toBe(reason !== "closed")
+    expect(isWorkerTerminalReason("unknown_x")).toBe(false)
+    expect(isWorkerTerminalReason(null)).toBe(false)
   })
 })

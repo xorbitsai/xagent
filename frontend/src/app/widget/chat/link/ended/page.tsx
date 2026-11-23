@@ -3,7 +3,7 @@
 import React, { Suspense } from "react"
 import { useSearchParams } from "next/navigation"
 import { useI18n } from "@/contexts/i18n-context"
-import { END_REASONS, type EndReason } from "@/components/widget/link-session-constants"
+import { isEndReason } from "@/components/widget/link-session-constants"
 
 // The URL of this page, in particular `reason`, is the signal the embedding app
 // reads from its WebView navigation hooks. The text below is for the person
@@ -16,10 +16,6 @@ const COPY = {
   closed: { title: "widgetLink.ended.closed.title", description: "widgetLink.ended.closed.description" },
   generic: { title: "widgetLink.ended.generic.title", description: "widgetLink.ended.generic.description" },
 } as const
-
-function isEndReason(value: string | null): value is EndReason {
-  return value !== null && (END_REASONS as readonly string[]).includes(value)
-}
 
 function LinkEnded() {
   const { t } = useI18n()

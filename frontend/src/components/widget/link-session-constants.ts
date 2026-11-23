@@ -68,14 +68,16 @@ export const END_REASONS = [
 ] as const
 export type EndReason = (typeof END_REASONS)[number]
 
+// The one runtime check for an end reason, derived from END_REASONS.
+export function isEndReason(value: unknown): value is EndReason {
+  return typeof value === "string" && (END_REASONS as readonly string[]).includes(value)
+}
+
 // Reasons a Worker may report. `closed` only comes from the user.
 export type WorkerTerminalReason = Exclude<EndReason, "closed">
 
 export function isWorkerTerminalReason(value: unknown): value is WorkerTerminalReason {
-  return value === "link_invalid"
-    || value === "session_ended"
-    || value === "unavailable"
-    || value === "network"
+  return isEndReason(value) && value !== "closed"
 }
 
 export function endedUrl(reason: EndReason): string {

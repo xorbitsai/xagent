@@ -303,6 +303,7 @@ export default defineConfig({
       "src/components/widget/use-widget-session.test.tsx",
       "src/components/widget/link-session-worker.test.ts",
       "src/components/widget/link-session-worker.entry.test.ts",
+      "src/components/widget/link-session-host.test.ts",
       "src/contexts/app-context-chat.test.tsx",
       "src/contexts/auth-context.test.tsx",
       "src/contexts/auth-context-idle.test.tsx",

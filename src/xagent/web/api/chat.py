@@ -356,6 +356,11 @@ async def create_task(
             has_access = own_model is not None
             if not has_access:
                 return None
+            # A model the visibility hook hides from this user is not accessible.
+            from ..services.model_service import _passes_model_visibility_hook
+
+            if not _passes_model_visibility_hook(db, authenticated_user_id, db_model):
+                return None
 
             return str(db_model.model_id)
 

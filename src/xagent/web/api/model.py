@@ -202,13 +202,18 @@ def _resolve_accessible_model(
     2. If not, check if any visible user shares this model.
     """
 
-    from ..services.model_service import _get_visible_user_ids
+    from ..services.model_service import (
+        _get_visible_user_ids,
+        _passes_model_visibility_hook,
+    )
 
     decoded_model_id = _decode_model_identifier(model_id)
     model_storage = CoreStorage(db, DBModel)
     db_model = model_storage.get_db_model(decoded_model_id)
     if not db_model:
         raise HTTPException(status_code=404, detail="Model not found")
+    if not _passes_model_visibility_hook(db, int(user.id), db_model):
+        raise HTTPException(status_code=404, detail="Model not found or access denied")
 
     # Step 1: own UserModel
     user_model = (
@@ -1370,6 +1375,7 @@ async def test_models(
 
     from ..services.model_service import (
         _get_visible_user_ids,
+        _passes_model_visibility_hook,
         build_user_model_visibility_filter,
     )
 
@@ -1402,6 +1408,12 @@ async def test_models(
             .all()
         )
 
+    # A model the visibility hook hides from this user is never called on their behalf.
+    models = [
+        model
+        for model in models
+        if _passes_model_visibility_hook(db, int(user.id), model)
+    ]
     if not models:
         return []
 

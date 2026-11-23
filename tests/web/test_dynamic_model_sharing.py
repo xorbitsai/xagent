@@ -421,6 +421,82 @@ class TestModelVisibilityHookOnIdResolution:
         # Other users, and the owner, still resolve it.
         assert self._resolve(model_id, admin_user["id"]) is not None
 
+    def test_a_hidden_model_is_hidden_from_its_owner_too(
+        self, test_db, admin_headers, admin_user, sample_model_data
+    ):
+        from xagent.web.services.model_service import set_model_visibility_hook
+
+        model_id = self._shared_model(admin_headers, sample_model_data)
+        owner = admin_user["id"]
+        set_model_visibility_hook(
+            lambda db, user_id, db_model: (
+                not (user_id == owner and db_model.model_id == model_id)
+            )
+        )
+        assert self._resolve(model_id, owner) is None
+
+    def test_a_hidden_shared_default_is_not_returned_by_the_defaults_fallback(
+        self, test_db, admin_headers, admin_user, regular_user, sample_model_data
+    ):
+        from xagent.web.services.llm_utils import resolve_llms_from_names
+        from xagent.web.services.model_service import set_model_visibility_hook
+
+        model_id = self._shared_model(admin_headers, sample_model_data)
+        db = next(get_db())
+        try:
+            from xagent.web.models.model import Model
+            from xagent.web.models.user import UserDefaultModel
+
+            row = db.query(Model).filter(Model.model_id == model_id).one()
+            db.add(
+                UserDefaultModel(
+                    user_id=admin_user["id"], model_id=row.id, config_type="general"
+                )
+            )
+            db.commit()
+            hidden_from = regular_user["id"]
+            names = [model_id, None, None, None]
+
+            visible = resolve_llms_from_names(names, db, hidden_from)[0]
+            assert visible is not None
+
+            set_model_visibility_hook(
+                lambda _db, user_id, db_model: (
+                    not (user_id == hidden_from and db_model.model_id == model_id)
+                )
+            )
+            assert resolve_llms_from_names(names, db, hidden_from)[0] is None
+        finally:
+            db.close()
+
+    def test_a_hidden_model_is_not_tested_or_fetched_for_the_user(
+        self,
+        test_db,
+        admin_headers,
+        regular_headers,
+        regular_user,
+        sample_model_data,
+    ):
+        from xagent.web.services.model_service import set_model_visibility_hook
+
+        model_id = self._shared_model(admin_headers, sample_model_data)
+        hidden_from = regular_user["id"]
+        set_model_visibility_hook(
+            lambda _db, user_id, db_model: (
+                not (user_id == hidden_from and db_model.model_id == model_id)
+            )
+        )
+
+        assert (
+            client.get(f"/api/models/{model_id}", headers=regular_headers).status_code
+            == 404
+        )
+        response = client.post(
+            "/api/models/test", json={"model_ids": [model_id]}, headers=regular_headers
+        )
+        assert response.status_code == 200
+        assert response.json() == []
+
 
 # ===========================================================================
 # 4. Mode C — Model Listing

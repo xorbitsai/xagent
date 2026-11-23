@@ -702,47 +702,16 @@ class UserAwareModelStorage:
                 logger.info(
                     f"Checking user access: user_id={user_id}, model_id={db_model.id}"
                 )
-                # A model the visibility hook hides from this user cannot be
-                # resolved by id either, however it is owned or shared.
-                from .model_service import _passes_model_visibility_hook
+                # Hook, ownership and sharing are decided in one place, the
+                # same check the listing paths use.
+                from .model_service import _is_model_visible_to_user
 
-                if not _passes_model_visibility_hook(self.db, user_id, db_model):
-                    logger.warning(
-                        f"Model '{model_name}' (db_model.id={db_model.id}) is hidden from user {user_id}"
-                    )
-                    return None
-                # Step 1: own UserModel (must be owner)
-                user_model = (
-                    self.db.query(UserModel)
-                    .filter(
-                        UserModel.user_id == user_id,
-                        UserModel.model_id == db_model.id,
-                        UserModel.is_owner.is_(True),
-                    )
-                    .first()
-                )
-                # Step 2: shared from visible users
-                if not user_model:
-                    from .model_service import _get_visible_user_ids
-
-                    visible_ids = _get_visible_user_ids(self.db, user_id)
-                    user_model = (
-                        self.db.query(UserModel)
-                        .filter(
-                            UserModel.model_id == db_model.id,
-                            UserModel.user_id.in_(visible_ids),
-                            UserModel.is_shared.is_(True),
-                        )
-                        .first()
-                    )
-
-                if not user_model:
+                if not _is_model_visible_to_user(self.db, int(db_model.id), user_id):
                     logger.warning(
                         f"User {user_id} does not have access to model '{model_name}' (db_model.id={db_model.id})"
                     )
                     return None
-                else:
-                    logger.info(f"User {user_id} has access to model '{model_name}'")
+                logger.info(f"User {user_id} has access to model '{model_name}'")
 
             if is_auto_router_model(
                 model_config.model_provider, model_config.model_name
@@ -1121,6 +1090,12 @@ class UserAwareModelStorage:
                 )
 
                 for admin_default in admin_defaults:
+                    from .model_service import _passes_model_visibility_hook
+
+                    if not _passes_model_visibility_hook(
+                        self.db, user_id, admin_default.model
+                    ):
+                        continue
                     if not default_llm and admin_default.config_type == "general":
                         default_llm = self._create_default_model(
                             admin_default.model, user_id

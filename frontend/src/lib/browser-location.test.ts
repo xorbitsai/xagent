@@ -1,8 +1,12 @@
 import { afterEach, describe, expect, it, vi } from "vitest"
 
 import {
+  getBrowserLocationHash,
   getBrowserLocationHostname,
   getBrowserLocationOrigin,
+  getBrowserLocationPathname,
+  getBrowserLocationSearch,
+  replaceBrowserLocation,
 } from "./browser-location"
 
 describe("browser location helpers", () => {
@@ -20,6 +24,9 @@ describe("browser location helpers", () => {
 
     expect(getBrowserLocationOrigin()).toBe("")
     expect(getBrowserLocationHostname()).toBe("")
+    expect(getBrowserLocationHash()).toBe("")
+    expect(getBrowserLocationPathname()).toBe("")
+    expect(getBrowserLocationSearch()).toBe("")
   })
 
   it("returns empty strings when location access throws", () => {
@@ -31,5 +38,26 @@ describe("browser location helpers", () => {
 
     expect(getBrowserLocationOrigin()).toBe("")
     expect(getBrowserLocationHostname()).toBe("")
+    expect(getBrowserLocationHash()).toBe("")
+    expect(getBrowserLocationPathname()).toBe("")
+    expect(getBrowserLocationSearch()).toBe("")
+  })
+
+  it("replaces the current history entry instead of assigning", () => {
+    const replace = vi.fn()
+    const assign = vi.fn()
+    vi.stubGlobal("window", { location: { replace, assign } })
+
+    replaceBrowserLocation("/next")
+
+    expect(replace).toHaveBeenCalledTimes(1)
+    expect(replace).toHaveBeenCalledWith("/next")
+    expect(assign).not.toHaveBeenCalled()
+  })
+
+  it("does nothing when window is unavailable while replacing", () => {
+    vi.stubGlobal("window", undefined)
+
+    expect(() => replaceBrowserLocation("/next")).not.toThrow()
   })
 })

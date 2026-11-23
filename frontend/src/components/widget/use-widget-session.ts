@@ -7,8 +7,9 @@ import { WidgetSessionUploadError } from "@/lib/widget-session-upload"
 
 const TOKEN_REFRESH_THRESHOLD_MS = 60_000
 const EXPIRY_WARNING_LEAD_MS = 10 * 60_000
-// Keep this predicate aligned with the two retry signals emitted by
-// frontend/public/widget.js; every other parent code fails closed.
+// Keep this predicate aligned with the two retry signals that a parent sends
+// (frontend/public/widget.js and the link host page, link-session-host.ts);
+// every other parent code fails closed.
 const isParentRecoverableCode = (code: string): boolean =>
   code === "network_unavailable" || code === "rate_limited"
 
@@ -243,6 +244,16 @@ export function useWidgetSession() {
   const transitionTerminal = useCallback((code: string) => {
     if (terminalRef.current) return
     terminalRef.current = true
+    // Tells the parent that this page ended the session, so a parent that owns
+    // navigation can act on it. widget.js has no handler for this type; the link
+    // host page (link-session-host.ts) maps the code to its end page.
+    const targetOrigin = targetOriginRef.current
+    if (mountedRef.current && targetOrigin) {
+      window.parent.postMessage(
+        { xagent: true, v: 1, type: "session_terminal_reached", code },
+        targetOrigin,
+      )
+    }
     activeSessionGenerationRef.current = null
     activeDeliveryIdRef.current = null
     sessionRef.current = null

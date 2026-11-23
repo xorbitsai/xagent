@@ -33,6 +33,11 @@ const widgetConfig = mergeConfig(baseConfig, defineConfig({
         "src/components/widget/use-session-attachments.ts",
         "src/components/widget/use-session-open-message.ts",
         "src/components/widget/use-widget-session.ts",
+        "src/components/widget/link-session-constants.ts",
+        "src/components/widget/link-session-host.ts",
+        "src/components/widget/link-session-page.tsx",
+        "src/components/widget/link-session-worker.ts",
+        "src/components/widget/link-session-worker-core.ts",
         "src/components/widget/widget-chrome-controls.tsx",
         "src/components/widget/widget-history-list.tsx",
         "src/components/widget/widget-history-shell.tsx",
@@ -116,6 +121,23 @@ const widgetConfig = mergeConfig(baseConfig, defineConfig({
         },
         "src/components/widget/widget-chrome-controls.tsx": {
           statements: 95, branches: 90, functions: 95, lines: 95,
+        },
+        // The link session modules carry the reconnect-token boundary and the
+        // fail-closed rules, so they keep a high floor.
+        "src/components/widget/link-session-constants.ts": {
+          statements: 100, branches: 100, functions: 100, lines: 100,
+        },
+        "src/components/widget/link-session-host.ts": {
+          statements: 94, branches: 90, functions: 95, lines: 95,
+        },
+        "src/components/widget/link-session-page.tsx": {
+          statements: 92, branches: 75, functions: 90, lines: 92,
+        },
+        "src/components/widget/link-session-worker-core.ts": {
+          statements: 92, branches: 88, functions: 95, lines: 95,
+        },
+        "src/components/widget/link-session-worker.ts": {
+          statements: 80, branches: 90, functions: 70, lines: 80,
         },
         "src/components/widget/use-paged-history.ts": {
           statements: 90, branches: 85, functions: 85, lines: 90,
@@ -250,6 +272,7 @@ export default defineConfig({
       "src/app/layout.test.tsx",
       "src/ci/browser-security.test.ts",
       "src/app/widget/chat/[token]/page-client.test.tsx",
+      "src/app/widget/chat/link/ended/page.test.tsx",
       "src/app/settings/page.test.tsx",
       "src/components/settings/settings-content.test.tsx",
       "src/components/chat/ChatInput.test.tsx",
@@ -269,6 +292,7 @@ export default defineConfig({
       "src/components/file/pptx-preview-renderer.test.tsx",
       "src/components/file/excel-preview-renderer.test.tsx",
       "src/components/layout/sidebar.test.tsx",
+      "src/components/layout/application-shell.test.tsx",
       "src/components/pages/login.test.tsx",
       "src/components/pages/oidc-callback.test.tsx",
       "src/components/task/task-conversation-panel.test.tsx",
@@ -301,6 +325,12 @@ export default defineConfig({
       "src/components/widget/use-session-attachments.test.tsx",
       "src/components/widget/use-session-open-message.test.tsx",
       "src/components/widget/use-widget-session.test.tsx",
+      "src/components/widget/link-session-worker.test.ts",
+      "src/components/widget/link-session-worker.entry.test.ts",
+      "src/components/widget/link-session-host.test.ts",
+      "src/components/widget/link-session-page.test.tsx",
+      "src/components/widget/link-session-page.ssr.test.tsx",
+      "src/components/widget/link-session-constants.test.ts",
       "src/contexts/app-context-chat.test.tsx",
       "src/contexts/auth-context.test.tsx",
       "src/contexts/auth-context-idle.test.tsx",
@@ -315,6 +345,7 @@ export default defineConfig({
       "src/hooks/widget-voice-call.test.tsx",
       "src/lib/api-wrapper.test.ts",
       "src/lib/api-wrapper-idle.test.ts",
+      "src/lib/browser-location.test.ts",
       "src/lib/auth-cache.test.ts",
       "src/lib/idle-session.test.ts",
       "src/lib/idle-activity.test.ts",

@@ -880,6 +880,36 @@ const zh = {
       description: "目前无法打开此聊天，请稍后重试。",
     },
   },
+  widgetLink: {
+    loading: "正在打开聊天...",
+    close: "关闭聊天",
+    ended: {
+      link_invalid: {
+        title: "此聊天链接已失效",
+        description: "请返回应用，重新打开聊天。",
+      },
+      session_ended: {
+        title: "聊天会话已结束",
+        description: "请返回应用，重新打开聊天。",
+      },
+      unavailable: {
+        title: "聊天暂不可用",
+        description: "请返回应用，稍后再试。",
+      },
+      network: {
+        title: "网络出现问题",
+        description: "请检查网络连接，然后返回应用重试。",
+      },
+      closed: {
+        title: "聊天已关闭",
+        description: "您可以返回应用。",
+      },
+      generic: {
+        title: "聊天已结束",
+        description: "请返回应用继续。",
+      },
+    },
+  },
   channels: {
     page_title: "渠道管理",
     page_description: "管理您的沟通渠道和机器人。",

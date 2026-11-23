@@ -1417,6 +1417,9 @@ class ToolFactory:
                             ),
                             sandbox=sandbox,
                             workspace=workspace,
+                            # An agent build: reuse a recent stdio listing
+                            # instead of spawning the server again (#3926).
+                            discovery_cache=True,
                         )
                         normal_tools.extend(load_result.tools)
                         unavailable_tools.extend(

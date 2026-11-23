@@ -81,6 +81,7 @@ from .connector_runtime import (
     runtime_bindings_from_config,
 )
 from .mcp_approval_gate import gate_mcp_tools
+from .mcp_discovery_cache import cached_discovery, discovery_key, remember_discovery
 from .mcp_error_envelope import is_error_envelope, speaks_error_envelope
 from .mcp_result_integrity import MCPResultIntegrityGuard
 from .mcp_tool_allowlist import (
@@ -5652,6 +5653,7 @@ async def _load_direct_mcp_tools(
     allow_users: Optional[List[str]],
     workspace: Any | None = None,
     recorder: "_TransportRecorder | None" = None,
+    discovery_cache: bool = False,
 ) -> MCPLoadResult:
     """Load MCP tools directly on the host.
 
@@ -5659,6 +5661,10 @@ async def _load_direct_mcp_tools(
     ``create_session``; tool adapters always receive ``connection`` itself.
     Once the recorder is sealed (the caller abandoned this load), no further
     attempt starts, whatever the transport.
+
+    With ``discovery_cache``, a stdio server launched exactly like one a recent
+    build listed is not spawned again: that listing is reused, and everything
+    after discovery runs as usual (see ``mcp_discovery_cache``).
 
     The connection's signed-upload settings are read once, before any session
     is opened.  Settings that are not valid end the load with an
@@ -5718,9 +5724,19 @@ async def _load_direct_mcp_tools(
         recorder.instrument(connection) if recorder is not None else connection
     )
 
-    loaded = False
+    # A cached listing stands in for the whole discovery: no attempt runs and
+    # no process is spawned. Everything after the loop runs as usual.
+    cache_key = discovery_key(connection) if discovery_cache else None
+    cached_tools = cached_discovery(cache_key) if cache_key is not None else None
+    if cached_tools is not None:
+        logger.info(
+            "Reusing the tool listing of MCP server %s from a recent build",
+            server_name,
+        )
+        mcp_tools = cached_tools
+    loaded = cached_tools is not None
     attempts = 0
-    for attempt in range(max_attempts):
+    for attempt in range(0 if loaded else max_attempts):
         if recorder is not None:
             # Also outside the try-block, so it ends the load instead of being
             # retried: an abandoned load must not open another session.
@@ -5814,6 +5830,9 @@ async def _load_direct_mcp_tools(
                 ),
             ),
         )
+    if cache_key is not None and cached_tools is None:
+        # The raw listing: everything below is reapplied on every build.
+        remember_discovery(cache_key, mcp_tools)
 
     # Applied to the listing, before any adapter is built, so a tool the
     # operator did not allowlist is never reachable (see mcp_tool_allowlist).
@@ -5997,6 +6016,7 @@ async def load_mcp_tools_as_agent_tools(
     allow_users: Optional[List[str]] = None,
     sandbox: Sandbox | None = None,
     workspace: Any | None = None,
+    discovery_cache: bool = False,
 ) -> MCPLoadResult:
     """Load MCP tools from multiple servers and convert to Agent tools.
 
@@ -6012,6 +6032,9 @@ async def load_mcp_tools_as_agent_tools(
             connections are routed through it. Connections explicitly marked
             sandbox_required fail closed when it is unavailable.
         workspace: Current task workspace for durable FileRef upload staging.
+        discovery_cache: Reuse a recent listing of a host stdio server launched
+            the same way instead of spawning it again (agent builds). Off for
+            callers that must reach the live server, such as connection tests.
 
     Returns:
         Structured MCP tools, loaded server names, and public-safe failures.
@@ -6156,6 +6179,7 @@ async def load_mcp_tools_as_agent_tools(
                         allow_users=allow_users,
                         workspace=workspace,
                         recorder=recorder,
+                        discovery_cache=discovery_cache,
                     ),
                     timeout_seconds,
                     recorder=recorder,

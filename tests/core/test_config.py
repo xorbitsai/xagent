@@ -72,6 +72,7 @@ from xagent.config import (
     MCP_OAUTH_CALLBACK_BASE_URL,
     MCP_OAUTH_CLIENT_NAME,
     MCP_OAUTH_PROXY_URL,
+    MCP_TOOL_DISCOVERY_CACHE_SECONDS,
     MCP_TOOL_INIT_TIMEOUT_SECONDS,
     NATIVE_BROWSER_APP_NAME,
     NATIVE_BROWSER_ENABLED,
@@ -196,6 +197,7 @@ from xagent.config import (
     get_mcp_oauth_callback_base_url,
     get_mcp_oauth_client_name,
     get_mcp_oauth_proxy_url,
+    get_mcp_tool_discovery_cache_seconds,
     get_mcp_tool_init_timeout_seconds,
     get_native_browser_app_name,
     get_native_browser_enabled,
@@ -2064,6 +2066,30 @@ class TestMcpToolInitTimeout:
     def test_invalid_falls_back(self, monkeypatch):
         monkeypatch.setenv(MCP_TOOL_INIT_TIMEOUT_SECONDS, "not-a-number")
         assert get_mcp_tool_init_timeout_seconds() == 60
+
+
+class TestMcpToolDiscoveryCacheSeconds:
+    """Test get_mcp_tool_discovery_cache_seconds() function."""
+
+    def test_default(self, monkeypatch):
+        monkeypatch.delenv(MCP_TOOL_DISCOVERY_CACHE_SECONDS, raising=False)
+        assert get_mcp_tool_discovery_cache_seconds() == 600
+
+    def test_env_override(self, monkeypatch):
+        monkeypatch.setenv(MCP_TOOL_DISCOVERY_CACHE_SECONDS, "120")
+        assert get_mcp_tool_discovery_cache_seconds() == 120
+
+    def test_zero_disables(self, monkeypatch):
+        monkeypatch.setenv(MCP_TOOL_DISCOVERY_CACHE_SECONDS, "0")
+        assert get_mcp_tool_discovery_cache_seconds() == 0
+
+    def test_invalid_falls_back(self, monkeypatch):
+        monkeypatch.setenv(MCP_TOOL_DISCOVERY_CACHE_SECONDS, "not-a-number")
+        assert get_mcp_tool_discovery_cache_seconds() == 600
+
+    def test_negative_falls_back(self, monkeypatch):
+        monkeypatch.setenv(MCP_TOOL_DISCOVERY_CACHE_SECONDS, "-5")
+        assert get_mcp_tool_discovery_cache_seconds() == 600
 
 
 class TestGetSandboxCpus:

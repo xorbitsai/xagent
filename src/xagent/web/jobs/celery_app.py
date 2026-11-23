@@ -88,10 +88,11 @@ celery_app = create_celery_app()
 # main process from before Celery replaces the root handlers and before the
 # startup checks below; ``worker_process_init`` covers every prefork child;
 # ``beat_init`` covers beat, including the one ``celery worker -B`` runs in a
-# child process; ``after_setup_logger`` covers a worker that configures its
-# logging without ``worker_init`` (``celery.contrib.testing.worker`` does).
-# The record factory and the httpx/httpcore filters installed here are the
-# parts Celery's log configuration never resets.
+# child process; ``after_setup_logger`` covers a caller that sets logging up
+# with a bare ``app.log.setup`` instead of a worker, such as
+# ``celery.contrib.testing.worker.setup_app_for_worker``, which does so before
+# the test worker starts. The record factory and the httpx/httpcore filters
+# installed here are the parts Celery's log configuration never resets.
 @after_setup_logger.connect
 @worker_process_init.connect
 @beat_init.connect

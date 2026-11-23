@@ -347,7 +347,10 @@ def install_log_redaction() -> None:
     its own logging needs: Celery builds the worker and beat log configuration
     itself (its ``worker_hijack_root_logger`` setting replaces the root
     handlers) and never calls ``setup_logging``, so those processes call this
-    function from the Celery signals that fire after that configuration.
+    from Celery's ``worker_init``, ``after_setup_logger``,
+    ``worker_process_init`` and ``beat_init`` signals. The order does not
+    matter: reconfiguring logging cannot drop a record factory or a logger
+    filter.
 
     Handlers, levels and the logging configuration are left untouched, so this
     is safe to call at any point after a process starts. Idempotent.

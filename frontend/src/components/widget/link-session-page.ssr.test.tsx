@@ -4,6 +4,8 @@ import { afterEach, describe, expect, it, vi } from "vitest"
 
 vi.mock("@/contexts/i18n-context", () => ({ useI18n: () => ({ t: (key: string) => key }) }))
 
+import { viewport } from "@/app/widget/chat/link/page"
+
 import { LinkSessionPage } from "./link-session-page"
 
 describe("LinkSessionPage rendered on the server", () => {
@@ -22,5 +24,13 @@ describe("LinkSessionPage rendered on the server", () => {
     }).not.toThrow()
     expect(html).toContain("widgetLink.loading")
     expect(html).not.toContain("<iframe")
+  })
+})
+
+describe("link page entry", () => {
+  // The page insets its content with env(safe-area-inset-*), which iOS reports
+  // as 0 unless the viewport covers the whole screen.
+  it("exports a viewport that covers the whole screen", () => {
+    expect(viewport).toEqual({ width: "device-width", initialScale: 1, viewportFit: "cover" })
   })
 })

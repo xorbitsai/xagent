@@ -386,7 +386,6 @@ describe("link session Worker end reasons for server error codes", () => {
     ["agent_not_granted", 403, "unavailable"],
     ["invalid_runtime_context", 400, "unavailable"],
     ["encryption_required", 400, "unavailable"],
-    ["rate_limited", 429, "network"],
   ]
 
   it.each(cases)("redeem: %s (%i) ends with %s", async (code, status, reason) => {
@@ -426,6 +425,127 @@ describe("link session Worker end reasons for server error codes", () => {
     await vi.advanceTimersByTimeAsync(5 * MINUTE)
     expect(h.fetchSpy).toHaveBeenCalledTimes(2)
     expect(terminals(h)).toEqual([{ type: "terminal", reason: "network" }])
+  })
+})
+
+describe("link session Worker rate limiting", () => {
+  type Phase = "redeem" | "renew"
+  const PHASES: Phase[] = ["redeem", "renew"]
+  const limited = (retryAfter = "1", status = 429) =>
+    errorResponse(status, "rate_limited", { "Retry-After": retryAfter })
+
+  // `respond` receives the 1-based ordinal of the request in the phase under
+  // test. For renew the redeem that precedes it always succeeds.
+  async function begin(phase: Phase, respond: (k: number) => Promise<Response> | Response) {
+    let k = 0
+    const h = makeHarness(({ url }) => {
+      if (phase === "renew" && url === REDEEM_URL) return jsonResponse(200, tokenResponse("rt_1"))
+      k += 1
+      return respond(k)
+    })
+    await startAndSettle(h)
+    if (phase === "renew") {
+      h.posts.length = 0
+      h.fetchTimes.length = 0
+      h.core.handleMessage({ type: "renew" })
+      await settle()
+    }
+    return h
+  }
+
+  const requests = (h: Harness) => h.fetchTimes.length
+  const degradedCodes = (h: Harness) =>
+    h.posts.filter((p) => p.type === "degraded").map((p) => (p as { code: string }).code)
+
+  it.each(PHASES)("%s: retries a coded rate_limited after Retry-After", async (phase) => {
+    const h = await begin(phase, (k) => (k === 1 ? limited("5") : jsonResponse(200, tokenResponse("rt_2"))))
+    expect(requests(h)).toBe(1)
+    await vi.advanceTimersByTimeAsync(4999)
+    expect(requests(h)).toBe(1)
+    await vi.advanceTimersByTimeAsync(1)
+    expect(requests(h)).toBe(2)
+    expect(h.fetchTimes[1] - h.fetchTimes[0]).toBe(5000)
+    expect(types(h)).toContain("session")
+    expect(terminals(h)).toEqual([])
+    expect(degradedCodes(h)).toEqual(phase === "renew" ? ["rate_limited"] : [])
+  })
+
+  it.each(PHASES)("%s: gives up after two rate-limit retries", async (phase) => {
+    const h = await begin(phase, () => limited("1"))
+    await vi.advanceTimersByTimeAsync(10_000)
+    expect(requests(h)).toBe(3)
+    expect(terminals(h)).toEqual([{ type: "terminal", reason: "network" }])
+    expect(degradedCodes(h)).toEqual(phase === "renew" ? ["rate_limited", "rate_limited"] : [])
+  })
+
+  it.each([
+    ["redeem", "29", 2],
+    ["redeem", "30", 1],
+    ["renew", "29", 2],
+    ["renew", "30", 1],
+  ] as const)("%s: a Retry-After of %s seconds makes %i request(s)", async (phase, retryAfter, expected) => {
+    const h = await begin(phase, (k) => (k === 1 ? limited(retryAfter) : jsonResponse(200, tokenResponse("rt_2"))))
+    await vi.advanceTimersByTimeAsync(60_000)
+    expect(requests(h)).toBe(expected)
+    expect(terminals(h)).toEqual(expected === 1 ? [{ type: "terminal", reason: "network" }] : [])
+  })
+
+  it.each(PHASES)(
+    "%s: a 429 without the rate_limited code stays final even with a short Retry-After",
+    async (phase) => {
+      const h = await begin(phase, () => jsonResponse(429, "<html>slow down</html>", { "Retry-After": "5" }))
+      await vi.advanceTimersByTimeAsync(60_000)
+      expect(requests(h)).toBe(1)
+      expect(terminals(h)).toEqual([{ type: "terminal", reason: "network" }])
+    },
+  )
+
+  it("renew: follows the code, not the status", async () => {
+    const h = await begin("renew", (k) => (k === 1 ? limited("5", 503) : jsonResponse(200, tokenResponse("rt_2"))))
+    await vi.advanceTimersByTimeAsync(5000)
+    expect(requests(h)).toBe(2)
+    expect(h.fetchTimes[1] - h.fetchTimes[0]).toBe(5000)
+    expect(types(h)).toContain("session")
+    expect(terminals(h)).toEqual([])
+  })
+
+  it.each(PHASES)("%s: a wake does not shorten a rate-limit wait", async (phase) => {
+    const h = await begin(phase, (k) => (k === 1 ? limited("20") : jsonResponse(200, tokenResponse("rt_2"))))
+    await vi.advanceTimersByTimeAsync(1000)
+    h.core.handleMessage({ type: "wake" })
+    await vi.advanceTimersByTimeAsync(18_999)
+    expect(requests(h)).toBe(1)
+    await vi.advanceTimersByTimeAsync(1)
+    expect(requests(h)).toBe(2)
+  })
+
+  it("renew: the budget starts over with each new reconnect token", async () => {
+    const h = await begin("renew", (k) => {
+      if (k === 3) return jsonResponse(200, tokenResponse("rt_2"))
+      if (k === 6) return jsonResponse(200, tokenResponse("rt_3"))
+      return limited("1")
+    })
+    await vi.advanceTimersByTimeAsync(3000)
+    expect(h.posts.filter((p) => p.type === "session")).toHaveLength(1)
+    h.core.handleMessage({ type: "renew" })
+    await settle()
+    await vi.advanceTimersByTimeAsync(3000)
+    expect(h.posts.filter((p) => p.type === "session")).toHaveLength(2)
+    expect(requests(h)).toBe(6)
+    expect(terminals(h)).toEqual([])
+  })
+
+  it("redeem: rate-limit retries do not use up the redeem attempts", async () => {
+    const h = await begin("redeem", (k) => {
+      if (k <= 2) return limited("1")
+      if (k <= 6) return Promise.reject(new TypeError("offline"))
+      return jsonResponse(200, tokenResponse("rt_1"))
+    })
+    await advanceUntilFetchCount(h, 7)
+    await settle()
+    expect(requests(h)).toBe(7)
+    expect(types(h)).toContain("session")
+    expect(terminals(h)).toEqual([])
   })
 })
 

@@ -1,6 +1,8 @@
 import {
   KNOWN_ERROR_CODES,
   LINK_CODE_PATTERN,
+  MAX_RATE_LIMIT_RETRIES,
+  MAX_RATE_LIMIT_WAIT_MS,
   REDEEM_MAX_ATTEMPTS,
   REDEEM_TIMEOUT_MS,
   RENEW_TIMEOUT_MS,
@@ -10,6 +12,7 @@ import {
   isRecord,
   isTimestamp,
   reasonForKnownCode,
+  retryAfterMs,
   retryDelayMs,
   type LinkSessionFields,
   type WorkerOutboundMessage,
@@ -46,7 +49,7 @@ export interface LinkSessionWorkerCore {
 type Phase = "redeem" | "renew"
 
 type RequestOutcome =
-  | { kind: "response"; status: number; data: unknown }
+  | { kind: "response"; status: number; data: unknown; retryAfter: string | null }
   // The request failed before an answer arrived. `mayHaveReachedServer` is set
   // when the server may have processed it anyway (a timeout).
   | { kind: "transport"; mayHaveReachedServer: boolean }
@@ -54,6 +57,7 @@ type RequestOutcome =
 type Verdict =
   | { kind: "ok"; data: unknown }
   | { kind: "final"; reason: WorkerTerminalReason }
+  | { kind: "rate_limited"; waitMs: number }
   | { kind: "retry"; mayHaveReachedServer: boolean }
 
 interface ParsedSession {
@@ -100,14 +104,29 @@ function parseSessionResponse(data: unknown): ParsedSession | null {
   return { fields, reconnectToken: data.reconnect_token }
 }
 
-function classify(phase: Phase, outcome: RequestOutcome): Verdict {
+function classify(
+  phase: Phase,
+  outcome: RequestOutcome,
+  rateLimitedSoFar: number,
+  now: number,
+): Verdict {
   if (outcome.kind === "transport") {
     return { kind: "retry", mayHaveReachedServer: outcome.mayHaveReachedServer }
   }
   const { status, data } = outcome
   const code = errorCode(data)
-  // The edge proxy's own 429 carries no error body, so the status decides.
-  if (status === 429 || code === "rate_limited") return { kind: "final", reason: "network" }
+  // A coded rate_limited follows widget.js's rate-limit rule (widget.js:257-266):
+  // the code decides, whatever the status; the request is retried after
+  // Retry-After while fewer than MAX_RATE_LIMIT_RETRIES such retries were used
+  // and the wait is under MAX_RATE_LIMIT_WAIT_MS, and is final otherwise. A 429
+  // without that code is always final.
+  if (code === "rate_limited") {
+    const waitMs = retryAfterMs(outcome.retryAfter, now)
+    return rateLimitedSoFar >= MAX_RATE_LIMIT_RETRIES || waitMs >= MAX_RATE_LIMIT_WAIT_MS
+      ? { kind: "final", reason: "network" }
+      : { kind: "rate_limited", waitMs }
+  }
+  if (status === 429) return { kind: "final", reason: "network" }
   if (status >= 200 && status < 300) return { kind: "ok", data }
   if (phase === "redeem" && status === 422) return { kind: "final", reason: "link_invalid" }
   if (code !== null) return { kind: "final", reason: reasonForKnownCode(code) }
@@ -143,15 +162,17 @@ export function createLinkSessionWorkerCore(deps: LinkSessionWorkerDeps): LinkSe
     terminate("unavailable")
   }
 
-  function wait(ms: number): Promise<void> {
+  // A rate-limit wait is not wakeable: the server asked for it (widget.js
+  // passes no wake for it).
+  function wait(ms: number, wakeable = true): Promise<void> {
     return new Promise((resolve) => {
       const done = () => {
         deps.clearTimer(timer)
-        if (wakeWait === done) wakeWait = null
+        if (wakeable && wakeWait === done) wakeWait = null
         resolve()
       }
       const timer = deps.setTimer(done, ms)
-      wakeWait = done
+      if (wakeable) wakeWait = done
     })
   }
 
@@ -179,6 +200,7 @@ export function createLinkSessionWorkerCore(deps: LinkSessionWorkerDeps): LinkSe
         return { kind: "transport", mayHaveReachedServer: isAbortError(error) }
       }
       const status = response.status
+      const retryAfter = response.headers.get("Retry-After")
       let text: string
       try {
         text = await response.text()
@@ -191,7 +213,7 @@ export function createLinkSessionWorkerCore(deps: LinkSessionWorkerDeps): LinkSe
       } catch {
         // A complete non-JSON body is judged by its status alone.
       }
-      return { kind: "response", status, data }
+      return { kind: "response", status, data, retryAfter }
     })()
     // If the deadline wins, the late result of `exchange` is ignored; keep it
     // from surfacing as an unhandled rejection.
@@ -210,11 +232,12 @@ export function createLinkSessionWorkerCore(deps: LinkSessionWorkerDeps): LinkSe
   }
 
   async function runRedeem(code: string): Promise<void> {
-    for (let attempt = 1; ; attempt += 1) {
+    let rateLimited = 0
+    for (let attempt = 1; ; ) {
       deps.post({ type: "redeeming" })
       const outcome = await send(REDEEM_URL, { code }, REDEEM_TIMEOUT_MS)
       if (terminated) return
-      const verdict = classify("redeem", outcome)
+      const verdict = classify("redeem", outcome, rateLimited, deps.now())
       if (verdict.kind === "ok") {
         const parsed = parseSessionResponse(verdict.data)
         if (parsed) accept(parsed)
@@ -225,6 +248,14 @@ export function createLinkSessionWorkerCore(deps: LinkSessionWorkerDeps): LinkSe
         terminate(verdict.reason)
         return
       }
+      if (verdict.kind === "rate_limited") {
+        // Counted on its own budget, apart from REDEEM_MAX_ATTEMPTS, like
+        // widget.js keeps rateLimited apart from transportRetries.
+        rateLimited += 1
+        await wait(verdict.waitMs, false)
+        if (terminated) return
+        continue
+      }
       if (attempt >= REDEEM_MAX_ATTEMPTS) {
         terminate("network")
         return
@@ -233,18 +264,20 @@ export function createLinkSessionWorkerCore(deps: LinkSessionWorkerDeps): LinkSe
       // after a timeout here.
       await wait(retryDelayMs(attempt, deps.random()))
       if (terminated) return
+      attempt += 1
     }
   }
 
   async function runRenew(): Promise<void> {
     renewing = true
     try {
+      let rateLimited = 0
       for (let retries = 0; ; ) {
         const token = reconnectToken
         if (token === null) return
         const outcome = await send(RENEW_URL, { reconnect_token: token }, RENEW_TIMEOUT_MS)
         if (terminated) return
-        const verdict = classify("renew", outcome)
+        const verdict = classify("renew", outcome, rateLimited, deps.now())
         if (verdict.kind === "ok") {
           const parsed = parseSessionResponse(verdict.data)
           if (
@@ -260,6 +293,13 @@ export function createLinkSessionWorkerCore(deps: LinkSessionWorkerDeps): LinkSe
         if (verdict.kind === "final") {
           terminate(verdict.reason)
           return
+        }
+        if (verdict.kind === "rate_limited") {
+          rateLimited += 1
+          deps.post({ type: "degraded", code: "rate_limited" })
+          await wait(verdict.waitMs, false)
+          if (terminated) return
+          continue
         }
         retries += 1
         deps.post({ type: "degraded", code: "network_unavailable" })

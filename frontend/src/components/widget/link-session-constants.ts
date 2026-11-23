@@ -6,7 +6,8 @@
 // ---------------------------------------------------------------------------
 // Retry and timing constants. Each one mirrors a value in public/widget.js; the
 // comment names the line it is copied from. link-session-constants.test.ts
-// reads widget.js and fails if the two drift apart.
+// compares each of them, the error-code set and the two functions below with
+// the widget.js source text.
 // ---------------------------------------------------------------------------
 
 // widget.js:39 SESSION_TIMEOUT_MS.
@@ -21,6 +22,12 @@ export const RETRY_MAX_DELAY_MS = 300000
 export const RETRY_MAX_DELAY_AFTER_TIMEOUT_MS = 10000
 // widget.js:61 SESSION_RETRY_POLICY.jitter.
 export const RETRY_JITTER = 0.2
+// widget.js:55 SESSION_RETRY_POLICY.maxRateLimitRetries.
+export const MAX_RATE_LIMIT_RETRIES = 2
+// widget.js:56 SESSION_RETRY_POLICY.maxRateLimitWaitMs.
+export const MAX_RATE_LIMIT_WAIT_MS = 30000
+// widget.js:65 SESSION_RETRY_AFTER_FALLBACK_MS.
+export const RETRY_AFTER_FALLBACK_MS = 1000
 // widget.js:66 SESSION_REFRESH_THRESHOLD_MS.
 export const SESSION_REFRESH_THRESHOLD_MS = 60000
 // widget.js:75 SESSION_STABLE_CONNECTION_MS.
@@ -99,8 +106,9 @@ export const KNOWN_ERROR_CODES: ReadonlySet<string> = new Set([
   "link_invalid",
 ])
 
-// Known code -> end reason for every code except rate_limited (429 maps to
-// `network` by status and code before this table is consulted).
+// Known code -> end reason for every code except rate_limited, which classify
+// (link-session-worker-core.ts) handles before this table: retried within the
+// rate-limit budget, otherwise network.
 export function reasonForKnownCode(code: string): WorkerTerminalReason {
   switch (code) {
     case "link_invalid":
@@ -126,14 +134,20 @@ export interface LinkSessionFields {
   capabilities?: Record<string, unknown>
 }
 
+// Codes the Worker may report while it waits to retry; the chat page treats
+// both as recoverable (use-widget-session.ts isParentRecoverableCode).
+export type WorkerDegradedCode = "network_unavailable" | "rate_limited"
+
 // The reconnect token is never a field of any message the Worker sends.
 export type WorkerOutboundMessage =
   | { type: "hello" }
   | { type: "redeeming" }
   | { type: "session"; session: LinkSessionFields }
-  | { type: "degraded"; code: "network_unavailable" }
+  | { type: "degraded"; code: WorkerDegradedCode }
   | { type: "terminal"; reason: WorkerTerminalReason }
 
+// Messages the host posts to the Worker (link-session-host.ts
+// LinkWorkerLike.postMessage takes only these).
 export type WorkerInboundMessage =
   | { type: "start"; code: string }
   | { type: "renew" }
@@ -159,4 +173,18 @@ export function retryDelayMs(attempt: number, random: number): number {
     RETRY_BASE_DELAY_MS * Math.pow(RETRY_BACKOFF_FACTOR, Math.max(0, attempt - 1)),
   )
   return Math.round(nominal * (1 - RETRY_JITTER + 2 * RETRY_JITTER * random))
+}
+
+// The wait a `Retry-After` header asks for, in milliseconds. Same rules as
+// widget.js retryAfterMs: whole seconds (a negative value or a missing or
+// unreadable header falls back to RETRY_AFTER_FALLBACK_MS), or an HTTP date
+// measured from `now` and never negative.
+export function retryAfterMs(header: string | null, now: number): number {
+  const value = header?.trim()
+  if (value && /^-?\d+$/.test(value)) {
+    const seconds = Number(value)
+    return seconds >= 0 ? seconds * 1000 : RETRY_AFTER_FALLBACK_MS
+  }
+  const retryAt = value ? Date.parse(value) : NaN
+  return Number.isNaN(retryAt) ? RETRY_AFTER_FALLBACK_MS : Math.max(0, retryAt - now)
 }

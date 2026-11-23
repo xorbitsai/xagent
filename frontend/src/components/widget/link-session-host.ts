@@ -13,7 +13,13 @@ import {
   isWorkerTerminalReason,
   type EndReason,
   type LinkSessionFields,
+  type WorkerDegradedCode,
+  type WorkerInboundMessage,
 } from "./link-session-constants"
+
+// Browsers fire a timer whose delay exceeds 2^31-1 ms at once, so a longer
+// wait is split into rounds of at most this length.
+const MAX_TIMER_DELAY_MS = 2_147_483_647
 
 // Main-thread logic of the link host page. No React and no network calls: the
 // redeem and renew requests belong to the Worker (link-session-worker-core.ts),
@@ -25,11 +31,14 @@ import {
 //  - speaks the postMessage protocol with the chat iframe,
 //  - counts rapid recoveries (the circuit breaker, copied from widget.js
 //    runRecoveryFlow), and
-//  - turns every way the session can end into one `location.replace` to the end
-//    page, whose `reason` is the contract with the embedding app.
+//  - ends the session with one `location.replace` to the end page, whose
+//    `reason` is the contract with the embedding app, when the Worker reports a
+//    terminal, a watchdog or the absolute expiry fires, the close button is
+//    used, the page is restored from the back-forward cache, or the chat page
+//    reports `session_terminal_reached`.
 
 export interface LinkWorkerLike {
-  postMessage: (message: unknown) => void
+  postMessage: (message: WorkerInboundMessage) => void
   terminate: () => void
   addEventListener: (
     type: "message" | "error" | "messageerror",
@@ -69,7 +78,7 @@ export interface LinkHostState {
   iframeReady: boolean
   chromeReady: boolean
   renewInFlight: boolean
-  recoverableCode: "network_unavailable" | null
+  recoverableCode: WorkerDegradedCode | null
   rapidRecoveries: number
   deliverySequence: number
   // The id of the session currently held; every new session gets one id.
@@ -123,6 +132,15 @@ function parseSessionFields(value: unknown): LinkSessionFields | null {
   }
   if (isRecord(value.capabilities)) fields.capabilities = value.capabilities
   return fields
+}
+
+// The chat page reports how it ended with its own code. A revoked or expired
+// session is one the app can replace with a new link; anything else, a code
+// this page does not know included, is `unavailable`.
+function endReasonForChatTerminal(code: unknown): EndReason {
+  return code === "ws_4403" || code === "ws_4408" || code === "session_expired"
+    ? "session_ended"
+    : "unavailable"
 }
 
 export function createLinkSessionHost(deps: LinkSessionHostDeps): LinkSessionHost {
@@ -295,9 +313,17 @@ export function createLinkSessionHost(deps: LinkSessionHostDeps): LinkSessionHos
     if (expiryFor === absoluteExpiresAt) return
     expiryTimer = clearTimer(expiryTimer)
     expiryFor = absoluteExpiresAt
-    const delay = Math.max(0, Date.parse(absoluteExpiresAt) - deps.now())
+    armExpiry(Date.parse(absoluteExpiresAt))
+  }
+
+  function armExpiry(absoluteMs: number): void {
+    const delay = Math.min(MAX_TIMER_DELAY_MS, Math.max(0, absoluteMs - deps.now()))
     expiryTimer = deps.setTimer(() => {
       expiryTimer = null
+      if (deps.now() < absoluteMs) {
+        armExpiry(absoluteMs)
+        return
+      }
       terminate("session_ended")
     }, delay)
   }
@@ -346,8 +372,8 @@ export function createLinkSessionHost(deps: LinkSessionHostDeps): LinkSessionHos
         onSession(data.session)
         return
       case "degraded":
-        if (data.code !== "network_unavailable") return
-        state.recoverableCode = "network_unavailable"
+        if (data.code !== "network_unavailable" && data.code !== "rate_limited") return
+        state.recoverableCode = data.code
         flush()
         return
       case "terminal":
@@ -405,6 +431,9 @@ export function createLinkSessionHost(deps: LinkSessionHostDeps): LinkSessionHos
         return
       case "session_connection_open":
         if (isNonBlankString(data.session_delivery_id)) beginStability(data.session_delivery_id)
+        return
+      case "session_terminal_reached":
+        terminate(endReasonForChatTerminal(data.code))
         return
       case "widget_close":
         terminate("closed")

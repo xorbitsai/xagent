@@ -310,6 +310,19 @@ describe("link session host end reasons", () => {
     expect(h.navs).toEqual(["/widget/chat/link/ended?reason=session_ended"])
   })
 
+  it("ends at an absolute expiry beyond the timer limit, and not before", () => {
+    const h = makeHost()
+    const thirtyDays = 30 * 24 * HOUR
+    const maxTimer = 2 ** 31 - 1
+    connect(h, { absolute_expires_at: new Date(Date.now() + thirtyDays).toISOString() })
+    vi.advanceTimersByTime(maxTimer)
+    expect(h.navs).toEqual([])
+    vi.advanceTimersByTime(thirtyDays - maxTimer - 1)
+    expect(h.navs).toEqual([])
+    vi.advanceTimersByTime(1)
+    expect(h.navs).toEqual(["/widget/chat/link/ended?reason=session_ended"])
+  })
+
   it("restarts the expiry timer when a renewed session carries a different absolute expiry", () => {
     const h = makeHost()
     const worker = connect(h)
@@ -522,6 +535,21 @@ describe("link session host iframe protocol", () => {
     expect(h.iframePosts[h.iframePosts.length - 1]).toMatchObject({ type: "session_update" })
   })
 
+  it("forwards a rate_limited degraded message to the iframe", () => {
+    const h = makeHost()
+    const worker = connect(h)
+    iframeSays(h, "ready")
+    worker.emit("message", { type: "degraded", code: "rate_limited" })
+    expect(h.iframePosts[h.iframePosts.length - 1]).toEqual({
+      xagent: true,
+      v: 1,
+      type: "session_degraded",
+      code: "rate_limited",
+    })
+    worker.emit("message", { type: "session", session: sessionFields() })
+    expect(h.iframePosts[h.iframePosts.length - 1]).toMatchObject({ type: "session_update" })
+  })
+
   it("ignores a degraded message with an unexpected code", () => {
     const h = makeHost()
     const worker = connect(h)
@@ -529,6 +557,23 @@ describe("link session host iframe protocol", () => {
     const before = h.iframePosts.length
     worker.emit("message", { type: "degraded", code: "other" })
     expect(h.iframePosts.length).toBe(before)
+  })
+
+  it.each([
+    ["ws_4403", { code: "ws_4403" }, "session_ended"],
+    ["ws_4408", { code: "ws_4408" }, "session_ended"],
+    ["session_expired", { code: "session_expired" }, "session_ended"],
+    ["unexpected_error", { code: "unexpected_error" }, "unavailable"],
+    ["an unknown code", { code: "future_code" }, "unavailable"],
+    ["a code that looks like a query string", { code: "session_ended&x=1" }, "unavailable"],
+    ["a numeric code", { code: 5 }, "unavailable"],
+    ["no code", {}, "unavailable"],
+  ])("maps the chat page's terminal report (%s) to its end reason", (_label, extra, reason) => {
+    const h = makeHost()
+    const worker = connect(h)
+    iframeSays(h, "session_terminal_reached", extra)
+    expect(h.navs).toEqual([`/widget/chat/link/ended?reason=${reason}`])
+    expect(worker.terminated).toBe(true)
   })
 
   it("ends with closed on widget_close", () => {
@@ -574,7 +619,13 @@ describe("link session host iframe protocol", () => {
   ])("ignores messages from %s", (_label, who) => {
     const h = makeHost()
     const worker = connect(h)
-    for (const type of ["ready", "reconnect_request", "widget_close", "widget_chrome_ready"]) {
+    for (const type of [
+      "ready",
+      "reconnect_request",
+      "widget_close",
+      "widget_chrome_ready",
+      "session_terminal_reached",
+    ]) {
       h.host.handleMessageEvent({
         source: who.source === "iframe" ? h.iframeWindow : who.source,
         origin: who.origin,

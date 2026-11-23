@@ -882,6 +882,36 @@ Build when you need.`,
       description: "This chat cannot be opened right now. Please try again later.",
     },
   },
+  widgetLink: {
+    loading: "Opening chat...",
+    close: "Close chat",
+    ended: {
+      link_invalid: {
+        title: "This chat link is no longer valid",
+        description: "Go back to the app and open the chat again.",
+      },
+      session_ended: {
+        title: "Chat session ended",
+        description: "Go back to the app and open the chat again.",
+      },
+      unavailable: {
+        title: "Chat unavailable",
+        description: "This chat cannot be opened right now. Please try again later.",
+      },
+      network: {
+        title: "Network problem",
+        description: "Check your connection, then go back to the app and try again.",
+      },
+      closed: {
+        title: "Chat closed",
+        description: "You can go back to the app.",
+      },
+      generic: {
+        title: "Chat ended",
+        description: "Go back to the app to continue.",
+      },
+    },
+  },
   channels: {
     page_title: "Channels Management",
     page_description: "Manage your communication channels and bots.",

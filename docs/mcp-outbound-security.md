@@ -156,14 +156,16 @@ One issuing tool cannot be used by both of the first two forms, and two issuer
 entries cannot name the same issuing tool.
 
 The setting decides which outside hosts receive task files, so only the
-connector's owner or a platform administrator can change it. The URL must be
-HTTPS without a port or user info, on one of `allowed_upload_hosts`, under
-`upload_path_prefix`, and the request uses the public-address egress policy of
-remote MCP sessions.
+connector's owner or a platform administrator can change it. In the first two
+forms, the URL must be HTTPS without a port or user info, on one of
+`allowed_upload_hosts`, under `upload_path_prefix`, and the request uses the
+public-address egress policy of remote MCP sessions.
 
-The first two forms have the host call the issuing tool itself. At log level DEBUG the
-MCP SDK can log server messages in full, which includes the issuing tool's
-reply and so its signed URL. The default level, INFO, does not. And if the
+At log level DEBUG the MCP SDK can log the messages it sends to and receives
+from the connector in full. In the first two forms the host calls the issuing
+tool itself, so such a log includes the issuing tool's reply and so its signed
+URL. With a link entry it includes the tool call that carries the download
+link and its ticket. The default level, INFO, logs neither. And if the
 connector also accepts its issuing tool through a dispatcher tool (for example
 `call_tool(name="request_upload", ...)`), the model can still reach the issuing
 tool that way and see its reply, because the host does not know the
@@ -181,6 +183,35 @@ the issuing tool, while an issuer entry would make it mark the connector
 unavailable. Do not clear the settings instead: without them the older version
 offers the issuing tool to the model again. After rolling forward, restore the
 issuer entry.
+
+Save a link entry only after every instance of the deployment runs this
+version. A version that does not know link entries reads the connector's
+settings as invalid and makes the connector unavailable with
+`invalid_configuration`.
+
+Before rolling a deployment back to a version that does not know link entries,
+remove the link entries; the connector then only stops replacing images with
+links. On PostgreSQL, run in each database:
+
+```sql
+-- Connectors with a link entry
+SELECT id, name FROM mcp_servers
+WHERE signed_uploads IS NOT NULL
+  AND json_typeof(signed_uploads) = 'array'
+  AND EXISTS (SELECT 1 FROM json_array_elements(signed_uploads) e WHERE e::jsonb ? 'link_argument');
+-- Remove only the link entries, keeping the other entries in order
+UPDATE mcp_servers SET signed_uploads = (
+  SELECT COALESCE(json_agg(t.e ORDER BY t.n), '[]'::json)
+  FROM json_array_elements(signed_uploads) WITH ORDINALITY AS t(e, n)
+  WHERE NOT (t.e::jsonb ? 'link_argument'))
+WHERE id IN (<ids from the first query>) AND json_typeof(signed_uploads) = 'array';
+```
+
+The column is `json`, so each element is cast to `jsonb` for `?`. On another
+database, such as the default SQLite, update each affected connector through
+`PUT /api/mcp/servers/{server_id}` with its `signed_uploads` minus the link
+entries, as the connector's owner or a platform administrator connected to it.
+After rolling forward, add the link entries again.
 
 Settings that cannot be used fail closed: the web runtime marks the whole
 connector unavailable with reason `invalid_configuration`, and

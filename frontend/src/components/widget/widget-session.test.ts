@@ -2268,6 +2268,9 @@ describe("widget session mode", () => {
     const { result } = renderHook(() => useWidgetSession())
     await vi.advanceTimersByTimeAsync(0)
     expect(result.current.status).toBe("active")
+    const panel = document.querySelector(".xagent-widget-panel")
+    act(() => document.querySelector<HTMLButtonElement>(".xagent-widget-fab")?.click())
+    expect(panel?.classList.contains("open")).toBe(true)
     const requests = fetchMock.mock.calls.length
     const markup = document.body.innerHTML
     const toIframe = bridge.postToIframe.mock.calls.length
@@ -2281,6 +2284,7 @@ describe("widget session mode", () => {
     await vi.advanceTimersByTimeAsync(60_000)
     expect(fetchMock).toHaveBeenCalledTimes(requests)
     expect(document.body.innerHTML).toBe(markup)
+    expect(panel?.classList.contains("open")).toBe(true)
     expect(bridge.postToIframe.mock.calls).toHaveLength(toIframe)
 
     fromIframe("ready")

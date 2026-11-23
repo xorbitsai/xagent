@@ -588,8 +588,15 @@ def test_unset_slot_values_are_not_listed_and_fall_back(value):
     assert _get(world.key, world.agent_id).json()["unresolved_models"] == []
 
 
-def test_a_model_hidden_by_the_hook_is_listed_though_runtime_resolves_it():
-    """Known difference: slot resolution does not apply the visibility hook."""
+def test_runtime_skips_the_hook_so_a_hidden_model_is_listed_yet_still_resolves():
+    """Documents current run-time behavior; it is not asserted as intended.
+
+    Slot resolution at run time does not apply the model visibility hook, so
+    a chat model the hook hides is listed in ``unresolved_models`` although a
+    task still resolves it. Tracked in https://github.com/xorbitsai/xagent/issues/3932.
+    Once run time applies the hook, the first assertion fails: change it to
+    ``is False`` and keep the second one.
+    """
     world = _build_world(False)
     hidden_llm = _add_model("hidden-llm", links=((_user_id("admin"), True, True),))
     world.hidden.append(hidden_llm)
@@ -597,6 +604,25 @@ def test_a_model_hidden_by_the_hook_is_listed_though_runtime_resolves_it():
 
     assert _resolved_at_run_time(world)["general"] is True
     assert _get(world.key, world.agent_id).json()["unresolved_models"] == ["general"]
+
+
+def test_a_model_that_fails_to_build_is_not_listed_yet_falls_back():
+    """Documents current run-time behavior; it is not asserted as intended.
+
+    The read does not build the model. Slot resolution at run time does, and
+    when building fails it logs the error and resolves no model for the
+    slot, so the slot is not listed although a task falls back.
+    """
+    world = _build_world(False)
+    _set_models(world.agent_id, {"general": world.models["m3"]})
+    assert _resolved_at_run_time(world)["general"] is True
+
+    with patch(
+        "xagent.web.services.llm_utils.create_base_llm",
+        side_effect=RuntimeError("the provider client cannot be built"),
+    ):
+        assert _resolved_at_run_time(world)["general"] is False
+        assert _get(world.key, world.agent_id).json()["unresolved_models"] == []
 
 
 def test_an_auto_model_without_candidates_is_not_listed():

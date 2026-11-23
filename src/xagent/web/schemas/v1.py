@@ -366,9 +366,11 @@ class V1AgentDetail(V1AgentResponse):
         description="The team the agent belongs to, or null for a personal agent."
     )
     visibility: str = Field(
-        description="'team' (every team member can manage the agent) or 'admins' "
-        "(only team admins can). A team agent set to admins-only is hidden from "
-        "its own creator unless they are a team admin."
+        description="Only meaningful for a team agent: 'team' (every team "
+        "member can manage the agent) or 'admins' (only team admins can). A "
+        "team agent set to admins-only is hidden from its own creator unless "
+        "they are a team admin. A personal agent (team_id null) can be managed "
+        "only by its owner, whatever this value is."
     )
     unresolved_models: list[str] = Field(
         description="Computed for the key holder: a task the holder starts "
@@ -376,7 +378,13 @@ class V1AgentDetail(V1AgentResponse):
         "agent's runtime key runs as the agent's owner and can differ. A slot "
         "whose stored value is not an integer id is always listed; set it "
         "again with an integer id. This only checks whether the slot's model "
-        "can be used; it does not check an Auto model's own candidates."
+        "can be used; it does not check an Auto model's own candidates. A chat "
+        "model the holder owns or that is shared with them is listed when a "
+        "model visibility hook registered by the deployment hides it from the "
+        "holder, although a task the holder starts still uses it. The check "
+        "does not build the model, so a slot is not listed when building its "
+        "model fails as the task starts, although the task then falls back to "
+        "another model."
     )
 
 

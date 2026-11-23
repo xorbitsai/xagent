@@ -14,6 +14,7 @@ from sqlalchemy.engine import CursorResult
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, aliased
 
+from ...core.tools.adapters.vibe.agent_model_resolution import AGENT_MODEL_KEYS
 from ...core.tools.adapters.vibe.selection_spec import normalize_mcp_server_name
 from ...core.tools.core.document_search import find_missing_knowledge_bases
 from ...core.utils.api_key import (
@@ -1029,9 +1030,6 @@ class AgentManagementService:
         return normalized
 
 
-# Order in which unresolved slots are reported. The runtime resolves the same
-# four slots.
-_MODEL_SLOT_ORDER = ("general", "small_fast", "visual", "compact")
 _MAX_MODEL_PK = 2**31 - 1
 
 
@@ -1057,7 +1055,7 @@ def unresolved_models(db: Session, agent: Agent, user_id: int) -> tuple[str, ...
         return (
             value is None
             or value is False
-            or (isinstance(value, str) and value == "")
+            or value == ""
             or (type(value) is int and value == 0)
         )
 
@@ -1066,7 +1064,7 @@ def unresolved_models(db: Session, agent: Agent, user_id: int) -> tuple[str, ...
 
     set_slots = {
         slot: stored[slot]
-        for slot in _MODEL_SLOT_ORDER
+        for slot in AGENT_MODEL_KEYS
         if slot in stored and not is_unset(stored[slot])
     }
     ids = sorted({value for value in set_slots.values() if is_canonical(value)})

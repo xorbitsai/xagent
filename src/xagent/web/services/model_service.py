@@ -271,9 +271,13 @@ def slot_assignable_models(
 ) -> list[DBModel]:
     """Return the models *user_id* can put in an agent model slot.
 
-    This is the only definition of which models take effect in a slot: the
-    usable ones whose category is ``llm``, because slot resolution at run
-    time only accepts chat models. Callers must not repeat the category test.
+    The usable models whose category is ``llm``, because slot resolution at
+    run time only accepts chat models. Code that needs this rule calls this
+    function instead of repeating the category test. It is not applied
+    everywhere: ``POST /v1/agents`` and ``POST /v1/agents/from-template``
+    accept a model of any category, and slot resolution at run time does not
+    call this function. The ``unresolved_models`` field description of
+    ``V1AgentDetail`` lists where run time differs.
     """
     return [
         model

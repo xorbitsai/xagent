@@ -128,6 +128,7 @@ from ..services.mcp_oauth import (
     select_mcp_oauth_grants,
     validate_mcp_oauth_persisted_value,
 )
+from ..services.mcp_oauth_repeated_callback import repeated_callback_outcome
 from ..services.mcp_runtime import HTTP_MCP_TRANSPORTS
 from ..services.user_oauth import (
     delete_scoped_user_oauth_accounts,
@@ -830,6 +831,25 @@ def _mcp_oauth_callback_error_redirect_for_path(
         params = (("mcp_oauth_error", "authorization_failed"),)
     redirect_path = _redirect_after_with_params(raw_redirect_after, params)
     response = RedirectResponse(_mcp_oauth_redirect_after_url(redirect_path))
+    _clear_mcp_oauth_state_cookie(response)
+    return response
+
+
+def _mcp_oauth_callback_success_redirect(
+    raw_redirect_after: str | None,
+) -> RedirectResponse:
+    # Positive success signal: the connect popup's self-close logic keys on
+    # this param instead of inferring success from "no error params", so a
+    # future error param added to the error redirect can't be mistaken for
+    # success by an out-of-date guard.
+    response = RedirectResponse(
+        _mcp_oauth_redirect_after_url(
+            _redirect_after_with_params(
+                raw_redirect_after,
+                (("mcp_oauth_success", "1"),),
+            )
+        )
+    )
     _clear_mcp_oauth_state_cookie(response)
     return response
 
@@ -7179,6 +7199,22 @@ async def mcp_oauth_callback(
     callback_redirect_after = (
         str(flow_state.redirect_after) if flow_state.redirect_after else None
     )
+    # An earlier callback already claimed this flow (a repeat, with or without
+    # the state cookie). Nothing is left to exchange; only pick the page.
+    repeated = repeated_callback_outcome(db, flow_state, now=_utc_now())
+    if repeated is not None:
+        logger.info(
+            "MCP OAuth callback repeated: server_id=%s outcome=%s",
+            flow_state.mcp_server_id,
+            repeated,
+        )
+        if repeated == "connected":
+            return _mcp_oauth_callback_success_redirect(callback_redirect_after)
+        return _mcp_oauth_callback_error_redirect_for_path(
+            callback_redirect_after,
+            error_code="state_already_consumed",
+            message="OAuth state consumed",
+        )
     try:
         _validate_mcp_oauth_state_cookie(request, state_value)
     except HTTPException as exc:
@@ -7379,20 +7415,7 @@ async def mcp_oauth_callback(
             message="MCP OAuth authorization failed",
         )
 
-    # Positive success signal: the connect popup's self-close logic keys on
-    # this param instead of inferring success from "no error params", so a
-    # future error param added to the error redirect can't be mistaken for
-    # success by an out-of-date guard.
-    response = RedirectResponse(
-        _mcp_oauth_redirect_after_url(
-            _redirect_after_with_params(
-                callback_redirect_after,
-                (("mcp_oauth_success", "1"),),
-            )
-        )
-    )
-    _clear_mcp_oauth_state_cookie(response)
-    return response
+    return _mcp_oauth_callback_success_redirect(callback_redirect_after)
 
 
 @mcp_router.post("/{server_id}/oauth/discover", response_model=MCPOAuthDiscoverResponse)

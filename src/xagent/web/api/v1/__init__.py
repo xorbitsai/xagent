@@ -25,6 +25,7 @@ from .agents import router as _agents_router
 from .features import router as _features_router
 from .mcp_servers import router as _mcp_servers_router
 from .me import router as _me_router
+from .models import router as _models_router
 from .skills import router as _skills_router
 from .tasks import router as _tasks_router
 from .templates import router as _templates_router
@@ -35,6 +36,7 @@ v1_router.include_router(_me_router)
 v1_router.include_router(_features_router)
 v1_router.include_router(_templates_router)
 v1_router.include_router(_agents_router)
+v1_router.include_router(_models_router)
 v1_router.include_router(_skills_router)
 v1_router.include_router(_mcp_servers_router)
 v1_router.include_router(_tasks_router)

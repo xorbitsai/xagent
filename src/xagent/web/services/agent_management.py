@@ -320,6 +320,35 @@ class AgentDetailSnapshot:
     unresolved_models: tuple[str, ...]
 
 
+def _ability_names(stored: Any) -> tuple[str, ...]:
+    """The ability names in a stored ``models.abilities`` value.
+
+    A list or tuple gives each element as ``str(element)``; for a list or a
+    tuple this is the same reading as ``_model_has_ability`` in
+    ``web/api/model.py``. A stored string is one ability. Any other value
+    (null, a number, an object) gives no abilities.
+    """
+    if isinstance(stored, str):
+        return (stored,)
+    if isinstance(stored, (list, tuple)):
+        return tuple(str(item) for item in stored)
+    return ()
+
+
+@dataclass(frozen=True)
+class UsableModelSnapshot:
+    """Detached public fields of one model the key holder can use."""
+
+    id: int
+    model_id: str
+    model_name: str
+    model_provider: str
+    category: str
+    abilities: tuple[str, ...]
+    is_platform: bool
+    owned_by_you: bool
+
+
 @dataclass(frozen=True)
 class RuntimeKeySnapshot:
     """One-shot runtime key returned after its write transaction commits."""
@@ -1304,6 +1333,53 @@ class AgentManagementRuntime:
             return AgentDetailSnapshot(
                 agent=_agent_response_snapshot(store.agent_to_response_dict(agent)),
                 unresolved_models=unresolved_models(db, agent, user_id),
+            )
+
+    async def list_usable_models(
+        self, *, user_id: int
+    ) -> tuple[UsableModelSnapshot, ...]:
+        """Every model ``user_id`` may use, of any category.
+
+        This is ``usable_models`` for the user, in its order, read from the
+        database and never from the model cache. Only the public fields are
+        carried. A database failure propagates; it is never reported as an
+        empty list.
+        """
+        return await run_db_io_cancellation_safe(
+            lambda: self._list_usable_models_sync(user_id=user_id)
+        )
+
+    @staticmethod
+    def _list_usable_models_sync(*, user_id: int) -> tuple[UsableModelSnapshot, ...]:
+        from ..models.user import UserModel
+        from .llm_utils import PLATFORM_MODEL_MANAGER
+        from .model_service import usable_models
+
+        SessionLocal = get_session_local()
+        with SessionLocal() as db:
+            models = usable_models(db, user_id)
+            owned: set[int] = set()
+            if models:
+                owned = {
+                    int(pk)
+                    for (pk,) in db.query(UserModel.model_id).filter(
+                        UserModel.user_id == user_id,
+                        UserModel.is_owner.is_(True),
+                        UserModel.model_id.in_([model.id for model in models]),
+                    )
+                }
+            return tuple(
+                UsableModelSnapshot(
+                    id=int(model.id),
+                    model_id=str(model.model_id),
+                    model_name=str(model.model_name),
+                    model_provider=str(model.model_provider),
+                    category=str(model.category),
+                    abilities=_ability_names(model.abilities),
+                    is_platform=bool(model.managed_by == PLATFORM_MODEL_MANAGER),
+                    owned_by_you=int(model.id) in owned,
+                )
+                for model in models
             )
 
     async def get_agent_skills(

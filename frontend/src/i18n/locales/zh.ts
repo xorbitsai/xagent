@@ -1532,7 +1532,7 @@ const zh = {
         removeTool: "移除工具",
         newTool: "新工具",
         unrecognizedEntryTitle: "无法识别的条目",
-        unrecognizedEntry: "表单认不出这个条目的格式，保存时会原样保留；要修改请通过接口。",
+        unrecognizedEntry: "表单认不出这个条目，服务器也会拒绝它。它还在列表里时，保存对上传设置的修改、修改 URL、或在“服务器发送事件”与“可流式 HTTP”之间切换都会失败。请在这里删除它，或通过接口改正。",
         unrecognizedEntryValue: "已保存的条目",
         empty: "暂无上传设置",
         invalid: "这些上传设置无法使用，该连接器当前不可用：{error}",

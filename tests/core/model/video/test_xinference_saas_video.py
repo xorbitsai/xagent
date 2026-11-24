@@ -452,6 +452,7 @@ async def test_saas_empty_reference_lists_are_ignored(transport):
         ("Remote input connection failed", ConnectionError),
         ("Remote input returned HTTP 503", ConnectionError),
         ("Remote input returned HTTP 429", ConnectionError),
+        ("Remote input returned HTTP 425", ConnectionError),
         ("Remote input returned HTTP 404", MediaParameterError),
         (
             "Remote input violated the public-network, redirect or size policy",
@@ -482,3 +483,60 @@ async def test_saas_frame_download_failures_keep_their_category(
         expected is MediaParameterError
     )
     assert transport["json"] == []
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        [{"type": "image_url", "role": "reference_image", "image_url": {"url": "x"}}],
+        [
+            {"type": "image_url", "role": "first_frame", "image_url": {"url": "x"}},
+            {"type": "image_url", "image_url": {"url": "y"}},
+        ],
+        [
+            {"type": "image_url", "role": "last_frame", "image_url": {"url": "x"}},
+            {"type": "image_url", "role": "last_frame", "image_url": {"url": "y"}},
+        ],
+        [{"type": "video_url", "video_url": {"url": "x"}}],
+    ],
+    ids=["reference-role", "two-first-frames", "two-last-frames", "video-item"],
+)
+async def test_saas_refuses_unsupported_content_before_any_request(transport, content):
+    model = _build()
+    with pytest.raises(MediaParameterError) as err:
+        await model.generate_video(
+            prompt="a fox", content=[{"type": "text", "text": "a fox"}, *content]
+        )
+    assert err.value.field == "content"
+    with pytest.raises(MediaParameterError):
+        await model.create_video_task([{"type": "text", "text": "a fox"}, *content])
+    assert transport["json"] == []
+
+
+async def test_saas_content_first_and_last_frame_roles_are_kept(transport):
+    first, last = _image(1344, 768), _image(1344, 768)
+    await _build().generate_video(
+        content=[
+            {"type": "text", "text": "a fox"},
+            {"type": "image_url", "role": "first_frame", "image_url": {"url": first}},
+            {"type": "image_url", "role": "last_frame", "image_url": {"url": last}},
+        ]
+    )
+    body = transport["json"][0]["body"]
+    assert body["first_frame_image"] == first and body["last_frame_image"] == last
+
+
+@pytest.mark.parametrize("size", ["1344 x 768", "1344X768", " 1344x768 "])
+async def test_saas_allowed_size_stays_binding_in_any_spelling(transport, size):
+    with pytest.raises(MediaParameterError):
+        await _build().generate_video(
+            prompt="a fox", input_reference=_image(1000, 1000), size=size
+        )
+    assert transport["json"] == []
+
+
+async def test_saas_frame_selected_shape_is_reported_for_sync(transport):
+    result = await _build().generate_video(
+        prompt="a fox", input_reference=_image(1000, 1000), ratio="16:9"
+    )
+    assert result["resolution"] == "768x768" and result["ratio"] == "1:1"

@@ -214,6 +214,7 @@ Provider notes:
 - Ark resolutions include "480p", "720p", "1080p", and "4k" depending on the model. Seedance 2.0 Fast and Mini do not support 1080p, and 4k is only for Seedance 2.0.
 - Ark image references may be http(s) URLs, data URLs, asset:// IDs, or workspace file references such as file:file_id. Workspace image references are converted to base64 data URLs automatically.
 - Xinference/OpenAI-compatible video models can use size and seconds directly when those parameters are supported by the model.
+- The Xinference SaaS model (MiniMax-H3) takes text plus a first frame (image_url or input_reference) and an optional last_frame_image_url. It refuses reference_image_urls / reference_video_urls / reference_audio_urls; for reference lists pass an explicit model_id of a model that supports them (for example Seedance). A frame's aspect ratio must match the video size; omit size to let the first frame pick it.
 
 The generated video URL is temporary on the provider side, so completed videos are automatically downloaded and saved to the workspace.
     """.strip()

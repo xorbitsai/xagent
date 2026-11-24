@@ -6,6 +6,7 @@ import io
 import json
 import logging
 import math
+import re
 import time
 import uuid
 from collections.abc import Mapping
@@ -24,7 +25,11 @@ from ....config import (
     get_media_download_max_bytes,
     get_xinference_saas_video_async_enabled,
 )
-from ...tools.core.media_errors import MediaParameterError, redact_provider_detail
+from ...tools.core.media_errors import (
+    _PROVIDER_UNAVAILABLE_STATUSES,
+    MediaParameterError,
+    redact_provider_detail,
+)
 from ...utils.public_download import PublicDownloadError, download_public_input
 from ..chat.token_context import MediaCallType
 from ..media_metering import record_provider_usage
@@ -281,6 +286,26 @@ def _saas_duration(value: Any) -> int | float | None:
     return int(number) if number == int(number) else number
 
 
+def _saas_parse_dimensions(size: Optional[str]) -> tuple[int, int] | None:
+    """The ``WxH`` pair a size names, whatever its spelling; None when unset."""
+    if not size:
+        return None
+    text = str(size).lower().strip()
+    try:
+        width_text, height_text = text.split("x", 1)
+        width, height = int(width_text), int(height_text)
+        if width <= 0 or height <= 0:
+            raise ValueError
+    except ValueError:
+        raise MediaParameterError(
+            f"Unsupported video size {size!r}; use one of "
+            + ", ".join(_saas_allowed_sizes()),
+            field="size",
+            allowed_values={"size": _saas_allowed_sizes()},
+        ) from None
+    return (width, height)
+
+
 def _saas_dimensions(size: Optional[str]) -> tuple[int, int] | None:
     """Return an allowed pair; other well-formed sizes snap to the closest ratio.
 
@@ -343,9 +368,6 @@ def _saas_nearest_shape(width: int, height: int) -> tuple[int, int]:
     )
 
 
-_TRANSIENT_DOWNLOAD_STATUSES = frozenset({408, 429})
-
-
 def _raise_frame_download_error(field: str, exc: PublicDownloadError) -> None:
     """Keep a fetch that may succeed later apart from an unusable input.
 
@@ -360,7 +382,8 @@ def _raise_frame_download_error(field: str, exc: PublicDownloadError) -> None:
     if "timed out" in text:
         raise TimeoutError(f"The {field} image download timed out") from None
     if "connection failed" in text or (
-        status is not None and (status >= 500 or status in _TRANSIENT_DOWNLOAD_STATUSES)
+        status is not None
+        and (status >= 500 or status in _PROVIDER_UNAVAILABLE_STATUSES)
     ):
         raise ConnectionError(
             f"The {field} image could not be downloaded: {text}"
@@ -368,6 +391,49 @@ def _raise_frame_download_error(field: str, exc: PublicDownloadError) -> None:
     raise MediaParameterError(
         f"The {field} image could not be loaded: {text}", field=field
     ) from None
+
+
+def _saas_check_content(content: Optional[list[dict[str, Any]]]) -> None:
+    """Refuse content items the keyframe API cannot carry, before flattening.
+
+    Only text, one first frame (an image with no role counts as one) and one
+    last frame fit. A ``reference_image`` role, a second image for a slot, or
+    any other item type would otherwise be dropped or turned into a keyframe
+    while the request is still billed.
+    """
+    seen = {"first": 0, "last": 0}
+    for item in content or []:
+        kind = item.get("type")
+        if kind == "text":
+            continue
+        if kind != "image_url":
+            raise MediaParameterError(
+                f"This Xinference video model does not accept {kind!r} content",
+                field="content",
+            )
+        role = item.get("role")
+        if role in (None, "", "first_frame"):
+            slot = "first"
+        elif role == "last_frame":
+            slot = "last"
+        else:
+            raise MediaParameterError(
+                f"This Xinference video model does not accept image role {role!r}; "
+                "only first_frame and last_frame images are supported",
+                field="content",
+            )
+        seen[slot] += 1
+        if seen[slot] > 1:
+            raise MediaParameterError(
+                f"This Xinference video model takes one {slot} frame image; "
+                "additional images are not supported",
+                field="content",
+            )
+
+
+def _ratio_label(width: int, height: int) -> str:
+    divisor = math.gcd(width, height)
+    return f"{width // divisor}:{height // divisor}"
 
 
 def _saas_frame_from_bytes(raw: bytes, field: str) -> _SaasFrame:
@@ -417,14 +483,15 @@ def _saas_resolve_frame_size(
     dimensions: tuple[int, int] | None,
     frames: dict[str, _SaasFrame],
     first_field: str,
-) -> tuple[int, int] | None:
+) -> tuple[tuple[int, int] | None, tuple[int, int]]:
     """Pick the video size for keyframes and check every frame against it.
 
-    Returns the size to send, or None to leave it to the server (no size was
-    asked for). ``dimensions`` is only the size the caller asked for by name; a
+    Returns ``(size to send, shape of the video)``. The size is None to leave
+    it to the server (none was asked for); the shape is then the one the
+    server will pick, for metadata. ``dimensions`` is only the size the caller asked for by name; a
     size that is not one of the allowed sizes (1280x720, say) is a hint the
-    caller drops, so the first frame decides. An allowed size is binding, and a frame that does not fit it is refused rather
-    than stretched.
+    caller drops, so the first frame decides. An allowed size is binding, and a
+    frame that does not fit it is refused rather than stretched.
     """
     first = frames[first_field]
     explicit = dimensions
@@ -450,7 +517,7 @@ def _saas_resolve_frame_size(
                 field=field,
                 allowed_values={"size": _saas_allowed_sizes()},
             )
-    return explicit
+    return explicit, shape
 
 
 def _saas_seed(value: Any) -> int | None:
@@ -714,6 +781,8 @@ class XinferenceVideoModel(BaseVideoModel):
         content: list[dict[str, Any]],
         **kwargs: Any,
     ) -> dict[str, Any]:
+        if self.saas_api:
+            _saas_check_content(content)
         prompt = ""
         image: Optional[str] = None
         first_frame: Optional[str] = None
@@ -857,7 +926,9 @@ class XinferenceVideoModel(BaseVideoModel):
             )
         duration_value = _saas_duration(seconds)
         dimensions = _saas_dimensions(size)
+        requested = _saas_parse_dimensions(size)
         seed_value = _saas_seed(seed)
+        frame_shape: tuple[int, int] | None = None
         first_frame, last_frame = await self._load_saas_frames(
             reference_image,
             last_frame_image_url,
@@ -868,10 +939,17 @@ class XinferenceVideoModel(BaseVideoModel):
             frames = {"first_frame_image": first_frame}
             if last_frame is not None:
                 frames["last_frame_image"] = last_frame
-            exact = bool(size) and str(size).lower().strip() in _saas_allowed_sizes()
-            dimensions = _saas_resolve_frame_size(
-                dimensions if exact else None, frames, "first_frame_image"
+            binding = requested if requested in SAAS_VIDEO_SIZES else None
+            dimensions, shape = _saas_resolve_frame_size(
+                binding, frames, "first_frame_image"
             )
+            if dimensions is None:
+                frame_shape = shape
+        # What the clip is reported as when the first frame, not the caller,
+        # picked its shape.
+        shape_label = f"{frame_shape[0]}x{frame_shape[1]}" if frame_shape else None
+        meta_resolution = shape_label or resolution
+        meta_ratio = _ratio_label(*frame_shape) if frame_shape else ratio
 
         if get_xinference_saas_video_async_enabled():
             return await self._run_saas_video_job(
@@ -884,6 +962,7 @@ class XinferenceVideoModel(BaseVideoModel):
                 timeout=timeout,
                 first_frame=first_frame,
                 last_frame=last_frame,
+                frame_shape=frame_shape,
             )
 
         body: dict[str, Any] = {
@@ -913,7 +992,7 @@ class XinferenceVideoModel(BaseVideoModel):
                 )
         except asyncio.CancelledError:
             if result is not _NOT_RECEIVED:
-                self._record_response_usage(result, duration_value, resolution)
+                self._record_response_usage(result, duration_value, meta_resolution)
             raise
         except BilledVideoTaskError:
             record_provider_usage(self, MediaCallType.VIDEO, 0)
@@ -926,7 +1005,7 @@ class XinferenceVideoModel(BaseVideoModel):
             raise RuntimeError(f"Xinference video generation failed: {exc}") from exc
 
         data, video_item = self._record_response_usage(
-            result, duration_value, resolution
+            result, duration_value, meta_resolution
         )
         if video_item is None:
             raise BilledVideoTaskError("Xinference video response was malformed")
@@ -945,8 +1024,8 @@ class XinferenceVideoModel(BaseVideoModel):
             "video_url": video_url,
             "last_frame_url": None,
             "seed": video_item.get("seed", seed_value),
-            "resolution": video_item.get("resolution") or resolution,
-            "ratio": video_item.get("ratio") or ratio,
+            "resolution": video_item.get("resolution") or meta_resolution,
+            "ratio": video_item.get("ratio") or meta_ratio,
             # Same precedence the usage recorder applied, so the returned
             # duration is the quantity that was billed.
             "duration": reported
@@ -1249,9 +1328,15 @@ class XinferenceVideoModel(BaseVideoModel):
         timeout: float,
         first_frame: Optional[_SaasFrame] = None,
         last_frame: Optional[_SaasFrame] = None,
+        frame_shape: tuple[int, int] | None = None,
     ) -> dict[str, Any]:
         seconds = math.ceil(duration_value) if duration_value is not None else None
         size = f"{dimensions[0]}x{dimensions[1]}" if dimensions else None
+        # No size is sent when the first frame picks it, but the job is still
+        # metered and reported at that shape.
+        meta_size = size or (
+            f"{frame_shape[0]}x{frame_shape[1]}" if frame_shape else None
+        )
         body: dict[str, Any] = {"model": self._model_uid, "prompt": prompt}
         if seconds is not None:
             body["seconds"] = seconds
@@ -1287,10 +1372,12 @@ class XinferenceVideoModel(BaseVideoModel):
                     session, job_id, deadline, state
                 )
             except asyncio.CancelledError:
-                await self._abandon_video_job(session, job_id, seconds, size)
+                await self._abandon_video_job(session, job_id, seconds, meta_size)
                 raise
             except _JobDeadline as exc:
-                outcome = await self._abandon_video_job(session, job_id, seconds, size)
+                outcome = await self._abandon_video_job(
+                    session, job_id, seconds, meta_size
+                )
                 message = (
                     f"Timed out waiting for video job {job_id}; "
                     f"last status: {state['status']}"
@@ -1299,13 +1386,23 @@ class XinferenceVideoModel(BaseVideoModel):
                     raise TimeoutError(message) from exc
                 raise BilledVideoTaskTimeout(message) from exc
             except _JobFatal as exc:
-                outcome = await self._abandon_video_job(session, job_id, seconds, size)
+                outcome = await self._abandon_video_job(
+                    session, job_id, seconds, meta_size
+                )
                 if outcome == "free":
                     raise RuntimeError(str(exc)) from None
                 raise BilledVideoTaskError(str(exc)) from None
 
             billed = self._job_billed_seconds(completed, seconds)
-            self._record_job_usage(billed, size or resolution, job_id, "completed")
+            reported_size = completed.get("size")
+            if not (
+                isinstance(reported_size, str)
+                and re.fullmatch(r"\d+x\d+", reported_size)
+            ):
+                reported_size = None
+            if frame_shape is not None:
+                meta_size = reported_size or meta_size
+            self._record_job_usage(billed, meta_size or resolution, job_id, "completed")
             content: Optional[_JobResponse] = None
             for attempt in range(SAAS_VIDEO_CONTENT_ATTEMPTS):
                 try:
@@ -1344,8 +1441,12 @@ class XinferenceVideoModel(BaseVideoModel):
             "video_url": f"data:video/mp4;base64,{encoded}",
             "last_frame_url": None,
             "seed": completed.get("seed", seed_value),
-            "resolution": size or resolution,
-            "ratio": ratio,
+            "resolution": meta_size or resolution,
+            "ratio": (
+                _ratio_label(*map(int, meta_size.split("x")))
+                if meta_size and not size
+                else ratio
+            ),
             "duration": billed,
             "frames": None,
             "raw_response": completed,
@@ -1452,6 +1553,8 @@ class XinferenceVideoModel(BaseVideoModel):
                 allowed_values={"n": [1]},
             )
 
+        if self.saas_api:
+            _saas_check_content(content)
         if content:
             for item in content:
                 if item.get("type") == "text" and not prompt:

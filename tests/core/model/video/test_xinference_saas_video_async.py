@@ -297,6 +297,28 @@ async def test_job_first_and_last_frame_are_sent(server):
     assert body["size"] == "768x1344"
 
 
+async def test_job_reports_the_shape_the_first_frame_selected(server):
+    server.post_replies = [accepted()]
+    server.get_replies = [completed()]
+    with TokenContextManager() as manager:
+        result = await _build().generate_video(
+            prompt="a fox", input_reference=_frame(1000, 1000), ratio="16:9"
+        )
+    assert "size" not in server.calls[0][3]
+    assert result["resolution"] == "768x768" and result["ratio"] == "1:1"
+    [row] = _rows(manager)
+    assert row["resolution"] == "768x768"
+
+
+async def test_job_prefers_the_size_the_server_reports(server):
+    server.post_replies = [accepted()]
+    server.get_replies = [job("completed", usage={"video_seconds": 5}, size="1344x768")]
+    result = await _build().generate_video(
+        prompt="a fox", input_reference=_frame(1024, 1024)
+    )
+    assert result["resolution"] == "1344x768" and result["ratio"] == "7:4"
+
+
 async def test_job_aspect_mismatch_is_refused_before_submit(server):
     with pytest.raises(MediaParameterError):
         await _build().generate_video(

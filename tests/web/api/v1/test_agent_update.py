@@ -35,7 +35,6 @@ from xagent.web.services.workforce_snapshot import _fingerprint_agent_payload
 from ..conftest import _admin_headers, _direct_db_session, client
 from .test_agent_detail import (
     _CELLS,
-    DETAIL_KEYS,
     NOT_FOUND,
     _add_user,
     _install_role,
@@ -313,20 +312,33 @@ def test_update_field_five_states(field, value, status, after):
         }
 
 
-def test_an_empty_body_returns_the_agent_and_writes_nothing(caplog):
+def test_an_empty_body_takes_no_lock_and_reads_as_get(monkeypatch, caplog):
+    """``{}`` has nothing to decide, so it takes no lock: while another
+    session holds SQLite's write lock it returns what GET returns."""
     holder = Holder()
     agent_id = _seed(holder.user_id, **_STORED)
     before = _row(agent_id)
-
-    with patch(CACHE_CLEAR) as cleared, caplog.at_level(logging.INFO):
-        resp = _patch(holder, agent_id, {})
+    reads, _writes = _spy_store(monkeypatch)
+    other = _direct_db_session()
+    other.connection().exec_driver_sql("BEGIN IMMEDIATE")
+    try:
+        with patch(CACHE_CLEAR) as cleared, caplog.at_level(logging.INFO):
+            resp = _patch(holder, agent_id, {})
+        read = client.get(f"/v1/agents/{agent_id}", headers=_bearer(holder.key))
+    finally:
+        other.rollback()
+        other.close()
 
     assert resp.status_code == 200, resp.text
-    assert set(resp.json()) == DETAIL_KEYS
+    assert resp.content == read.content
     assert resp.json()["instructions"] == "stored i"
+    # One read for the PATCH and one for the GET, neither under the row lock.
+    assert [kw.get("for_update") for kw, _agent in reads] == [None, None]
     assert _row(agent_id) == before
     cleared.assert_not_called()
     assert _update_records(caplog) == []
+    missing = _patch(holder, 999_999, {})
+    assert missing.status_code == 404 and missing.json() == NOT_FOUND
 
 
 _EXTRA_BODIES = [
@@ -761,6 +773,29 @@ def test_sqlite_write_lock_serializes_length_decisions():
     assert outcomes["first"] == "ok"
     assert isinstance(outcomes["second"], agent_management.AgentTextTooLongError)
     assert _row(agent_id)["instructions"] == "f" * 10_000
+
+
+def test_locked_database_returns_500_and_writes_nothing(monkeypatch, caplog):
+    """The SQLite write lock cannot be taken: 500 before the agent is read,
+    nothing written or cleared from the cache, and neither update log line."""
+    holder = Holder()
+    agent_id = _seed(holder.user_id, **_STORED)
+    before = _row(agent_id)
+    reads, writes = _spy_store(monkeypatch)
+
+    def locked(_db):
+        raise OperationalError("BEGIN IMMEDIATE", {}, Exception("database is locked"))
+
+    monkeypatch.setattr(agent_management, "begin_sqlite_write_transaction", locked)
+    with patch(CACHE_CLEAR) as cleared, caplog.at_level(logging.INFO):
+        resp = _patch(holder, agent_id, {"instructions": "changed"})
+
+    _error(resp, 500, "internal_error")
+    assert reads == [] and writes == []
+    assert _row(agent_id) == before
+    cleared.assert_not_called()
+    assert _update_records(caplog) == []
+    assert _update_records(caplog, UNKNOWN_LOG) == []
 
 
 # ===== nothing else is touched =====

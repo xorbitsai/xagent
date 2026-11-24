@@ -135,3 +135,24 @@ def test_write_transaction_noop_for_non_sqlite() -> None:
         begin_sqlite_write_transaction(session)
         assert not session.in_transaction()
     engine.dispose()
+
+
+def test_write_transaction_takes_the_write_lock(tmp_path) -> None:
+    from sqlalchemy.exc import OperationalError
+    from sqlalchemy.orm import Session
+
+    from xagent.db.sqlite import begin_sqlite_write_transaction
+
+    # A blocked writer gives up after 0.1 seconds, not the default 5.
+    engine = create_engine(
+        f"sqlite:///{tmp_path / 'lock.db'}", connect_args={"timeout": 0.1}
+    )
+    with Session(engine) as first, Session(engine) as second:
+        begin_sqlite_write_transaction(first)
+        with pytest.raises(OperationalError, match="database is locked"):
+            begin_sqlite_write_transaction(second)
+        first.rollback()
+        second.rollback()
+        # Once the first session's transaction ends, the lock is free.
+        begin_sqlite_write_transaction(second)
+    engine.dispose()

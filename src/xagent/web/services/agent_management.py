@@ -1370,18 +1370,8 @@ class AgentManagementRuntime:
     ) -> AgentDetailSnapshot | None:
         """Change the name, description or instructions of an agent.
 
-        ``changes`` holds the fields the request sent, each with its new
-        value. Returns ``None`` when the user cannot see the agent, decided
-        under the lock the write takes. Otherwise returns the configuration
-        as it is after the change, read again after the write with the same
-        visibility rule; when the user can no longer see the agent by then,
-        ``None`` is returned although the change is stored. Only a field whose
-        value differs from the stored one is written, and nothing is written,
-        cleared from the cache or logged when none does. A text field may not
-        grow past its limit (:class:`AgentTextTooLongError`) and a new name
-        may not be taken (:class:`DuplicateAgentNameError`). The write is the
-        one the web app uses; see :meth:`_update_agent_sync` for the locks and
-        the failure contract.
+        Raises :class:`AgentTextTooLongError` or :class:`DuplicateAgentNameError`
+        when a change is refused; :meth:`_update_agent_sync` has the contract.
         """
         return await run_db_io_cancellation_safe(
             lambda: self._update_agent_sync(
@@ -1402,11 +1392,19 @@ class AgentManagementRuntime:
     ) -> AgentDetailSnapshot | None:
         """Decide and write in one locked transaction, log, then read again.
 
-        The decisions are made under a lock held until the commit: the row
-        lock on the agent, and on SQLite, which ignores that lock, the
-        database's write lock, taken before the first read. When another
-        writer holds the SQLite write lock past the busy timeout, this fails
-        before reading anything and nothing is written.
+        ``changes`` maps each field the request sent to its new value. An
+        empty ``changes`` has nothing to decide: it takes no lock and returns
+        what :meth:`_get_agent_detail_sync` returns, as ``GET`` does.
+
+        Otherwise the decisions are made under a lock held until the
+        transaction ends: the row lock on the agent, and on SQLite, which
+        ignores that lock, the database's write lock, taken before the first
+        read. When another writer holds the SQLite write lock past the busy
+        timeout, this fails before reading anything and nothing is written.
+        ``None`` is returned when the user cannot see the agent under the
+        lock. Only a field whose value differs from the stored one is written,
+        and nothing is written, cleared from the cache or logged when none
+        does.
 
         The commit releases the lock, so after a write the agent is read again
         with the visibility rule and team scope of the first read, and the
@@ -1425,6 +1423,10 @@ class AgentManagementRuntime:
         line of its own. Retrying the same request is safe: a change that was
         stored shows no difference and writes nothing.
         """
+        if not changes:
+            return AgentManagementRuntime._get_agent_detail_sync(
+                user_id=user_id, agent_id=agent_id
+            )
         SessionLocal = get_session_local()
         with SessionLocal() as db:
             # First, before any read: SQLite ignores the row lock below.
@@ -1460,7 +1462,7 @@ class AgentManagementRuntime:
                     store.update_agent_fields(
                         user_id,
                         agent_id,
-                        dict(updates),
+                        updates,
                         team_scope=team_scope,
                         agent=agent,
                     )

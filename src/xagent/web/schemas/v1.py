@@ -385,6 +385,35 @@ class V1AgentDetail(V1AgentResponse):
     )
 
 
+class V1Model(BaseModel):
+    """One model the key holder can use. Order is not guaranteed."""
+
+    id: int = Field(
+        description="The id an agent's model slot stores. Only models whose "
+        "`category` is `llm` can be placed in an agent's model slots. This id "
+        "is specific to the region you call. The same model has a different "
+        "id in another region; look it up there by `model_id`."
+    )
+    model_id: str = Field(
+        description="A stable, readable identifier. Use it to find the same "
+        "model across regions."
+    )
+    model_name: str
+    model_provider: str
+    category: str = Field(
+        description="Only models whose `category` is `llm` can be placed in "
+        "an agent's model slots."
+    )
+    abilities: list[str] = Field(
+        description="The model's abilities, for example `chat` or `vision`. "
+        "An ability stored as a non-string value is returned as its string "
+        "form; a stored value that is not a list gives `[]`, except a stored "
+        "string, which gives a list with that one string."
+    )
+    is_platform: bool = Field(description="True for a platform-managed model.")
+    owned_by_you: bool = Field(description="True when the key holder owns the model.")
+
+
 class V1AgentCreateResponse(BaseModel):
     agent: V1AgentResponse
     api_key: Optional[RuntimeKeyResponse] = None

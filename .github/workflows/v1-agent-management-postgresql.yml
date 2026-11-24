@@ -5,6 +5,7 @@ on:
     paths:
       - 'src/xagent/web/api/v1/agents.py'
       - 'src/xagent/web/api/v1/errors.py'
+      - 'src/xagent/web/api/v1/models.py'
       - 'src/xagent/web/schemas/v1.py'
       - 'src/xagent/web/services/agent_management.py'
       - 'src/xagent/web/services/model_service.py'
@@ -19,6 +20,7 @@ on:
       - 'src/xagent/web/models/database.py'
       - 'src/xagent/core/model/storage/db/db_models.py'
       - 'tests/web/api/v1/test_agent_detail.py'
+      - 'tests/web/api/v1/test_models_listing.py'
       - 'tests/web/api/v1/test_management.py'
       - 'tests/web/api/v1/test_skills.py'
       - 'tests/conftest.py'
@@ -33,6 +35,7 @@ on:
     paths:
       - 'src/xagent/web/api/v1/agents.py'
       - 'src/xagent/web/api/v1/errors.py'
+      - 'src/xagent/web/api/v1/models.py'
       - 'src/xagent/web/schemas/v1.py'
       - 'src/xagent/web/services/agent_management.py'
       - 'src/xagent/web/services/model_service.py'
@@ -47,6 +50,7 @@ on:
       - 'src/xagent/web/models/database.py'
       - 'src/xagent/core/model/storage/db/db_models.py'
       - 'tests/web/api/v1/test_agent_detail.py'
+      - 'tests/web/api/v1/test_models_listing.py'
       - 'tests/web/api/v1/test_management.py'
       - 'tests/web/api/v1/test_skills.py'
       - 'tests/conftest.py'
@@ -94,7 +98,7 @@ jobs:
           XAGENT_TEST_POSTGRES_URL: postgresql://xagent:xagent_test@localhost:5432/xagent_test
         shell: bash
         run: |
-          uv run --frozen pytest tests/web/api/v1/test_agent_detail.py -m postgresql -v 2>&1 | tee pg.log
+          uv run --frozen pytest tests/web/api/v1/test_agent_detail.py tests/web/api/v1/test_models_listing.py -m postgresql -v 2>&1 | tee pg.log
           if grep -Eq '(^|[^0-9])[0-9]+ skipped' pg.log; then
             echo "::error::Postgres-only cells were skipped; skipped is not passed"
             exit 1

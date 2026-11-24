@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from types import TracebackType
 from typing import Any, Callable, Generic, Literal, TypeVar, cast
@@ -13,6 +13,7 @@ from sqlalchemy import func, or_, select, update
 from sqlalchemy.engine import CursorResult
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, aliased
+from sqlalchemy.orm.attributes import flag_modified
 
 from ...core.tools.adapters.vibe.agent_model_resolution import AGENT_MODEL_KEYS
 from ...core.tools.adapters.vibe.selection_spec import normalize_mcp_server_name
@@ -97,6 +98,19 @@ class AgentTextTooLongError(ValueError):
         super().__init__(field)
         self.field = field
         self.limit = limit
+
+
+class ModelSlotsUnusableError(ValueError):
+    """Raised when a slot would be set to a model it cannot take.
+
+    ``rejections`` has one entry per refused slot, in slot order: ``slot``,
+    ``model_id`` (the model's primary key), ``reason`` and, for
+    ``owner_cannot_use`` only, ``owner_user_id``.
+    """
+
+    def __init__(self, rejections: list[dict[str, Any]]) -> None:
+        super().__init__(", ".join(str(r["slot"]) for r in rejections))
+        self.rejections = rejections
 
 
 class TemplateQuickAccessRaceError(ValueError):
@@ -365,6 +379,13 @@ class UsableModelSnapshot:
     abilities: tuple[str, ...]
     is_platform: bool
     owned_by_you: bool
+
+
+@dataclass(frozen=True)
+class UsableModelForAgentSnapshot(UsableModelSnapshot):
+    """A usable model plus whether one agent's owner can use it too."""
+
+    owner_can_use: bool
 
 
 @dataclass(frozen=True)
@@ -1300,6 +1321,100 @@ async def _validate_agent_knowledge_bases(
         )
 
 
+def _model_snapshots(
+    db: Session, user_id: int, models: list[DBModel]
+) -> tuple[UsableModelSnapshot, ...]:
+    """Public fields of *models*, with whether *user_id* owns each."""
+    from ..models.user import UserModel
+    from .llm_utils import PLATFORM_MODEL_MANAGER
+
+    owned: set[int] = set()
+    if models:
+        owned = {
+            int(pk)
+            for (pk,) in db.query(UserModel.model_id).filter(
+                UserModel.user_id == user_id,
+                UserModel.is_owner.is_(True),
+                UserModel.model_id.in_([model.id for model in models]),
+            )
+        }
+    return tuple(
+        UsableModelSnapshot(
+            id=int(model.id),
+            model_id=str(model.model_id),
+            model_name=str(model.model_name),
+            model_provider=str(model.model_provider),
+            category=str(model.category),
+            abilities=_ability_names(model.abilities),
+            is_platform=bool(model.managed_by == PLATFORM_MODEL_MANAGER),
+            owned_by_you=int(model.id) in owned,
+        )
+        for model in models
+    )
+
+
+def _changed_slots(
+    base: dict[str, Any], requested: dict[str, int | None]
+) -> dict[str, int | None]:
+    """The requested slots whose stored value differs, in slot order.
+
+    A requested id equals the stored value only when the stored value is an
+    ``int`` itself: ``bool`` is a subclass of ``int``, and a stored ``True``,
+    ``1.0`` or ``"1"`` must be rewritten with the integer. Clearing a slot is a
+    no-op when it is absent or null.
+    """
+    changed: dict[str, int | None] = {}
+    for slot in AGENT_MODEL_KEYS:
+        if slot not in requested:
+            continue
+        new, old = requested[slot], base.get(slot)
+        same = old is None if new is None else (type(old) is int and old == new)
+        if not same:
+            changed[slot] = new
+    return changed
+
+
+def _check_slot_models(
+    db: Session, holder_id: int, owner_id: int, changed: dict[str, int | None]
+) -> None:
+    """Refuse the change unless every new model can be put in its slot.
+
+    A model must be usable by the holder, then be of a kind slots accept, then
+    be usable by the agent's owner. The holder is checked first so that a model
+    the holder cannot see never reveals its category. Raises
+    :class:`ModelSlotsUnusableError` naming every refused slot.
+    """
+    from .model_service import slot_assignable_models, usable_models
+
+    ids = sorted({pk for pk in changed.values() if pk is not None})
+    if not ids:
+        return
+    usable = {m.id for m in usable_models(db, holder_id, among_ids=ids)}
+    holder_ok = {m.id for m in slot_assignable_models(db, holder_id, among_ids=ids)}
+    owner_ok = (
+        holder_ok
+        if owner_id == holder_id
+        else {m.id for m in slot_assignable_models(db, owner_id, among_ids=ids)}
+    )
+    rejections: list[dict[str, Any]] = []
+    for slot, pk in changed.items():
+        if pk is None:
+            continue
+        rejection: dict[str, Any] = {"slot": slot, "model_id": pk}
+        if pk not in usable:
+            rejection["reason"] = "unavailable"
+        elif pk not in holder_ok:
+            rejection["reason"] = "not_llm"
+        elif pk not in owner_ok:
+            rejection["reason"] = "owner_cannot_use"
+            rejection["owner_user_id"] = owner_id
+        else:
+            continue
+        rejections.append(rejection)
+    if rejections:
+        raise ModelSlotsUnusableError(rejections)
+
+
 class AgentManagementRuntime:
     """Async owner for V1 agent management.
 
@@ -1366,12 +1481,13 @@ class AgentManagementRuntime:
         user_id: int,
         key_prefix: str,
         agent_id: int,
-        changes: dict[str, str],
+        changes: dict[str, Any],
     ) -> AgentDetailSnapshot | None:
-        """Change the name, description or instructions of an agent.
+        """Change the name, description, instructions or model slots of an agent.
 
-        Raises :class:`AgentTextTooLongError` or :class:`DuplicateAgentNameError`
-        when a change is refused; :meth:`_update_agent_sync` has the contract.
+        Raises :class:`AgentTextTooLongError`, :class:`DuplicateAgentNameError`
+        or :class:`ModelSlotsUnusableError` when a change is refused;
+        :meth:`_update_agent_sync` has the contract.
         """
         return await run_db_io_cancellation_safe(
             lambda: self._update_agent_sync(
@@ -1388,7 +1504,7 @@ class AgentManagementRuntime:
         user_id: int,
         key_prefix: str,
         agent_id: int,
-        changes: dict[str, str],
+        changes: dict[str, Any],
     ) -> AgentDetailSnapshot | None:
         """Decide and write in one locked transaction, log, then read again.
 
@@ -1405,6 +1521,13 @@ class AgentManagementRuntime:
         lock. Only a field whose value differs from the stored one is written,
         and nothing is written, cleared from the cache or logged when none
         does.
+
+        ``changes["models"]`` maps only the slots the request named to a model
+        id or ``None``. Those that differ from the stored slots
+        (:func:`_changed_slots`) are merged into a new dict. Each slot changed
+        to a model id is checked under the lock, after the length and name
+        checks (:func:`_check_slot_models`); a refused slot raises
+        :class:`ModelSlotsUnusableError` and nothing is written.
 
         The commit releases the lock, so after a write the agent is read again
         with the visibility rule and team scope of the first read, and the
@@ -1438,11 +1561,18 @@ class AgentManagementRuntime:
             )
             if agent is None:
                 return None
-            updates = {
+            updates: dict[str, Any] = {
                 field: value
                 for field, value in changes.items()
-                if getattr(agent, field) != value
+                if field != "models" and getattr(agent, field) != value
             }
+            # A new dict; a stored value that is not a dict counts as empty.
+            base: dict[str, Any] = (
+                dict(agent.models) if isinstance(agent.models, dict) else {}
+            )
+            changed_slots = _changed_slots(base, changes.get("models") or {})
+            if changed_slots:
+                updates["models"] = {**base, **changed_slots}
             if updates:
                 for field, limit in _UPDATE_TEXT_LIMITS:
                     if field not in updates:
@@ -1457,7 +1587,17 @@ class AgentManagementRuntime:
                     team_scope=team_scope,
                 ):
                     raise DuplicateAgentNameError()
-                fields = ",".join(sorted(updates))
+                if changed_slots:
+                    _check_slot_models(db, user_id, int(agent.user_id), changed_slots)
+                fields = ",".join(
+                    f"models[{','.join(changed_slots)}]" if name == "models" else name
+                    for name in sorted(updates)
+                )
+                if "models" in updates:
+                    # A stored ``{"general": true}`` compares equal to
+                    # ``{"general": 1}``, so without this the change would be
+                    # dropped at flush and the bad slot could never be fixed.
+                    flag_modified(agent, "models")
                 try:
                     store.update_agent_fields(
                         user_id,
@@ -1519,35 +1659,59 @@ class AgentManagementRuntime:
 
     @staticmethod
     def _list_usable_models_sync(*, user_id: int) -> tuple[UsableModelSnapshot, ...]:
-        from ..models.user import UserModel
-        from .llm_utils import PLATFORM_MODEL_MANAGER
         from .model_service import usable_models
 
         SessionLocal = get_session_local()
         with SessionLocal() as db:
-            models = usable_models(db, user_id)
-            owned: set[int] = set()
-            if models:
-                owned = {
-                    int(pk)
-                    for (pk,) in db.query(UserModel.model_id).filter(
-                        UserModel.user_id == user_id,
-                        UserModel.is_owner.is_(True),
-                        UserModel.model_id.in_([model.id for model in models]),
+            return _model_snapshots(db, user_id, usable_models(db, user_id))
+
+    async def list_models_for_agent(
+        self, *, user_id: int, agent_id: int
+    ) -> tuple[UsableModelForAgentSnapshot, ...] | None:
+        """The slot models ``user_id`` can use, marked for one agent's owner.
+
+        Returns ``None`` when the user cannot manage the agent. Otherwise
+        every model the user can put in a slot is listed, each with whether
+        the agent's owner can use it too; a model the owner cannot use is
+        marked, not left out, so an empty list always means the user has no
+        slot model. Both sides come from ``slot_assignable_models``, the
+        definition the update check uses. Read from the database; a database
+        failure propagates.
+        """
+        return await run_db_io_cancellation_safe(
+            lambda: self._list_models_for_agent_sync(user_id=user_id, agent_id=agent_id)
+        )
+
+    @staticmethod
+    def _list_models_for_agent_sync(
+        *, user_id: int, agent_id: int
+    ) -> tuple[UsableModelForAgentSnapshot, ...] | None:
+        from .model_service import slot_assignable_models
+
+        SessionLocal = get_session_local()
+        with SessionLocal() as db:
+            team_scope = get_agent_team_scope(db, user_id)
+            agent = AgentStore(db).get_owned_agent(user_id, agent_id, team_scope)
+            if agent is None:
+                return None
+            holder = slot_assignable_models(db, user_id)
+            if int(agent.user_id) == user_id:
+                owner_ok = {int(m.id) for m in holder}
+            else:
+                owner_ok = {
+                    int(m.id)
+                    for m in slot_assignable_models(
+                        db,
+                        int(agent.user_id),
+                        among_ids=[int(m.id) for m in holder],
                     )
                 }
             return tuple(
-                UsableModelSnapshot(
-                    id=int(model.id),
-                    model_id=str(model.model_id),
-                    model_name=str(model.model_name),
-                    model_provider=str(model.model_provider),
-                    category=str(model.category),
-                    abilities=_ability_names(model.abilities),
-                    is_platform=bool(model.managed_by == PLATFORM_MODEL_MANAGER),
-                    owned_by_you=int(model.id) in owned,
+                UsableModelForAgentSnapshot(
+                    **asdict(snapshot),
+                    owner_can_use=snapshot.id in owner_ok,
                 )
-                for model in models
+                for snapshot in _model_snapshots(db, user_id, holder)
             )
 
     async def get_agent_skills(

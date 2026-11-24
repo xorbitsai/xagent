@@ -290,6 +290,13 @@ class AgentRuntimeKeyRevokeResponse(BaseModel):
     revoked_at: datetime
 
 
+_CREATE_MODELS_DESCRIPTION = (
+    "Each slot takes a model id from `GET /v1/models` (an id is specific to the "
+    "region you call). A model of any category is accepted here; `category` in "
+    "that list says which ones a slot uses at run time."
+)
+
+
 class V1AgentCreateRequest(BaseModel):
     """Body for ``POST /v1/agents``."""
 
@@ -297,7 +304,10 @@ class V1AgentCreateRequest(BaseModel):
     description: Optional[str] = None
     instructions: Optional[str] = None
     execution_mode: Optional[str] = "balanced"
-    models: Optional[dict[str, Any]] = None
+    models: Optional[dict[str, Any]] = Field(
+        default=None,
+        description=_CREATE_MODELS_DESCRIPTION,
+    )
     knowledge_bases: list[str] = Field(default_factory=list)
     skills: list[str] = Field(default_factory=list)
     tool_categories: list[str] = Field(default_factory=list)
@@ -314,7 +324,10 @@ class V1AgentTemplateCreateRequest(BaseModel):
     description: Optional[str] = None
     instructions: Optional[str] = None
     execution_mode: Optional[str] = None
-    models: Optional[dict[str, Any]] = None
+    models: Optional[dict[str, Any]] = Field(
+        default=None,
+        description=_CREATE_MODELS_DESCRIPTION,
+    )
     knowledge_bases: Optional[list[str]] = None
     skills: Optional[list[str]] = None
     tool_categories: Optional[list[str]] = None
@@ -411,23 +424,44 @@ def _reject_unstorable_text(value: str) -> str:
 StorableText = AfterValidator(_reject_unstorable_text)
 
 
+_ModelPk = Annotated[StrictInt, Field(gt=0, le=2**31 - 1)]
+
+
+class V1AgentModelSlots(BaseModel):
+    """Model slots to change: each a model id, or null to clear the slot."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    general: Optional[_ModelPk] = Field(default=None, description="The main model.")
+    small_fast: Optional[_ModelPk] = Field(
+        default=None, description="The small, fast helper model."
+    )
+    visual: Optional[_ModelPk] = Field(
+        default=None, description="The model that reads images."
+    )
+    compact: Optional[_ModelPk] = Field(
+        default=None, description="The model that compacts long contexts."
+    )
+
+
 class V1AgentUpdateRequest(BaseModel):
     """Body for ``PATCH /v1/agents/{agent_id}``.
 
     Send only the fields to change; a field that is left out keeps its stored
     value, and a field sent as null is refused. Any other field is refused.
-    There is no conflict detection: of two concurrent changes the later one
-    wins.
+    There is no conflict detection: of two concurrent changes to one field or
+    one model slot, the later one wins.
 
     A new task uses the changed agent at once. A task that already runs keeps
-    the previous text while its cached agent runtime is alive, which depends on
-    the task's state.
+    the previous configuration while its cached agent runtime is alive, which
+    depends on the task's state.
 
-    Changing ``instructions`` also rejects, with ``workforce_config_changed``,
-    the next turn of an ongoing workforce conversation in which this agent is
-    the manager or an enabled worker. A preview conversation in the workforce
-    builder is not checked, and neither is a conversation that started before
-    the check, or under an earlier version of it.
+    Changing ``instructions`` or ``models`` also rejects, with
+    ``workforce_config_changed``, the next turn of an ongoing workforce
+    conversation in which this agent is the manager or an enabled worker. A
+    preview conversation in the workforce builder is not checked, and neither
+    is a conversation that started before the check, or under an earlier
+    version of it.
 
     The agent is read again for the response after the change is stored. If
     the key holder can no longer see it then, the response is 404
@@ -483,6 +517,24 @@ class V1AgentUpdateRequest(BaseModel):
             "the 1000000-character bound."
         ),
     )
+    models: Optional[V1AgentModelSlots] = Field(
+        default=None,
+        description=(
+            "The model slots to change. Only the slots named are changed and "
+            "the others keep their stored model; `{}` changes nothing. A slot "
+            "sent with the model it already stores is left as it is and not "
+            "checked. Otherwise a slot can be set only to a model that "
+            "`GET /v1/models?agent_id=` lists for this agent with "
+            "`owner_can_use` true; any other model returns 400 `invalid_input`, "
+            "and `details.models` names each refused slot with its reason: "
+            "`unavailable`, `not_llm` or `owner_cannot_use`. A request also "
+            "refused for its name or a text length gets that refusal instead, "
+            "and its slots are not checked. A task resolves "
+            "each slot as the user it runs as; if that user cannot use the "
+            "model, the task silently uses another model, so prefer shared "
+            "models on a team agent."
+        ),
+    )
 
 
 class V1Model(BaseModel):
@@ -505,7 +557,8 @@ class V1Model(BaseModel):
         description="Only `llm` models resolve in an agent's model slots at run "
         "time. `POST /v1/agents` and `POST /v1/agents/from-template` also accept "
         "a model of another category; `GET /v1/agents/{agent_id}` then lists "
-        "that slot in `unresolved_models`."
+        "that slot in `unresolved_models`, and `PATCH /v1/agents/{agent_id}` "
+        "refuses to set one."
     )
     abilities: list[str] = Field(
         description="The model's abilities, for example `chat` or `vision`. "
@@ -515,6 +568,16 @@ class V1Model(BaseModel):
     )
     is_platform: bool = Field(description="True for a platform-managed model.")
     owned_by_you: bool = Field(description="True when the key holder owns the model.")
+
+
+class V1ModelForAgent(V1Model):
+    """An ``llm`` model the key holder can use, marked for one agent's owner."""
+
+    owner_can_use: bool = Field(
+        description="True when the agent's owner can use the model too, which "
+        "a change to the agent's model slots requires. Always true when the "
+        "key holder owns the agent."
+    )
 
 
 class V1AgentCreateResponse(BaseModel):

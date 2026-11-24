@@ -1,9 +1,10 @@
-"""Integration tests for ``PATCH /v1/agents/{agent_id}`` (name, description, instructions).
+"""Integration tests for ``PATCH /v1/agents/{agent_id}``.
 
-The route changes the three text fields through the write the web app uses.
-Every refusal leaves the agent row, the agent cache and the log untouched. A
-failure inside the write is reported as an unknown outcome, a failure reading
-the response after the write is not, and in both the stored change stays.
+The route changes the name, description, instructions and model slots through
+the write the web app uses. Every refusal leaves the agent row, the agent
+cache and the log untouched. A failure inside the write is reported as an
+unknown outcome, a failure reading the response after the write is not, and
+in both the stored change stays.
 """
 
 from __future__ import annotations
@@ -12,16 +13,21 @@ import asyncio
 import contextlib
 import logging
 import threading
+from pathlib import Path
 from typing import Any
 from unittest.mock import patch
 
 import pytest
 from sqlalchemy import inspect as sa_inspect
 from sqlalchemy.exc import OperationalError
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, sessionmaker
 
+from tests.shared.postgres_disposable import disposable_database_factory
+from xagent.web import models as _all_models  # noqa: F401  (registers every table)
 from xagent.web.models.agent import Agent
-from xagent.web.schemas.v1 import V1AgentUpdateRequest
+from xagent.web.models.database import Base
+from xagent.web.models.user import User, UserModel
+from xagent.web.schemas.v1 import V1AgentModelSlots, V1AgentUpdateRequest
 from xagent.web.services import agent_management
 from xagent.web.services.agent_host_settings import set_agent_host_settings_writer
 from xagent.web.services.agent_management import AgentManagementRuntime
@@ -30,14 +36,23 @@ from xagent.web.services.agent_team_scope import (
     AgentTeamScope,
     set_agent_team_scope_hook,
 )
+from xagent.web.services.model_service import (
+    set_model_visibility_hook,
+    set_visible_user_ids_hook,
+)
 from xagent.web.services.workforce_snapshot import _fingerprint_agent_payload
 
-from ..conftest import _admin_headers, _direct_db_session, client
+from ..conftest import _admin_headers, _direct_db_session, _register_second_user, client
 from .test_agent_detail import (
+    _CELL_NAMES,
     _CELLS,
     NOT_FOUND,
+    World,
+    _add_model,
     _add_user,
+    _build_world,
     _install_role,
+    _seed_agent,
     _seed_column,
     _user_id,
 )
@@ -47,10 +62,11 @@ from .test_skills import _KEY_KINDS, _error, _headers_for, _key_for
 pytestmark = pytest.mark.usefixtures("_test_db")
 
 TEXT_FIELDS = ("name", "description", "instructions")
+UPDATE_FIELDS = (*TEXT_FIELDS, "models")
 UPDATE_LOG = "personal key agent update:"
 UNKNOWN_LOG = "personal key agent update outcome unknown:"
 CACHE_CLEAR = "xagent.web.services.agent_store.invalidate_agent_cache"
-# Request fields that are not among the three the route accepts.
+# Request fields that are not among the four the route accepts.
 UNSUPPORTED_FIELDS = (
     "execution_mode",
     "knowledge_bases",
@@ -76,6 +92,8 @@ UNSUPPORTED_FIELDS = (
 def _reset_team_hook():
     yield
     set_agent_team_scope_hook(None)
+    set_visible_user_ids_hook(None)
+    set_model_visibility_hook(None)
 
 
 # ===== helpers =====
@@ -180,6 +198,7 @@ def test_update_visibility_matrix(role, column, status):
 
 _TOO_LONG = "can be at most 10000 characters unless it is no longer than the stored"
 _TAKEN = "Agent with this name already exists."
+_NULL_MODELS = "models cannot be null; omit it to keep the stored value."
 _ABSOLUTE = "at most 1000000 characters"
 # (id, request body, status, text the message contains)
 _REFUSALS = [
@@ -195,6 +214,7 @@ _REFUSALS = [
         _ABSOLUTE,
     ),
     ("null", {"name": None}, 400, "name cannot be null; omit it to keep"),
+    ("models-null", {"models": None}, 400, _NULL_MODELS),
     ("instructions-too-long", {"instructions": "x" * 10_001}, 400, _TOO_LONG),
     ("description-too-long", {"description": "x" * 10_001}, 400, _TOO_LONG),
     ("name-taken", {"name": "taken"}, 400, _TAKEN),
@@ -312,9 +332,11 @@ def test_update_field_five_states(field, value, status, after):
         }
 
 
-def test_an_empty_body_takes_no_lock_and_reads_as_get(monkeypatch, caplog):
-    """``{}`` has nothing to decide, so it takes no lock: while another
-    session holds SQLite's write lock it returns what GET returns."""
+@pytest.mark.parametrize("body", [{}, {"models": {}}], ids=["empty", "no-slot"])
+def test_an_empty_body_takes_no_lock_and_reads_as_get(monkeypatch, caplog, body):
+    """A body that names nothing to change has nothing to decide, so it takes
+    no lock: while another session holds SQLite's write lock it returns what
+    GET returns."""
     holder = Holder()
     agent_id = _seed(holder.user_id, **_STORED)
     before = _row(agent_id)
@@ -323,7 +345,7 @@ def test_an_empty_body_takes_no_lock_and_reads_as_get(monkeypatch, caplog):
     other.connection().exec_driver_sql("BEGIN IMMEDIATE")
     try:
         with patch(CACHE_CLEAR) as cleared, caplog.at_level(logging.INFO):
-            resp = _patch(holder, agent_id, {})
+            resp = _patch(holder, agent_id, body)
         read = client.get(f"/v1/agents/{agent_id}", headers=_bearer(holder.key))
     finally:
         other.rollback()
@@ -337,16 +359,14 @@ def test_an_empty_body_takes_no_lock_and_reads_as_get(monkeypatch, caplog):
     assert _row(agent_id) == before
     cleared.assert_not_called()
     assert _update_records(caplog) == []
-    missing = _patch(holder, 999_999, {})
+    missing = _patch(holder, 999_999, body)
     assert missing.status_code == 404 and missing.json() == NOT_FOUND
 
 
 _EXTRA_BODIES = [
     {"foo": 1},
     {"foo": 1, "description": "x"},
-    {"models": {"general": 1}},
-    {"models": None},
-    {"name": "x", "models": {}},
+    {"name": "x", "foo": 1, "models": {}},
 ]
 _REFUSED_FIELD_BODIES = [{field: 1} for field in UNSUPPORTED_FIELDS]
 
@@ -356,14 +376,14 @@ _REFUSED_FIELD_BODIES = [{field: 1} for field in UNSUPPORTED_FIELDS]
     _EXTRA_BODIES + _REFUSED_FIELD_BODIES,
     ids=["+".join(body) for body in _EXTRA_BODIES + _REFUSED_FIELD_BODIES],
 )
-def test_only_three_fields_are_accepted(caplog, body):
+def test_only_four_fields_are_accepted(caplog, body):
     assert len(UNSUPPORTED_FIELDS) == 17
-    # The request model declares exactly the three fields.
-    assert set(V1AgentUpdateRequest.model_fields) == set(TEXT_FIELDS)
+    # The request model declares exactly the four fields.
+    assert set(V1AgentUpdateRequest.model_fields) == set(UPDATE_FIELDS)
     holder = Holder()
     agent_id = _seed(holder.user_id, **_STORED)
     before = _row(agent_id)
-    extra = next(key for key in body if key not in TEXT_FIELDS)
+    extra = next(key for key in body if key not in UPDATE_FIELDS)
 
     with patch(CACHE_CLEAR) as cleared, caplog.at_level(logging.INFO):
         resp = _patch(holder, agent_id, body)
@@ -375,10 +395,9 @@ def test_only_three_fields_are_accepted(caplog, body):
     assert _update_records(caplog) == []
 
 
-def test_every_update_field_is_described():
-    assert all(
-        field.description for field in V1AgentUpdateRequest.model_fields.values()
-    )
+@pytest.mark.parametrize("schema", [V1AgentUpdateRequest, V1AgentModelSlots])
+def test_every_update_field_is_described(schema):
+    assert all(field.description for field in schema.model_fields.values())
 
 
 # ===== how the write is made =====
@@ -417,13 +436,27 @@ def _spy_store(monkeypatch: pytest.MonkeyPatch):
         # A field that already has the sent value is not written.
         ({"name": "stored name", "instructions": "i2"}, {"instructions"}),
         ({"name": "stored name"}, set()),
+        (lambda ok: {"models": {"visual": ok}}, {"models"}),
+        (lambda ok: {"name": "renamed", "models": {"visual": ok}}, {"name", "models"}),
+        (lambda ok: {"models": {"general": ok}}, set()),
     ],
-    ids=["name", "description", "all", "partly-unchanged", "unchanged"],
+    ids=[
+        "name",
+        "description",
+        "all",
+        "partly-unchanged",
+        "unchanged",
+        "models",
+        "name-and-models",
+        "same-slot",
+    ],
 )
 def test_update_writes_once_through_update_agent_fields(monkeypatch, body, written):
     holder = Holder()
-    agent_id = _seed(holder.user_id, **_STORED)
+    ok = _add_model("ok", links=((holder.user_id, True, False),))
+    agent_id = _seed(holder.user_id, models={"general": ok}, **_STORED)
     reads, writes = _spy_store(monkeypatch)
+    body = body(ok) if callable(body) else body
 
     assert _patch(holder, agent_id, body).status_code == 200
 
@@ -503,6 +536,21 @@ def test_access_lost_before_the_lock_refuses_the_update(monkeypatch, caplog):
 
 _LOG_REQUESTS = [
     ("name", {"name": "renamed"}, "name"),
+    (
+        "two-slots",
+        lambda ok: {"models": {"general": ok, "visual": ok}},
+        "models[general,visual]",
+    ),
+    (
+        "every-field",
+        lambda ok: {
+            "name": "n2",
+            "description": "SECRET-D",
+            "instructions": "SECRET-BODY",
+            "models": {"compact": ok, "general": ok, "small_fast": ok, "visual": ok},
+        },
+        "description,instructions,models[general,small_fast,visual,compact],name",
+    ),
     ("instructions", {"instructions": "SECRET-BODY"}, "instructions"),
     (
         "all",
@@ -520,6 +568,8 @@ _LOG_REQUESTS = [
 def test_update_log_line(caplog, body, fields):
     holder = Holder()
     agent_id = _seed(holder.user_id, **_STORED)
+    ok = _add_model("ok", links=((holder.user_id, True, False),))
+    body = body(ok) if callable(body) else body
 
     with caplog.at_level(logging.INFO):
         resp = _patch(holder, agent_id, body)
@@ -576,11 +626,17 @@ def test_cancelled_update_still_logs(caplog):
 
 @pytest.mark.parametrize(
     ("field", "fingerprint_changes"),
-    [("name", False), ("description", False), ("instructions", True)],
+    [
+        ("name", False),
+        ("description", False),
+        ("instructions", True),
+        ("models", True),
+    ],
 )
 def test_update_workforce_fingerprint_by_field(field, fingerprint_changes):
     holder = Holder()
     agent_id = _seed(holder.user_id, **_STORED)
+    ok = _add_model("ok", links=((holder.user_id, True, False),))
 
     def fingerprint() -> dict[str, Any]:
         db = _direct_db_session()
@@ -590,7 +646,8 @@ def test_update_workforce_fingerprint_by_field(field, fingerprint_changes):
             db.close()
 
     before = fingerprint()
-    assert _patch(holder, agent_id, {field: "changed"}).status_code == 200
+    body = {"models": {"general": ok}} if field == "models" else {field: "changed"}
+    assert _patch(holder, agent_id, body).status_code == 200
 
     assert (fingerprint() != before) is fingerprint_changes
 
@@ -663,11 +720,14 @@ def test_agent_hidden_after_the_commit_returns_404(caplog):
     assert _update_records(caplog, UNKNOWN_LOG) == []
 
 
-def test_response_comes_from_one_read_after_the_commit():
+@pytest.mark.parametrize("field", ["description", "models"])
+def test_response_comes_from_one_read_after_the_commit(field):
     """Another writer changes the agent after the update's commit: every
     response field, ``unresolved_models`` included, shows that writer's row."""
     holder = Holder()
     agent_id = _seed(holder.user_id, instructions="before")
+    ok = _add_model("ok", links=((holder.user_id, True, False),))
+    sent = {"description": "changed", "models": {"visual": ok}}[field]
     real_write = AgentStore.update_agent_fields
 
     def write_then_another_writer(self, *args, **kwargs):
@@ -678,11 +738,12 @@ def test_response_comes_from_one_read_after_the_commit():
         return written
 
     with patch.object(AgentStore, "update_agent_fields", write_then_another_writer):
-        resp = _patch(holder, agent_id, {"description": "changed"})
+        resp = _patch(holder, agent_id, {field: sent})
 
     assert resp.status_code == 200, resp.text
     body = resp.json()
-    assert body["description"] == "changed"
+    if field == "description":
+        assert body["description"] == "changed"
     assert body["instructions"] == "another writer"
     assert body["models"] == {"general": 999_999}
     assert body["unresolved_models"] == ["general"]
@@ -808,11 +869,22 @@ def test_locked_database_returns_500_and_writes_nothing(monkeypatch, caplog):
         ({"name": "taken"}, 400),
         ({"description": "x" * 10_001}, 400),
         ({"visibility": "admins"}, 422),
+        (lambda ok: {"models": {"visual": ok}}, 200),
+        (lambda ok: {"models": {"visual": ok + 100}}, 400),
     ],
-    ids=["success", "refused-name", "refused-length", "refused-field"],
+    ids=[
+        "success",
+        "refused-name",
+        "refused-length",
+        "refused-field",
+        "models",
+        "refused-models",
+    ],
 )
 def test_update_never_calls_the_host_settings_writer(body, status):
     holder = Holder()
+    ok = _add_model("ok", links=((holder.user_id, True, False),))
+    body = body(ok) if callable(body) else body
     agent_id = _seed(
         holder.user_id,
         tool_categories=["a"],
@@ -953,3 +1025,580 @@ def test_long_text_can_be_sent_back_but_not_grown(
     else:
         assert row[field] == value
         assert len(writes) == 1 and set(writes[0][0]) == {field}
+
+
+# ===== model slots: what the body may say =====
+
+_BAD_SLOT_BODIES = [
+    {"foo": 1},
+    {"general": True},
+    {"general": False},
+    {"general": "5"},
+    {"general": 5.0},
+    {"general": 0},
+    {"general": -1},
+    {"general": 2**31},
+    {"general": 1, "foo": 1},
+]
+
+
+@pytest.mark.parametrize(
+    "slots", _BAD_SLOT_BODIES, ids=[repr(slots) for slots in _BAD_SLOT_BODIES]
+)
+def test_invalid_slot_values_are_refused_without_a_write(caplog, slots):
+    holder = Holder()
+    agent_id = _seed(holder.user_id, models={"general": 999_999}, **_STORED)
+    before = _row(agent_id)
+
+    with patch(CACHE_CLEAR) as cleared, caplog.at_level(logging.INFO):
+        resp = _patch(holder, agent_id, {"models": slots})
+
+    _error(resp, 422, "invalid_input")
+    assert _row(agent_id) == before
+    cleared.assert_not_called()
+    assert _update_records(caplog) == []
+
+
+# ===== model slots: merge and comparison =====
+
+
+def _stored_variants(old: int, stale: int) -> dict[str, Any]:
+    return {
+        "dict": {"general": old, "compact": stale},
+        "none": None,
+        "corrupt-list": [1, 2],
+        "unknown-key": {"foo": 3, "general": old, "compact": stale},
+    }
+
+
+# Requests that are applied, as functions of (usable model, stale model).
+_SLOT_REQUESTS = {
+    "empty": lambda ok, stale: {},
+    "clear-general": lambda ok, stale: {"general": None},
+    "set-visual": lambda ok, stale: {"visual": ok},
+    "unchanged-stale": lambda ok, stale: {"general": ok, "compact": stale},
+}
+
+
+@pytest.mark.parametrize("stored_kind", list(_stored_variants(1, 2)))
+@pytest.mark.parametrize("request_kind", list(_SLOT_REQUESTS))
+def test_update_models_merges_by_slot(stored_kind, request_kind):
+    holder = Holder()
+    me = holder.user_id
+    old = _add_model("old", links=((me, True, False),))
+    ok = _add_model("ok", links=((me, True, False),))
+    stale = _add_model("stale", active=False, links=((me, True, False),))
+    stored = _stored_variants(old, stale)[stored_kind]
+    agent_id = _seed(me, models=stored)
+    before = _row(agent_id)
+    sent = _SLOT_REQUESTS[request_kind](ok, stale)
+    base = dict(stored) if isinstance(stored, dict) else {}
+    differs = {slot: pk for slot, pk in sent.items() if base.get(slot) != pk}
+
+    resp = _patch(holder, agent_id, {"models": sent})
+
+    # The stale model is refused as a new value and kept when it is stored.
+    if request_kind == "unchanged-stale" and base.get("compact") != stale:
+        _error(resp, 400, "invalid_input")
+        assert resp.json()["error"]["details"]["models"] == [
+            {"slot": "compact", "model_id": stale, "reason": "unavailable"}
+        ]
+        assert _row(agent_id) == before
+        return
+    assert resp.status_code == 200, resp.text
+    if not differs:
+        assert _row(agent_id) == before
+        assert resp.json()["models"] == (stored if isinstance(stored, dict) else None)
+        return
+    expected = {**base, **differs}
+    assert resp.json()["models"] == expected
+    assert _row(agent_id)["models"] == expected
+    assert resp.json()["unresolved_models"] == (
+        ["compact"] if expected.get("compact") == stale else []
+    )
+
+
+@pytest.mark.parametrize("stored", ["true", "float", "string"])
+def test_noncanonical_stored_slot_can_be_fixed(stored):
+    holder = Holder()
+    ok = _add_model("ok", links=((holder.user_id, True, False),))
+    # ``True`` is the integer 1, so it stands for this model only when it is 1.
+    assert ok == 1
+    value = {"true": True, "float": 1.0, "string": "1"}[stored]
+    agent_id = _seed(holder.user_id, models={"general": value})
+    before = client.get(f"/v1/agents/{agent_id}", headers=_bearer(holder.key))
+    assert before.json()["unresolved_models"] == ["general"]
+
+    resp = _patch(holder, agent_id, {"models": {"general": ok}})
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["unresolved_models"] == []
+    stored_value = _row(agent_id)["models"]["general"]
+    assert stored_value == 1 and type(stored_value) is int
+
+
+def test_two_refused_slots_are_reported_in_slot_order():
+    holder = Holder()
+    me = holder.user_id
+    image = _add_model("image", category="image", links=((me, True, False),))
+    agent_id = _seed(me)
+
+    resp = _patch(holder, agent_id, {"models": {"compact": 999_999, "general": image}})
+
+    error = _error(resp, 400, "invalid_input")
+    assert error["details"]["models"] == [
+        {"slot": "general", "model_id": image, "reason": "not_llm"},
+        {"slot": "compact", "model_id": 999_999, "reason": "unavailable"},
+    ]
+    assert error["message"] == (
+        "These model slots cannot use the requested model: "
+        "general (not_llm), compact (unavailable)."
+    )
+
+
+# ===== model slots: who may use the model =====
+
+_COLUMN_NAMES = ["H=O", "H!=O", "O-left"]
+# Result of changing a slot to each kind of model, per column of the table of
+# who the agent's owner is. Anything not listed is accepted.
+_ALWAYS_UNAVAILABLE = {"m5", "m6", "m7", "m8", "m9"}
+_OUTCOMES = {
+    "H=O": {**dict.fromkeys(_ALWAYS_UNAVAILABLE, "unavailable")}
+    | {"m10": "not_llm", "m11": "not_llm"},
+    "H!=O": {
+        **dict.fromkeys(_ALWAYS_UNAVAILABLE, "unavailable"),
+        "m1": "owner_cannot_use",
+        "m2": "unavailable",
+        "m10": "not_llm",
+        "m11": "not_llm",
+    },
+    "O-left": {
+        **dict.fromkeys(_ALWAYS_UNAVAILABLE, "unavailable"),
+        "m1": "owner_cannot_use",
+        "m2": "unavailable",
+        "m4": "owner_cannot_use",
+        "m10": "not_llm",
+        "m11": "not_llm",
+    },
+}
+_OWNER_CANNOT_USE_TAIL = (
+    " The agent's owner cannot use this model, so tasks started with the "
+    "agent's runtime keys would fall back to another model. Choose a model "
+    "with owner_can_use true in GET /v1/models?agent_id=…, or change it in "
+    "the web app."
+)
+
+
+def _install_team(scopes: dict[int, AgentTeamScope], team_admin: int) -> None:
+    set_agent_team_scope_hook(lambda _db, user_id: scopes.get(int(user_id)))
+
+    def sharers(db, user_id):
+        admins = [int(u.id) for u in db.query(User).filter(User.is_admin)]
+        scope = scopes.get(int(user_id)) if user_id is not None else None
+        return admins + ([team_admin] if scope and scope.team_id == 1 else [])
+
+    set_visible_user_ids_hook(sharers)
+
+
+def _owner_leaves_team(world: World) -> None:
+    """Move the agent's owner out of the team the holder and the agent are in."""
+    hana, tara = world.holder, _user_id("tara")
+    _install_team(
+        {
+            hana: AgentTeamScope(team_id=1, is_team_admin=False),
+            tara: AgentTeamScope(team_id=1, is_team_admin=True),
+        },
+        tara,
+    )
+
+
+def _column_world(column: str) -> World:
+    world = _build_world(column == "H=O")
+    if column == "O-left":
+        _owner_leaves_team(world)
+    return world
+
+
+def _agent_owner(world: World) -> int:
+    return int(_row(world.agent_id)["user_id"])
+
+
+@pytest.mark.parametrize("cell", _CELL_NAMES)
+@pytest.mark.parametrize("column", _COLUMN_NAMES)
+def test_listing_for_agent_matches_patch(column, cell):
+    world = _column_world(column)
+    model_id = world.models[cell]
+    before = _row(world.agent_id)
+    headers = _bearer(world.key)
+
+    listed = client.get(
+        "/v1/models", headers=headers, params={"agent_id": world.agent_id}
+    ).json()
+    in_list = any(row["id"] == model_id and row["owner_can_use"] for row in listed)
+    resp = client.patch(
+        f"/v1/agents/{world.agent_id}",
+        headers=headers,
+        json={"models": {"general": model_id}},
+    )
+
+    reason = _OUTCOMES[column].get(cell)
+    assert (resp.status_code == 200) == (reason is None), (column, cell, resp.text)
+    assert in_list == (reason is None), (column, cell)
+    if reason is None:
+        assert _row(world.agent_id)["models"] == {"general": model_id}
+        return
+    assert _row(world.agent_id) == before
+    entry = {"slot": "general", "model_id": model_id, "reason": reason}
+    if reason == "owner_cannot_use":
+        entry["owner_user_id"] = _agent_owner(world)
+    error = _error(resp, 400, "invalid_input")
+    assert error["details"] == {"models": [entry]}
+    assert error["message"] == (
+        f"These model slots cannot use the requested model: general ({reason})."
+        + (_OWNER_CANNOT_USE_TAIL if reason == "owner_cannot_use" else "")
+    )
+
+
+def test_a_stored_model_is_not_checked_when_it_is_sent_back():
+    world = _build_world(False)
+    inactive = world.models["m5"]
+    _set_columns(world.agent_id, models={"general": inactive})
+
+    resp = client.patch(
+        f"/v1/agents/{world.agent_id}",
+        headers=_bearer(world.key),
+        json={"models": {"general": inactive}},
+    )
+    listed = client.get(
+        "/v1/models", headers=_bearer(world.key), params={"agent_id": world.agent_id}
+    ).json()
+
+    assert resp.status_code == 200, resp.text
+    assert inactive not in {row["id"] for row in listed}
+    assert resp.json()["unresolved_models"] == ["general"]
+
+
+def test_slot_rule_has_one_owner():
+    world = _build_world(False)
+    ok = world.models["m3"]
+    calls: list[int] = []
+    from xagent.web.services import model_service
+
+    real = model_service.slot_assignable_models
+
+    def spy(*args, **kwargs):
+        calls.append(1)
+        return real(*args, **kwargs)
+
+    headers = _bearer(world.key)
+    for send in (
+        lambda: client.get(
+            "/v1/models", headers=headers, params={"agent_id": world.agent_id}
+        ),
+        lambda: client.patch(
+            f"/v1/agents/{world.agent_id}",
+            headers=headers,
+            json={"models": {"general": ok}},
+        ),
+        lambda: client.get(f"/v1/agents/{world.agent_id}", headers=headers),
+    ):
+        calls.clear()
+        with patch.object(model_service, "slot_assignable_models", spy):
+            assert send().status_code == 200
+        assert calls, "the request did not go through slot_assignable_models"
+
+    source = Path(agent_management.__file__).read_text()
+    assert "slot_assignable_models" in source
+    assert 'category == "llm"' not in source
+
+
+# ===== model slots: refusals change nothing =====
+
+_MODEL_REFUSALS = [
+    ("unavailable", {"models": {"general": "m9"}}, 400, "(unavailable)"),
+    ("not-llm", {"models": {"general": "m10"}}, 400, "(not_llm)"),
+    ("owner-cannot-use", {"models": {"general": "m1"}}, 400, "(owner_cannot_use)"),
+    ("owner-left", {"models": {"general": "m4"}}, 400, "(owner_cannot_use)"),
+    ("taken-and-model", {"name": "taken", "models": {"general": "m1"}}, 400, _TAKEN),
+    (
+        "too-long-taken-model",
+        {"name": "taken", "instructions": "x" * 10_001, "models": {"general": "m1"}},
+        400,
+        _TOO_LONG,
+    ),
+    ("model-read-fails", {"models": {"general": "m3"}}, 500, ""),
+]
+
+
+@pytest.mark.parametrize(
+    ("body", "status", "text"),
+    [row[1:] for row in _MODEL_REFUSALS],
+    ids=[row[0] for row in _MODEL_REFUSALS],
+)
+def test_rejected_model_update_changes_nothing(request, caplog, body, status, text):
+    case = request.node.callspec.id
+    world = _column_world("O-left" if case == "owner-left" else "H!=O")
+    body = {
+        **body,
+        "models": {slot: world.models[cell] for slot, cell in body["models"].items()},
+    }
+    _set_columns(world.agent_id, name="mine")
+    _seed(_agent_owner(world), name="taken", team_id=1)
+    before = _row(world.agent_id)
+    boom = OperationalError("SELECT secret_table", {}, Exception("secret detail"))
+    failing = (
+        patch(
+            "xagent.web.services.model_service.rank_name_matched_models",
+            side_effect=boom,
+        )
+        if status == 500
+        else contextlib.nullcontext()
+    )
+
+    with patch(CACHE_CLEAR) as cleared, failing, caplog.at_level(logging.INFO):
+        resp = client.patch(
+            f"/v1/agents/{world.agent_id}", headers=_bearer(world.key), json=body
+        )
+
+    assert resp.status_code == status, resp.text
+    assert text in resp.json()["error"]["message"]
+    assert "secret" not in resp.text
+    assert _row(world.agent_id) == before
+    cleared.assert_not_called()
+    assert _update_records(caplog) == []
+    assert _update_records(caplog, UNKNOWN_LOG) == []
+
+
+# ===== model slots: decided under the row lock =====
+
+
+def test_update_decides_models_on_the_agent_under_the_lock(monkeypatch):
+    holder = Holder()
+    me = holder.user_id
+    ok = _add_model("ok", links=((me, True, False),))
+    other = _add_model("other", links=((me, True, False),))
+    agent_id = _seed(me, models={"foo": 1})
+    # Another request changes ``visual`` after this one was accepted.
+    ran = _before_the_lock(
+        monkeypatch,
+        lambda: _set_columns(agent_id, models={"foo": 1, "visual": other}),
+    )
+
+    resp = _patch(holder, agent_id, {"models": {"general": ok}})
+
+    assert ran == [1], "the change before the lock did not happen"
+    assert resp.status_code == 200, resp.text
+    assert _row(agent_id)["models"] == {"foo": 1, "visual": other, "general": ok}
+
+
+@pytest.mark.postgresql
+def test_concurrent_slot_updates_both_survive(monkeypatch):
+    """Two updates of different slots of one agent read it at once unless the
+    row lock keeps them apart."""
+    with disposable_database_factory("xagent_v1_agent_update") as make_database:
+        engine = make_database("update")
+        Base.metadata.create_all(bind=engine)
+        factory = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+        monkeypatch.setattr(agent_management, "get_session_local", lambda: factory)
+
+        with factory() as db:
+            user = User(username="holder", password_hash="x", is_admin=False)
+            db.add(user)
+            db.flush()
+            pks = []
+            for name in ("one", "two"):
+                model = _all_models.model.Model(
+                    model_id=name,
+                    category="llm",
+                    model_provider="openai",
+                    model_name=name,
+                    api_key="test-key",
+                    abilities=["chat"],
+                    is_active=True,
+                )
+                db.add(model)
+                db.flush()
+                db.add(UserModel(user_id=user.id, model_id=model.id, is_owner=True))
+                pks.append(int(model.id))
+            agent = Agent(user_id=user.id, name="agent")
+            db.add(agent)
+            db.commit()
+            holder_id, agent_id = int(user.id), int(agent.id)
+
+        # Each update waits, after reading the agent, until the other has read
+        # it too. Under the row lock the second read waits for the first
+        # commit, so the first wait runs out and both slots survive; without
+        # the lock both read the old row and one slot is lost.
+        barrier = threading.Barrier(2)
+        real_changed_slots = agent_management._changed_slots
+
+        def read_then_wait(base, requested):
+            with contextlib.suppress(threading.BrokenBarrierError):
+                barrier.wait(2)
+            return real_changed_slots(base, requested)
+
+        errors: list[BaseException] = []
+
+        def update(slot: str, pk: int) -> None:
+            try:
+                AgentManagementRuntime._update_agent_sync(
+                    user_id=holder_id,
+                    key_prefix="xag_personal_t",
+                    agent_id=agent_id,
+                    changes={"models": {slot: pk}},
+                )
+            except BaseException as exc:  # noqa: BLE001
+                errors.append(exc)
+
+        with patch.object(agent_management, "_changed_slots", read_then_wait):
+            threads = [
+                threading.Thread(target=update, args=("general", pks[0])),
+                threading.Thread(target=update, args=("visual", pks[1])),
+            ]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(30)
+        assert errors == []
+        with factory() as db:
+            stored = db.get(Agent, agent_id).models
+        assert stored == {"general": pks[0], "visual": pks[1]}
+
+
+# ===== the baseline flow a batch client follows =====
+
+
+class Flow:
+    """A key holder's requests, counted."""
+
+    def __init__(self, key: str) -> None:
+        self.key = key
+        self.count = 0
+
+    def send(self, method: str, url: str, **kwargs: Any):
+        self.count += 1
+        return client.request(method, url, headers=_bearer(self.key), **kwargs)
+
+
+def _team_world(bob_leaves: bool):
+    """Holder alice administers team 1; bob is a member; three team agents."""
+    _admin_headers()
+    sysadmin = _user_id("admin")
+    alice_key = _key_for(_register_second_user("alice"))["full_key"]
+    alice, bob = _user_id("alice"), _add_user("bob")
+    _install_team(
+        {
+            alice: AgentTeamScope(team_id=1, is_team_admin=True),
+            bob: AgentTeamScope(team_id=2 if bob_leaves else 1, is_team_admin=False),
+        },
+        alice,
+    )
+    stale = _add_model("stale", active=False, links=((sysadmin, True, True),))
+    models = {
+        "system": _add_model("system", links=((sysadmin, True, True),)),
+        "team-admin": _add_model("team-admin", links=((alice, True, True),)),
+        "private": _add_model("private", links=((alice, True, False),)),
+    }
+    agents = [
+        _seed_agent(alice, team_id=1, models={"visual": stale}),
+        _seed_agent(alice, team_id=1),
+        _seed_agent(bob, team_id=1, models={"visual": stale}),
+    ]
+    return alice_key, alice, bob, agents, models
+
+
+def _batch_flow(flow: Flow, agents: list[int], pick: dict[int, int]):
+    """List, read one agent per owner, list models per owner, then change.
+
+    Returns the change responses and the model listing read for each owner.
+    """
+    assert flow.send("GET", "/v1/agents").status_code == 200
+    for agent_id in (agents[0], agents[2]):
+        detail = flow.send("GET", f"/v1/agents/{agent_id}").json()
+        assert detail["unresolved_models"] == ["visual"]
+    listings = [
+        flow.send("GET", "/v1/models", params={"agent_id": agent_id}).json()
+        for agent_id in (agents[0], agents[2])
+    ]
+    assert all(listings)
+    responses = [
+        flow.send(
+            "PATCH",
+            f"/v1/agents/{agent_id}",
+            json={"models": {"visual": pick[agent_id]}},
+        )
+        for agent_id in agents
+    ]
+    return responses, listings
+
+
+def _assert_reads_match(flow: Flow, agents: list[int], responses: list[Any]) -> None:
+    """Each agent reads back exactly as its change response said."""
+    for agent_id, resp in zip(agents, responses):
+        assert resp.status_code == 200 and resp.json()["unresolved_models"] == []
+        assert flow.send("GET", f"/v1/agents/{agent_id}").json() == resp.json()
+
+
+def test_batch_client_flow_with_a_shared_model():
+    key, _alice, _bob, agents, models = _team_world(False)
+    flow = Flow(key)
+
+    responses, _listings = _batch_flow(
+        flow, agents, dict.fromkeys(agents, models["system"])
+    )
+    _assert_reads_match(flow, agents, responses)
+
+    assert flow.count == 1 + 2 + 2 + 3 + 3
+
+
+def test_batch_client_flow_when_only_one_owner_can_use_the_model():
+    key, _alice, bob, agents, models = _team_world(False)
+    flow = Flow(key)
+
+    # The holder's private model suits the holder's agents, not bob's.
+    responses, listings = _batch_flow(
+        flow, agents, dict.fromkeys(agents, models["private"])
+    )
+    assert [resp.status_code for resp in responses] == [200, 200, 400]
+    assert responses[2].json()["error"]["details"]["models"] == [
+        {
+            "slot": "visual",
+            "model_id": models["private"],
+            "reason": "owner_cannot_use",
+            "owner_user_id": bob,
+        }
+    ]
+    # bob's listing, already read, marks it, so the client picks a shared model.
+    marks = {row["id"]: row["owner_can_use"] for row in listings[1]}
+    assert marks[models["private"]] is False and marks[models["system"]] is True
+    responses[2] = flow.send(
+        "PATCH",
+        f"/v1/agents/{agents[2]}",
+        json={"models": {"visual": models["system"]}},
+    )
+    _assert_reads_match(flow, agents, responses)
+
+    # The refused request costs one more request than the shared-model flow.
+    assert flow.count == 1 + 2 + 2 + 3 + 3 + 1
+
+
+def test_batch_client_flow_when_the_owner_left_the_team():
+    # Known exception to the baseline: this agent has to be saved in the web app.
+    key, _alice, bob, agents, models = _team_world(True)
+    flow = Flow(key)
+
+    resp = flow.send(
+        "PATCH",
+        f"/v1/agents/{agents[2]}",
+        json={"models": {"visual": models["team-admin"]}},
+    )
+
+    error = _error(resp, 400, "invalid_input")
+    assert error["details"]["models"] == [
+        {
+            "slot": "visual",
+            "model_id": models["team-admin"],
+            "reason": "owner_cannot_use",
+            "owner_user_id": bob,
+        }
+    ]

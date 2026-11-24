@@ -10,9 +10,11 @@ on:
       - 'src/xagent/web/services/agent_management.py'
       - 'src/xagent/web/services/model_service.py'
       - 'src/xagent/web/services/agent_store.py'
+      - 'src/xagent/web/services/agent_host_settings.py'
       - 'src/xagent/web/services/agent_team_scope.py'
       - 'src/xagent/web/services/hot_path_cache.py'
       - 'src/xagent/web/services/llm_utils.py'
+      - 'src/xagent/web/services/workforce_snapshot.py'
       - 'src/xagent/web/models/__init__.py'
       - 'src/xagent/web/models/agent.py'
       - 'src/xagent/web/models/model.py'
@@ -21,6 +23,7 @@ on:
       - 'src/xagent/core/model/storage/db/db_models.py'
       - 'tests/web/api/v1/test_agent_detail.py'
       - 'tests/web/api/v1/test_models_listing.py'
+      - 'tests/web/api/v1/test_agent_update.py'
       - 'tests/web/api/v1/test_management.py'
       - 'tests/web/api/v1/test_skills.py'
       - 'tests/conftest.py'
@@ -40,9 +43,11 @@ on:
       - 'src/xagent/web/services/agent_management.py'
       - 'src/xagent/web/services/model_service.py'
       - 'src/xagent/web/services/agent_store.py'
+      - 'src/xagent/web/services/agent_host_settings.py'
       - 'src/xagent/web/services/agent_team_scope.py'
       - 'src/xagent/web/services/hot_path_cache.py'
       - 'src/xagent/web/services/llm_utils.py'
+      - 'src/xagent/web/services/workforce_snapshot.py'
       - 'src/xagent/web/models/__init__.py'
       - 'src/xagent/web/models/agent.py'
       - 'src/xagent/web/models/model.py'
@@ -51,6 +56,7 @@ on:
       - 'src/xagent/core/model/storage/db/db_models.py'
       - 'tests/web/api/v1/test_agent_detail.py'
       - 'tests/web/api/v1/test_models_listing.py'
+      - 'tests/web/api/v1/test_agent_update.py'
       - 'tests/web/api/v1/test_management.py'
       - 'tests/web/api/v1/test_skills.py'
       - 'tests/conftest.py'
@@ -98,7 +104,7 @@ jobs:
           XAGENT_TEST_POSTGRES_URL: postgresql://xagent:xagent_test@localhost:5432/xagent_test
         shell: bash
         run: |
-          uv run --frozen pytest tests/web/api/v1/test_agent_detail.py tests/web/api/v1/test_models_listing.py -m postgresql -v 2>&1 | tee pg.log
+          uv run --frozen pytest tests/web/api/v1/test_agent_detail.py tests/web/api/v1/test_models_listing.py tests/web/api/v1/test_agent_update.py -m postgresql -v 2>&1 | tee pg.log
           if grep -Eq '(^|[^0-9])[0-9]+ skipped' pg.log; then
             echo "::error::Postgres-only cells were skipped; skipped is not passed"
             exit 1

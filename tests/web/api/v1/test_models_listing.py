@@ -20,16 +20,20 @@ from sqlalchemy.orm import sessionmaker
 from tests.shared.postgres_disposable import disposable_database_factory
 from xagent.web import models as _all_models  # noqa: F401  (registers every table)
 from xagent.web.api.v1.models import list_models
+from xagent.web.models.agent import Agent
 from xagent.web.models.database import Base
 from xagent.web.models.model import Model
 from xagent.web.models.user import User, UserModel
-from xagent.web.schemas.v1 import V1Model
+from xagent.web.schemas.v1 import V1Model, V1ModelForAgent
 from xagent.web.services import agent_management
 from xagent.web.services.agent_management import (
     AgentManagementService,
     InvalidAgentModelConfigError,
 )
-from xagent.web.services.agent_team_scope import set_agent_team_scope_hook
+from xagent.web.services.agent_team_scope import (
+    AgentTeamScope,
+    set_agent_team_scope_hook,
+)
 from xagent.web.services.model_service import (
     set_model_visibility_hook,
     set_visible_user_ids_hook,
@@ -39,10 +43,12 @@ from xagent.web.services.model_service import (
 from ..conftest import _direct_db_session, client
 from .test_agent_detail import (
     _CELL_NAMES,
+    NOT_FOUND,
     _add_model,
     _add_user,
     _build_world,
     _get,
+    _seed_agent,
     _set_models,
     _user_id,
 )
@@ -71,8 +77,9 @@ def _reset_hooks():
     set_agent_team_scope_hook(None)
 
 
-def _list(key: str):
-    return client.get("/v1/models", headers=_bearer(key))
+def _list(key: str, agent_id: Any = None):
+    params = {} if agent_id is None else {"agent_id": agent_id}
+    return client.get("/v1/models", headers=_bearer(key), params=params)
 
 
 def _set_columns(model_pk: int, **columns: Any) -> None:
@@ -183,8 +190,9 @@ def test_abilities_are_listed_as_strings(stored, listed):
     assert row["abilities"] == listed
 
 
-def test_every_model_field_is_described():
-    assert all(field.description for field in V1Model.model_fields.values())
+@pytest.mark.parametrize("schema", [V1Model, V1ModelForAgent])
+def test_every_model_field_is_described(schema):
+    assert all(field.description for field in schema.model_fields.values())
 
 
 # ===== which models are listed =====
@@ -251,6 +259,92 @@ def _statements(engine: Any, call: Callable[[], Any]) -> tuple[Any, int]:
     finally:
         event.remove(engine, "before_cursor_execute", capture)
     return result, len(seen)
+
+
+def _owned_by_another_user(factory: Any, holder_id: int) -> int:
+    """A team agent the holder manages and another user owns."""
+    scope = AgentTeamScope(team_id=1, is_team_admin=False)
+    set_agent_team_scope_hook(
+        lambda _db, user_id: scope if int(user_id) == holder_id else None
+    )
+    with factory() as db:
+        owner = User(username="owner", password_hash="x", is_admin=False)
+        db.add(owner)
+        db.flush()
+        agent = Agent(user_id=owner.id, name="team agent", team_id=1)
+        db.add(agent)
+        db.commit()
+        return int(agent.id)
+
+
+def test_agent_listing_query_count_does_not_grow_with_models():
+    from xagent.web.models.database import get_session_local
+
+    factory = get_session_local()
+    holder_id = _seed_shared_json_models(factory, 0, 3)
+    agent_id = _owned_by_another_user(factory, holder_id)
+    rows, small_count = _statements(
+        factory.kw["bind"], lambda: _call_list(holder_id, agent_id)
+    )
+    assert [row.category for row in rows] == ["llm", "llm"]
+    assert [row.owner_can_use for row in rows] == [True, True]
+
+    _seed_shared_json_models(factory, 3, 30)
+    rows, large_count = _statements(
+        factory.kw["bind"], lambda: _call_list(holder_id, agent_id)
+    )
+
+    assert len(rows) == 15
+    assert small_count > 0 and small_count == large_count
+
+
+# ===== the listing for one agent =====
+
+
+@pytest.mark.parametrize("kind", _KEY_KINDS)
+def test_agent_listing_accepts_only_a_live_personal_key(kind):
+    resp = client.get("/v1/models?agent_id=1", headers=_headers_for(kind))
+
+    _error(resp, 401, "invalid_api_key")
+
+
+@pytest.mark.parametrize("holder_is_owner", [True, False], ids=["H=O", "H!=O"])
+def test_agent_listing_marks_what_the_owner_can_use(holder_is_owner):
+    world = _build_world(holder_is_owner)
+    named = {pk: name for name, pk in world.models.items()}
+
+    resp = _list(world.key, world.agent_id)
+
+    assert resp.status_code == 200, resp.text
+    rows = resp.json()
+    # Only chat models the holder can use, each marked for the owner. A model
+    # the owner cannot use is marked, not left out.
+    assert {named[row["id"]]: row["owner_can_use"] for row in rows} == (
+        {"m1": True, "m2": True, "m3": True, "m4": True}
+        if holder_is_owner
+        else {"m1": False, "m3": True, "m4": True}
+    )
+    assert all(set(row) == MODEL_KEYS | {"owner_can_use"} for row in rows)
+    assert all(type(row["owner_can_use"]) is bool for row in rows)
+    # The listing without an agent never carries the mark.
+    plain = _list(world.key).json()
+    assert plain and all(set(row) == MODEL_KEYS for row in plain)
+
+
+@pytest.mark.parametrize("bad", ["0", "-1", str(2**31), "abc"])
+def test_agent_listing_refuses_an_id_out_of_range(bad):
+    world = _build_world(False)
+    _error(_list(world.key, bad), 422, "invalid_input")
+
+
+def test_an_agent_the_holder_cannot_manage_is_not_found():
+    world = _build_world(False)
+    someone_elses = _seed_agent(_user_id("tess"))
+
+    hidden = _list(world.key, someone_elses)
+
+    assert hidden.status_code == 404 and hidden.json() == NOT_FOUND
+    assert hidden.content == _list(world.key, 999_999).content
 
 
 # ===== read failures are errors, not empty answers =====
@@ -333,13 +427,14 @@ def _seed_shared_json_models(factory: Any, start: int, stop: int) -> int:
         return users["holder"]
 
 
-def _call_list(holder_id: int) -> list[Any]:
+def _call_list(holder_id: int, agent_id: int | None = None) -> list[Any]:
     return asyncio.run(
         list_models(
+            agent_id=agent_id,
             authed=(
                 SimpleNamespace(id=holder_id),
                 SimpleNamespace(key_prefix="xag_personal_t"),
-            )
+            ),
         )
     )
 

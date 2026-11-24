@@ -1,9 +1,9 @@
 """Integration tests for ``PATCH /v1/agents/{agent_id}`` (name, description, instructions).
 
 The route changes the three text fields through the write the web app uses.
-Every refusal leaves the agent row, the agent cache and the log untouched, and
-a failure after the commit is reported as an unknown outcome while the stored
-change stays.
+Every refusal leaves the agent row, the agent cache and the log untouched. A
+failure inside the write is reported as an unknown outcome, a failure reading
+the response after the write is not, and in both the stored change stays.
 """
 
 from __future__ import annotations
@@ -415,8 +415,10 @@ def test_update_writes_once_through_update_agent_fields(monkeypatch, body, writt
 
     assert _patch(holder, agent_id, body).status_code == 200
 
-    # The agent is read once, and under the row lock.
-    assert [kw.get("for_update") for kw, _agent in reads] == [True]
+    # The agent is read under the row lock and, after a write, once more
+    # without it for the response.
+    expected_reads = [True, None] if written else [True]
+    assert [kw.get("for_update") for kw, _agent in reads] == expected_reads
     locked = reads[0][1]
     assert locked is not None
     if not written:
@@ -428,24 +430,27 @@ def test_update_writes_once_through_update_agent_fields(monkeypatch, body, writt
     assert kwargs["agent"] is locked
 
 
-def _after_team_scope(monkeypatch: pytest.MonkeyPatch, act) -> list[int]:
-    """Run ``act`` once right after the update has read the holder's team scope.
+def _before_the_lock(monkeypatch: pytest.MonkeyPatch, act) -> list[int]:
+    """Run ``act`` once right before the update takes its first lock.
 
-    That is the last step before the row lock, so what ``act`` does is
-    something that happens between the request being accepted and the agent
-    being read under the lock.
+    On SQLite that is the database write lock, taken before anything is read,
+    so what ``act`` does is something that happens between the request being
+    accepted and the update reading the agent.
     """
     ran: list[int] = []
-    real = agent_management.get_agent_team_scope
+    real = agent_management.begin_sqlite_write_transaction
 
-    def get_agent_team_scope(db, user_id):
-        scope = real(db, user_id)
+    def begin_sqlite_write_transaction(db):
         if not ran:
             act()
             ran.append(1)
-        return scope
+        real(db)
 
-    monkeypatch.setattr(agent_management, "get_agent_team_scope", get_agent_team_scope)
+    monkeypatch.setattr(
+        agent_management,
+        "begin_sqlite_write_transaction",
+        begin_sqlite_write_transaction,
+    )
     return ran
 
 
@@ -468,7 +473,7 @@ def test_access_lost_before_the_lock_refuses_the_update(monkeypatch, caplog):
         lambda _db, user_id: scope if int(user_id) == holder.user_id else None
     )
     agent_id = _seed(bob, team_id=1, description="d")
-    ran = _after_team_scope(
+    ran = _before_the_lock(
         monkeypatch, lambda: _set_columns(agent_id, visibility="admins")
     )
     with patch(CACHE_CLEAR) as cleared, caplog.at_level(logging.INFO):
@@ -609,6 +614,153 @@ def test_update_response_equals_next_get(body):
 
     assert resp.status_code == 200 and read.status_code == 200
     assert resp.json() == read.json()
+
+
+# ===== the response after the write =====
+
+
+def test_agent_hidden_after_the_commit_returns_404(caplog):
+    """A team admin makes the agent admins-only between the update's commit
+    and its response: the change stays stored and the member gets 404."""
+    holder = Holder()
+    bob = _add_user("bob")
+    scope = AgentTeamScope(team_id=1, is_team_admin=False)
+    set_agent_team_scope_hook(
+        lambda _db, user_id: scope if int(user_id) == holder.user_id else None
+    )
+    agent_id = _seed(bob, team_id=1, instructions="team text")
+    missing = _patch(holder, 999_999, {"description": "changed"})
+    real_refresh = Session.refresh
+    ran: list[int] = []
+
+    def refresh(self, instance, *args, **kwargs):
+        if not ran and isinstance(instance, Agent):
+            ran.append(1)
+            _set_columns(agent_id, visibility="admins", instructions="ADMIN-ONLY")
+        return real_refresh(self, instance, *args, **kwargs)
+
+    with patch.object(Session, "refresh", refresh), caplog.at_level(logging.INFO):
+        resp = _patch(holder, agent_id, {"description": "changed"})
+
+    assert ran == [1], "the admin's change did not happen"
+    assert missing.status_code == 404
+    assert resp.status_code == 404 and resp.content == missing.content
+    row = _row(agent_id)
+    assert row["description"] == "changed" and row["instructions"] == "ADMIN-ONLY"
+    assert len(_update_records(caplog)) == 1
+    assert _update_records(caplog, UNKNOWN_LOG) == []
+
+
+def test_response_comes_from_one_read_after_the_commit():
+    """Another writer changes the agent after the update's commit: every
+    response field, ``unresolved_models`` included, shows that writer's row."""
+    holder = Holder()
+    agent_id = _seed(holder.user_id, instructions="before")
+    real_write = AgentStore.update_agent_fields
+
+    def write_then_another_writer(self, *args, **kwargs):
+        written = real_write(self, *args, **kwargs)
+        _set_columns(
+            agent_id, instructions="another writer", models={"general": 999_999}
+        )
+        return written
+
+    with patch.object(AgentStore, "update_agent_fields", write_then_another_writer):
+        resp = _patch(holder, agent_id, {"description": "changed"})
+
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["description"] == "changed"
+    assert body["instructions"] == "another writer"
+    assert body["models"] == {"general": 999_999}
+    assert body["unresolved_models"] == ["general"]
+
+
+def test_failure_reading_the_response_after_the_commit(caplog):
+    """The change is stored and logged at INFO before the response is read,
+    so a failure there is not an unknown outcome."""
+    holder = Holder()
+    agent_id = _seed(holder.user_id, **_STORED)
+    boom = OperationalError("SELECT secret_table", {}, Exception("secret detail"))
+    real_get = AgentStore.get_owned_agent
+
+    def get_owned_agent(self, *args, **kwargs):
+        if not kwargs.get("for_update"):
+            raise boom
+        return real_get(self, *args, **kwargs)
+
+    with (
+        patch.object(AgentStore, "get_owned_agent", get_owned_agent),
+        caplog.at_level(logging.INFO),
+    ):
+        resp = _patch(holder, agent_id, {"instructions": "changed"})
+
+    _error(resp, 500, "internal_error")
+    assert _row(agent_id)["instructions"] == "changed"
+    assert [record.args for record in _update_records(caplog)] == [
+        (holder.prefix, holder.user_id, agent_id, "instructions")
+    ]
+    assert _update_records(caplog, UNKNOWN_LOG) == []
+
+
+def test_sqlite_write_lock_serializes_length_decisions():
+    """Two updates of a 15000-character text, to 10000 and to 14000: the
+    second waits for the first's write lock, then reads 10000 and is refused.
+
+    SQLite ignores the row lock, so this holds only because the update takes
+    SQLite's write lock before it reads anything.
+    """
+    holder = Holder()
+    agent_id = _seed(holder.user_id, instructions="x" * 15_000)
+    first_read, release_first = threading.Event(), threading.Event()
+    second_started, second_read = threading.Event(), threading.Event()
+    real_get = AgentStore.get_owned_agent
+    outcomes: dict[str, Any] = {}
+
+    def get_owned_agent(self, *args, **kwargs):
+        agent = real_get(self, *args, **kwargs)
+        if kwargs.get("for_update"):
+            if threading.current_thread().name == "first":
+                first_read.set()
+                assert release_first.wait(10)
+            else:
+                second_read.set()
+        return agent
+
+    def run(length: int) -> None:
+        name = threading.current_thread().name
+        if name == "second":
+            second_started.set()
+        try:
+            AgentManagementRuntime._update_agent_sync(
+                user_id=holder.user_id,
+                key_prefix=holder.prefix,
+                agent_id=agent_id,
+                changes={"instructions": name[0] * length},
+            )
+            outcomes[name] = "ok"
+        except Exception as exc:  # noqa: BLE001
+            outcomes[name] = exc
+
+    first = threading.Thread(target=run, args=(10_000,), name="first")
+    second = threading.Thread(target=run, args=(14_000,), name="second")
+    with patch.object(AgentStore, "get_owned_agent", get_owned_agent):
+        first.start()
+        try:
+            assert first_read.wait(10)
+            second.start()
+            assert second_started.wait(10)
+            # While the first holds the write lock the second may not read.
+            read_too_early = second_read.wait(1.0)
+        finally:
+            release_first.set()
+            first.join(15)
+            second.join(15)
+
+    assert not read_too_early
+    assert outcomes["first"] == "ok"
+    assert isinstance(outcomes["second"], agent_management.AgentTextTooLongError)
+    assert _row(agent_id)["instructions"] == "f" * 10_000
 
 
 # ===== nothing else is touched =====

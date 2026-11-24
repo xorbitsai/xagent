@@ -421,11 +421,20 @@ class V1AgentUpdateRequest(BaseModel):
 
     A new task uses the changed agent at once. A task that already runs keeps
     the previous text while its cached agent runtime is alive, which depends on
-    the task's state. Changing ``instructions`` also rejects the next turn of
-    an ongoing workforce conversation that includes this agent with
-    ``workforce_config_changed``. A 500 response can arrive after the change
-    was stored. Sending the same request again is safe: it returns the agent
-    as it is now and writes nothing if the change is already there.
+    the task's state.
+
+    Changing ``instructions`` also rejects, with ``workforce_config_changed``,
+    the next turn of an ongoing workforce conversation in which this agent is
+    the manager or an enabled worker. A preview conversation in the workforce
+    builder is not checked, and neither is a conversation that started before
+    the check, or under an earlier version of it.
+
+    The agent is read again for the response after the change is stored. If
+    the key holder can no longer see it then, the response is 404
+    ``agent_not_found``, as for an agent that does not exist, although the
+    change is stored. A 500 response can also arrive after the change was
+    stored. Sending the same request again is safe: it writes nothing if the
+    change is already there.
     """
 
     model_config = ConfigDict(extra="forbid")

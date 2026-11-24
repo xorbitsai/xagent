@@ -287,7 +287,8 @@ async def update_agent(
     """Change the name, description or instructions of an agent the holder can see.
 
     Only the fields sent are changed. The response is the configuration after
-    the change.
+    the change, read again once it is stored. It is 404 if the holder can no
+    longer see the agent by then, although the change is stored.
     """
     user, key = authed
     _reject_null_fields(request)

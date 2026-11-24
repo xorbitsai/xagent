@@ -23,6 +23,7 @@ from ...core.utils.api_key import (
     generate_api_key,
 )
 from ...core.utils.type_check import ensure_list
+from ...db.sqlite import begin_sqlite_write_transaction
 from ...templates.manager import TemplateManager
 from ..models.agent import (
     AGENT_NAME_UNIQUE_INDEX,
@@ -1370,14 +1371,17 @@ class AgentManagementRuntime:
         """Change the name, description or instructions of an agent.
 
         ``changes`` holds the fields the request sent, each with its new
-        value. Returns the configuration as it is after the change, or
-        ``None`` when the user cannot see the agent; that is decided under the
-        row lock the write takes. Only a field whose value differs from the
-        stored one is written, and nothing is written, cleared from the cache
-        or logged when none does. A text field may not grow past its limit
-        (:class:`AgentTextTooLongError`) and a new name may not be taken
-        (:class:`DuplicateAgentNameError`). The write is the one the web app
-        uses; see :meth:`_update_agent_sync` for the failure contract.
+        value. Returns ``None`` when the user cannot see the agent, decided
+        under the lock the write takes. Otherwise returns the configuration
+        as it is after the change, read again after the write with the same
+        visibility rule; when the user can no longer see the agent by then,
+        ``None`` is returned although the change is stored. Only a field whose
+        value differs from the stored one is written, and nothing is written,
+        cleared from the cache or logged when none does. A text field may not
+        grow past its limit (:class:`AgentTextTooLongError`) and a new name
+        may not be taken (:class:`DuplicateAgentNameError`). The write is the
+        one the web app uses; see :meth:`_update_agent_sync` for the locks and
+        the failure contract.
         """
         return await run_db_io_cancellation_safe(
             lambda: self._update_agent_sync(
@@ -1396,7 +1400,19 @@ class AgentManagementRuntime:
         agent_id: int,
         changes: dict[str, str],
     ) -> AgentDetailSnapshot | None:
-        """Decide and write in one locked transaction, then log.
+        """Decide and write in one locked transaction, log, then read again.
+
+        The decisions are made under a lock held until the commit: the row
+        lock on the agent, and on SQLite, which ignores that lock, the
+        database's write lock, taken before the first read. When another
+        writer holds the SQLite write lock past the busy timeout, this fails
+        before reading anything and nothing is written.
+
+        The commit releases the lock, so after a write the agent is read again
+        with the visibility rule and team scope of the first read, and the
+        response, ``unresolved_models`` included, comes from that read alone.
+        ``None`` is returned when that read finds nothing, although the change
+        is stored.
 
         A cancelled request does not stop this worker, so both log lines are
         written here, not after the awaiting caller resumes. The lines carry
@@ -1404,11 +1420,15 @@ class AgentManagementRuntime:
 
         An exception from the write may have come before or after the commit,
         which cannot be told apart here, so it is logged as an unknown outcome
-        and re-raised. Retrying the same request is safe: a change that was
+        and re-raised. An exception from the read after the write comes after
+        the change was stored and logged at INFO, and is re-raised without a
+        line of its own. Retrying the same request is safe: a change that was
         stored shows no difference and writes nothing.
         """
         SessionLocal = get_session_local()
         with SessionLocal() as db:
+            # First, before any read: SQLite ignores the row lock below.
+            begin_sqlite_write_transaction(db)
             team_scope = get_agent_team_scope(db, user_id)
             store = AgentStore(db)
             agent = store.get_owned_agent(
@@ -1436,10 +1456,6 @@ class AgentManagementRuntime:
                 ):
                     raise DuplicateAgentNameError()
                 fields = ",".join(sorted(updates))
-                # Computed before the write so that nothing after the commit
-                # reads the database. The models are not part of this update,
-                # so the stored ones are what the response reflects.
-                unresolved = unresolved_models(db, agent, user_id)
                 try:
                     store.update_agent_fields(
                         user_id,
@@ -1471,11 +1487,18 @@ class AgentManagementRuntime:
                     agent_id,
                     fields,
                 )
-            else:
-                unresolved = unresolved_models(db, agent, user_id)
+                # The commit released the lock, so another writer may have
+                # changed the row since, its visibility included. A query does
+                # not overwrite the attributes of an object the session holds,
+                # so the session's copy is expired before the agent is read
+                # again.
+                db.expire(agent)
+                agent = store.get_owned_agent(user_id, agent_id, team_scope)
+                if agent is None:
+                    return None
             return AgentDetailSnapshot(
                 agent=_agent_response_snapshot(store.agent_to_response_dict(agent)),
-                unresolved_models=unresolved,
+                unresolved_models=unresolved_models(db, agent, user_id),
             )
 
     async def list_usable_models(

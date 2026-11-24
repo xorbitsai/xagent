@@ -40,12 +40,12 @@ from xagent.web.services.managed_task_lease import (
     finalize_managed_task_lease_result_sync,
     start_managed_task_lease,
 )
-from xagent.web.services.task_settlement_report import SettlementReport
 from xagent.web.services.task_lease_service import (
     TaskLease,
     TaskLeaseHeartbeatOutcome,
     acquire_task_lease,
 )
+from xagent.web.services.task_settlement_report import SettlementReport
 
 
 @pytest.fixture()

@@ -210,6 +210,195 @@ export function signedUploadsFromRows(rows: SignedUploadRow[]): Record<string, u
   return entries
 }
 
+interface RowFieldsProps {
+  row: SignedUploadRow
+  fieldId: (field: string) => string
+  update: (patch: Partial<SignedUploadRow>) => void
+}
+
+// The inputs of a link row: the tool that takes the link and the argument
+// that receives it.
+function LinkFields({ row, fieldId, update }: RowFieldsProps) {
+  const { t } = useI18n()
+  return (
+    <>
+      <div className="space-y-2">
+        <Label htmlFor={fieldId("toolName")}>
+          {t("tools.mcp.signedUploads.linkToolName")}
+        </Label>
+        <Input
+          id={fieldId("toolName")}
+          value={row.toolName}
+          onChange={(event) => update({ toolName: event.target.value })}
+        />
+      </div>
+      <div className="space-y-2">
+        <Label htmlFor={fieldId("linkArgument")}>
+          {t("tools.mcp.signedUploads.linkArgument")}
+        </Label>
+        <Input
+          id={fieldId("linkArgument")}
+          value={row.linkArgument}
+          onChange={(event) =>
+            update({ linkArgument: event.target.value })}
+        />
+      </div>
+      <p className="text-xs text-slate-500">
+        {t("tools.mcp.signedUploads.linkNamesNotCheckedHint")}
+      </p>
+    </>
+  )
+}
+
+// The inputs of a replacement or an issuer row. Only a replacement row has
+// the tool that takes the file and its file argument; both have the issuing
+// tool and the upload rules.
+function UploadFields({
+  row,
+  fieldId,
+  update,
+  nextRowId,
+}: RowFieldsProps & { nextRowId: () => string }) {
+  const { t } = useI18n()
+  return (
+    <>
+      {row.mode === "replacement" && (
+        <>
+          <div className="space-y-2">
+            <Label htmlFor={fieldId("toolName")}>
+              {t("tools.mcp.signedUploads.toolName")}
+            </Label>
+            <Input
+              id={fieldId("toolName")}
+              value={row.toolName}
+              onChange={(event) => update({ toolName: event.target.value })}
+            />
+          </div>
+          <div className="space-y-2">
+            <Label htmlFor={fieldId("fileArgument")}>
+              {t("tools.mcp.signedUploads.fileArgument")}
+            </Label>
+            <Input
+              id={fieldId("fileArgument")}
+              value={row.fileArgument}
+              onChange={(event) =>
+                update({ fileArgument: event.target.value })}
+            />
+          </div>
+        </>
+      )}
+      <div className="space-y-2">
+        <Label htmlFor={fieldId("issuingToolName")}>
+          {t("tools.mcp.signedUploads.issuingToolName")}
+        </Label>
+        <Input
+          id={fieldId("issuingToolName")}
+          value={row.issuingToolName}
+          onChange={(event) =>
+            update({ issuingToolName: event.target.value })}
+        />
+      </div>
+      <p className="text-xs text-slate-500">
+        {t("tools.mcp.signedUploads.toolNamesHint")}
+      </p>
+      <p className="text-xs text-slate-500">
+        {t("tools.mcp.signedUploads.namesNotCheckedHint")}
+      </p>
+
+      <div className="space-y-2">
+        <Label htmlFor={fieldId("allowedUploadHosts")}>
+          {t("tools.mcp.signedUploads.allowedUploadHosts")}
+        </Label>
+        <Textarea
+          id={fieldId("allowedUploadHosts")}
+          value={row.hostsText}
+          placeholder="uploads.example.test"
+          onChange={(event) => update({ hostsText: event.target.value })}
+        />
+        <p className="text-xs text-slate-500">
+          {t("tools.mcp.signedUploads.allowedUploadHostsHint")}
+        </p>
+      </div>
+
+      <div className="space-y-2">
+        <Label htmlFor={fieldId("uploadPathPrefix")}>
+          {t("tools.mcp.signedUploads.uploadPathPrefix")}
+        </Label>
+        <Input
+          id={fieldId("uploadPathPrefix")}
+          value={row.uploadPathPrefix}
+          placeholder="/uploads/"
+          onChange={(event) =>
+            update({ uploadPathPrefix: event.target.value })}
+        />
+      </div>
+
+      <div className="space-y-2">
+        <Label>{t("tools.mcp.signedUploads.contentTypes")}</Label>
+        {row.contentTypes.map((item) => (
+          <div key={item.id} className="flex items-center gap-2">
+            <Input
+              aria-label={t("tools.mcp.signedUploads.extension")}
+              value={item.extension}
+              placeholder=".pdf"
+              className="flex-1"
+              onChange={(event) =>
+                update({
+                  contentTypes: row.contentTypes.map((other) =>
+                    other.id === item.id
+                      ? { ...other, extension: event.target.value }
+                      : other),
+                })}
+            />
+            <Input
+              aria-label={t("tools.mcp.signedUploads.contentType")}
+              value={item.contentType}
+              placeholder="application/pdf"
+              className="flex-1"
+              onChange={(event) =>
+                update({
+                  contentTypes: row.contentTypes.map((other) =>
+                    other.id === item.id
+                      ? { ...other, contentType: event.target.value }
+                      : other),
+                })}
+            />
+            <Button
+              type="button"
+              variant="ghost"
+              size="sm"
+              className="text-red-500 hover:text-red-700"
+              aria-label={t("tools.mcp.signedUploads.removeContentType")}
+              title={t("tools.mcp.signedUploads.removeContentType")}
+              onClick={() =>
+                update({
+                  contentTypes: row.contentTypes.filter((other) => other.id !== item.id),
+                })}
+            >
+              <Trash2 className="h-4 w-4" />
+            </Button>
+          </div>
+        ))}
+        <Button
+          type="button"
+          variant="outline"
+          size="sm"
+          onClick={() =>
+            update({
+              contentTypes: [
+                ...row.contentTypes,
+                { id: nextRowId(), extension: "", contentType: "" },
+              ],
+            })}
+        >
+          <Plus className="h-4 w-4 mr-2" />
+          {t("tools.mcp.signedUploads.addContentType")}
+        </Button>
+      </div>
+    </>
+  )
+}
+
 /**
  * The "File uploads" section of the custom MCP form. It reads and writes
  * formData.signed_uploads and shows formData.signed_uploads_error. Mounting
@@ -267,13 +456,6 @@ export function SignedUploadsForm({
     }
   }
 
-  const updateContentTypes = (
-    row: SignedUploadRow,
-    contentTypes: SignedUploadContentTypeRow[],
-  ) => {
-    updateRow(row.id, { contentTypes })
-  }
-
   const clearSettings = () => {
     const next: Record<string, unknown>[] = []
     setRows([])
@@ -317,6 +499,7 @@ export function SignedUploadsForm({
           <div className="space-y-3">
             {rows.map((row) => {
               const fieldId = (field: string) => `signed-upload-${row.id}-${field}`
+              const update = (patch: Partial<SignedUploadRow>) => updateRow(row.id, patch)
               return (
                 <div key={row.id} className="space-y-3 rounded-md border bg-white p-3">
                   <div className="flex items-center justify-between gap-2">
@@ -353,218 +536,60 @@ export function SignedUploadsForm({
                       />
                     </div>
                   ) : (
-                  <>
-                  <div className="space-y-2">
-                    <Label id={fieldId("mode")}>{t("tools.mcp.signedUploads.mode")}</Label>
-                    <RadioGroup
-                      aria-labelledby={fieldId("mode")}
-                      value={row.mode}
-                      disabled={disabled}
-                      onValueChange={(value) =>
-                        updateMode(
-                          row,
-                          value === "issuer" || value === "link" ? value : "replacement",
-                        )}
-                    >
-                      <div className="flex items-center space-x-2">
-                        <RadioGroupItem value="replacement" id={fieldId("modeReplacement")} />
-                        <Label
-                          htmlFor={fieldId("modeReplacement")}
-                          className="font-normal cursor-pointer"
-                        >
-                          {t("tools.mcp.signedUploads.modeReplacement")}
-                        </Label>
-                      </div>
-                      <div className="flex items-center space-x-2">
-                        <RadioGroupItem value="issuer" id={fieldId("modeIssuer")} />
-                        <Label htmlFor={fieldId("modeIssuer")} className="font-normal cursor-pointer">
-                          {t("tools.mcp.signedUploads.modeIssuer")}
-                        </Label>
-                      </div>
-                      <div className="flex items-center space-x-2">
-                        <RadioGroupItem value="link" id={fieldId("modeLink")} />
-                        <Label htmlFor={fieldId("modeLink")} className="font-normal cursor-pointer">
-                          {t("tools.mcp.signedUploads.modeLink")}
-                        </Label>
-                      </div>
-                    </RadioGroup>
-                    <p className="text-xs text-slate-500">
-                      {row.mode === "issuer"
-                        ? t("tools.mcp.signedUploads.modeIssuerHint")
-                        : row.mode === "link"
-                          ? t("tools.mcp.signedUploads.modeLinkHint")
-                          : t("tools.mcp.signedUploads.modeReplacementHint")}
-                    </p>
-                  </div>
-
-                  {row.mode === "link" && (
                     <>
                       <div className="space-y-2">
-                        <Label htmlFor={fieldId("toolName")}>
-                          {t("tools.mcp.signedUploads.linkToolName")}
-                        </Label>
-                        <Input
-                          id={fieldId("toolName")}
-                          value={row.toolName}
-                          onChange={(event) => updateRow(row.id, { toolName: event.target.value })}
-                        />
-                      </div>
-                      <div className="space-y-2">
-                        <Label htmlFor={fieldId("linkArgument")}>
-                          {t("tools.mcp.signedUploads.linkArgument")}
-                        </Label>
-                        <Input
-                          id={fieldId("linkArgument")}
-                          value={row.linkArgument}
-                          onChange={(event) =>
-                            updateRow(row.id, { linkArgument: event.target.value })}
-                        />
-                      </div>
-                      <p className="text-xs text-slate-500">
-                        {t("tools.mcp.signedUploads.linkNamesNotCheckedHint")}
-                      </p>
-                    </>
-                  )}
-
-                  {row.mode !== "link" && (
-                  <>
-                  {row.mode === "replacement" && (
-                    <>
-                      <div className="space-y-2">
-                        <Label htmlFor={fieldId("toolName")}>
-                          {t("tools.mcp.signedUploads.toolName")}
-                        </Label>
-                        <Input
-                          id={fieldId("toolName")}
-                          value={row.toolName}
-                          onChange={(event) => updateRow(row.id, { toolName: event.target.value })}
-                        />
-                      </div>
-                      <div className="space-y-2">
-                        <Label htmlFor={fieldId("fileArgument")}>
-                          {t("tools.mcp.signedUploads.fileArgument")}
-                        </Label>
-                        <Input
-                          id={fieldId("fileArgument")}
-                          value={row.fileArgument}
-                          onChange={(event) =>
-                            updateRow(row.id, { fileArgument: event.target.value })}
-                        />
-                      </div>
-                    </>
-                  )}
-                  <div className="space-y-2">
-                    <Label htmlFor={fieldId("issuingToolName")}>
-                      {t("tools.mcp.signedUploads.issuingToolName")}
-                    </Label>
-                    <Input
-                      id={fieldId("issuingToolName")}
-                      value={row.issuingToolName}
-                      onChange={(event) =>
-                        updateRow(row.id, { issuingToolName: event.target.value })}
-                    />
-                  </div>
-                  <p className="text-xs text-slate-500">
-                    {t("tools.mcp.signedUploads.toolNamesHint")}
-                  </p>
-                  <p className="text-xs text-slate-500">
-                    {t("tools.mcp.signedUploads.namesNotCheckedHint")}
-                  </p>
-
-                  <div className="space-y-2">
-                    <Label htmlFor={fieldId("allowedUploadHosts")}>
-                      {t("tools.mcp.signedUploads.allowedUploadHosts")}
-                    </Label>
-                    <Textarea
-                      id={fieldId("allowedUploadHosts")}
-                      value={row.hostsText}
-                      placeholder="uploads.example.test"
-                      onChange={(event) => updateRow(row.id, { hostsText: event.target.value })}
-                    />
-                    <p className="text-xs text-slate-500">
-                      {t("tools.mcp.signedUploads.allowedUploadHostsHint")}
-                    </p>
-                  </div>
-
-                  <div className="space-y-2">
-                    <Label htmlFor={fieldId("uploadPathPrefix")}>
-                      {t("tools.mcp.signedUploads.uploadPathPrefix")}
-                    </Label>
-                    <Input
-                      id={fieldId("uploadPathPrefix")}
-                      value={row.uploadPathPrefix}
-                      placeholder="/uploads/"
-                      onChange={(event) =>
-                        updateRow(row.id, { uploadPathPrefix: event.target.value })}
-                    />
-                  </div>
-
-                  <div className="space-y-2">
-                    <Label>{t("tools.mcp.signedUploads.contentTypes")}</Label>
-                    {row.contentTypes.map((item) => (
-                      <div key={item.id} className="flex items-center gap-2">
-                        <Input
-                          aria-label={t("tools.mcp.signedUploads.extension")}
-                          value={item.extension}
-                          placeholder=".pdf"
-                          className="flex-1"
-                          onChange={(event) =>
-                            updateContentTypes(
+                        <Label id={fieldId("mode")}>{t("tools.mcp.signedUploads.mode")}</Label>
+                        <RadioGroup
+                          aria-labelledby={fieldId("mode")}
+                          value={row.mode}
+                          disabled={disabled}
+                          onValueChange={(value) =>
+                            updateMode(
                               row,
-                              row.contentTypes.map((other) =>
-                                other.id === item.id
-                                  ? { ...other, extension: event.target.value }
-                                  : other),
-                            )}
-                        />
-                        <Input
-                          aria-label={t("tools.mcp.signedUploads.contentType")}
-                          value={item.contentType}
-                          placeholder="application/pdf"
-                          className="flex-1"
-                          onChange={(event) =>
-                            updateContentTypes(
-                              row,
-                              row.contentTypes.map((other) =>
-                                other.id === item.id
-                                  ? { ...other, contentType: event.target.value }
-                                  : other),
-                            )}
-                        />
-                        <Button
-                          type="button"
-                          variant="ghost"
-                          size="sm"
-                          className="text-red-500 hover:text-red-700"
-                          aria-label={t("tools.mcp.signedUploads.removeContentType")}
-                          title={t("tools.mcp.signedUploads.removeContentType")}
-                          onClick={() =>
-                            updateContentTypes(
-                              row,
-                              row.contentTypes.filter((other) => other.id !== item.id),
+                              value === "issuer" || value === "link" ? value : "replacement",
                             )}
                         >
-                          <Trash2 className="h-4 w-4" />
-                        </Button>
+                          <div className="flex items-center space-x-2">
+                            <RadioGroupItem value="replacement" id={fieldId("modeReplacement")} />
+                            <Label
+                              htmlFor={fieldId("modeReplacement")}
+                              className="font-normal cursor-pointer"
+                            >
+                              {t("tools.mcp.signedUploads.modeReplacement")}
+                            </Label>
+                          </div>
+                          <div className="flex items-center space-x-2">
+                            <RadioGroupItem value="issuer" id={fieldId("modeIssuer")} />
+                            <Label htmlFor={fieldId("modeIssuer")} className="font-normal cursor-pointer">
+                              {t("tools.mcp.signedUploads.modeIssuer")}
+                            </Label>
+                          </div>
+                          <div className="flex items-center space-x-2">
+                            <RadioGroupItem value="link" id={fieldId("modeLink")} />
+                            <Label htmlFor={fieldId("modeLink")} className="font-normal cursor-pointer">
+                              {t("tools.mcp.signedUploads.modeLink")}
+                            </Label>
+                          </div>
+                        </RadioGroup>
+                        <p className="text-xs text-slate-500">
+                          {row.mode === "issuer"
+                            ? t("tools.mcp.signedUploads.modeIssuerHint")
+                            : row.mode === "link"
+                              ? t("tools.mcp.signedUploads.modeLinkHint")
+                              : t("tools.mcp.signedUploads.modeReplacementHint")}
+                        </p>
                       </div>
-                    ))}
-                    <Button
-                      type="button"
-                      variant="outline"
-                      size="sm"
-                      onClick={() =>
-                        updateContentTypes(row, [
-                          ...row.contentTypes,
-                          { id: nextRowId(), extension: "", contentType: "" },
-                        ])}
-                    >
-                      <Plus className="h-4 w-4 mr-2" />
-                      {t("tools.mcp.signedUploads.addContentType")}
-                    </Button>
-                  </div>
-                  </>
-                  )}
-                  </>
+                      {row.mode === "link" ? (
+                        <LinkFields row={row} fieldId={fieldId} update={update} />
+                      ) : (
+                        <UploadFields
+                          row={row}
+                          fieldId={fieldId}
+                          update={update}
+                          nextRowId={nextRowId}
+                        />
+                      )}
+                    </>
                   )}
                 </div>
               )

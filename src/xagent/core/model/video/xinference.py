@@ -1341,6 +1341,13 @@ class XinferenceVideoModel(BaseVideoModel):
 
         effective_timeout = timeout if timeout is not None else self.timeout
 
+        has_image = bool(
+            input_reference
+            or image_url
+            or image
+            or first_frame_image_url
+            or last_frame_image_url
+        )
         if self.saas_api:
             return await self._generate_saas_video(
                 prompt=prompt,
@@ -1352,7 +1359,14 @@ class XinferenceVideoModel(BaseVideoModel):
                 allowed_local_media_roots=allowed_local_media_roots,
                 extra_references=kwargs,
                 seconds=seconds if seconds is not None else duration,
-                size=size or _size_from_resolution_ratio(resolution, ratio),
+                # With an image only an explicit size is sent; the server
+                # picks the one that matches the picture.
+                size=size
+                or (
+                    None
+                    if has_image
+                    else _size_from_resolution_ratio(resolution, ratio)
+                ),
                 resolution=resolution,
                 ratio=ratio,
                 seed=kwargs.get("seed"),

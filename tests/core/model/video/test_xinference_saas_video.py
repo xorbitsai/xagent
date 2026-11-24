@@ -359,6 +359,7 @@ async def test_saas_frame_download_failures_keep_their_category(
 ):
     from xagent.core.tools.core.media_errors import (
         INVALID_REQUEST,
+        PROVIDER_UNAVAILABLE,
         classify_media_failure,
     )
     from xagent.core.utils.public_download import PublicDownloadError
@@ -373,7 +374,30 @@ async def test_saas_frame_download_failures_keep_their_category(
         await _build().generate_video(
             prompt="a fox", input_reference="https://x.test/a.png"
         )
-    assert (classify_media_failure(err.value) == INVALID_REQUEST) is (
-        expected is MediaParameterError
+    expected_category = (
+        INVALID_REQUEST if expected is MediaParameterError else PROVIDER_UNAVAILABLE
     )
+    assert classify_media_failure(err.value) == expected_category
     assert transport["json"] == []
+
+
+async def test_saas_image_ignores_resolution_and_ratio_for_size(transport):
+    await _build().generate_video(
+        prompt="a fox", input_reference=FIRST, resolution="720p", ratio="16:9"
+    )
+    body = transport["json"][0]["body"]
+    assert "width" not in body and "height" not in body
+
+
+async def test_saas_explicit_size_is_still_sent_with_an_image(transport):
+    await _build().generate_video(
+        prompt="a fox", input_reference=FIRST, size="768x1344"
+    )
+    body = transport["json"][0]["body"]
+    assert (body["width"], body["height"]) == (768, 1344)
+
+
+async def test_saas_resolution_still_derives_size_without_an_image(transport):
+    await _build().generate_video(prompt="a fox", resolution="720p", ratio="16:9")
+    body = transport["json"][0]["body"]
+    assert (body["width"], body["height"]) == (1344, 768)

@@ -320,6 +320,74 @@ async def test_generate_video_converts_workspace_refs_to_data_urls_for_saas(
     mock_workspace.discard_staged_external_upload.assert_called_once_with(image_path)
 
 
+def _saas_tool(mock_workspace):
+    saas_model = XinferenceVideoModel(model_name="minimax-h3", saas_api=True)
+    saas_model.generate_video = AsyncMock(
+        return_value={"task_id": "t", "status": "succeeded", "video_url": ""}
+    )
+    tool = VideoGenerationToolCore(
+        {"saas": saas_model},
+        workspace=mock_workspace,
+        default_video_model=saas_model,
+    )
+    return tool, saas_model
+
+
+@pytest.mark.asyncio
+async def test_saas_image_with_resolution_alias_sends_no_derived_size(mock_workspace):
+    tool, model = _saas_tool(mock_workspace)
+
+    await tool.generate_video(
+        "Animate", input_reference="https://x.test/a.png", resolution="720p"
+    )
+
+    assert "size" not in model.generate_video.await_args.kwargs
+
+
+@pytest.mark.asyncio
+async def test_saas_text_only_resolution_alias_still_derives_size(mock_workspace):
+    tool, model = _saas_tool(mock_workspace)
+
+    await tool.generate_video("A fox", resolution="720p")
+
+    assert model.generate_video.await_args.kwargs["size"] == "1280x720"
+
+
+@pytest.mark.asyncio
+async def test_saas_image_keeps_an_explicit_size_or_ratio(mock_workspace):
+    tool, model = _saas_tool(mock_workspace)
+
+    await tool.generate_video(
+        "Animate", input_reference="https://x.test/a.png", size="768x1344"
+    )
+    assert model.generate_video.await_args.kwargs["size"] == "768x1344"
+
+    await tool.generate_video(
+        "Animate",
+        input_reference="https://x.test/a.png",
+        resolution="720p",
+        ratio="9:16",
+    )
+    assert model.generate_video.await_args.kwargs["size"] == "720x1280"
+
+
+@pytest.mark.asyncio
+async def test_saas_unloadable_workspace_ref_is_a_categorized_parameter_error(
+    mock_workspace,
+):
+    mock_workspace.stage_path_for_external_upload = Mock(
+        side_effect=ValueError("no such file id")
+    )
+    tool, model = _saas_tool(mock_workspace)
+
+    result = await tool.generate_video("Animate", image_url="file:missing")
+
+    assert result["success"] is False
+    assert result["error_category"] == "invalid_request"
+    assert "Ark" not in result["error"] and "missing" not in result["error"]
+    model.generate_video.assert_not_called()
+
+
 @pytest.mark.asyncio
 async def test_list_video_models_reports_lightning_by_running_uid(
     monkeypatch, mock_workspace

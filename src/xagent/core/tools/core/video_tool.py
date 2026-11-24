@@ -36,8 +36,10 @@ from ...workspace import TaskWorkspace
 from .media_errors import (
     INVALID_REQUEST,
     PROVIDER_UNAVAILABLE,
+    MediaParameterError,
     media_error_fields,
     media_failure_fields,
+    redact_provider_detail,
 )
 
 logger = logging.getLogger(__name__)
@@ -839,6 +841,27 @@ The generated video URL is temporary on the provider side, so completed videos a
             effective_size = size or self._size_from_resolution_ratio(
                 resolution, effective_ratio
             )
+            # The SaaS model sizes an image-to-video clip from the image, so a
+            # size derived from the default ratio and a resolution alias would
+            # only force a landscape canvas on a portrait picture. Only an
+            # explicit size or ratio is the caller's choice.
+            if (
+                not size
+                and not explicit_ratio
+                and isinstance(inner_video_model, XinferenceVideoModel)
+                and inner_video_model.saas_api
+                and any(
+                    _has_value(value)
+                    for value in (
+                        input_reference,
+                        image_url,
+                        image,
+                        first_frame_image_url,
+                        last_frame_image_url,
+                    )
+                )
+            ):
+                effective_size = None
             if effective_size:
                 generate_params["size"] = effective_size
                 derived_ratio = self._ratio_from_size(effective_size)
@@ -900,9 +923,32 @@ The generated video URL is temporary on the provider side, so completed videos a
                 # Workspace file references become data URLs through the same
                 # staging as Ark; the reference list is left for the model to
                 # refuse, since it only takes keyframes.
-                await self._prepare_ark_image_references(
-                    generate_params, convert_reference_list=False
-                )
+                try:
+                    await self._prepare_ark_image_references(
+                        generate_params, convert_reference_list=False
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "Could not load the image reference: %s",
+                        redact_provider_detail(e),
+                    )
+                    return {
+                        "success": False,
+                        **media_failure_fields(
+                            MediaParameterError(
+                                "The image reference could not be loaded; use an "
+                                "http(s) image URL, a data URL or an image file "
+                                "in the workspace",
+                                field="input_reference",
+                            ),
+                            logger=logger,
+                            action=(
+                                f"Video generation failed (model={actual_model_id})"
+                            ),
+                            model=video_model,
+                        ),
+                        "video_path": None,
+                    }
             if self._workspace and isinstance(inner_video_model, XinferenceVideoModel):
                 generate_params["allowed_local_media_roots"] = [
                     self._workspace.workspace_dir

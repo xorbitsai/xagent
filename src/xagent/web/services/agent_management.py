@@ -23,6 +23,7 @@ from ...core.utils.api_key import (
     generate_api_key,
 )
 from ...core.utils.type_check import ensure_list
+from ...db.sqlite import begin_sqlite_write_transaction
 from ...templates.manager import TemplateManager
 from ..models.agent import (
     AGENT_NAME_UNIQUE_INDEX,
@@ -36,6 +37,10 @@ from ..models.model import Model as DBModel
 from ..models.user import User
 from ..models.workforce import Workforce, WorkforceAgent, WorkforceRun
 from ..schemas.agent_api_key import APIKeyGenerateResponse
+from ..schemas.v1 import (
+    V1_AGENT_DESCRIPTION_MAX_CHARS,
+    V1_AGENT_INSTRUCTIONS_MAX_CHARS,
+)
 from ..services.agent_store import (
     AgentStore,
     UnsharedConnectorsError,
@@ -79,6 +84,19 @@ TEMPLATE_RESOLVE_RACE_RETRIES = 3
 
 class DuplicateAgentNameError(ValueError):
     """Raised when a user already owns an agent with the requested name."""
+
+
+class AgentTextTooLongError(ValueError):
+    """Raised when a text field would grow past its limit.
+
+    A value no longer than the stored one is never refused for its length, so
+    ``field`` here is one that grows and exceeds ``limit``.
+    """
+
+    def __init__(self, field: str, limit: int) -> None:
+        super().__init__(field)
+        self.field = field
+        self.limit = limit
 
 
 class TemplateQuickAccessRaceError(ValueError):
@@ -1059,6 +1077,13 @@ class AgentManagementService:
         return normalized
 
 
+# The text fields an update may change that are length limited, with their
+# limits, in the order they are checked.
+_UPDATE_TEXT_LIMITS = (
+    ("description", V1_AGENT_DESCRIPTION_MAX_CHARS),
+    ("instructions", V1_AGENT_INSTRUCTIONS_MAX_CHARS),
+)
+
 _MAX_MODEL_PK = 2**31 - 1
 
 
@@ -1330,6 +1355,149 @@ class AgentManagementRuntime:
             agent = store.get_owned_agent(user_id, agent_id, team_scope)
             if agent is None:
                 return None
+            return AgentDetailSnapshot(
+                agent=_agent_response_snapshot(store.agent_to_response_dict(agent)),
+                unresolved_models=unresolved_models(db, agent, user_id),
+            )
+
+    async def update_agent(
+        self,
+        *,
+        user_id: int,
+        key_prefix: str,
+        agent_id: int,
+        changes: dict[str, str],
+    ) -> AgentDetailSnapshot | None:
+        """Change the name, description or instructions of an agent.
+
+        Raises :class:`AgentTextTooLongError` or :class:`DuplicateAgentNameError`
+        when a change is refused; :meth:`_update_agent_sync` has the contract.
+        """
+        return await run_db_io_cancellation_safe(
+            lambda: self._update_agent_sync(
+                user_id=user_id,
+                key_prefix=key_prefix,
+                agent_id=agent_id,
+                changes=changes,
+            )
+        )
+
+    @staticmethod
+    def _update_agent_sync(
+        *,
+        user_id: int,
+        key_prefix: str,
+        agent_id: int,
+        changes: dict[str, str],
+    ) -> AgentDetailSnapshot | None:
+        """Decide and write in one locked transaction, log, then read again.
+
+        ``changes`` maps each field the request sent to its new value. An
+        empty ``changes`` has nothing to decide: it takes no lock and returns
+        what :meth:`_get_agent_detail_sync` returns, as ``GET`` does.
+
+        Otherwise the decisions are made under a lock held until the
+        transaction ends: the row lock on the agent, and on SQLite, which
+        ignores that lock, the database's write lock, taken before the first
+        read. When another writer holds the SQLite write lock past the busy
+        timeout, this fails before reading anything and nothing is written.
+        ``None`` is returned when the user cannot see the agent under the
+        lock. Only a field whose value differs from the stored one is written,
+        and nothing is written, cleared from the cache or logged when none
+        does.
+
+        The commit releases the lock, so after a write the agent is read again
+        with the visibility rule and team scope of the first read, and the
+        response, ``unresolved_models`` included, comes from that read alone.
+        ``None`` is returned when that read finds nothing, although the change
+        is stored.
+
+        A cancelled request does not stop this worker, so both log lines are
+        written here, not after the awaiting caller resumes. The lines carry
+        field names only, never a value.
+
+        An exception from the write may have come before or after the commit,
+        which cannot be told apart here, so it is logged as an unknown outcome
+        and re-raised. An exception from the read after the write comes after
+        the change was stored and logged at INFO, and is re-raised without a
+        line of its own. Retrying the same request is safe: a change that was
+        stored shows no difference and writes nothing.
+        """
+        if not changes:
+            return AgentManagementRuntime._get_agent_detail_sync(
+                user_id=user_id, agent_id=agent_id
+            )
+        SessionLocal = get_session_local()
+        with SessionLocal() as db:
+            # First, before any read: SQLite ignores the row lock below.
+            begin_sqlite_write_transaction(db)
+            team_scope = get_agent_team_scope(db, user_id)
+            store = AgentStore(db)
+            agent = store.get_owned_agent(
+                user_id, agent_id, team_scope, for_update=True
+            )
+            if agent is None:
+                return None
+            updates = {
+                field: value
+                for field, value in changes.items()
+                if getattr(agent, field) != value
+            }
+            if updates:
+                for field, limit in _UPDATE_TEXT_LIMITS:
+                    if field not in updates:
+                        continue
+                    stored_length = len(getattr(agent, field) or "")
+                    if len(updates[field]) > max(limit, stored_length):
+                        raise AgentTextTooLongError(field, limit)
+                if "name" in updates and store.agent_name_exists(
+                    user_id,
+                    updates["name"],
+                    exclude_agent_id=agent_id,
+                    team_scope=team_scope,
+                ):
+                    raise DuplicateAgentNameError()
+                fields = ",".join(sorted(updates))
+                try:
+                    store.update_agent_fields(
+                        user_id,
+                        agent_id,
+                        updates,
+                        team_scope=team_scope,
+                        agent=agent,
+                    )
+                except BaseException as exc:
+                    if isinstance(exc, IntegrityError) and (
+                        is_agent_name_unique_violation(exc)
+                    ):
+                        db.rollback()
+                        raise DuplicateAgentNameError() from exc
+                    logger.error(
+                        "personal key agent update outcome unknown: "
+                        "key_prefix=%s user_id=%d agent_id=%d fields=%s",
+                        key_prefix,
+                        user_id,
+                        agent_id,
+                        fields,
+                    )
+                    raise
+                logger.info(
+                    "personal key agent update: key_prefix=%s user_id=%d "
+                    "agent_id=%d fields=%s",
+                    key_prefix,
+                    user_id,
+                    agent_id,
+                    fields,
+                )
+                # The commit released the lock, so another writer may have
+                # changed the row since, its visibility included. A query does
+                # not overwrite the attributes of an object the session holds,
+                # so the session's copy is expired before the agent is read
+                # again.
+                db.expire(agent)
+                agent = store.get_owned_agent(user_id, agent_id, team_scope)
+                if agent is None:
+                    return None
             return AgentDetailSnapshot(
                 agent=_agent_response_snapshot(store.agent_to_response_dict(agent)),
                 unresolved_models=unresolved_models(db, agent, user_id),

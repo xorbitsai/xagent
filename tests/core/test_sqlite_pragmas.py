@@ -107,3 +107,52 @@ def test_apply_pragmas_noop_for_non_sqlite() -> None:
     engine = create_engine("postgresql://user:pass@localhost:5432/db")
     apply_sqlite_concurrency_pragmas(engine)
     engine.dispose()
+
+
+def test_write_transaction_must_be_the_first_statement(tmp_path) -> None:
+    from sqlalchemy import text
+    from sqlalchemy.orm import Session
+
+    from xagent.db.sqlite import begin_sqlite_write_transaction
+
+    engine = create_engine(f"sqlite:///{tmp_path / 'fence.db'}")
+    with Session(engine) as session:
+        session.execute(text("SELECT 1"))
+        with pytest.raises(RuntimeError, match="first statement"):
+            begin_sqlite_write_transaction(session)
+    engine.dispose()
+
+
+def test_write_transaction_noop_for_non_sqlite() -> None:
+    from sqlalchemy.orm import Session
+
+    from xagent.db.sqlite import begin_sqlite_write_transaction
+
+    # create_engine does not connect; taking a connection would open a
+    # transaction (and fail with no server), so none may be open afterwards.
+    engine = create_engine("postgresql://user:pass@localhost:5432/db")
+    with Session(engine) as session:
+        begin_sqlite_write_transaction(session)
+        assert not session.in_transaction()
+    engine.dispose()
+
+
+def test_write_transaction_takes_the_write_lock(tmp_path) -> None:
+    from sqlalchemy.exc import OperationalError
+    from sqlalchemy.orm import Session
+
+    from xagent.db.sqlite import begin_sqlite_write_transaction
+
+    # A blocked writer gives up after 0.1 seconds, not the default 5.
+    engine = create_engine(
+        f"sqlite:///{tmp_path / 'lock.db'}", connect_args={"timeout": 0.1}
+    )
+    with Session(engine) as first, Session(engine) as second:
+        begin_sqlite_write_transaction(first)
+        with pytest.raises(OperationalError, match="database is locked"):
+            begin_sqlite_write_transaction(second)
+        first.rollback()
+        second.rollback()
+        # Once the first session's transaction ends, the lock is free.
+        begin_sqlite_write_transaction(second)
+    engine.dispose()

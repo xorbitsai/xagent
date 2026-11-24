@@ -17,6 +17,7 @@ from ...schemas.v1 import (
     V1AgentSkillsUpdateResponse,
     V1AgentSummary,
     V1AgentTemplateCreateRequest,
+    V1AgentUpdateRequest,
 )
 from ...services.agent_management import (
     AgentConnectorsNotSharedError,
@@ -26,6 +27,7 @@ from ...services.agent_management import (
     AgentManagementRuntime,
     AgentResponseSnapshot,
     AgentSummarySnapshot,
+    AgentTextTooLongError,
     AgentToolsUnconfiguredError,
     DuplicateAgentNameError,
     InvalidAgentConnectorsError,
@@ -257,6 +259,58 @@ async def get_agent(
     detail = await AgentManagementRuntime().get_agent_detail(
         user_id=int(user.id), agent_id=agent_id
     )
+    if detail is None:
+        raise V1ApiError(V1ErrorCode.AGENT_NOT_FOUND, 404)
+    return _agent_detail(detail)
+
+
+def _reject_null_fields(request: V1AgentUpdateRequest) -> None:
+    """Refuse a field sent as null: sending nothing is how to keep a value."""
+    for field in V1AgentUpdateRequest.model_fields:
+        if field in request.model_fields_set and getattr(request, field) is None:
+            raise V1ApiError(
+                V1ErrorCode.INVALID_INPUT,
+                400,
+                f"{field} cannot be null; omit it to keep the stored value.",
+            )
+
+
+@router.patch("/{agent_id}", response_model=V1AgentDetail)
+async def update_agent(
+    request: V1AgentUpdateRequest,
+    # ``agents.id`` is a 32-bit integer column.
+    agent_id: int = Path(gt=0, le=2**31 - 1),
+    authed: tuple[UserPrincipalSnapshot, PersonalApiKeySnapshot] = Depends(
+        get_user_from_personal_key
+    ),
+) -> V1AgentDetail:
+    """Change the name, description or instructions of an agent the holder can see.
+
+    Only the fields sent are changed. The response is the configuration after
+    the change, read again once it is stored. It is 404 if the holder can no
+    longer see the agent by then, although the change is stored.
+    """
+    user, key = authed
+    _reject_null_fields(request)
+    changes = request.model_dump(exclude_unset=True)
+    try:
+        detail = await AgentManagementRuntime().update_agent(
+            user_id=int(user.id),
+            key_prefix=key.key_prefix,
+            agent_id=agent_id,
+            changes=changes,
+        )
+    except AgentTextTooLongError as e:
+        raise V1ApiError(
+            V1ErrorCode.INVALID_INPUT,
+            400,
+            f"{e.field} can be at most {e.limit} characters unless it is no "
+            f"longer than the stored {e.field}.",
+        )
+    except DuplicateAgentNameError:
+        raise V1ApiError(
+            V1ErrorCode.INVALID_INPUT, 400, "Agent with this name already exists."
+        )
     if detail is None:
         raise V1ApiError(V1ErrorCode.AGENT_NOT_FOUND, 404)
     return _agent_detail(detail)

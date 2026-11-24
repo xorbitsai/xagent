@@ -502,6 +502,12 @@ describe("ToolsPage signed upload settings", () => {
   // A replacement entry whose issuing tool differs from ISSUER_ENTRY's.
   const REPLACEMENT_ENTRY = { ...SIGNED_UPLOADS[0], issuing_tool_name: "request_image_upload" }
   const BOTH_KINDS = [REPLACEMENT_ENTRY, ISSUER_ENTRY]
+  // A link entry: exactly tool_name and link_argument.
+  const LINK_ENTRY = { tool_name: "attach_picture", link_argument: "image_url" }
+  // An entry with a key the form does not know: the server rejects it, so the
+  // detail reports an error for it.
+  const UNRECOGNIZED_ENTRY = { ...ISSUER_ENTRY, note: "x" }
+  const UNRECOGNIZED_ERROR = "signed_uploads[1] must have exactly the documented keys"
 
   function uploadsServer(overrides: Partial<MCPServer> = {}): MCPServer {
     return officialMcpServer({
@@ -820,6 +826,39 @@ describe("ToolsPage signed upload settings", () => {
   it("keeps a stored issuer entry when the owner saves without touching uploads", async () => {
     const requests = installUploadsApiMock([uploadsServer()], { signed_uploads: BOTH_KINDS })
     const dialog = await openUploadsEditor()
+    fireEvent.change(dialog.getByLabelText("tools.mcp.form.descriptionLabel"), {
+      target: { value: "Updated" },
+    })
+    fireEvent.click(saveButton(dialog))
+    await waitFor(() => expect(requests.put).toHaveLength(1))
+    expect(requests.put[0]).toStrictEqual({ description: "Updated" })
+  })
+
+  it("saves an edited link row as exactly its two keys", async () => {
+    const requests = installUploadsApiMock([uploadsServer()], {
+      signed_uploads: [REPLACEMENT_ENTRY, LINK_ENTRY],
+    })
+    const dialog = await openUploadsEditor()
+    fireEvent.change(dialog.getByLabelText(`${KEY}.linkArgument`), {
+      target: { value: " picture_url " },
+    })
+    fireEvent.click(saveButton(dialog))
+    await waitFor(() => expect(requests.put).toHaveLength(1))
+    expect(requests.put[0]).toStrictEqual({
+      signed_uploads: [
+        REPLACEMENT_ENTRY,
+        { tool_name: "attach_picture", link_argument: "picture_url" },
+      ],
+    })
+  })
+
+  it("sends no upload settings when the owner saves an unrelated edit with an unrecognized entry stored", async () => {
+    const requests = installUploadsApiMock([uploadsServer()], {
+      signed_uploads: [LINK_ENTRY, UNRECOGNIZED_ENTRY],
+      signed_uploads_error: UNRECOGNIZED_ERROR,
+    })
+    const dialog = await openUploadsEditor()
+    expect(dialog.getByText(`${KEY}.unrecognizedEntry`)).toBeInTheDocument()
     fireEvent.change(dialog.getByLabelText("tools.mcp.form.descriptionLabel"), {
       target: { value: "Updated" },
     })

@@ -87,6 +87,13 @@ function unrecognizedTitle(raw: unknown): string {
   return ""
 }
 
+// A file type row with both cells blank, which is dropped on save. A new
+// row starts with one, and so does a row switched to a mode that has file
+// types.
+function blankContentTypeRow(nextId: () => string): SignedUploadContentTypeRow {
+  return { id: nextId(), extension: "", contentType: "" }
+}
+
 function hasExactKeys(item: Record<string, unknown>, expected: readonly string[]): boolean {
   const keys = Object.keys(item)
   return keys.length === expected.length && expected.every((key) => keys.includes(key))
@@ -398,7 +405,7 @@ function UploadFields({
             update({
               contentTypes: [
                 ...row.contentTypes,
-                { id: nextRowId(), extension: "", contentType: "" },
+                blankContentTypeRow(nextRowId),
               ],
             })}
         >
@@ -448,7 +455,9 @@ export function SignedUploadsForm({
   }
 
   // Switching mode drops the fields the new mode does not have. The tool name
-  // is kept between replacement and link rows, which both have one.
+  // is kept between replacement and link rows, which both have one. A row
+  // switched to replacement or issuer gets one blank file type row when it
+  // has none, as a new row does.
   const updateMode = (row: SignedUploadRow, mode: SignedUploadMode) => {
     if (mode === row.mode) return
     if (mode === "link") {
@@ -460,10 +469,15 @@ export function SignedUploadsForm({
         uploadPathPrefix: "",
         contentTypes: [],
       })
-    } else if (mode === "issuer") {
-      updateRow(row.id, { mode, toolName: "", fileArgument: "", linkArgument: "" })
+      return
+    }
+    const contentTypes = row.contentTypes.length > 0
+      ? row.contentTypes
+      : [blankContentTypeRow(nextRowId)]
+    if (mode === "issuer") {
+      updateRow(row.id, { mode, toolName: "", fileArgument: "", linkArgument: "", contentTypes })
     } else {
-      updateRow(row.id, { mode, linkArgument: "" })
+      updateRow(row.id, { mode, linkArgument: "", contentTypes })
     }
   }
 
@@ -625,7 +639,7 @@ export function SignedUploadsForm({
                 issuingToolName: "",
                 hostsText: "",
                 uploadPathPrefix: "",
-                contentTypes: [{ id: nextRowId(), extension: "", contentType: "" }],
+                contentTypes: [blankContentTypeRow(nextRowId)],
               },
             ])}
         >

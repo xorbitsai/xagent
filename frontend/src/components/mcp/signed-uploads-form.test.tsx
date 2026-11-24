@@ -30,6 +30,13 @@ const ISSUER = {
   content_types: { ".pdf": "application/pdf" },
 }
 const LINK = { tool_name: "attach_picture", link_argument: "image_url" }
+const EMPTY_UPLOAD = {
+  issuing_tool_name: "",
+  allowed_upload_hosts: [],
+  upload_path_prefix: "",
+  content_types: {},
+  file_argument: "",
+}
 
 function counter() {
   let n = 0
@@ -223,6 +230,49 @@ describe("SignedUploadsForm link entries", () => {
     fireEvent.click(screen.getByRole("radio", { name: `${KEY}.modeLink` }))
     expect(screen.getByLabelText(`${KEY}.linkArgument`)).toHaveValue("")
   })
+
+  const SHAPE_ISSUER = { ...ISSUER, tool_name: "", file_argument: "" }
+  it.each([
+    ["a replacement row", "Replacement", "Issuer", REPLACEMENT, [ISSUER], [".pdf"], [SHAPE_ISSUER], [".pdf"]],
+    [
+      "a replacement row",
+      "Replacement",
+      "Link",
+      REPLACEMENT,
+      [{ tool_name: "attach_document", link_argument: "" }],
+      [],
+      [{ tool_name: "attach_document", ...EMPTY_UPLOAD }],
+      [""],
+    ],
+    ["an issuer row", "Issuer", "Replacement", ISSUER, [SHAPE_ISSUER], [".pdf"], [ISSUER], [".pdf"]],
+    ["an issuer row", "Issuer", "Link", ISSUER, [], [], [], [""]],
+    [
+      "a link row",
+      "Link",
+      "Replacement",
+      LINK,
+      [{ tool_name: "attach_picture", ...EMPTY_UPLOAD }],
+      [""],
+      [{ tool_name: "attach_picture", link_argument: "" }],
+      [],
+    ],
+    ["a link row", "Link", "Issuer", LINK, [], [""], [], []],
+  ])(
+    "switches %s from %s to %s and back, keeping only the fields each mode has",
+    (_name, from, to, start, valueAway, typesAway, valueBack, typesBack) => {
+      const { latest } = renderForm([start])
+      const extensions = () =>
+        screen
+          .queryAllByLabelText(`${KEY}.extension`)
+          .map((el) => (el as HTMLInputElement).value)
+      fireEvent.click(screen.getByRole("radio", { name: `${KEY}.mode${to}` }))
+      expect(latest().signed_uploads).toEqual(valueAway)
+      expect(extensions()).toEqual(typesAway)
+      fireEvent.click(screen.getByRole("radio", { name: `${KEY}.mode${from}` }))
+      expect(latest().signed_uploads).toEqual(valueBack)
+      expect(extensions()).toEqual(typesBack)
+    },
+  )
 
   it("shows an unrecognized entry read-only and writes it back unchanged", () => {
     const odd = { tool_name: "attach", link_argument: "u", extra: 1 }

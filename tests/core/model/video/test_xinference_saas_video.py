@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import io
 import json
 from typing import Any
 
 import aiohttp
 import pytest
+from PIL import Image
 
 from xagent.core.model import VideoModelConfig
 from xagent.core.model.chat.token_context import TokenContextManager
@@ -148,25 +151,6 @@ async def test_saas_rejects_bad_seed(transport):
     assert transport["json"] == []
 
 
-@pytest.mark.parametrize(
-    "extra",
-    [
-        {"input_reference": "https://x.test/a.png"},
-        {"image_url": "https://x.test/a.png"},
-        {"first_frame_image_url": "https://x.test/a.png"},
-        {"last_frame_image_url": "https://x.test/b.png"},
-        {
-            "first_frame_image_url": "https://x.test/a.png",
-            "last_frame_image_url": "https://x.test/b.png",
-        },
-    ],
-)
-async def test_saas_refuses_image_and_frame_input_before_any_request(transport, extra):
-    with pytest.raises(MediaParameterError):
-        await _build().generate_video(prompt="a fox", **extra)
-    assert transport["json"] == [] and transport["form"] == []
-
-
 async def test_saas_records_usage_from_video_seconds(transport):
     transport["response"] = {
         "data": [{"b64_json": "dmlkZW8="}],
@@ -277,12 +261,169 @@ def test_observation_omits_inline_data_urls():
     assert "inline video/mp4 data omitted" in text
 
 
-async def test_saas_video_model_reports_text_to_video_only():
-    assert _build().supports_image_input() is False
+# ---------------------------------------------------------------------------
+# Image-to-video keyframes
+# ---------------------------------------------------------------------------
 
 
-async def test_self_hosted_xinference_video_accepts_image_input():
-    model = XinferenceVideoModel(
-        model_name="m", base_url="http://localhost:9997", saas_api=False
+def _image(width: int, height: int, fmt: str = "PNG") -> str:
+    buffer = io.BytesIO()
+    Image.new("RGB", (width, height), "red").save(buffer, fmt)
+    mime = {"PNG": "png", "JPEG": "jpeg", "WEBP": "webp", "GIF": "gif"}[fmt]
+    return f"data:image/{mime};base64," + base64.b64encode(buffer.getvalue()).decode()
+
+
+async def test_saas_video_model_supports_image_input():
+    assert _build().supports_image_input() is True
+
+
+async def test_saas_sync_first_frame_sends_data_url_and_omits_size(transport):
+    frame = _image(1920, 1080)
+    await _build().generate_video(prompt="a fox", input_reference=frame)
+    body = transport["json"][0]["body"]
+    assert transport["json"][0]["path"] == "/v1/video/generations"
+    assert body["first_frame_image"] == frame
+    assert "last_frame_image" not in body
+    assert "width" not in body and "height" not in body
+
+
+async def test_saas_sync_first_and_last_frame(transport):
+    first, last = _image(1344, 768), _image(1920, 1080, "JPEG")
+    await _build().generate_video(
+        prompt="a fox", first_frame_image_url=first, last_frame_image_url=last
     )
-    assert model.supports_image_input() is True
+    body = transport["json"][0]["body"]
+    assert body["first_frame_image"] == first
+    assert body["last_frame_image"].startswith("data:image/jpeg;base64,")
+    assert transport["form"] == []
+
+
+async def test_saas_sync_loads_local_file_into_a_data_url(transport, tmp_path):
+    path = tmp_path / "a.png"
+    path.write_bytes(base64.b64decode(_image(768, 768).split(",", 1)[1]))
+    await _build().generate_video(
+        prompt="a fox",
+        input_reference=str(path),
+        allowed_local_media_roots=[tmp_path],
+    )
+    assert transport["json"][0]["body"]["first_frame_image"].startswith(
+        "data:image/png;base64,"
+    )
+
+
+async def test_saas_explicit_allowed_size_is_sent_with_a_matching_frame(transport):
+    await _build().generate_video(
+        prompt="a fox", input_reference=_image(1920, 1080), size="1344x768"
+    )
+    body = transport["json"][0]["body"]
+    assert (body["width"], body["height"]) == (1344, 768)
+
+
+async def test_saas_unlisted_size_is_a_hint_the_first_frame_overrides(transport):
+    # 1280x720 is not an allowed size; the square image decides, and the server
+    # picks 768x768 itself, so no size is sent.
+    await _build().generate_video(
+        prompt="a fox", input_reference=_image(1000, 1000), size="1280x720"
+    )
+    body = transport["json"][0]["body"]
+    assert "width" not in body and "height" not in body
+
+
+async def test_saas_aspect_mismatch_with_an_allowed_size_is_refused_locally(transport):
+    with pytest.raises(MediaParameterError) as err:
+        await _build().generate_video(
+            prompt="a fox", input_reference=_image(1000, 1000), size="1344x768"
+        )
+    assert err.value.field == "first_frame_image"
+    assert transport["json"] == []
+
+
+async def test_saas_last_frame_must_fit_the_chosen_size(transport):
+    with pytest.raises(MediaParameterError) as err:
+        await _build().generate_video(
+            prompt="a fox",
+            first_frame_image_url=_image(1344, 768),
+            last_frame_image_url=_image(768, 1344),
+        )
+    assert err.value.field == "last_frame_image"
+    assert transport["json"] == []
+
+
+async def test_saas_image_matching_no_size_is_refused(transport):
+    with pytest.raises(MediaParameterError):
+        await _build().generate_video(
+            prompt="a fox", input_reference=_image(1500, 1000)
+        )
+    assert transport["json"] == []
+
+
+async def test_saas_last_frame_without_first_is_refused(transport):
+    with pytest.raises(MediaParameterError) as err:
+        await _build().generate_video(
+            prompt="a fox", last_frame_image_url=_image(768, 768)
+        )
+    assert err.value.field == "last_frame_image_url"
+    assert transport["json"] == []
+
+
+async def test_saas_oversize_image_is_refused_before_any_request(transport):
+    # A valid, readable PNG padded past the limit: only the size check refuses it.
+    big = base64.b64decode(_image(768, 768).split(",", 1)[1]) + b"0" * (5 * 1024 * 1024)
+    with pytest.raises(MediaParameterError) as err:
+        await _build().generate_video(prompt="a fox", input_reference=big)
+    assert "5 MiB" in str(err.value)
+    assert transport["json"] == []
+
+
+async def test_saas_exif_rotated_photo_is_sized_by_its_upright_shape(transport):
+    buffer = io.BytesIO()
+    image = Image.new("RGB", (1344, 768), "red")
+    exif = Image.Exif()
+    exif[0x0112] = 6  # stored landscape, displayed portrait
+    image.save(buffer, "JPEG", exif=exif)
+    frame = "data:image/jpeg;base64," + base64.b64encode(buffer.getvalue()).decode()
+    await _build().generate_video(
+        prompt="a fox", input_reference=frame, size="768x1344"
+    )
+    assert transport["json"][0]["body"]["height"] == 1344
+
+
+@pytest.mark.parametrize(
+    "frame",
+    [_image(8200, 100), _image(100, 100, "GIF"), "data:image/png;base64,AAAA"],
+    ids=["too-wide", "gif", "garbage"],
+)
+async def test_saas_unsupported_images_are_refused(transport, frame):
+    with pytest.raises(MediaParameterError):
+        await _build().generate_video(prompt="a fox", input_reference=frame)
+    assert transport["json"] == []
+
+
+async def test_saas_too_many_pixels_is_refused(transport):
+    with pytest.raises(MediaParameterError):
+        await _build().generate_video(
+            prompt="a fox", input_reference=_image(6000, 4000, "WEBP")
+        )
+    assert transport["json"] == []
+
+
+async def test_saas_remote_url_is_downloaded_and_sent_as_data_url(
+    transport, monkeypatch
+):
+    raw = base64.b64decode(_image(768, 768).split(",", 1)[1])
+
+    async def fake_download(url, **kwargs):
+        class _R:
+            content = raw
+
+        return _R()
+
+    monkeypatch.setattr(
+        "xagent.core.model.video.xinference.download_public_input", fake_download
+    )
+    await _build().generate_video(
+        prompt="a fox", input_reference="https://x.test/a.png"
+    )
+    assert transport["json"][0]["body"]["first_frame_image"].startswith(
+        "data:image/png;base64,"
+    )

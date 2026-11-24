@@ -24,6 +24,7 @@ from xagent.core.model.video.adapter import (
 )
 from xagent.core.model.video.base import BilledVideoTaskError, BilledVideoTaskTimeout
 from xagent.core.model.video.xinference import XinferenceVideoModel
+from xagent.core.tools.core.media_errors import MediaParameterError
 
 pytestmark = pytest.mark.asyncio
 
@@ -257,6 +258,59 @@ async def test_minimal_body_omits_unset_fields(server):
     server.get_replies = [completed()]
     await _build().generate_video(prompt="a fox")
     assert server.calls[0][3] == {"model": "minimax-h3", "prompt": "a fox"}
+
+
+def _frame(width: int, height: int) -> str:
+    import io
+
+    from PIL import Image
+
+    buffer = io.BytesIO()
+    Image.new("RGB", (width, height), "blue").save(buffer, "PNG")
+    return "data:image/png;base64," + base64.b64encode(buffer.getvalue()).decode()
+
+
+async def test_job_first_frame_is_sent_as_input_reference(server):
+    server.post_replies = [accepted()]
+    server.get_replies = [completed()]
+    frame = _frame(1920, 1080)
+    await _build().generate_video(prompt="a fox", input_reference=frame)
+    body = server.calls[0][3]
+    assert body["input_reference"] == frame
+    assert "last_frame_reference" not in body
+    assert "size" not in body
+
+
+async def test_job_first_and_last_frame_are_sent(server):
+    server.post_replies = [accepted()]
+    server.get_replies = [completed()]
+    first, last = _frame(768, 1344), _frame(768, 1344)
+    await _build().generate_video(
+        prompt="a fox",
+        first_frame_image_url=first,
+        last_frame_image_url=last,
+        size="768x1344",
+    )
+    body = server.calls[0][3]
+    assert body["input_reference"] == first
+    assert body["last_frame_reference"] == last
+    assert body["size"] == "768x1344"
+
+
+async def test_job_aspect_mismatch_is_refused_before_submit(server):
+    with pytest.raises(MediaParameterError):
+        await _build().generate_video(
+            prompt="a fox", input_reference=_frame(1000, 1000), size="1344x768"
+        )
+    assert server.calls == []
+
+
+async def test_job_last_frame_without_first_is_refused(server):
+    with pytest.raises(MediaParameterError):
+        await _build().generate_video(
+            prompt="a fox", last_frame_image_url=_frame(768, 768)
+        )
+    assert server.calls == []
 
 
 async def test_usage_falls_back_to_requested_seconds(server):

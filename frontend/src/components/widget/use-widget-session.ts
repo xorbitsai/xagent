@@ -359,7 +359,11 @@ export function useWidgetSession() {
     connectionIdentity?: string,
   ): "handled" => {
     if (!isActiveConnection(connectionIdentity)) return "handled"
-    if (event.code === 1000 || event.code === 1001) {
+    // 1001 (going away) is not a verdict on the session: some reverse proxies
+    // send it to every socket they proxy when their configuration is reloaded,
+    // so it falls through to the reconnect below like any other dropped
+    // connection.
+    if (event.code === 1000) {
       transitionTerminal("unexpected_error")
       return "handled"
     }

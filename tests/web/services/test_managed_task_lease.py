@@ -45,6 +45,7 @@ from xagent.web.services.task_lease_service import (
     TaskLeaseHeartbeatOutcome,
     acquire_task_lease,
 )
+from xagent.web.services.task_settlement_report import SettlementReport
 
 
 @pytest.fixture()
@@ -734,6 +735,82 @@ async def test_execution_result_identity_at_finalize_resources(
     )
     assert received == [sentinel]
     assert received[0] is sentinel
+
+
+# ---------------------------------------------------------------------------
+# settle_interruption / report: threaded through the managed finalize layers.
+# ---------------------------------------------------------------------------
+
+
+def _managed_for_settlement(task_id: int) -> ManagedTaskLease:
+    return ManagedTaskLease(
+        lease=TaskLease(task_id=task_id, runner_id="runner-a", run_id="run-a"),
+        stop_event=asyncio.Event(),
+        heartbeat_task=asyncio.create_task(asyncio.sleep(0)),  # type: ignore[arg-type]
+    )
+
+
+@pytest.mark.asyncio
+async def test_settlement_options_default_off_at_every_managed_layer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A caller that passes neither option keeps today's settlement."""
+
+    managed = _managed_for_settlement(206)
+    received: dict[str, dict[str, object]] = {}
+
+    async def stop_heartbeat(*_args, **_kwargs) -> TaskLeaseHeartbeatOutcome:
+        return TaskLeaseHeartbeatOutcome()
+
+    async def capture_isolated(_lease, **kwargs):
+        received["isolated"] = kwargs
+        return True
+
+    monkeypatch.setattr(managed_task_lease, "stop_task_lease_heartbeat", stop_heartbeat)
+    monkeypatch.setattr(
+        managed_task_lease,
+        "finalize_managed_task_lease_result_isolated",
+        capture_isolated,
+    )
+
+    assert await managed.finalize_result(status=TaskStatus.COMPLETED) is True
+    assert received["isolated"]["settle_interruption"] is False
+    assert received["isolated"]["report"] is None
+
+
+@pytest.mark.asyncio
+async def test_settlement_options_reach_the_sync_finalizer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    managed = _managed_for_settlement(207)
+    report = SettlementReport()
+    received: dict[str, object] = {}
+
+    async def stop_heartbeat(*_args, **_kwargs) -> TaskLeaseHeartbeatOutcome:
+        return TaskLeaseHeartbeatOutcome()
+
+    def capture_sync(_lease, **kwargs):
+        received.update(kwargs)
+        return True
+
+    monkeypatch.setattr(managed_task_lease, "stop_task_lease_heartbeat", stop_heartbeat)
+    monkeypatch.setattr(
+        managed_task_lease,
+        "finalize_managed_task_lease_result_sync",
+        capture_sync,
+    )
+
+    assert (
+        await managed.finalize_result(
+            status=TaskStatus.FAILED,
+            execution_result={"success": False},
+            settle_interruption=True,
+            report=report,
+        )
+        is True
+    )
+    assert received["settle_interruption"] is True
+    assert received["report"] is report
 
 
 # ---------------------------------------------------------------------------

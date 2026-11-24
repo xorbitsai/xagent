@@ -37,7 +37,11 @@ const ISSUER_ENTRY_KEYS = [
   "upload_path_prefix",
   "content_types",
 ] as const
-const REPLACEMENT_ENTRY_KEYS = ["tool_name", "file_argument", ...ISSUER_ENTRY_KEYS] as const
+const REPLACEMENT_ENTRY_KEYS: ReadonlySet<string> = new Set([
+  "tool_name",
+  "file_argument",
+  ...ISSUER_ENTRY_KEYS,
+])
 const LINK_ENTRY_KEYS = ["tool_name", "link_argument"] as const
 
 export interface SignedUploadRow {
@@ -88,7 +92,7 @@ function entryMode(entry: unknown): SignedUploadMode {
   if (hasExactKeys(entry, ISSUER_ENTRY_KEYS)) return "issuer"
   if (hasExactKeys(entry, LINK_ENTRY_KEYS)) return "link"
   const keys = Object.keys(entry)
-  return keys.every((key) => (REPLACEMENT_ENTRY_KEYS as readonly string[]).includes(key))
+  return keys.every((key) => REPLACEMENT_ENTRY_KEYS.has(key))
     ? "replacement"
     : "unrecognized"
 }
@@ -532,7 +536,7 @@ export function SignedUploadsForm({
                         readOnly
                         aria-label={t("tools.mcp.signedUploads.unrecognizedEntryValue")}
                         className="font-mono text-xs"
-                        value={JSON.stringify(row.raw, null, 2) ?? ""}
+                        value={JSON.stringify(row.raw, null, 2)}
                       />
                     </div>
                   ) : (

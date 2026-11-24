@@ -331,7 +331,7 @@ describe("useWidgetSession", () => {
     },
   )
 
-  it.each([4401, 1006, 4500])(
+  it.each([4401, 1006, 1001, 4500])(
     "owns abnormal WebSocket close %s and requests one parent reconnect",
     (code) => {
       const postMessage = vi.spyOn(window, "postMessage")
@@ -353,6 +353,9 @@ describe("useWidgetSession", () => {
         { xagent: true, v: 1, type: "reconnect_request", reason: "ws_closed" },
         PARENT_ORIGIN,
       )
+      expect(postMessage.mock.calls.filter((call) => call[0]?.type === "reconnect_request")).toHaveLength(1)
+      expect(result.current.terminalCode).toBeNull()
+      expect(terminalReports(postMessage)).toEqual([])
     },
   )
 
@@ -383,7 +386,7 @@ describe("useWidgetSession", () => {
     },
   )
 
-  it.each([1000])("terminalizes a current-owner standard WebSocket close %s without reconnecting", (code) => {
+  it("terminalizes a current-owner standard WebSocket close 1000 without reconnecting", () => {
     const postMessage = vi.spyOn(window, "postMessage")
     const { result } = renderHook(() => useWidgetSession())
     dispatchFromParent(updateMessage())
@@ -392,7 +395,7 @@ describe("useWidgetSession", () => {
     let disposition: "handled" | "default" | undefined
     act(() => {
       disposition = result.current.handleConnectionClose(
-        new CloseEvent("close", { code }),
+        new CloseEvent("close", { code: 1000 }),
       )
     })
 
@@ -519,19 +522,6 @@ describe("useWidgetSession", () => {
 
     act(() => result.current.requestReconnect("ws_closed"))
     act(() => vi.advanceTimersByTime(30_000))
-
-    expect(result.current.status).toBe("refreshing")
-    expect(result.current.terminalCode).toBeNull()
-    expect(postMessage.mock.calls.filter((call) => call[0]?.type === "reconnect_request")).toHaveLength(1)
-  })
-
-  it("reconnects after a 1001 going-away close instead of ending the session", () => {
-    vi.useFakeTimers()
-    const postMessage = vi.spyOn(window, "postMessage")
-    const { result } = renderHook(() => useWidgetSession())
-    dispatchFromParent(updateMessage())
-
-    act(() => result.current.handleConnectionClose(new CloseEvent("close", { code: 1001 })))
 
     expect(result.current.status).toBe("refreshing")
     expect(result.current.terminalCode).toBeNull()

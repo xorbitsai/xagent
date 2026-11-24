@@ -246,12 +246,38 @@ describe("SignedUploadsForm link entries", () => {
     ])
   })
 
-  it("titles an unrecognized row by its tool name, else by a generic label", () => {
-    renderForm([{ tool_name: " attach ", extra: 1 }, { extra: 1 }, { tool_name: 3, extra: 1 }])
-    expect(screen.getByText("attach")).toBeInTheDocument()
-    expect(screen.getAllByText(`${KEY}.unrecognizedEntryTitle`)).toHaveLength(2)
-    expect(screen.queryByText(`${KEY}.newTool`)).not.toBeInTheDocument()
-  })
+  it.each([
+    ["tool_name", { tool_name: " attach ", extra: 1 }, "attach"],
+    ["an issuer-shaped entry with an extra key", { ...ISSUER, note: "x" }, "request_upload"],
+    [
+      "both names, tool_name first",
+      { tool_name: "attach", issuing_tool_name: "request_upload", extra: 1 },
+      "attach",
+    ],
+    [
+      "a blank tool_name",
+      { tool_name: "  ", issuing_tool_name: " request_upload ", extra: 1 },
+      "request_upload",
+    ],
+    [
+      "a tool_name that is not a string",
+      { tool_name: 3, issuing_tool_name: "request_upload", extra: 1 },
+      "request_upload",
+    ],
+    ["neither name", { extra: 1 }, `${KEY}.unrecognizedEntryTitle`],
+    [
+      "neither name usable",
+      { tool_name: 3, issuing_tool_name: "", extra: 1 },
+      `${KEY}.unrecognizedEntryTitle`,
+    ],
+  ])(
+    "titles an unrecognized row by its tool name, else its issuing tool, else a generic label: %s",
+    (_name, entry, expected) => {
+      renderForm([entry])
+      expect(screen.getByText(expected, { selector: "span" })).toBeInTheDocument()
+      expect(screen.queryByText(`${KEY}.newTool`)).not.toBeInTheDocument()
+    },
+  )
 
   it("explains in the link row that an unmatched name means no link", () => {
     renderForm([LINK])

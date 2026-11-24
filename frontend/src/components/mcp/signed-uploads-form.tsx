@@ -75,9 +75,16 @@ function textOrEmpty(value: unknown): string {
   return typeof value === "string" ? value : ""
 }
 
-// The tool name of an unrecognized entry, when it has a usable one.
+// The title of an unrecognized entry: its tool_name, else its
+// issuing_tool_name, when that is a string that is not blank. Empty when it
+// has neither, and the row then shows a generic title.
 function unrecognizedTitle(raw: unknown): string {
-  return isRecord(raw) && typeof raw.tool_name === "string" ? raw.tool_name.trim() : ""
+  if (!isRecord(raw)) return ""
+  for (const key of ["tool_name", "issuing_tool_name"]) {
+    const value = raw[key]
+    if (typeof value === "string" && value.trim() !== "") return value.trim()
+  }
+  return ""
 }
 
 function hasExactKeys(item: Record<string, unknown>, expected: readonly string[]): boolean {

@@ -23,11 +23,13 @@ from xagent.web.api.v1.models import list_models
 from xagent.web.models.database import Base
 from xagent.web.models.model import Model
 from xagent.web.models.user import User, UserModel
+from xagent.web.schemas.v1 import V1Model
 from xagent.web.services import agent_management
 from xagent.web.services.agent_management import (
     AgentManagementService,
     InvalidAgentModelConfigError,
 )
+from xagent.web.services.agent_team_scope import set_agent_team_scope_hook
 from xagent.web.services.model_service import (
     set_model_visibility_hook,
     set_visible_user_ids_hook,
@@ -66,6 +68,7 @@ def _reset_hooks():
     yield
     set_visible_user_ids_hook(None)
     set_model_visibility_hook(None)
+    set_agent_team_scope_hook(None)
 
 
 def _list(key: str):
@@ -178,6 +181,10 @@ def test_abilities_are_listed_as_strings(stored, listed):
     (row,) = _list(key).json()
 
     assert row["abilities"] == listed
+
+
+def test_every_model_field_is_described():
+    assert all(field.description for field in V1Model.model_fields.values())
 
 
 # ===== which models are listed =====

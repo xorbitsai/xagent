@@ -323,9 +323,10 @@ class AgentDetailSnapshot:
 def _ability_names(stored: Any) -> tuple[str, ...]:
     """The ability names in a stored ``models.abilities`` value.
 
-    A list or tuple gives each element as ``str(element)``, the same reading
-    the model endpoints use when they test an ability. A stored string is one
-    ability. Any other value (null, a number, an object) gives no abilities.
+    A list or tuple gives each element as ``str(element)``; for a list or a
+    tuple this is the same reading as ``_model_has_ability`` in
+    ``web/api/model.py``. A stored string is one ability. Any other value
+    (null, a number, an object) gives no abilities.
     """
     if isinstance(stored, str):
         return (stored,)

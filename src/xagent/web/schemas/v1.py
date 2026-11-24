@@ -389,20 +389,23 @@ class V1Model(BaseModel):
     """One model the key holder can use. Order is not guaranteed."""
 
     id: int = Field(
-        description="The id an agent's model slot stores. Only models whose "
-        "`category` is `llm` can be placed in an agent's model slots. This id "
-        "is specific to the region you call. The same model has a different "
-        "id in another region; look it up there by `model_id`."
+        description="The id an agent's model slot stores. This id is specific "
+        "to the region you call. The same model has a different id in another "
+        "region; look it up there by `model_id`."
     )
     model_id: str = Field(
         description="A stable, readable identifier. Use it to find the same "
         "model across regions."
     )
-    model_name: str
-    model_provider: str
+    model_name: str = Field(description="The model's name as stored.")
+    model_provider: str = Field(
+        description="The model's provider as stored, for example `openai`."
+    )
     category: str = Field(
-        description="Only models whose `category` is `llm` can be placed in "
-        "an agent's model slots."
+        description="Only `llm` models resolve in an agent's model slots at run "
+        "time. `POST /v1/agents` and `POST /v1/agents/from-template` also accept "
+        "a model of another category; `GET /v1/agents/{agent_id}` then lists "
+        "that slot in `unresolved_models`."
     )
     abilities: list[str] = Field(
         description="The model's abilities, for example `chat` or `vision`. "

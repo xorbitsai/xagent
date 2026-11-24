@@ -28,6 +28,7 @@ from datetime import datetime
 from typing import Annotated, Any, Dict, List, Literal, Optional
 
 from pydantic import (
+    AfterValidator,
     BaseModel,
     ConfigDict,
     Field,
@@ -382,6 +383,96 @@ class V1AgentDetail(V1AgentResponse):
         "check does not build the model, so a slot whose model the check "
         "accepts is not listed even when building that model fails as the task "
         "starts, and the task then falls back to another model."
+    )
+
+
+V1_AGENT_NAME_MAX_CHARS = 200
+V1_AGENT_DESCRIPTION_MAX_CHARS = 10_000
+V1_AGENT_INSTRUCTIONS_MAX_CHARS = 10_000
+# A cheap rejection at the request body, far above any legitimate text. The
+# limits above are applied against the stored value by the service.
+V1_AGENT_TEXT_ABSOLUTE_MAX_CHARS = 1_000_000
+
+
+def _reject_unstorable_text(value: str) -> str:
+    """Refuse text the database cannot store.
+
+    A NUL character parses but fails on write, which would surface as a server
+    error. A lone surrogate (JSON ``"\\ud800"``) is already refused by string
+    validation itself, before this runs.
+    """
+    if "\x00" in value:
+        raise ValueError("must not contain NUL characters")
+    return value
+
+
+# Listed after the length constraint so an oversized value is refused for its
+# length before it is scanned character by character.
+StorableText = AfterValidator(_reject_unstorable_text)
+
+
+class V1AgentUpdateRequest(BaseModel):
+    """Body for ``PATCH /v1/agents/{agent_id}``.
+
+    Send only the fields to change; a field that is left out keeps its stored
+    value, and a field sent as null is refused. Any other field is refused.
+    There is no conflict detection: of two concurrent changes the later one
+    wins.
+
+    A new task uses the changed agent at once. A task that already runs keeps
+    the previous text while its cached agent runtime is alive, which depends on
+    the task's state. Changing ``instructions`` also rejects the next turn of
+    an ongoing workforce conversation that includes this agent with
+    ``workforce_config_changed``. A 500 response can arrive after the change
+    was stored. Sending the same request again is safe: it returns the agent
+    as it is now and writes nothing if the change is already there.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: Optional[
+        Annotated[
+            str,
+            StringConstraints(min_length=1, max_length=V1_AGENT_NAME_MAX_CHARS),
+            StorableText,
+        ]
+    ] = Field(
+        default=None,
+        description=(
+            "The agent's new name, 1-200 characters. A name that is already in "
+            "use returns 400 `invalid_input`. The agent's own current name is "
+            "not a conflict."
+        ),
+    )
+    description: Optional[
+        Annotated[
+            str,
+            StringConstraints(max_length=V1_AGENT_TEXT_ABSOLUTE_MAX_CHARS),
+            StorableText,
+        ]
+    ] = Field(
+        default=None,
+        description=(
+            "The agent's new description. It may be at most 10000 characters "
+            "unless it is no longer than the stored description, so a longer "
+            "description created through `POST /v1/agents` can be sent back "
+            "unchanged or shortened. A value over 1000000 characters is always "
+            "refused."
+        ),
+    )
+    instructions: Optional[
+        Annotated[
+            str,
+            StringConstraints(max_length=V1_AGENT_TEXT_ABSOLUTE_MAX_CHARS),
+            StorableText,
+        ]
+    ] = Field(
+        default=None,
+        description=(
+            "The agent's new instructions. The length rule of `description` "
+            "applies, measured against the stored instructions, and so does "
+            "the 1000000-character bound."
+        ),
     )
 
 

@@ -36,6 +36,10 @@ from ..models.model import Model as DBModel
 from ..models.user import User
 from ..models.workforce import Workforce, WorkforceAgent, WorkforceRun
 from ..schemas.agent_api_key import APIKeyGenerateResponse
+from ..schemas.v1 import (
+    V1_AGENT_DESCRIPTION_MAX_CHARS,
+    V1_AGENT_INSTRUCTIONS_MAX_CHARS,
+)
 from ..services.agent_store import (
     AgentStore,
     UnsharedConnectorsError,
@@ -79,6 +83,19 @@ TEMPLATE_RESOLVE_RACE_RETRIES = 3
 
 class DuplicateAgentNameError(ValueError):
     """Raised when a user already owns an agent with the requested name."""
+
+
+class AgentTextTooLongError(ValueError):
+    """Raised when a text field would grow past its limit.
+
+    A value no longer than the stored one is never refused for its length, so
+    ``field`` here is one that grows and exceeds ``limit``.
+    """
+
+    def __init__(self, field: str, limit: int) -> None:
+        super().__init__(field)
+        self.field = field
+        self.limit = limit
 
 
 class TemplateQuickAccessRaceError(ValueError):
@@ -1059,6 +1076,13 @@ class AgentManagementService:
         return normalized
 
 
+# The text fields an update may change that are length limited, with their
+# limits, in the order they are checked.
+_UPDATE_TEXT_LIMITS = (
+    ("description", V1_AGENT_DESCRIPTION_MAX_CHARS),
+    ("instructions", V1_AGENT_INSTRUCTIONS_MAX_CHARS),
+)
+
 _MAX_MODEL_PK = 2**31 - 1
 
 
@@ -1333,6 +1357,125 @@ class AgentManagementRuntime:
             return AgentDetailSnapshot(
                 agent=_agent_response_snapshot(store.agent_to_response_dict(agent)),
                 unresolved_models=unresolved_models(db, agent, user_id),
+            )
+
+    async def update_agent(
+        self,
+        *,
+        user_id: int,
+        key_prefix: str,
+        agent_id: int,
+        changes: dict[str, str],
+    ) -> AgentDetailSnapshot | None:
+        """Change the name, description or instructions of an agent.
+
+        ``changes`` holds the fields the request sent, each with its new
+        value. Returns the configuration as it is after the change, or
+        ``None`` when the user cannot see the agent; that is decided under the
+        row lock the write takes. Only a field whose value differs from the
+        stored one is written, and nothing is written, cleared from the cache
+        or logged when none does. A text field may not grow past its limit
+        (:class:`AgentTextTooLongError`) and a new name may not be taken
+        (:class:`DuplicateAgentNameError`). The write is the one the web app
+        uses; see :meth:`_update_agent_sync` for the failure contract.
+        """
+        return await run_db_io_cancellation_safe(
+            lambda: self._update_agent_sync(
+                user_id=user_id,
+                key_prefix=key_prefix,
+                agent_id=agent_id,
+                changes=changes,
+            )
+        )
+
+    @staticmethod
+    def _update_agent_sync(
+        *,
+        user_id: int,
+        key_prefix: str,
+        agent_id: int,
+        changes: dict[str, str],
+    ) -> AgentDetailSnapshot | None:
+        """Decide and write in one locked transaction, then log.
+
+        A cancelled request does not stop this worker, so both log lines are
+        written here, not after the awaiting caller resumes. The lines carry
+        field names only, never a value.
+
+        An exception from the write may have come before or after the commit,
+        which cannot be told apart here, so it is logged as an unknown outcome
+        and re-raised. Retrying the same request is safe: a change that was
+        stored shows no difference and writes nothing.
+        """
+        SessionLocal = get_session_local()
+        with SessionLocal() as db:
+            team_scope = get_agent_team_scope(db, user_id)
+            store = AgentStore(db)
+            agent = store.get_owned_agent(
+                user_id, agent_id, team_scope, for_update=True
+            )
+            if agent is None:
+                return None
+            updates = {
+                field: value
+                for field, value in changes.items()
+                if getattr(agent, field) != value
+            }
+            if updates:
+                for field, limit in _UPDATE_TEXT_LIMITS:
+                    if field not in updates:
+                        continue
+                    stored_length = len(getattr(agent, field) or "")
+                    if len(updates[field]) > max(limit, stored_length):
+                        raise AgentTextTooLongError(field, limit)
+                if "name" in updates and store.agent_name_exists(
+                    user_id,
+                    updates["name"],
+                    exclude_agent_id=agent_id,
+                    team_scope=team_scope,
+                ):
+                    raise DuplicateAgentNameError()
+                fields = ",".join(sorted(updates))
+                # Computed before the write so that nothing after the commit
+                # reads the database. The models are not part of this update,
+                # so the stored ones are what the response reflects.
+                unresolved = unresolved_models(db, agent, user_id)
+                try:
+                    store.update_agent_fields(
+                        user_id,
+                        agent_id,
+                        dict(updates),
+                        team_scope=team_scope,
+                        agent=agent,
+                    )
+                except BaseException as exc:
+                    if isinstance(exc, IntegrityError) and (
+                        is_agent_name_unique_violation(exc)
+                    ):
+                        db.rollback()
+                        raise DuplicateAgentNameError() from exc
+                    logger.error(
+                        "personal key agent update outcome unknown: "
+                        "key_prefix=%s user_id=%d agent_id=%d fields=%s",
+                        key_prefix,
+                        user_id,
+                        agent_id,
+                        fields,
+                    )
+                    raise
+                logger.info(
+                    "personal key agent update: key_prefix=%s user_id=%d "
+                    "agent_id=%d fields=%s",
+                    key_prefix,
+                    user_id,
+                    agent_id,
+                    fields,
+                )
+            else:
+                unresolved = unresolved_models(db, agent, user_id)
+            return AgentDetailSnapshot(
+                agent=_agent_response_snapshot(store.agent_to_response_dict(agent)),
+                unresolved_models=unresolved,
             )
 
     async def list_usable_models(

@@ -383,7 +383,7 @@ describe("useWidgetSession", () => {
     },
   )
 
-  it.each([1000, 1001])("terminalizes a current-owner standard WebSocket close %s without reconnecting", (code) => {
+  it.each([1000])("terminalizes a current-owner standard WebSocket close %s without reconnecting", (code) => {
     const postMessage = vi.spyOn(window, "postMessage")
     const { result } = renderHook(() => useWidgetSession())
     dispatchFromParent(updateMessage())
@@ -519,6 +519,19 @@ describe("useWidgetSession", () => {
 
     act(() => result.current.requestReconnect("ws_closed"))
     act(() => vi.advanceTimersByTime(30_000))
+
+    expect(result.current.status).toBe("refreshing")
+    expect(result.current.terminalCode).toBeNull()
+    expect(postMessage.mock.calls.filter((call) => call[0]?.type === "reconnect_request")).toHaveLength(1)
+  })
+
+  it("reconnects after a 1001 going-away close instead of ending the session", () => {
+    vi.useFakeTimers()
+    const postMessage = vi.spyOn(window, "postMessage")
+    const { result } = renderHook(() => useWidgetSession())
+    dispatchFromParent(updateMessage())
+
+    act(() => result.current.handleConnectionClose(new CloseEvent("close", { code: 1001 })))
 
     expect(result.current.status).toBe("refreshing")
     expect(result.current.terminalCode).toBeNull()
@@ -1334,7 +1347,6 @@ describe("useWidgetSession terminal report to the parent", () => {
   }
   const rows: Array<[string, string, (hook: ReturnType<typeof useWidgetSession>) => void]> = [
     ["chat socket closed with 1000", "unexpected_error", closeWith(1000)],
-    ["chat socket closed with 1001", "unexpected_error", closeWith(1001)],
     ["chat socket closed with 4403", "ws_4403", closeWith(4403)],
     ["chat socket closed with 4408", "ws_4408", closeWith(4408)],
     ["an unrecoverable connection failure", "unexpected_error", (hook) => {

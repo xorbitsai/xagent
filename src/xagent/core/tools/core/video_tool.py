@@ -557,7 +557,7 @@ The generated video URL is temporary on the provider side, so completed videos a
         return f"data:{mime_type};base64,{encoded}"
 
     async def _prepare_ark_image_references(
-        self, generate_params: dict[str, Any]
+        self, generate_params: dict[str, Any], *, convert_reference_list: bool = True
     ) -> None:
         converted_refs: dict[str, str] = {}
 
@@ -572,7 +572,7 @@ The generated video URL is temporary on the provider side, so completed videos a
                 generate_params[key] = await convert_ref(generate_params[key])
 
         reference_image_urls = generate_params.get("reference_image_urls")
-        if reference_image_urls:
+        if reference_image_urls and convert_reference_list:
             generate_params["reference_image_urls"] = [
                 await convert_ref(url) for url in reference_image_urls
             ]
@@ -893,6 +893,15 @@ The generated video URL is temporary on the provider side, so completed videos a
             generate_params.update(kwargs)
             if isinstance(inner_video_model, ArkVideoModel):
                 await self._prepare_ark_image_references(generate_params)
+            elif isinstance(inner_video_model, XinferenceVideoModel) and (
+                inner_video_model.saas_api
+            ):
+                # Workspace file references become data URLs through the same
+                # staging as Ark; the reference list is left for the model to
+                # refuse, since it only takes keyframes.
+                await self._prepare_ark_image_references(
+                    generate_params, convert_reference_list=False
+                )
             if self._workspace and isinstance(inner_video_model, XinferenceVideoModel):
                 generate_params["allowed_local_media_roots"] = [
                     self._workspace.workspace_dir

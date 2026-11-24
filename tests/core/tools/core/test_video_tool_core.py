@@ -287,6 +287,40 @@ async def test_generate_video_keeps_workspace_image_ref_for_xinference(mock_work
 
 
 @pytest.mark.asyncio
+async def test_generate_video_converts_workspace_refs_to_data_urls_for_saas(
+    mock_workspace,
+):
+    image_path = mock_workspace.output_dir / "frame.png"
+    image_path.write_bytes(b"image bytes")
+    mock_workspace.stage_path_for_external_upload = Mock(return_value=image_path)
+    mock_workspace.discard_staged_external_upload = Mock()
+    saas_model = XinferenceVideoModel(model_name="minimax-h3", saas_api=True)
+    saas_model.generate_video = AsyncMock(
+        return_value={"task_id": "t", "status": "succeeded", "video_url": ""}
+    )
+    tool = VideoGenerationToolCore(
+        {"saas": saas_model},
+        workspace=mock_workspace,
+        default_video_model=saas_model,
+    )
+
+    result = await tool.generate_video(
+        "Animate this frame",
+        image_url="file:image-file-id",
+        reference_image_urls=["https://x.test/ref.png"],
+        seconds=4,
+    )
+
+    assert result["success"] is True
+    kwargs = saas_model.generate_video.await_args.kwargs
+    assert kwargs["first_frame_image_url"].startswith("data:image/")
+    assert kwargs["input_reference"] == kwargs["first_frame_image_url"]
+    # The list is left for the model to refuse, not converted or dropped here.
+    assert kwargs["reference_image_urls"] == ["https://x.test/ref.png"]
+    mock_workspace.discard_staged_external_upload.assert_called_once_with(image_path)
+
+
+@pytest.mark.asyncio
 async def test_list_video_models_reports_lightning_by_running_uid(
     monkeypatch, mock_workspace
 ):

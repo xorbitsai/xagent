@@ -427,3 +427,58 @@ async def test_saas_remote_url_is_downloaded_and_sent_as_data_url(
     assert transport["json"][0]["body"]["first_frame_image"].startswith(
         "data:image/png;base64,"
     )
+
+
+@pytest.mark.parametrize(
+    "key",
+    ["reference_image_urls", "reference_video_urls", "reference_audio_urls"],
+)
+async def test_saas_refuses_reference_lists_instead_of_dropping_them(transport, key):
+    with pytest.raises(MediaParameterError) as err:
+        await _build().generate_video(prompt="a fox", **{key: ["https://x.test/r"]})
+    assert err.value.field == key
+    assert transport["json"] == []
+
+
+async def test_saas_empty_reference_lists_are_ignored(transport):
+    await _build().generate_video(prompt="a fox", reference_image_urls=[])
+    assert len(transport["json"]) == 1
+
+
+@pytest.mark.parametrize(
+    ("message", "expected"),
+    [
+        ("Remote input download timed out", TimeoutError),
+        ("Remote input connection failed", ConnectionError),
+        ("Remote input returned HTTP 503", ConnectionError),
+        ("Remote input returned HTTP 429", ConnectionError),
+        ("Remote input returned HTTP 404", MediaParameterError),
+        (
+            "Remote input violated the public-network, redirect or size policy",
+            MediaParameterError,
+        ),
+    ],
+)
+async def test_saas_frame_download_failures_keep_their_category(
+    transport, monkeypatch, message, expected
+):
+    from xagent.core.tools.core.media_errors import (
+        INVALID_REQUEST,
+        classify_media_failure,
+    )
+    from xagent.core.utils.public_download import PublicDownloadError
+
+    async def failing(url, **kwargs):
+        raise PublicDownloadError(message)
+
+    monkeypatch.setattr(
+        "xagent.core.model.video.xinference.download_public_input", failing
+    )
+    with pytest.raises(expected) as err:
+        await _build().generate_video(
+            prompt="a fox", input_reference="https://x.test/a.png"
+        )
+    assert (classify_media_failure(err.value) == INVALID_REQUEST) is (
+        expected is MediaParameterError
+    )
+    assert transport["json"] == []

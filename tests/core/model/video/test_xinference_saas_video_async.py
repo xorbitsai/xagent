@@ -629,7 +629,7 @@ async def test_validation_still_runs_before_any_request(server):
         {"seconds": 3},
         {"size": "banana"},
         {"n": 2},
-        {"input_reference": "https://x.test/a.png"},
+        {"reference_image_urls": ["https://x.test/a.png"]},
     ):
         with pytest.raises(MediaParameterError):
             await _build().generate_video(prompt="a fox", **kwargs)

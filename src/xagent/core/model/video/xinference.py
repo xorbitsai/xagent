@@ -25,7 +25,7 @@ from ....config import (
     get_xinference_saas_video_async_enabled,
 )
 from ...tools.core.media_errors import MediaParameterError, redact_provider_detail
-from ...utils.public_download import download_public_input
+from ...utils.public_download import PublicDownloadError, download_public_input
 from ..chat.token_context import MediaCallType
 from ..media_metering import record_provider_usage
 from ..public_http import create_public_model_aiohttp_session
@@ -341,6 +341,33 @@ def _saas_nearest_shape(width: int, height: int) -> tuple[int, int]:
         SAAS_VIDEO_SIZES,
         key=lambda shape: (_saas_log_ratio(width, height, shape), shape),
     )
+
+
+_TRANSIENT_DOWNLOAD_STATUSES = frozenset({408, 429})
+
+
+def _raise_frame_download_error(field: str, exc: PublicDownloadError) -> None:
+    """Keep a fetch that may succeed later apart from an unusable input.
+
+    A timeout, a refused connection or a 5xx/408/429 answer says nothing about
+    the image, so it surfaces as an operational error. A policy refusal, a 4xx
+    answer or an oversized body is the caller's input and stays a parameter
+    error.
+    """
+    text = str(exc)
+    status_text = text.removeprefix("Remote input returned HTTP ")
+    status = int(status_text) if status_text.isdigit() else None
+    if "timed out" in text:
+        raise TimeoutError(f"The {field} image download timed out") from None
+    if "connection failed" in text or (
+        status is not None and (status >= 500 or status in _TRANSIENT_DOWNLOAD_STATUSES)
+    ):
+        raise ConnectionError(
+            f"The {field} image could not be downloaded: {text}"
+        ) from None
+    raise MediaParameterError(
+        f"The {field} image could not be loaded: {text}", field=field
+    ) from None
 
 
 def _saas_frame_from_bytes(raw: bytes, field: str) -> _SaasFrame:
@@ -783,6 +810,8 @@ class XinferenceVideoModel(BaseVideoModel):
                 )
             except MediaParameterError:
                 raise
+            except PublicDownloadError as exc:
+                _raise_frame_download_error(field, exc)
             except Exception as exc:  # noqa: BLE001 - classified as bad input
                 raise MediaParameterError(
                     f"The {field} image could not be loaded: "
@@ -799,6 +828,7 @@ class XinferenceVideoModel(BaseVideoModel):
         reference_image: Optional[str],
         last_frame_image_url: Optional[str],
         allowed_local_media_roots: Optional[list[str | Path]],
+        extra_references: dict[str, Any],
         seconds: Any,
         size: Optional[str],
         resolution: Optional[str],
@@ -807,6 +837,18 @@ class XinferenceVideoModel(BaseVideoModel):
         timeout: float,
     ) -> dict[str, Any]:
         # Every refusal and validation happens before a request is built.
+        for key in (
+            "reference_image_urls",
+            "reference_video_urls",
+            "reference_audio_urls",
+        ):
+            if extra_references.get(key):
+                raise MediaParameterError(
+                    f"This Xinference video model does not accept {key}; use a "
+                    "first frame (input_reference) and optional last frame, or "
+                    "choose another video model",
+                    field=key,
+                )
         if last_frame_image_url and not reference_image:
             raise MediaParameterError(
                 "last_frame_image_url requires a first frame "
@@ -1438,6 +1480,7 @@ class XinferenceVideoModel(BaseVideoModel):
                 or image,
                 last_frame_image_url=last_frame_image_url,
                 allowed_local_media_roots=allowed_local_media_roots,
+                extra_references=kwargs,
                 seconds=seconds if seconds is not None else duration,
                 size=size or _size_from_resolution_ratio(resolution, ratio),
                 resolution=resolution,

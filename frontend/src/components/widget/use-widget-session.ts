@@ -518,6 +518,7 @@ export function useWidgetSession() {
   // Resolves once the socket of the current generation is open; waits through
   // a refresh for the next generation's socket.
   const waitForOpenConnection = useCallback((): Promise<void> => {
+    sendDelayedReconnectNow()
     const unavailable = unavailableError()
     if (unavailable) {
       return Promise.reject(new WidgetSessionUploadError("connection_not_ready", "session unavailable"))
@@ -532,7 +533,7 @@ export function useWidgetSession() {
       }, "connection_not_ready")
       openWaitersRef.current.push(waiter)
     })
-  }, [newWaiter, unavailableError])
+  }, [newWaiter, sendDelayedReconnectNow, unavailableError])
 
   const scheduleExpiryWarning = useCallback((absoluteExpiresAt: number) => {
     clearWarningTimer()

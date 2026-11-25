@@ -1529,6 +1529,20 @@ describe("useWidgetSession reconnect jitter", () => {
     return expect(pending).resolves.toMatchObject({ token: "st_next" })
   })
 
+  it("sends the delayed request at once when a caller waits for the connection", () => {
+    vi.spyOn(Math, "random").mockReturnValue(0.5)
+    const { result, postMessage } = mountActive()
+    act(() => {
+      result.current.handleConnectionClose(new CloseEvent("close", { code: 1006 }))
+    })
+    expect(reconnectRequests(postMessage)).toHaveLength(0)
+
+    act(() => {
+      void result.current.waitForOpenConnection().catch(() => undefined)
+    })
+    expect(reconnectRequests(postMessage)).toHaveLength(1)
+  })
+
   it("does not delay a reconnect for an expiring token", () => {
     vi.spyOn(Math, "random").mockReturnValue(0.5)
     const { result, postMessage } = mountActive()

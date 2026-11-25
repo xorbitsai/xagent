@@ -2529,6 +2529,23 @@ describe("widget session mode", () => {
     expect(fetchMock).toHaveBeenCalledTimes(2)
   })
 
+  it("does not spread a 503 whose back-off is longer than its Retry-After", async () => {
+    vi.useFakeTimers()
+    vi.mocked(Math.random).mockReturnValue(0.999_999)
+    fetchMock.mockImplementation(() => Promise.resolve(jsonResponse(
+      503,
+      { error: { code: "service_unavailable" } },
+      { "Retry-After": "1" },
+    )))
+    runWidget({ "data-encrypted-context": GRANT })
+
+    // Back-off alone: 1000 * (0.8 + 0.4 * 0.999999) = 1200 ms.
+    await vi.advanceTimersByTimeAsync(1_199)
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+    await vi.advanceTimersByTimeAsync(1)
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+  })
+
   it("spreads a Retry-After of 0 instead of retrying every client at once", async () => {
     vi.useFakeTimers()
     vi.mocked(Math.random).mockReturnValue(0.5)

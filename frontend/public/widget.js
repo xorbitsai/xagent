@@ -247,8 +247,8 @@
         // An overloaded server answers 503 with Retry-After, how long to stay away; honour
         // it (up to the rate-limit cap) and spread the clients that were
         // refused together.
-        wait = Math.max(wait, Math.min(retryAfterMs(result), policy.maxRateLimitWaitMs));
-        wait = sessionSpreadDelayMs(policy, wait, Math.random());
+        var asked = Math.min(retryAfterMs(result), policy.maxRateLimitWaitMs);
+        if (asked > wait) wait = sessionSpreadDelayMs(policy, asked, Math.random());
       }
       if (mayHaveReachedServer) wait = Math.min(wait, policy.maxDelayAfterTimeoutMs);
       return retryAfter(wait, 'network_unavailable', wake);

@@ -7,6 +7,7 @@ import { uploadWidgetSessionFile } from "@/lib/widget-session-upload"
 import {
   buildWidgetSessionWebSocketUrl,
   useWidgetSession,
+  WS_CLOSE_RECONNECT_JITTER_MAX_MS,
   type WidgetSession,
 } from "./use-widget-session"
 
@@ -235,6 +236,7 @@ describe("useWidgetSession", () => {
     dispatchFromParent(updateMessage())
 
     act(() => result.current.requestReconnect("ws_closed"))
+    act(() => vi.advanceTimersByTime(WS_CLOSE_RECONNECT_JITTER_MAX_MS))
     expect(postMessage.mock.calls.filter((call) => call[0]?.type === "reconnect_request")).toHaveLength(1)
 
     dispatchFromParent({
@@ -257,6 +259,7 @@ describe("useWidgetSession", () => {
   })
 
   it("sends an exact-origin reconnect request once and removes the usable token", () => {
+    vi.useFakeTimers()
     const postMessage = vi.spyOn(window, "postMessage")
     const { result } = renderHook(() => useWidgetSession())
     dispatchFromParent(updateMessage())
@@ -265,6 +268,7 @@ describe("useWidgetSession", () => {
       result.current.requestReconnect("ws_closed")
       result.current.requestReconnect("ws_closed")
     })
+    act(() => vi.advanceTimersByTime(WS_CLOSE_RECONNECT_JITTER_MAX_MS))
 
     expect(result.current.status).toBe("refreshing")
     expect(result.current.session).toBeNull()
@@ -276,6 +280,7 @@ describe("useWidgetSession", () => {
   })
 
   it("owns recoverable transport failures with the existing one-shot reconnect latch", () => {
+    vi.useFakeTimers()
     const postMessage = vi.spyOn(window, "postMessage")
     const { result } = renderHook(() => useWidgetSession())
     dispatchFromParent(updateMessage())
@@ -294,6 +299,7 @@ describe("useWidgetSession", () => {
         error: new Error("duplicate physical transport failure"),
       })
     })
+    act(() => vi.advanceTimersByTime(WS_CLOSE_RECONNECT_JITTER_MAX_MS))
 
     expect(result.current.status).toBe("refreshing")
     expect(result.current.session).toBeNull()
@@ -334,6 +340,7 @@ describe("useWidgetSession", () => {
   it.each([4401, 1006, 1001, 4500])(
     "owns abnormal WebSocket close %s and requests one parent reconnect",
     (code) => {
+      vi.useFakeTimers()
       const postMessage = vi.spyOn(window, "postMessage")
       const { result } = renderHook(() => useWidgetSession())
       dispatchFromParent(updateMessage())
@@ -344,6 +351,7 @@ describe("useWidgetSession", () => {
           new CloseEvent("close", { code }),
         )
       })
+      act(() => vi.advanceTimersByTime(WS_CLOSE_RECONNECT_JITTER_MAX_MS))
 
       expect(disposition).toBe("handled")
       expect(result.current.status).toBe("refreshing")
@@ -1451,5 +1459,116 @@ describe("useWidgetSession handleSessionExpired", () => {
     dispatchFromParent(updateMessage())
     act(() => { closed.result.current.handleConnectionClose(new CloseEvent("close", { code: 4408 })) })
     expect(ended(closed.result.current)).toEqual(viaVoice)
+  })
+})
+
+describe("useWidgetSession reconnect jitter", () => {
+  const reconnectRequests = (postMessage: { mock: { calls: unknown[][] } }) =>
+    postMessage.mock.calls.filter(
+      ([message]) => (message as { type?: string } | null)?.type === "reconnect_request",
+    )
+
+  function mountActive() {
+    vi.useFakeTimers()
+    const postMessage = vi.spyOn(EMBEDDED_PARENT, "postMessage").mockImplementation(() => undefined)
+    const hook = renderHook(() => useWidgetSession())
+    dispatchFromParent(updateMessage())
+    postMessage.mockClear()
+    return { ...hook, postMessage }
+  }
+
+  it.each([
+    ["the low", 0, 0],
+    ["the middle", 0.5, WS_CLOSE_RECONNECT_JITTER_MAX_MS / 2],
+    ["the high", 0.999_999, WS_CLOSE_RECONNECT_JITTER_MAX_MS - 1],
+  ])("waits %s end of the jitter range before the first reconnect after a drop", (_end, random, delay) => {
+    vi.spyOn(Math, "random").mockReturnValue(random)
+    const { result, postMessage } = mountActive()
+
+    act(() => {
+      result.current.handleConnectionClose(new CloseEvent("close", { code: 1001 }))
+    })
+
+    // The reconnecting state shows at once; the request does not go out yet.
+    expect(result.current.status).toBe("refreshing")
+    if (delay > 0) {
+      act(() => vi.advanceTimersByTime(delay - 1))
+      expect(reconnectRequests(postMessage)).toHaveLength(0)
+    }
+    act(() => vi.advanceTimersByTime(1))
+    expect(reconnectRequests(postMessage)).toEqual([[
+      { xagent: true, v: 1, type: "reconnect_request", reason: "ws_closed" },
+      PARENT_ORIGIN,
+    ]])
+    expect(delay).toBeLessThan(WS_CLOSE_RECONNECT_JITTER_MAX_MS)
+  })
+
+  it("keeps the jitter bound under the thresholds that lose a session", () => {
+    expect(WS_CLOSE_RECONNECT_JITTER_MAX_MS).toBeLessThanOrEqual(30_000)
+  })
+
+  it("sends the delayed request at once when a caller needs a session", () => {
+    vi.spyOn(Math, "random").mockReturnValue(0.5)
+    const { result, postMessage } = mountActive()
+    act(() => {
+      result.current.handleConnectionClose(new CloseEvent("close", { code: 1006 }))
+    })
+    expect(reconnectRequests(postMessage)).toHaveLength(0)
+
+    let pending: Promise<unknown> | undefined
+    act(() => {
+      pending = result.current.ensureFreshSession()
+    })
+    expect(reconnectRequests(postMessage)).toHaveLength(1)
+
+    // The timer is gone: no second request when the delay would have ended.
+    act(() => vi.advanceTimersByTime(WS_CLOSE_RECONNECT_JITTER_MAX_MS))
+    expect(reconnectRequests(postMessage)).toHaveLength(1)
+
+    dispatchFromParent(updateMessage({ session_token: "st_next" }))
+    return expect(pending).resolves.toMatchObject({ token: "st_next" })
+  })
+
+  it("sends the delayed request at once when a caller waits for the connection", () => {
+    vi.spyOn(Math, "random").mockReturnValue(0.5)
+    const { result, postMessage } = mountActive()
+    act(() => {
+      result.current.handleConnectionClose(new CloseEvent("close", { code: 1006 }))
+    })
+    expect(reconnectRequests(postMessage)).toHaveLength(0)
+
+    act(() => {
+      void result.current.waitForOpenConnection().catch(() => undefined)
+    })
+    expect(reconnectRequests(postMessage)).toHaveLength(1)
+  })
+
+  it("does not delay a reconnect for an expiring token", () => {
+    vi.spyOn(Math, "random").mockReturnValue(0.5)
+    const { result, postMessage } = mountActive()
+    act(() => result.current.requestReconnect("token_expired"))
+    expect(reconnectRequests(postMessage)).toHaveLength(1)
+  })
+
+  it("drops the delayed request when the parent delivers a session first", () => {
+    vi.spyOn(Math, "random").mockReturnValue(0.5)
+    const { result, postMessage } = mountActive()
+    act(() => {
+      result.current.handleConnectionClose(new CloseEvent("close", { code: 1006 }))
+    })
+    dispatchFromParent(updateMessage({ session_token: "st_pushed" }))
+    act(() => vi.advanceTimersByTime(WS_CLOSE_RECONNECT_JITTER_MAX_MS))
+    expect(reconnectRequests(postMessage)).toHaveLength(0)
+  })
+
+  it("drops the delayed request when the session ends meanwhile", () => {
+    vi.spyOn(Math, "random").mockReturnValue(0.5)
+    const { result, postMessage } = mountActive()
+    act(() => {
+      result.current.handleConnectionClose(new CloseEvent("close", { code: 1006 }))
+    })
+    dispatchFromParent({ xagent: true, v: 1, type: "session_terminal", code: "session_expired" })
+    act(() => vi.advanceTimersByTime(WS_CLOSE_RECONNECT_JITTER_MAX_MS))
+    expect(reconnectRequests(postMessage)).toHaveLength(0)
   })
 })

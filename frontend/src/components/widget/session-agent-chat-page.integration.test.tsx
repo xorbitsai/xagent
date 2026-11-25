@@ -278,6 +278,7 @@ describe("SessionAgentChatPage connection failure integration", () => {
   )
 
   it("requests one parent reconnect for a physical failure and its abnormal close", async () => {
+    vi.spyOn(Math, "random").mockReturnValue(0) // no reconnect jitter
     const parentPostMessage = vi.spyOn(window, "postMessage")
       .mockImplementation(() => {})
     vi.spyOn(console, "error").mockImplementation(() => {})

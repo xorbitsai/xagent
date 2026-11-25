@@ -59,6 +59,11 @@
     maxDelayMs: 300000,
     maxDelayAfterTimeoutMs: 10000,
     jitter: 0.2,
+    // Extra random wait, as a fraction of the wait, added after a 429 or 503
+    // so that clients refused together do not come back together. At most
+    // +50% of a wait of at most 30 s is 45 s, under the 60 s staleness threshold and far
+    // under the 10 min reconnect token replay window.
+    spread: 0.5,
     // After this many transport retries, a rejected fetch logs the CSP/CORS hint.
     unreachableHintAfter: 5
   };
@@ -153,6 +158,14 @@
     return Math.round(nominal * (1 - policy.jitter + 2 * policy.jitter * random));
   }
 
+  // Adds a random share of up to policy.spread of `waitMs` (at least of the
+  // one-second fallback, so a Retry-After of 0 still spreads), in whole
+  // milliseconds. `random` is a value in [0, 1).
+  function sessionSpreadDelayMs(policy, waitMs, random) {
+    var base = Math.max(waitMs, SESSION_RETRY_AFTER_FALLBACK_MS);
+    return waitMs + Math.floor(base * policy.spread * random);
+  }
+
   function isPlainSessionErrorObject(value) {
     if (!value || typeof value !== 'object') return false;
     // Prototype identity is not affected by host-page Symbol.toStringTag pollution.
@@ -227,9 +240,16 @@
 
     // Never gives up. A wake runs the next attempt at once; if it fails, the
     // back-off continues where it was.
-    function retryTransport(mayHaveReachedServer) {
+    function retryTransport(mayHaveReachedServer, result) {
       retry.transportRetries += 1;
       var wait = sessionRetryDelayMs(policy, retry.transportRetries, Math.random());
+      if (result && result.status === 503 && result.retryAfter) {
+        // An overloaded server answers 503 with Retry-After, how long to stay away; honour
+        // it (up to the rate-limit cap) and spread the clients that were
+        // refused together.
+        var asked = Math.min(retryAfterMs(result), policy.maxRateLimitWaitMs);
+        if (asked > wait) wait = sessionSpreadDelayMs(policy, asked, Math.random());
+      }
       if (mayHaveReachedServer) wait = Math.min(wait, policy.maxDelayAfterTimeoutMs);
       return retryAfter(wait, 'network_unavailable', wake);
     }
@@ -261,11 +281,15 @@
             return result;
           }
           retry.rateLimited += 1;
-          // The server asked for this wait; a wake does not shorten it.
-          return retryAfter(wait, 'rate_limited', null);
+          // The server asked for at least this wait, and a wake does not
+          // shorten it. The spread stays under maxRateLimitWaitMs so that a
+          // wait the check above accepted never exceeds the give-up bound.
+          var room = policy.maxRateLimitWaitMs - 1 - wait;
+          var spread = sessionSpreadDelayMs(policy, wait, Math.random()) - wait;
+          return retryAfter(wait + Math.max(0, Math.min(spread, room)), 'rate_limited', null);
         }
         if (!isKnownSessionErrorCode(code) && result.status >= 500) {
-          return retryTransport(result.status === 504);
+          return retryTransport(result.status === 504, result);
         }
         return result;
       }, function (error) {

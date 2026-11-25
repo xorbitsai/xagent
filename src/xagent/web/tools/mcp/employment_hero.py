@@ -308,6 +308,27 @@ def employment_hero_list_organisations(
 
 
 @mcp.tool(annotations=READ_ONLY)
+def employment_hero_get_current_user() -> str:
+    """
+    Identify the person this connection signed in as: their Employment Hero
+    user id and every active membership, each with organisation_id,
+    organisation_name, member_id, role, name, and email. Call this first
+    when the person asks about themselves ("my leave balance", "submit leave
+    for me"): pass that organisation's member_id as employee_id to the leave
+    tools instead of searching the employee directory, which staff without
+    an admin or manager role may not be allowed to list.
+    """
+    try:
+        result = _request("GET", "/user_info")
+        return success_with_capped_dict(
+            "current_user", _record_payload(result, "current user")
+        )
+    except Exception as e:
+        logger.error(f"Error getting the current Employment Hero user: {e}")
+        return _error(str(e))
+
+
+@mcp.tool(annotations=READ_ONLY)
 def employment_hero_list_employees(
     organisation_id: str,
     member_type: str = "",
@@ -513,7 +534,9 @@ def employment_hero_get_leave_balances(
     this endpoint for organisations using HR Leave with Leave Balance data;
     payroll-connected organisations are not supported by the vendor.
     organisation_id: id from employment_hero_list_organisations.
-    employee_id: resolve with employment_hero_list_employees(query=...).
+    employee_id: for the person themselves, member_id from
+    employment_hero_get_current_user; for anyone else, resolve with
+    employment_hero_list_employees(query=...).
     page_index: 1-based page number.
     item_per_page: results per page (max 100).
     """
@@ -549,7 +572,9 @@ def employment_hero_list_leave_requests(
     List leave requests. Leave employee_id empty for an organisation-wide
     manager/approver view, or provide it for one employee's requests.
     organisation_id: id from employment_hero_list_organisations.
-    employee_id: optional id from employment_hero_list_employees(query=...).
+    employee_id: optional; for the person's own requests, member_id from
+    employment_hero_get_current_user; for anyone else, an id from
+    employment_hero_list_employees(query=...).
     statuses: optional request status filters: pending, approved, or declined.
     start_date, end_date: optional inclusive YYYY-MM-DD range boundaries.
     leave_category_id: optional id from employment_hero_list_leave_categories.
@@ -621,7 +646,9 @@ def employment_hero_create_leave_request(
     comment with the user before calling, and do not blindly retry after an
     ambiguous timeout.
     organisation_id: id from employment_hero_list_organisations.
-    employee_id: resolve with employment_hero_list_employees(query=...).
+    employee_id: for the person themselves, member_id from
+    employment_hero_get_current_user; for anyone else, resolve with
+    employment_hero_list_employees(query=...).
     leave_category_id: id from employment_hero_list_leave_categories.
     start_date, end_date: inclusive YYYY-MM-DD dates.
     comment: optional comment for the request.

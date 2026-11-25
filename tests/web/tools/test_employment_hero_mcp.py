@@ -237,6 +237,41 @@ def test_list_organisations_errors_on_non_dict_data_shape(monkeypatch):
     assert result["status"] == "error"
 
 
+def test_get_current_user_returns_memberships_from_user_info(monkeypatch):
+    membership = {
+        "member_id": "member-1",
+        "organisation_id": "org-1",
+        "organisation_name": "Acme Pty Ltd",
+        "role": "employee",
+        "email": "jane.citizen@example.com",
+        "name": "Jane Citizen",
+    }
+    mock_request = Mock(
+        return_value=MockResponse(
+            json_data={"data": {"id": "user-1", "memberships": [membership]}}
+        )
+    )
+    monkeypatch.setattr(employment_hero.requests, "request", mock_request)
+
+    result = json.loads(employment_hero.employment_hero_get_current_user())
+
+    assert result["status"] == "success"
+    assert result["current_user"] == {"id": "user-1", "memberships": [membership]}
+    call = mock_request.call_args
+    assert call.kwargs["method"] == "GET"
+    assert call.kwargs["url"] == f"{employment_hero.EMPLOYMENT_HERO_BASE_URL}/user_info"
+    assert call.kwargs["headers"] == {"Authorization": "Bearer access-token"}
+
+
+def test_get_current_user_errors_on_unexpected_shape(monkeypatch):
+    mock_request = Mock(return_value=MockResponse(json_data={"data": []}))
+    monkeypatch.setattr(employment_hero.requests, "request", mock_request)
+
+    result = json.loads(employment_hero.employment_hero_get_current_user())
+
+    assert result["status"] == "error"
+
+
 def test_list_employees_includes_member_type_only_when_provided(monkeypatch):
     mock_request = Mock(return_value=MockResponse(json_data={"data": {"items": []}}))
     monkeypatch.setattr(employment_hero.requests, "request", mock_request)
@@ -720,6 +755,7 @@ def test_leave_tools_are_discoverable_with_expected_annotations_and_search_schem
     tools = {tool.name: tool for tool in asyncio.run(employment_hero.mcp.list_tools())}
 
     expected_leave_tools = {
+        "employment_hero_get_current_user",
         "employment_hero_list_leave_categories",
         "employment_hero_get_leave_balances",
         "employment_hero_list_leave_requests",
@@ -730,6 +766,7 @@ def test_leave_tools_are_discoverable_with_expected_annotations_and_search_schem
     assert "query" in tools["employment_hero_list_employees"].inputSchema["properties"]
 
     for name in (
+        "employment_hero_get_current_user",
         "employment_hero_list_leave_categories",
         "employment_hero_get_leave_balances",
         "employment_hero_list_leave_requests",

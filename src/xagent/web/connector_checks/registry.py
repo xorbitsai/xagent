@@ -364,10 +364,17 @@ def _jira_checks() -> ConnectorChecks:
                     Equals(("issue", "key"), seeded_issue),
                     HasKeys(
                         ("issue",),
-                        ("summary", "description", "status", "issue_type"),
+                        (
+                            "summary",
+                            "description",
+                            "status",
+                            "issue_type",
+                            "custom_fields",
+                        ),
                     ),
                     IsType(("issue", "summary"), "string"),
                     IsType(("issue", "description"), "string"),
+                    IsType(("issue", "custom_fields"), "array"),
                 ),
             ),
             ReadCheck(

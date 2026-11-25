@@ -19,6 +19,7 @@ from xagent.web.models.user import User
 from xagent.web.services.agent_service_manager import (
     AgentServiceManager,
     AgentServiceMemoryPolicy,
+    _task_model_override_allowed_model_ids,
     _task_model_override_excluded_categories,
     _task_model_override_excluded_model_ids,
 )
@@ -873,3 +874,104 @@ async def test_build_tools_for_task_passes_excluded_model_ids() -> None:
         )
 
     assert create_tools.await_args.kwargs["excluded_model_ids"] == frozenset({"img-1"})
+
+
+class TestAllowedModelIds:
+    def test_any_collection_becomes_a_frozenset(self):
+        override = TaskModelOverride(
+            llm=NamedLLM("selected"),
+            allowed_model_ids=["img-1", "vid-1"],  # type: ignore[arg-type]
+        )
+        assert override.allowed_model_ids == frozenset({"img-1", "vid-1"})
+
+    def test_the_default_is_no_bound(self):
+        assert TaskModelOverride(llm=NamedLLM("selected")).allowed_model_ids is None
+
+    def test_an_empty_set_is_not_the_unrestricted_default(self):
+        override = TaskModelOverride(
+            llm=NamedLLM("selected"), allowed_model_ids=frozenset()
+        )
+        assert override.allowed_model_ids == frozenset()
+
+    @pytest.mark.parametrize("value", ["img-1", b"img-1"])
+    def test_a_single_string_is_refused(self, value):
+        with pytest.raises(TypeError):
+            TaskModelOverride(llm=NamedLLM("selected"), allowed_model_ids=value)  # type: ignore[arg-type]
+
+    def test_ids_must_be_strings(self):
+        with pytest.raises(TypeError):
+            TaskModelOverride(llm=NamedLLM("selected"), allowed_model_ids={1})  # type: ignore[arg-type]
+
+    def test_the_reader_takes_the_set_from_the_snapshot_override(self):
+        assert _task_model_override_allowed_model_ids(None) is None
+        assert _task_model_override_allowed_model_ids(_snapshot(["image"])) is None
+        applied = apply_task_model_override(
+            _snapshot(["image"]),
+            TaskModelOverride(
+                llm=NamedLLM("selected"), allowed_model_ids=frozenset({"img-1"})
+            ),
+        )
+        assert _task_model_override_allowed_model_ids(applied) == frozenset({"img-1"})
+
+
+@pytest.mark.asyncio
+async def test_get_agent_for_task_passes_allowed_model_ids() -> None:
+    builds = _Builds()
+    override = TaskModelOverride(
+        llm=NamedLLM("selected"), allowed_model_ids=frozenset({"img-1"})
+    )
+    await builds.get(apply_task_model_override(_snapshot(["image"]), override))
+
+    assert builds.tool_calls[-1]["allowed_model_ids"] == frozenset({"img-1"})
+
+
+@pytest.mark.asyncio
+async def test_get_agent_for_task_without_override_passes_no_allowed_model_ids() -> (
+    None
+):
+    builds = _Builds()
+    await builds.get(_snapshot(["image"]))
+
+    assert builds.tool_calls[-1]["allowed_model_ids"] is None
+
+
+@pytest.mark.asyncio
+async def test_build_tools_for_task_passes_allowed_model_ids() -> None:
+    manager = AgentServiceManager()
+    override = TaskModelOverride(
+        llm=NamedLLM("selected"), allowed_model_ids=frozenset({"img-1"})
+    )
+    snapshot = apply_task_model_override(_snapshot(["image", "basic"]), override)
+    create_tools = AsyncMock(return_value=([], MagicMock()))
+    task = SimpleNamespace(
+        id=42,
+        user_id=1,
+        source="external",
+        agent_config={},
+        channel_id=None,
+        channel_name=None,
+        telegram_user_id=None,
+        sdk_credential_kind=None,
+    )
+
+    with (
+        patch.object(
+            manager, "_get_or_create_task_sandbox", new=AsyncMock(return_value=None)
+        ),
+        patch(
+            "xagent.web.services.agent_service_manager.create_default_tools",
+            new=create_tools,
+        ),
+    ):
+        await manager._build_tools_for_task(
+            task_id=42,
+            task=task,
+            db=None,
+            user=RuntimeUserFields(id=1, is_admin=False),
+            agent_config=snapshot.agent_config,
+            task_llm=snapshot.task_llm,
+            task_vision_llm=snapshot.task_vision_llm,
+            task_setup_snapshot=snapshot,
+        )
+
+    assert create_tools.await_args.kwargs["allowed_model_ids"] == frozenset({"img-1"})

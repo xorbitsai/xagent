@@ -706,6 +706,15 @@ def _task_model_override_excluded_model_ids(
     return snapshot.model_override.excluded_model_ids
 
 
+def _task_model_override_allowed_model_ids(
+    snapshot: Optional[TaskSetupSnapshot],
+) -> frozenset[str] | None:
+    """Media model ids this run's task model override allows; None without one."""
+    if snapshot is None or snapshot.model_override is None:
+        return None
+    return snapshot.model_override.allowed_model_ids
+
+
 def _build_tool_selection_spec_for_task(
     agent_config: Optional[dict],
     workforce_runtime: Optional[WorkforceTaskRuntime],
@@ -943,6 +952,7 @@ async def create_default_tools(
     declared_knowledge_bases: Optional[List[str]] = None,
     excluded_model_ids: frozenset[str] = frozenset(),
     mcp_team_member_grants_allowed: bool = False,
+    allowed_model_ids: frozenset[str] | None = None,
 ) -> tuple[list[Any], Any]:
     """Create default tools and tool_config for AgentService using ToolFactory.
 
@@ -1064,6 +1074,7 @@ async def create_default_tools(
         declared_knowledge_bases=declared_knowledge_bases,
         excluded_model_ids=excluded_model_ids,
         mcp_team_member_grants_allowed=mcp_team_member_grants_allowed,
+        allowed_model_ids=allowed_model_ids,
     )
 
     # Store excluded_agent_id in tool_config for agent tool filtering
@@ -2326,6 +2337,7 @@ class AgentServiceManager:
         excluded_model_ids = _task_model_override_excluded_model_ids(
             task_setup_snapshot
         )
+        allowed_model_ids = _task_model_override_allowed_model_ids(task_setup_snapshot)
         if task_setup_snapshot is not None:
             workforce_runtime = task_setup_snapshot.workforce_runtime
             excluded_agent_id = task_setup_snapshot.excluded_agent_id
@@ -2477,6 +2489,7 @@ class AgentServiceManager:
             mcp_team_member_grants_allowed=team_member_mcp_grants_allowed_for_task(
                 task
             ),
+            allowed_model_ids=allowed_model_ids,
         )
 
     @agent_setup.measure()
@@ -3235,6 +3248,7 @@ class AgentServiceManager:
                 )
 
                 excluded_model_ids = _task_model_override_excluded_model_ids(snapshot)
+                allowed_model_ids = _task_model_override_allowed_model_ids(snapshot)
                 tool_selection = _resolve_task_tool_selection(
                     agent_config,
                     workforce_runtime,
@@ -3331,6 +3345,7 @@ class AgentServiceManager:
                     mcp_team_member_grants_allowed=(
                         team_member_mcp_grants_allowed_for_task(task)
                     ),
+                    allowed_model_ids=allowed_model_ids,
                 )
 
                 with UserContext(runtime_user_id):

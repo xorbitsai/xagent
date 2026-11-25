@@ -170,3 +170,67 @@ async def test_create_default_tools_defaults_to_no_excluded_model_ids(
     )
 
     assert captured.get("excluded_model_ids") == frozenset()
+
+
+@pytest.mark.asyncio
+async def test_create_default_tools_forwards_allowed_model_ids(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from xagent.web.services.agent_service_manager import create_default_tools
+
+    captured: dict[str, Any] = {}
+
+    class _FakeToolConfig:
+        def __init__(self, **kwargs: Any) -> None:
+            captured.update(kwargs)
+
+        def set_task_runtime_contribution(self, contribution: Any) -> None:
+            pass
+
+    async def create_tools(config: Any) -> list:
+        return []
+
+    monkeypatch.setattr("xagent.web.tools.config.WebToolConfig", _FakeToolConfig)
+    monkeypatch.setattr("xagent.web.models.database._SessionLocal", object())
+    monkeypatch.setattr(ToolFactory, "create_all_tools", create_tools)
+
+    await create_default_tools(
+        None,
+        user=SimpleNamespace(id=7, is_admin=False),
+        task_id="web_task_11",
+        allowed_model_ids=frozenset({"img-1"}),
+    )
+
+    assert captured.get("allowed_model_ids") == frozenset({"img-1"})
+
+
+@pytest.mark.asyncio
+async def test_create_default_tools_defaults_to_no_allowed_model_ids(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from xagent.web.services.agent_service_manager import create_default_tools
+
+    captured: dict[str, Any] = {}
+
+    class _FakeToolConfig:
+        def __init__(self, **kwargs: Any) -> None:
+            captured.update(kwargs)
+
+        def set_task_runtime_contribution(self, contribution: Any) -> None:
+            pass
+
+    async def create_tools(config: Any) -> list:
+        return []
+
+    monkeypatch.setattr("xagent.web.tools.config.WebToolConfig", _FakeToolConfig)
+    monkeypatch.setattr("xagent.web.models.database._SessionLocal", object())
+    monkeypatch.setattr(ToolFactory, "create_all_tools", create_tools)
+
+    await create_default_tools(
+        None,
+        user=SimpleNamespace(id=7, is_admin=False),
+        task_id="web_task_11",
+    )
+
+    # No bound at all, which is not the empty allow-list.
+    assert captured.get("allowed_model_ids") is None

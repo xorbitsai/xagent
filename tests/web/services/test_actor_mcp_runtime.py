@@ -498,13 +498,14 @@ def test_web_tool_config_actor_parameters_are_appended_after_voice() -> None:
 
     # Later parameters are appended after these, never inserted before
     # them, so positional callers keep binding the same values.
-    assert parameters[-6:] == [
+    assert parameters[-7:] == [
         "voice",
         "mcp_actor_stdio_connection_adapter",
         "mcp_actor_execution_identity",
         "knowledge_base_team_id",
         "excluded_model_ids",
         "mcp_team_member_grants_allowed",
+        "allowed_model_ids",
     ]
 
 

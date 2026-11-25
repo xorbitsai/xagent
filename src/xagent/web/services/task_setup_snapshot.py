@@ -205,6 +205,22 @@ class TaskModelOverrideError(ValueError):
 _VISION_TOOL_CATEGORY = "vision"
 
 
+def _as_str_frozenset(value: Any, field_name: str, item: str) -> frozenset[str]:
+    """``value`` as a frozenset of strings, or ``TypeError`` naming ``field_name``.
+
+    A bare string would be read character by character (or matched as a
+    substring) instead of naming one ``item``, so it is refused.
+    """
+    if isinstance(value, (str, bytes)):
+        raise TypeError(
+            f"{field_name} must be a collection of {item}s, not a single string"
+        )
+    normalized = frozenset(value)
+    if not all(isinstance(entry, str) for entry in normalized):
+        raise TypeError(f"{field_name} must hold {item}s")
+    return normalized
+
+
 @dataclass(frozen=True)
 class TaskModelOverride:
     """One caller-selected model for every conversational role of a task run.
@@ -235,6 +251,17 @@ class TaskModelOverride:
     ``excluded_model_ids`` removes the named media models and re-picks an excluded
     kind's default; LLM, vision, embedding and rerank slots are untouched.
 
+    ``allowed_model_ids`` is the positive form of that: when set, this run's
+    media tools may only use the models whose ``model_id`` is in it, so a model
+    registered after the task was set up is not offered either -- a removal list
+    can only take away what was already known. ``None`` (the default) puts no
+    bound and the empty set leaves no media model at all. Unlike
+    ``excluded_model_ids``, which also matches a media dict's key, it matches
+    ``model_id`` only: the ASR and TTS dicts are keyed by model name, so names
+    reused from an exclusion list match nothing and leave those kinds empty.
+    LLM, vision, embedding and rerank slots are untouched, and when both are
+    given the exclusion applies first. Delegated sub-agents inherit it.
+
     Handing ``AgentServiceManager.get_agent_for_task`` a snapshot this was
     applied to rebuilds a cached service for the task unless that service
     was built from this same override object, so a later turn cannot run on
@@ -247,36 +274,38 @@ class TaskModelOverride:
     vision_llm: BaseLLM | None = None
     excluded_tool_categories: frozenset[str] = frozenset()
     excluded_model_ids: frozenset[str] = frozenset()
+    allowed_model_ids: frozenset[str] | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.llm, BaseLLM):
             raise TypeError("llm must be a BaseLLM")
         if self.vision_llm is not None and not isinstance(self.vision_llm, BaseLLM):
             raise TypeError("vision_llm must be a BaseLLM or None")
-        categories: Any = self.excluded_tool_categories
-        # A bare string would be read character by character, or matched as
-        # a substring; neither is a category selection.
-        if isinstance(categories, (str, bytes)):
-            raise TypeError(
-                "excluded_tool_categories must be a collection of category "
-                "names, not a single string"
+        object.__setattr__(
+            self,
+            "excluded_tool_categories",
+            _as_str_frozenset(
+                self.excluded_tool_categories,
+                "excluded_tool_categories",
+                "category name",
+            ),
+        )
+        object.__setattr__(
+            self,
+            "excluded_model_ids",
+            _as_str_frozenset(
+                self.excluded_model_ids, "excluded_model_ids", "model id"
+            ),
+        )
+        # ``None`` is not a restriction, so it stays as it is.
+        if self.allowed_model_ids is not None:
+            object.__setattr__(
+                self,
+                "allowed_model_ids",
+                _as_str_frozenset(
+                    self.allowed_model_ids, "allowed_model_ids", "model id"
+                ),
             )
-        normalized = frozenset(categories)
-        if not all(isinstance(category, str) for category in normalized):
-            raise TypeError("excluded_tool_categories must hold category names")
-        object.__setattr__(self, "excluded_tool_categories", normalized)
-        model_ids: Any = self.excluded_model_ids
-        # Same reasoning as the categories above: a bare string would be read
-        # character by character instead of naming one model id.
-        if isinstance(model_ids, (str, bytes)):
-            raise TypeError(
-                "excluded_model_ids must be a collection of model ids, "
-                "not a single string"
-            )
-        normalized_model_ids = frozenset(model_ids)
-        if not all(isinstance(model_id, str) for model_id in normalized_model_ids):
-            raise TypeError("excluded_model_ids must hold model ids")
-        object.__setattr__(self, "excluded_model_ids", normalized_model_ids)
 
 
 def apply_task_model_override(
@@ -292,7 +321,7 @@ def apply_task_model_override(
     needs the intent (an old agent's list may never have listed ``mcp``, yet
     this run still excludes it) to decide whether an actor-marked task may
     re-add ``mcp``, and filters the media model dicts by the excluded model
-    ids. See :class:`TaskModelOverride` for the exact-name /
+    ids and the allowed ones. See :class:`TaskModelOverride` for the exact-name /
     scoped-``mcp:<server>`` semantics. The vision-category removal is
     deliberately not part of that set: it already has its own stand-in
     mechanism.

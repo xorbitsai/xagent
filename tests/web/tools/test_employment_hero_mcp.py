@@ -272,6 +272,24 @@ def test_get_current_user_errors_on_unexpected_shape(monkeypatch):
     assert result["status"] == "error"
 
 
+def test_get_current_user_403_tells_the_user_to_reconnect(monkeypatch):
+    monkeypatch.setattr(
+        employment_hero.requests,
+        "request",
+        Mock(
+            return_value=MockResponse(
+                status_code=403, json_data={"message": "scope validating failed"}
+            )
+        ),
+    )
+
+    result = json.loads(employment_hero.employment_hero_get_current_user())
+
+    assert result["status"] == "error"
+    assert employment_hero.USER_INFO_SHOW_SCOPE in result["message"]
+    assert "reconnect" in result["message"]
+
+
 def test_list_employees_includes_member_type_only_when_provided(monkeypatch):
     mock_request = Mock(return_value=MockResponse(json_data={"data": {"items": []}}))
     monkeypatch.setattr(employment_hero.requests, "request", mock_request)

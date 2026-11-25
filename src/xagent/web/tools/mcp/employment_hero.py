@@ -53,6 +53,9 @@ LEAVE_BALANCES_LIST_SCOPE = "leave_balances:list"
 LEAVE_REQUESTS_LIST_SCOPE = "leave_requests:list"
 LEAVE_REQUESTS_CREATE_SCOPE = "leave_requests:create"
 LEAVE_REQUESTS_APPROVE_SCOPE = "leave_requests:approve"
+# Same resource:action convention as the hints above. Not yet in the app
+# row's oauth_scopes: the vendor identifier for /user_info is unconfirmed.
+USER_INFO_SHOW_SCOPE = "user_info:show"
 
 
 def _error(message: str) -> str:
@@ -289,7 +292,8 @@ def employment_hero_list_organisations(
     List the organisations this connection can access, with each
     organisation's id, name, and country. Call this first -- every other
     tool in this connector needs an organisation_id, and this is how to find
-    one.
+    one -- unless the person asks about themselves: then call
+    employment_hero_get_current_user, which returns the organisation_id too.
     page_index: 1-based page number.
     item_per_page: results per page (max 100).
     """
@@ -314,12 +318,16 @@ def employment_hero_get_current_user() -> str:
     user id and every active membership, each with organisation_id,
     organisation_name, member_id, role, name, and email. Call this first
     when the person asks about themselves ("my leave balance", "submit leave
-    for me"): pass that organisation's member_id as employee_id to the leave
-    tools instead of searching the employee directory, which staff without
-    an admin or manager role may not be allowed to list.
+    for me"), instead of searching the employee directory, which staff
+    without an admin or manager role may not be allowed to list. Use that
+    organisation's member_id as employee_id for reads. Employment Hero
+    documents member_id for the other endpoints but not as the employee
+    id, so before creating a leave request with it, confirm it with
+    employment_hero_get_employee(organisation_id, member_id) and check the
+    name or email matches.
     """
     try:
-        result = _request("GET", "/user_info")
+        result = _request("GET", "/user_info", required_scope=USER_INFO_SHOW_SCOPE)
         return success_with_capped_dict(
             "current_user", _record_payload(result, "current user")
         )
@@ -647,7 +655,9 @@ def employment_hero_create_leave_request(
     ambiguous timeout.
     organisation_id: id from employment_hero_list_organisations.
     employee_id: for the person themselves, member_id from
-    employment_hero_get_current_user; for anyone else, resolve with
+    employment_hero_get_current_user, only after
+    employment_hero_get_employee(organisation_id, member_id) returned the
+    same person; for anyone else, resolve with
     employment_hero_list_employees(query=...).
     leave_category_id: id from employment_hero_list_leave_categories.
     start_date, end_date: inclusive YYYY-MM-DD dates.

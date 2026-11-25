@@ -7,6 +7,12 @@ import { WidgetSessionUploadError } from "@/lib/widget-session-upload"
 
 const TOKEN_REFRESH_THRESHOLD_MS = 60_000
 const EXPIRY_WARNING_LEAD_MS = 10 * 60_000
+// The longest a reconnect after a 1001 (going away) close waits before it asks
+// the parent. A reverse proxy reloading its configuration, or a server shutting
+// down, closes every socket it holds with 1001 at the same instant; a random
+// wait in [0, this] spreads the resulting reconnect requests out instead of
+// sending them all to the session server in the same second.
+export const GOING_AWAY_RECONNECT_MAX_DELAY_MS = 30_000
 // Keep this predicate aligned with the two retry signals that a parent sends
 // (frontend/public/widget.js and the link host page, link-session-host.ts);
 // every other parent code fails closed.
@@ -202,6 +208,9 @@ export function useWidgetSession() {
   const activeSessionGenerationRef = useRef<number | null>(null)
   const activeDeliveryIdRef = useRef<string | null>(null)
   const warningTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  // A reconnect request that is waiting out its random delay (see
+  // GOING_AWAY_RECONNECT_MAX_DELAY_MS) before it is sent to the parent.
+  const delayedReconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   // The session the current generation was built from; null while there is no
   // usable session (waiting, refreshing, degraded, terminal).
   const sessionRef = useRef<WidgetSession | null>(null)
@@ -241,9 +250,17 @@ export function useWidgetSession() {
     }
   }, [])
 
+  const clearDelayedReconnect = useCallback(() => {
+    if (delayedReconnectTimerRef.current) {
+      clearTimeout(delayedReconnectTimerRef.current)
+      delayedReconnectTimerRef.current = null
+    }
+  }, [])
+
   const transitionTerminal = useCallback((code: string) => {
     if (terminalRef.current) return
     terminalRef.current = true
+    clearDelayedReconnect()
     // Tells the parent that this page ended the session, so a parent that owns
     // navigation can act on it. widget.js has no handler for this type; the link
     // host page (link-session-host.ts) maps the code to its end page.
@@ -268,7 +285,7 @@ export function useWidgetSession() {
       terminalCode: code,
       isAbsoluteExpiryWarningVisible: false,
     })
-  }, [clearWarningTimer, failPendingWaits])
+  }, [clearDelayedReconnect, clearWarningTimer, failPendingWaits])
 
   const transitionDegraded = useCallback(() => {
     if (terminalRef.current) return
@@ -288,7 +305,11 @@ export function useWidgetSession() {
     }))
   }, [clearWarningTimer, failPendingWaits])
 
-  const issueReconnectRequest = useCallback((reason: WidgetSessionReconnectReason) => {
+  // Enters "refreshing" at once and asks the parent for a new session, after
+  // `delayMs` when it is positive. The recovery counts as in flight from the
+  // start, so any other reconnect during the delay joins it instead of
+  // sending a request of its own.
+  const issueReconnectRequest = useCallback((reason: WidgetSessionReconnectReason, delayMs: number) => {
     const targetOrigin = targetOriginRef.current
     if (!mountedRef.current || !targetOrigin || terminalRef.current) return
 
@@ -304,14 +325,29 @@ export function useWidgetSession() {
       terminalCode: null,
       isAbsoluteExpiryWarningVisible: false,
     }))
-    window.parent.postMessage({ xagent: true, v: 1, type: "reconnect_request", reason }, targetOrigin)
+    const send = () => {
+      window.parent.postMessage({ xagent: true, v: 1, type: "reconnect_request", reason }, targetOrigin)
+    }
+    if (delayMs <= 0) {
+      send()
+      return
+    }
+    delayedReconnectTimerRef.current = setTimeout(() => {
+      delayedReconnectTimerRef.current = null
+      if (!mountedRef.current || terminalRef.current) return
+      send()
+    }, delayMs)
   }, [clearWarningTimer])
 
-  const requestReconnect = useCallback((reason: WidgetSessionReconnectReason) => {
+  const startReconnect = useCallback((reason: WidgetSessionReconnectReason, delayMs: number) => {
     if (!mountedRef.current || terminalRef.current || recoveryInFlightRef.current) return
     activeSessionGenerationRef.current = null
-    issueReconnectRequest(reason)
+    issueReconnectRequest(reason, delayMs)
   }, [issueReconnectRequest])
+
+  const requestReconnect = useCallback((reason: WidgetSessionReconnectReason) => {
+    startReconnect(reason, 0)
+  }, [startReconnect])
 
   const isActiveConnection = useCallback((connectionIdentity?: string) => {
     const activeGeneration = activeSessionGenerationRef.current
@@ -361,8 +397,14 @@ export function useWidgetSession() {
     if (!isActiveConnection(connectionIdentity)) return "handled"
     // 1001 (going away) is not a verdict on the session: some reverse proxies
     // send it to every socket they proxy when their configuration is reloaded,
-    // so it falls through to the reconnect below like any other dropped
-    // connection.
+    // and servers send it when they shut down. It reconnects like any other
+    // dropped connection, but after a random delay, because every other widget
+    // behind the same proxy or server got the same close at the same moment.
+    if (event.code === 1001) {
+      startReconnect("ws_closed", Math.round(Math.random() * GOING_AWAY_RECONNECT_MAX_DELAY_MS))
+      return "handled"
+    }
+
     if (event.code === 1000) {
       transitionTerminal("unexpected_error")
       return "handled"
@@ -380,7 +422,7 @@ export function useWidgetSession() {
 
     requestReconnect("ws_closed")
     return "handled"
-  }, [isActiveConnection, requestReconnect, transitionTerminal])
+  }, [isActiveConnection, requestReconnect, startReconnect, transitionTerminal])
 
   const handleConnectionFailure = useCallback((
     failure: WebSocketConnectionFailure,
@@ -569,6 +611,9 @@ export function useWidgetSession() {
         return
       }
 
+      // A session that arrives while a delayed reconnect request is still
+      // waiting makes that request unnecessary.
+      clearDelayedReconnect()
       recoveryInFlightRef.current = false
       generationRef.current += 1
       const capabilities = parseCapabilities(event.data.capabilities)
@@ -613,6 +658,7 @@ export function useWidgetSession() {
       failPendingWaits()
       window.removeEventListener("message", onMessage)
       recoveryInFlightRef.current = false
+      clearDelayedReconnect()
       clearWarningTimer()
     }
     // The bridge owns its parent message subscription for the mounted lifetime.

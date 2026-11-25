@@ -6,6 +6,7 @@ import { uploadWidgetSessionFile } from "@/lib/widget-session-upload"
 
 import {
   buildWidgetSessionWebSocketUrl,
+  GOING_AWAY_RECONNECT_MAX_DELAY_MS,
   useWidgetSession,
   type WidgetSession,
 } from "./use-widget-session"
@@ -331,7 +332,7 @@ describe("useWidgetSession", () => {
     },
   )
 
-  it.each([4401, 1006, 1001, 4500])(
+  it.each([4401, 1006, 4500])(
     "owns abnormal WebSocket close %s and requests one parent reconnect",
     (code) => {
       const postMessage = vi.spyOn(window, "postMessage")
@@ -385,6 +386,135 @@ describe("useWidgetSession", () => {
       expect(postMessage.mock.calls.filter((call) => call[0]?.type === "reconnect_request")).toHaveLength(0)
     },
   )
+
+  describe("after a 1001 going-away close", () => {
+    const reconnectRequests = (postMessage: { mock: { calls: unknown[][] } }) =>
+      postMessage.mock.calls.filter(
+        ([message]) => (message as { type?: string } | null)?.type === "reconnect_request",
+      )
+
+    function closeWith1001(result: { current: ReturnType<typeof useWidgetSession> }) {
+      let disposition: "handled" | "default" | undefined
+      act(() => {
+        disposition = result.current.handleConnectionClose(new CloseEvent("close", { code: 1001 }))
+      })
+      return disposition
+    }
+
+    it("enters refreshing at once and asks the parent only after a random delay", () => {
+      vi.useFakeTimers()
+      vi.spyOn(Math, "random").mockReturnValue(0.5)
+      const postMessage = vi.spyOn(window, "postMessage")
+      const { result } = renderHook(() => useWidgetSession())
+      dispatchFromParent(updateMessage())
+
+      expect(closeWith1001(result)).toBe("handled")
+      expect(result.current.status).toBe("refreshing")
+      expect(result.current.session).toBeNull()
+      expect(result.current.agent?.name).toBe("Support Agent")
+      expect(reconnectRequests(postMessage)).toEqual([])
+
+      act(() => vi.advanceTimersByTime(GOING_AWAY_RECONNECT_MAX_DELAY_MS / 2 - 1))
+      expect(reconnectRequests(postMessage)).toEqual([])
+
+      act(() => vi.advanceTimersByTime(1))
+      expect(reconnectRequests(postMessage)).toEqual([[
+        { xagent: true, v: 1, type: "reconnect_request", reason: "ws_closed" },
+        PARENT_ORIGIN,
+      ]])
+      expect(result.current.terminalCode).toBeNull()
+      expect(terminalReports(postMessage)).toEqual([])
+    })
+
+    it.each([
+      [0, 0],
+      [1 - Number.EPSILON, GOING_AWAY_RECONNECT_MAX_DELAY_MS],
+    ])("keeps the delay within [0, max] (random %s waits %s ms)", (random, expectedDelay) => {
+      vi.useFakeTimers()
+      vi.spyOn(Math, "random").mockReturnValue(random)
+      const postMessage = vi.spyOn(window, "postMessage")
+      const { result } = renderHook(() => useWidgetSession())
+      dispatchFromParent(updateMessage())
+
+      closeWith1001(result)
+      if (expectedDelay > 0) {
+        act(() => vi.advanceTimersByTime(expectedDelay - 1))
+        expect(reconnectRequests(postMessage)).toEqual([])
+        act(() => vi.advanceTimersByTime(1))
+      }
+      expect(reconnectRequests(postMessage)).toHaveLength(1)
+    })
+
+    it("folds every other reconnect during the delay into the one delayed request", async () => {
+      vi.useFakeTimers()
+      vi.spyOn(Math, "random").mockReturnValue(0.5)
+      const postMessage = vi.spyOn(window, "postMessage")
+      const { result } = renderHook(() => useWidgetSession())
+      dispatchFromParent(updateMessage())
+
+      closeWith1001(result)
+      closeWith1001(result)
+      act(() => {
+        result.current.handleConnectionClose(new CloseEvent("close", { code: 1006 }))
+        result.current.requestReconnect("token_expired")
+      })
+      const nextSession = result.current.ensureFreshSession()
+      expect(reconnectRequests(postMessage)).toEqual([])
+
+      act(() => vi.advanceTimersByTime(GOING_AWAY_RECONNECT_MAX_DELAY_MS))
+      expect(reconnectRequests(postMessage)).toHaveLength(1)
+
+      dispatchFromParent(updateMessage({ session_token: "st_next", session_delivery_id: "delivery-next" }))
+      await expect(nextSession).resolves.toMatchObject({ token: "st_next" })
+      expect(result.current.status).toBe("active")
+    })
+
+    it("drops the delayed request when the hook unmounts during the delay", () => {
+      vi.useFakeTimers()
+      vi.spyOn(Math, "random").mockReturnValue(0.5)
+      const postMessage = vi.spyOn(window, "postMessage")
+      const { result, unmount } = renderHook(() => useWidgetSession())
+      dispatchFromParent(updateMessage())
+
+      closeWith1001(result)
+      unmount()
+      act(() => vi.advanceTimersByTime(GOING_AWAY_RECONNECT_MAX_DELAY_MS))
+
+      expect(reconnectRequests(postMessage)).toEqual([])
+    })
+
+    it("drops the delayed request when the session ends during the delay", () => {
+      vi.useFakeTimers()
+      vi.spyOn(Math, "random").mockReturnValue(0.5)
+      const postMessage = vi.spyOn(window, "postMessage")
+      const { result } = renderHook(() => useWidgetSession())
+      dispatchFromParent(updateMessage())
+
+      closeWith1001(result)
+      dispatchFromParent({ xagent: true, v: 1, type: "session_terminal", code: "session_expired" })
+      act(() => vi.advanceTimersByTime(GOING_AWAY_RECONNECT_MAX_DELAY_MS))
+
+      expect(result.current.status).toBe("terminal")
+      expect(result.current.terminalCode).toBe("session_expired")
+      expect(reconnectRequests(postMessage)).toEqual([])
+    })
+
+    it("drops the delayed request when the parent delivers a session during the delay", () => {
+      vi.useFakeTimers()
+      vi.spyOn(Math, "random").mockReturnValue(0.5)
+      const postMessage = vi.spyOn(window, "postMessage")
+      const { result } = renderHook(() => useWidgetSession())
+      dispatchFromParent(updateMessage())
+
+      closeWith1001(result)
+      dispatchFromParent(updateMessage({ session_token: "st_pushed", session_delivery_id: "delivery-pushed" }))
+      act(() => vi.advanceTimersByTime(GOING_AWAY_RECONNECT_MAX_DELAY_MS))
+
+      expect(result.current.status).toBe("active")
+      expect(result.current.session?.token).toBe("st_pushed")
+      expect(reconnectRequests(postMessage)).toEqual([])
+    })
+  })
 
   it("terminalizes a current-owner standard WebSocket close 1000 without reconnecting", () => {
     const postMessage = vi.spyOn(window, "postMessage")

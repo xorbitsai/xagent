@@ -3,7 +3,7 @@ import logging
 import os
 import time
 from datetime import datetime, timezone
-from typing import Any, NamedTuple
+from typing import Any, Iterable, NamedTuple
 from urllib.parse import quote
 
 from mcp.server.fastmcp import FastMCP
@@ -549,7 +549,11 @@ def jira_list_fields(query: str = "", cloud_id: str = "") -> str:
     fields). clause_names gives each name as Jira spells it, so a name
     with spaces or special characters has to be written in double quotes
     to use it in JQL, e.g. '"Freshdesk ticket" ~ "139325"'. A field whose
-    searchable is false cannot be used to filter in JQL.
+    searchable is false cannot be used to filter in JQL. Reading one
+    issue's custom fields does not require this tool first:
+    jira_get_issue already lists the custom fields that issue has values
+    for, with their names. Call this to find a field's id and the JQL
+    spelling (clause_names) to filter by.
     query: optional substring, matched case-insensitively against a
     field's name and id, to narrow a long list.
     cloud_id: optional site id from jira_list_accessible_sites; omit when
@@ -1878,7 +1882,10 @@ def _summarize_full_issue(issue: dict[str, Any]) -> dict[str, Any]:
 #: in test_jira_mcp.py pins this constant's value so a change here shows
 #: up in review, but it does not by itself verify the two stay matched --
 #: check _summarize_full_issue's fields.get(...) calls by hand when
-#: editing either.
+#: editing either. The summarized request appends
+#: _GET_ISSUE_CUSTOM_FIELDS_SELECTOR to this list (raw_fields does not),
+#: so the customfield_* keys it reads for issue.custom_fields are not
+#: individually named here.
 _GET_ISSUE_FIELDS = (
     "summary,description,status,assignee,reporter,creator,"
     "priority,issuetype,project,parent,resolution,labels,"
@@ -1897,6 +1904,37 @@ _GET_ISSUE_FIELDS = (
 _GET_ISSUE_FIELD_NAMES = frozenset(
     name.lower() for name in _GET_ISSUE_FIELDS.split(",")
 )
+
+#: Appended to _GET_ISSUE_FIELDS on jira_get_issue's summarized request so
+#: an issue's custom fields come back without the caller having to name
+#: each one first: `*all` asks Jira for every field the issue carries
+#: (customfield_* included), and the three exclusions are the unbounded
+#: collections that would otherwise dwarf everything the summary lists.
+_GET_ISSUE_CUSTOM_FIELDS_SELECTOR = "*all,-comment,-worklog,-attachment"
+
+#: Per-value cap for issue.custom_fields: every custom field with a value
+#: is listed on every summarized call now, so one rich-text field has to
+#: be bounded before it can crowd the rest of the summary (and the other
+#: fields) out of the output budget. 1,000 is the bound
+#: truncate_error_text already defaults to.
+_CUSTOM_FIELD_VALUE_MAX_CHARS = 1_000
+
+
+def _custom_fields_selector(requested_ids: Iterable[str]) -> str:
+    """The custom-fields selector to append to this call's `fields` param.
+
+    Normally _GET_ISSUE_CUSTOM_FIELDS_SELECTOR itself. A field the caller
+    named in extra_fields must not stay excluded, though: Jira's `-field`
+    would drop it from the response, leaving the very value the caller
+    asked for missing, so its exclusion is removed (matched case-
+    insensitively, the same way the default-set dedup matches ids).
+    """
+    named = {field_id.casefold() for field_id in requested_ids}
+    return ",".join(
+        entry
+        for entry in _GET_ISSUE_CUSTOM_FIELDS_SELECTOR.split(",")
+        if entry[1:].casefold() not in named
+    )
 
 
 def _cap_extra_field_value(value: Any, max_chars: int) -> tuple[Any, bool]:
@@ -1924,6 +1962,102 @@ def _cap_extra_field_value(value: Any, max_chars: int) -> tuple[Any, bool]:
     if len(serialized) > max_chars:
         return truncate_error_text(serialized, max_chars), True
     return value, False
+
+
+def _is_empty_custom_field_value(value: Any) -> bool:
+    """Whether a summarized custom-field value carries nothing worth
+    listing: None, a blank string, an empty list/dict. 0 and False are
+    real values, not absences, and are deliberately not empty here.
+    """
+    if value is None:
+        return True
+    if isinstance(value, str):
+        return not value.strip()
+    if isinstance(value, (list, dict)):
+        return not value
+    return False
+
+
+def _summarize_custom_field_value(value: Any) -> Any:
+    """Reduce one raw custom-field value to what a reader needs.
+
+    Jira shapes custom fields by type, so the handful of shapes that
+    cover almost every field are unwrapped here -- rich text
+    (description-like ADF) to plain text, a select/cascade option object
+    to its option value(s), a user to their display name, and a version/
+    component/sprint/team object to its name -- while a shape this
+    function doesn't recognize is passed through untouched rather than
+    guessed at.
+    """
+    if isinstance(value, dict):
+        if value.get("type") == "doc":
+            return _flatten_adf(value)
+        option = value.get("value")
+        if isinstance(option, str):
+            # A cascading select spells its two levels as
+            # {"value": child-level-parent, "child": {"value": ...}}.
+            child = _as_dict(value.get("child")).get("value")
+            if isinstance(child, str):
+                return f"{option} / {child}"
+            return option
+        for key in ("displayName", "name"):
+            label = value.get(key)
+            if isinstance(label, str):
+                return label
+        return value
+    if isinstance(value, list):
+        summarized = [_summarize_custom_field_value(item) for item in value]
+        return [item for item in summarized if not _is_empty_custom_field_value(item)]
+    return value
+
+
+def _summarize_custom_fields(
+    fields: dict[str, Any], names: Any, skip_ids: set[str]
+) -> tuple[list[dict[str, Any]], bool]:
+    """List the custom fields of one issue that actually hold a value.
+
+    Only customfield_* keys are considered -- the request now fetches
+    every field the issue has, so system fields (votes, environment,
+    ...) come back too and are already covered by the summary's own keys.
+    A field the caller named in extra_fields is skipped (`skip_ids`)
+    because its raw value is reported under extra_field_values instead,
+    and an empty value is dropped rather than listed as a row saying
+    nothing. Returns (entries, whether any value was capped); each entry
+    is {id, name, value}, name being None when the response carried no
+    `names` entry for that id, sorted by name then id so two fields
+    sharing a display name still appear as two distinct rows.
+    """
+    display_names = _as_dict(names)
+    entries: list[dict[str, Any]] = []
+    truncated = False
+    for field_id, raw_value in fields.items():
+        if not isinstance(field_id, str) or not field_id.startswith("customfield_"):
+            continue
+        if field_id in skip_ids:
+            continue
+        value = _summarize_custom_field_value(raw_value)
+        if _is_empty_custom_field_value(value):
+            continue
+        value, was_truncated = _cap_extra_field_value(
+            value, _CUSTOM_FIELD_VALUE_MAX_CHARS
+        )
+        truncated = truncated or was_truncated
+        name = display_names.get(field_id)
+        entries.append(
+            {
+                "id": field_id,
+                "name": name if isinstance(name, str) else None,
+                "value": value,
+            }
+        )
+    entries.sort(
+        key=lambda entry: (
+            entry["name"] is None,
+            (entry["name"] or "").casefold(),
+            entry["id"],
+        )
+    )
+    return entries, truncated
 
 
 def _restore_extra_field_bookkeeping(
@@ -1975,9 +2109,21 @@ def jira_get_issue(
     its dependencies (issue_links -- e.g. blocks/is blocked by/relates to
     -- and subtasks). Only the fields listed here are fetched by default;
     other Jira fields (attachments, worklog, votes, watchers, time
-    tracking, affected versions, security level, sprint/epic link,
-    custom fields) are not requested and will not appear in the result
-    unless named via extra_fields.
+    tracking, affected versions, security level, sprint/epic link) are
+    not requested and will not appear in the result unless named via
+    extra_fields. The exception is custom fields: the summary lists every
+    custom field this issue has a value for under issue.custom_fields, as
+    [{id, name, value}] (empty ones are left out; values are simplified --
+    rich text to plain text, an option to its option value, a user to
+    their display name, a version/sprint and the like to its name -- and
+    each value is at most 1,000 characters). So to answer "which custom
+    fields does this issue have" or "what is this custom field's value",
+    just call this tool and read custom_fields; there is no need to call
+    jira_list_fields first. An empty list genuinely means the issue has no
+    custom field with a value. A top-level custom_fields_truncated true
+    means some value was cut, or the list was shortened to fit the output
+    limit; name the fields you need in extra_fields to get their full
+    value.
     issue_key: an issue key (e.g. "ENG-123") or its numeric id.
     extra_fields: optional comma-separated Jira fields not in the default
     set above -- standard or custom, named either by field id (e.g.
@@ -1991,8 +2137,12 @@ def jira_get_issue(
     through as an id instead). A name that contains a comma cannot be
     passed as a name: give its id or cf[N] form instead. Use
     jira_list_fields to find a field's id, its name and the JQL name to
-    filter by. A field already in the default set is ignored, since it's
-    already visible under its own summarized key. Returned as
+    filter by. Use it for a standard field outside custom_fields, or to
+    get one custom field's raw value -- unsimplified, with a larger cap
+    than custom_fields applies. A field named here appears only under
+    extra_field_values, not duplicated in custom_fields. A field already
+    in the default set is ignored, since it's already visible under its
+    own summarized key. Returned as
     {name you wrote: raw_value} under a top-level extra_field_values (a
     sibling of "issue", not nested inside it), so you can reach any
     field this tool doesn't summarize by name. An ADF-shaped (rich
@@ -2024,10 +2174,12 @@ def jira_get_issue(
     default set are fetched, and each requested value is already in the
     raw "fields" object -- by the id extra_field_ids gives for a name
     token; extra_field_values/description_truncated are not produced in
-    this mode. Bigger per-issue payload than the default projection, so a
-    raw response can shrink further under a small output budget (see
-    success_with_capped_dict) than the same request would at the default
-    setting.
+    this mode. Neither is custom_fields: this mode requests exactly the
+    fields it always has, so a custom field appears here only when
+    extra_fields named it. Bigger per-issue payload than the default
+    projection, so a raw response can shrink further under a small
+    output budget (see success_with_capped_dict) than the same request
+    would at the default setting.
     """
     try:
         issue_path = _issue_path(issue_key)
@@ -2054,11 +2206,25 @@ def jira_get_issue(
         extra_field_ids = resolved_fields.ids_by_token
         requested_extra = list(extra_field_ids)
         fields_param = f"{_GET_ISSUE_FIELDS}{resolved_fields.fields_suffix}"
+        if raw_fields:
+            request_params: dict[str, Any] = {"fields": fields_param}
+        else:
+            # The summary lists the issue's custom fields under
+            # issue.custom_fields, so its request has to fetch them all
+            # (they are never in the fixed default set) and ask for
+            # `names` to label them without a second, field-table request.
+            request_params = {
+                "fields": (
+                    f"{fields_param},"
+                    f"{_custom_fields_selector(extra_field_ids.values())}"
+                ),
+                "expand": "names",
+            }
         result = _request(
             "GET",
             resolved_cloud_id,
             issue_path,
-            params={"fields": fields_param},
+            params=request_params,
         )
         if not isinstance(result, dict):
             return _error("Unexpected response format from Jira issue API")
@@ -2086,6 +2252,12 @@ def jira_get_issue(
                 resolved_extras,
             )
         issue = _summarize_full_issue(result)
+        custom_fields, custom_fields_truncated = _summarize_custom_fields(
+            _as_dict(result.get("fields")),
+            result.get("names"),
+            set(extra_field_ids.values()),
+        )
+        issue["custom_fields"] = custom_fields
         description_truncated = _cap_text_field(
             issue, "description", _ISSUE_DESCRIPTION_MAX_CHARS
         )
@@ -2104,6 +2276,11 @@ def jira_get_issue(
         top_level_extra: dict[str, Any] = {
             "description_truncated": description_truncated
         }
+        if custom_fields_truncated:
+            # Only when true: emitting the flag unconditionally would put
+            # a key on every response -- including the many issues with no
+            # custom fields at all -- to report that nothing was cut.
+            top_level_extra["custom_fields_truncated"] = True
         if requested_extra:
             response_fields = _as_dict(result.get("fields"))
             extra_field_values: dict[str, Any] = {}
@@ -2182,7 +2359,19 @@ def jira_get_issue(
         # this otherwise-rare path (both flags were already true and no
         # extra fields were requested, or the response fit without
         # shrinking at all, in the common case).
-        if not description_truncated or requested_extra or resolved_extras:
+        # Shrinking `issue` shrinks issue.custom_fields before anything
+        # else on the summary does (it is the one list the common case
+        # actually populates), so a caller can receive fewer custom
+        # fields than it started with and no sign of it. custom_fields is
+        # a list, so success_with_capped_dict halves it or drops it
+        # whole; either way the length comes back shorter than what was
+        # built, and that is the condition patched as _truncated below.
+        if (
+            not description_truncated
+            or requested_extra
+            or resolved_extras
+            or custom_fields
+        ):
             parsed = json.loads(response)
             patched = False
             if not description_truncated and "description" not in parsed.get(
@@ -2190,6 +2379,15 @@ def jira_get_issue(
             ):
                 parsed["description_truncated"] = True
                 patched = True
+            if custom_fields and not custom_fields_truncated:
+                returned_custom_fields = _as_dict(parsed.get("issue")).get(
+                    "custom_fields"
+                )
+                if not isinstance(returned_custom_fields, list) or len(
+                    returned_custom_fields
+                ) < len(custom_fields):
+                    parsed["custom_fields_truncated"] = True
+                    patched = True
             if requested_extra and "extra_field_values" not in parsed:
                 parsed["extra_field_values_truncated"] = True
                 patched = True

@@ -2410,7 +2410,8 @@ def test_get_issue_extra_fields_returns_raw_custom_field_values(monkeypatch):
     assert "extra_field_values" not in result["issue"]
     issue_call = mock_request.call_args_list[1]
     assert issue_call.kwargs["params"]["fields"] == (
-        f"{jira._GET_ISSUE_FIELDS},customfield_10010,customfield_10020"
+        f"{jira._GET_ISSUE_FIELDS},customfield_10010,customfield_10020,"
+        f"{jira._GET_ISSUE_CUSTOM_FIELDS_SELECTOR}"
     )
 
 
@@ -2435,7 +2436,9 @@ def test_get_issue_extra_fields_ignores_a_name_already_in_the_default_set(monkey
     assert result["issue"]["due_date"] == "2026-01-01"
     assert "extra_field_values" not in result
     issue_call = mock_request.call_args_list[1]
-    assert issue_call.kwargs["params"]["fields"] == jira._GET_ISSUE_FIELDS
+    assert issue_call.kwargs["params"]["fields"] == (
+        f"{jira._GET_ISSUE_FIELDS},{jira._GET_ISSUE_CUSTOM_FIELDS_SELECTOR}"
+    )
 
 
 def test_get_issue_extra_fields_ignores_a_default_name_regardless_of_case(
@@ -2460,7 +2463,9 @@ def test_get_issue_extra_fields_ignores_a_default_name_regardless_of_case(
 
     assert "extra_field_values" not in result
     issue_call = mock_request.call_args_list[1]
-    assert issue_call.kwargs["params"]["fields"] == jira._GET_ISSUE_FIELDS
+    assert issue_call.kwargs["params"]["fields"] == (
+        f"{jira._GET_ISSUE_FIELDS},{jira._GET_ISSUE_CUSTOM_FIELDS_SELECTOR}"
+    )
 
 
 def test_get_issue_extra_fields_ignores_fixversions_default_field(monkeypatch):
@@ -2487,7 +2492,9 @@ def test_get_issue_extra_fields_ignores_fixversions_default_field(monkeypatch):
     assert result["issue"]["fix_versions"] == ["v1.0"]
     assert "extra_field_values" not in result
     issue_call = mock_request.call_args_list[1]
-    assert issue_call.kwargs["params"]["fields"] == jira._GET_ISSUE_FIELDS
+    assert issue_call.kwargs["params"]["fields"] == (
+        f"{jira._GET_ISSUE_FIELDS},{jira._GET_ISSUE_CUSTOM_FIELDS_SELECTOR}"
+    )
 
 
 def test_get_issue_extra_fields_deduplicates_repeated_names(monkeypatch):
@@ -2514,7 +2521,8 @@ def test_get_issue_extra_fields_deduplicates_repeated_names(monkeypatch):
     assert result["extra_field_values"] == {"customfield_a": "value-a"}
     issue_call = mock_request.call_args_list[1]
     assert issue_call.kwargs["params"]["fields"] == (
-        f"{jira._GET_ISSUE_FIELDS},customfield_a"
+        f"{jira._GET_ISSUE_FIELDS},customfield_a,"
+        f"{jira._GET_ISSUE_CUSTOM_FIELDS_SELECTOR}"
     )
 
 
@@ -2762,7 +2770,9 @@ def test_get_issue_rejects_jira_field_selector_syntax_in_extra_fields(monkeypatc
     assert result["issue"]["description"] == "the real description"
     assert "extra_field_values" not in result
     issue_call = mock_request.call_args_list[1]
-    assert issue_call.kwargs["params"]["fields"] == jira._GET_ISSUE_FIELDS
+    assert issue_call.kwargs["params"]["fields"] == (
+        f"{jira._GET_ISSUE_FIELDS},{jira._GET_ISSUE_CUSTOM_FIELDS_SELECTOR}"
+    )
 
 
 def test_cap_text_field_marks_truncation():
@@ -4127,7 +4137,9 @@ def test_get_issue_requests_exact_field_list(monkeypatch):
     jira.jira_get_issue("ENG-1")
 
     issue_call = mock_request.call_args_list[1]
-    assert issue_call.kwargs["params"]["fields"] == jira._GET_ISSUE_FIELDS
+    assert issue_call.kwargs["params"]["fields"] == (
+        f"{jira._GET_ISSUE_FIELDS},{jira._GET_ISSUE_CUSTOM_FIELDS_SELECTOR}"
+    )
 
 
 def test_get_issue_fields_constant_value():
@@ -5029,7 +5041,8 @@ def test_get_issue_resolves_a_custom_field_name(monkeypatch):
         "https://api.atlassian.com/ex/jira/site-a/rest/api/2/field"
     )
     assert issue_call.kwargs["params"]["fields"] == (
-        f"{jira._GET_ISSUE_FIELDS},customfield_10050"
+        f"{jira._GET_ISSUE_FIELDS},customfield_10050,"
+        f"{jira._GET_ISSUE_CUSTOM_FIELDS_SELECTOR}"
     )
 
 
@@ -5076,7 +5089,8 @@ def test_get_issue_maps_cf_field_syntax_without_a_field_table_request(monkeypatc
     assert mock_request.call_count == 2
     issue_call = mock_request.call_args_list[1]
     assert issue_call.kwargs["params"]["fields"] == (
-        f"{jira._GET_ISSUE_FIELDS},customfield_10050"
+        f"{jira._GET_ISSUE_FIELDS},customfield_10050,"
+        f"{jira._GET_ISSUE_CUSTOM_FIELDS_SELECTOR}"
     )
 
 
@@ -5099,7 +5113,9 @@ def test_get_issue_reports_an_unresolved_field_name(monkeypatch):
     assert "extra_field_values" not in result
     assert "extra_field_ids" not in result
     issue_call = mock_request.call_args_list[2]
-    assert issue_call.kwargs["params"]["fields"] == jira._GET_ISSUE_FIELDS
+    assert issue_call.kwargs["params"]["fields"] == (
+        f"{jira._GET_ISSUE_FIELDS},{jira._GET_ISSUE_CUSTOM_FIELDS_SELECTOR}"
+    )
 
 
 def test_get_issue_reports_a_field_name_shared_by_two_fields(monkeypatch):
@@ -5136,7 +5152,9 @@ def test_get_issue_reports_a_field_name_shared_by_two_fields(monkeypatch):
     ]
     assert "extra_field_values" not in result
     issue_call = mock_request.call_args_list[2]
-    assert issue_call.kwargs["params"]["fields"] == jira._GET_ISSUE_FIELDS
+    assert issue_call.kwargs["params"]["fields"] == (
+        f"{jira._GET_ISSUE_FIELDS},{jira._GET_ISSUE_CUSTOM_FIELDS_SELECTOR}"
+    )
 
 
 def test_get_issue_drops_a_name_that_resolves_to_a_default_field(monkeypatch):
@@ -5156,7 +5174,9 @@ def test_get_issue_drops_a_name_that_resolves_to_a_default_field(monkeypatch):
     assert "extra_field_values" not in result
     assert "extra_field_ids" not in result
     issue_call = mock_request.call_args_list[2]
-    assert issue_call.kwargs["params"]["fields"] == jira._GET_ISSUE_FIELDS
+    assert issue_call.kwargs["params"]["fields"] == (
+        f"{jira._GET_ISSUE_FIELDS},{jira._GET_ISSUE_CUSTOM_FIELDS_SELECTOR}"
+    )
 
 
 def test_get_issue_fetches_a_field_named_both_ways_once(monkeypatch):
@@ -5186,7 +5206,8 @@ def test_get_issue_fetches_a_field_named_both_ways_once(monkeypatch):
     assert result["extra_field_ids"] == {"Freshdesk ticket": "customfield_10050"}
     issue_call = mock_request.call_args_list[2]
     assert issue_call.kwargs["params"]["fields"] == (
-        f"{jira._GET_ISSUE_FIELDS},customfield_10050"
+        f"{jira._GET_ISSUE_FIELDS},customfield_10050,"
+        f"{jira._GET_ISSUE_CUSTOM_FIELDS_SELECTOR}"
     )
 
 
@@ -5453,7 +5474,8 @@ def test_get_issue_passes_a_field_name_through_when_the_field_table_fails(
     assert mock_request.call_count == 3
     issue_call = mock_request.call_args_list[2]
     assert issue_call.kwargs["params"]["fields"] == (
-        f"{jira._GET_ISSUE_FIELDS},Freshdesk ticket"
+        f"{jira._GET_ISSUE_FIELDS},Freshdesk ticket,"
+        f"{jira._GET_ISSUE_CUSTOM_FIELDS_SELECTOR}"
     )
     # One warning, carrying the exception's type but not its message.
     assert "field table" in caplog.text
@@ -5483,7 +5505,8 @@ def test_get_issue_passes_a_field_name_through_when_the_field_table_is_not_a_lis
     assert mock_request.call_count == 3
     issue_call = mock_request.call_args_list[2]
     assert issue_call.kwargs["params"]["fields"] == (
-        f"{jira._GET_ISSUE_FIELDS},Freshdesk ticket"
+        f"{jira._GET_ISSUE_FIELDS},Freshdesk ticket,"
+        f"{jira._GET_ISSUE_CUSTOM_FIELDS_SELECTOR}"
     )
 
 
@@ -5580,7 +5603,9 @@ def test_get_issue_resolves_a_standard_field_id_the_field_table_knows(monkeypatc
     assert "extra_field_ids" not in result
     assert "unresolved_extra_fields" not in result
     issue_call = mock_request.call_args_list[2]
-    assert issue_call.kwargs["params"]["fields"] == (f"{jira._GET_ISSUE_FIELDS},votes")
+    assert issue_call.kwargs["params"]["fields"] == (
+        f"{jira._GET_ISSUE_FIELDS},votes,{jira._GET_ISSUE_CUSTOM_FIELDS_SELECTOR}"
+    )
 
 
 def test_search_issues_does_not_fetch_the_field_table_for_ids(monkeypatch):
@@ -5681,7 +5706,9 @@ def test_get_issue_drops_a_default_field_id_matched_case_insensitively(monkeypat
         "https://api.atlassian.com/ex/jira/site-a/rest/api/2/issue/DW-571",
     ]
     issue_call = mock_request.call_args_list[1]
-    assert issue_call.kwargs["params"]["fields"] == jira._GET_ISSUE_FIELDS
+    assert issue_call.kwargs["params"]["fields"] == (
+        f"{jira._GET_ISSUE_FIELDS},{jira._GET_ISSUE_CUSTOM_FIELDS_SELECTOR}"
+    )
 
 
 def test_get_issue_accepts_a_quoted_field_name(monkeypatch):
@@ -5710,7 +5737,8 @@ def test_get_issue_accepts_a_quoted_field_name(monkeypatch):
     assert result["extra_field_ids"] == {"Freshdesk ticket": "customfield_10050"}
     issue_call = mock_request.call_args_list[2]
     assert issue_call.kwargs["params"]["fields"] == (
-        f"{jira._GET_ISSUE_FIELDS},customfield_10050"
+        f"{jira._GET_ISSUE_FIELDS},customfield_10050,"
+        f"{jira._GET_ISSUE_CUSTOM_FIELDS_SELECTOR}"
     )
 
 
@@ -5958,3 +5986,461 @@ def test_list_fields_error_does_not_suggest_a_query(monkeypatch):
     assert result["status"] == "error"
     assert "output limit" in result["message"]
     assert "query" not in result["message"]
+
+
+# Custom fields on jira_get_issue's default (summarized) response.
+
+
+def test_get_issue_lists_the_custom_fields_with_values_by_default(monkeypatch):
+    # The whole point of the feature: asking one question about an issue
+    # must not require the model to guess a custom field's name first.
+    raw_issue = {
+        "id": "1",
+        "key": "ENG-1",
+        "names": {
+            "customfield_10116": "GitHub Issue URL",
+            "customfield_10019": "Story Points",
+        },
+        "fields": {
+            "summary": "ok",
+            "customfield_10116": "https://github.com/example/repo/issues/1",
+            "customfield_10019": "0|i00001:",
+        },
+    }
+    mock_request = Mock(
+        side_effect=[
+            MockResponse(json_data=[_SITE_A]),
+            MockResponse(json_data=raw_issue),
+        ]
+    )
+    monkeypatch.setattr(jira.requests, "request", mock_request)
+
+    result = json.loads(jira.jira_get_issue("ENG-1"))
+
+    # One request, the default field set plus the custom-fields selector,
+    # asking for `names` in the same response.
+    issue_calls = [
+        call
+        for call in mock_request.call_args_list
+        if call.kwargs["url"].endswith("/rest/api/2/issue/ENG-1")
+    ]
+    assert len(issue_calls) == 1
+    assert issue_calls[0].kwargs["params"] == {
+        "fields": (
+            f"{jira._GET_ISSUE_FIELDS},{jira._GET_ISSUE_CUSTOM_FIELDS_SELECTOR}"
+        ),
+        "expand": "names",
+    }
+    # No separate field-table request.
+    assert not [
+        call
+        for call in mock_request.call_args_list
+        if call.kwargs["url"].endswith("/rest/api/2/field")
+    ]
+    # Sorted by display name: "GitHub Issue URL" before "Story Points",
+    # which is the reverse of sorting by field id.
+    assert result["issue"]["custom_fields"] == [
+        {
+            "id": "customfield_10116",
+            "name": "GitHub Issue URL",
+            "value": "https://github.com/example/repo/issues/1",
+        },
+        {
+            "id": "customfield_10019",
+            "name": "Story Points",
+            "value": "0|i00001:",
+        },
+    ]
+    assert "custom_fields_truncated" not in result
+
+
+def test_get_issue_omits_custom_fields_that_hold_no_value(monkeypatch):
+    # An empty custom field must not be listed as a row saying nothing:
+    # the list is meant to answer "what is set here", and 0 is a real
+    # value that still has to appear.
+    raw_issue = {
+        "id": "1",
+        "key": "ENG-1",
+        "fields": {
+            "summary": "ok",
+            "customfield_1": None,
+            "customfield_2": "",
+            "customfield_3": "   ",
+            "customfield_4": [],
+            "customfield_5": {},
+            "customfield_6": [{"value": ""}],
+            "customfield_7": [None],
+            "customfield_8": 0,
+        },
+    }
+    monkeypatch.setattr(
+        jira.requests,
+        "request",
+        Mock(
+            side_effect=[
+                MockResponse(json_data=[_SITE_A]),
+                MockResponse(json_data=raw_issue),
+            ]
+        ),
+    )
+
+    result = json.loads(jira.jira_get_issue("ENG-1"))
+
+    assert result["issue"]["custom_fields"] == [
+        {"id": "customfield_8", "name": None, "value": 0}
+    ]
+
+
+def test_get_issue_returns_an_empty_custom_fields_list_when_nothing_is_set(
+    monkeypatch,
+):
+    # Always present, never a missing key: an empty list is the tool
+    # saying "this issue really has no custom field with a value".
+    raw_issue = {
+        "id": "1",
+        "key": "ENG-1",
+        "fields": {"summary": "ok", "customfield_1": None, "customfield_2": ""},
+    }
+    monkeypatch.setattr(
+        jira.requests,
+        "request",
+        Mock(
+            side_effect=[
+                MockResponse(json_data=[_SITE_A]),
+                MockResponse(json_data=raw_issue),
+            ]
+        ),
+    )
+
+    result = json.loads(jira.jira_get_issue("ENG-1"))
+
+    assert result["issue"]["custom_fields"] == []
+
+
+def test_get_issue_simplifies_custom_field_values(monkeypatch):
+    # Each field type Jira has a well-known shape for is reduced to the
+    # part a reader wants, instead of echoing the whole nested object.
+    rich_text = {
+        "type": "doc",
+        "version": 1,
+        "content": [
+            {
+                "type": "paragraph",
+                "content": [{"type": "text", "text": "Rich text body"}],
+            }
+        ],
+    }
+    raw_issue = {
+        "id": "1",
+        "key": "ENG-1",
+        "fields": {
+            "summary": "ok",
+            "customfield_1": {"self": "https://x/1", "value": "High", "id": "1"},
+            "customfield_2": {"value": "A", "child": {"value": "B"}},
+            "customfield_3": {"accountId": "acc-1", "displayName": "Ann"},
+            "customfield_4": [{"value": "a"}, {"value": "b"}],
+            "customfield_5": [{"id": 1, "name": "Sprint 3", "state": "active"}],
+            "customfield_6": rich_text,
+            "customfield_7": 5,
+        },
+    }
+    monkeypatch.setattr(
+        jira.requests,
+        "request",
+        Mock(
+            side_effect=[
+                MockResponse(json_data=[_SITE_A]),
+                MockResponse(json_data=raw_issue),
+            ]
+        ),
+    )
+
+    result = json.loads(jira.jira_get_issue("ENG-1"))
+    values = {entry["id"]: entry["value"] for entry in result["issue"]["custom_fields"]}
+
+    assert values == {
+        "customfield_1": "High",
+        "customfield_2": "A / B",
+        "customfield_3": "Ann",
+        "customfield_4": ["a", "b"],
+        "customfield_5": ["Sprint 3"],
+        "customfield_6": "Rich text body",
+        "customfield_7": 5,
+    }
+
+
+def test_get_issue_lists_two_custom_fields_that_share_a_name(monkeypatch):
+    # Jira allows two fields with the same name; both must be listed and
+    # told apart by their id.
+    raw_issue = {
+        "id": "1",
+        "key": "ENG-1",
+        "names": {
+            "customfield_10020": "Story Points",
+            "customfield_10021": "Story Points",
+        },
+        "fields": {
+            "summary": "ok",
+            "customfield_10020": 3,
+            "customfield_10021": 5,
+        },
+    }
+    monkeypatch.setattr(
+        jira.requests,
+        "request",
+        Mock(
+            side_effect=[
+                MockResponse(json_data=[_SITE_A]),
+                MockResponse(json_data=raw_issue),
+            ]
+        ),
+    )
+
+    result = json.loads(jira.jira_get_issue("ENG-1"))
+
+    assert result["issue"]["custom_fields"] == [
+        {"id": "customfield_10020", "name": "Story Points", "value": 3},
+        {"id": "customfield_10021", "name": "Story Points", "value": 5},
+    ]
+
+
+def test_get_issue_custom_fields_without_a_name_are_still_listed(monkeypatch):
+    # A response that carried no `names` expansion: the id and value are
+    # still worth returning, so the field is listed with name None.
+    raw_issue = {
+        "id": "1",
+        "key": "ENG-1",
+        "fields": {"summary": "ok", "customfield_10116": "https://example.invalid/1"},
+    }
+    monkeypatch.setattr(
+        jira.requests,
+        "request",
+        Mock(
+            side_effect=[
+                MockResponse(json_data=[_SITE_A]),
+                MockResponse(json_data=raw_issue),
+            ]
+        ),
+    )
+
+    result = json.loads(jira.jira_get_issue("ENG-1"))
+
+    assert result["issue"]["custom_fields"] == [
+        {
+            "id": "customfield_10116",
+            "name": None,
+            "value": "https://example.invalid/1",
+        }
+    ]
+
+
+def test_get_issue_custom_fields_exclude_system_fields(monkeypatch):
+    # `*all` brings every system field back too; those are not custom
+    # fields and must not be listed here.
+    raw_issue = {
+        "id": "1",
+        "key": "ENG-1",
+        "names": {"customfield_10050": "Freshdesk ticket"},
+        "fields": {
+            "summary": "ok",
+            "votes": {"votes": 3, "hasVoted": False},
+            "environment": "Production",
+            "customfield_10050": "139325",
+        },
+    }
+    monkeypatch.setattr(
+        jira.requests,
+        "request",
+        Mock(
+            side_effect=[
+                MockResponse(json_data=[_SITE_A]),
+                MockResponse(json_data=raw_issue),
+            ]
+        ),
+    )
+
+    result = json.loads(jira.jira_get_issue("ENG-1"))
+
+    assert result["issue"]["custom_fields"] == [
+        {"id": "customfield_10050", "name": "Freshdesk ticket", "value": "139325"}
+    ]
+
+
+def test_get_issue_caps_an_oversized_custom_field_value(monkeypatch):
+    oversized = "x" * 5000
+    raw_issue = {
+        "id": "1",
+        "key": "ENG-1",
+        "fields": {"summary": "ok", "customfield_1": oversized},
+    }
+    monkeypatch.setattr(
+        jira.requests,
+        "request",
+        Mock(
+            side_effect=[
+                MockResponse(json_data=[_SITE_A]),
+                MockResponse(json_data=raw_issue),
+            ]
+        ),
+    )
+
+    result = json.loads(jira.jira_get_issue("ENG-1"))
+
+    assert result["issue"]["custom_fields"] == [
+        {
+            "id": "customfield_1",
+            "name": None,
+            "value": jira.truncate_error_text(
+                oversized, jira._CUSTOM_FIELD_VALUE_MAX_CHARS
+            ),
+        }
+    ]
+    assert result["custom_fields_truncated"] is True
+
+
+def test_get_issue_marks_custom_fields_shortened_to_fit_the_output_cap(monkeypatch):
+    # custom_fields lives inside `issue`, so success_with_capped_dict can
+    # halve the list (or drop it entirely) to fit the budget -- long after
+    # the per-value check above already said nothing was cut. Shrinking
+    # the list has to be signalled too.
+    monkeypatch.setattr(jira, "get_tool_max_output_length", lambda: 2000)
+    monkeypatch.setattr(jira_mcp_utils, "get_tool_max_output_length", lambda: 2000)
+    names = {f"customfield_{i}": f"Field {i:02d}" for i in range(40)}
+    fields = {f"customfield_{i}": f"value-{i:02d}-" + "y" * 40 for i in range(40)}
+    raw_issue = {
+        "id": "1",
+        "key": "ENG-1",
+        "names": names,
+        "fields": {"summary": "ok", **fields},
+    }
+    monkeypatch.setattr(
+        jira.requests,
+        "request",
+        Mock(
+            side_effect=[
+                MockResponse(json_data=[_SITE_A]),
+                MockResponse(json_data=raw_issue),
+            ]
+        ),
+    )
+
+    raw_response = jira.jira_get_issue("ENG-1")
+    result = json.loads(raw_response)
+
+    assert result["status"] == "success"
+    assert len(raw_response) <= 2000
+    assert result["custom_fields_truncated"] is True
+    returned = result["issue"].get("custom_fields", [])
+    assert len(returned) < len(fields)
+
+
+def test_get_issue_does_not_repeat_an_extra_fields_field_in_custom_fields(
+    monkeypatch,
+):
+    # A field named in extra_fields is already reported, raw, under
+    # extra_field_values; listing it again under custom_fields would spend
+    # output budget on the same data twice.
+    raw_issue = {
+        "id": "1",
+        "key": "ENG-1",
+        "names": {
+            "customfield_10116": "GitHub Issue URL",
+            "customfield_10019": "Story Points",
+        },
+        "fields": {
+            "summary": "ok",
+            "customfield_10116": "https://github.com/example/repo/issues/1",
+            "customfield_10019": "0|i00001:",
+        },
+    }
+    mock_request = Mock(
+        side_effect=[
+            MockResponse(json_data=[_SITE_A]),
+            MockResponse(json_data=raw_issue),
+        ]
+    )
+    monkeypatch.setattr(jira.requests, "request", mock_request)
+
+    result = json.loads(jira.jira_get_issue("ENG-1", extra_fields="customfield_10116"))
+
+    assert result["extra_field_values"] == {
+        "customfield_10116": "https://github.com/example/repo/issues/1"
+    }
+    assert result["issue"]["custom_fields"] == [
+        {
+            "id": "customfield_10019",
+            "name": "Story Points",
+            "value": "0|i00001:",
+        }
+    ]
+    issue_call = mock_request.call_args_list[1]
+    assert issue_call.kwargs["params"]["fields"] == (
+        f"{jira._GET_ISSUE_FIELDS},customfield_10116,"
+        f"{jira._GET_ISSUE_CUSTOM_FIELDS_SELECTOR}"
+    )
+
+
+@pytest.mark.parametrize(
+    ("field_id", "field_name", "excluded"),
+    [
+        ("comment", "Comment", "-comment"),
+        ("worklog", "Worklog", "-worklog"),
+    ],
+)
+def test_get_issue_does_not_exclude_a_field_named_in_extra_fields(
+    monkeypatch, field_id, field_name, excluded
+):
+    # The selector excludes comment/worklog/attachment because they are
+    # unbounded; asking for one of them by name must not leave it
+    # excluded, or Jira would drop the very value the caller asked for.
+    raw_issue = {
+        "id": "1",
+        "key": "ENG-1",
+        "fields": {"summary": "ok", field_id: {field_id: [{"id": "1"}], "total": 1}},
+    }
+    mock_request = Mock(
+        side_effect=[
+            MockResponse(json_data=[_SITE_A]),
+            MockResponse(json_data=[{"id": field_id, "name": field_name}]),
+            MockResponse(json_data=raw_issue),
+        ]
+    )
+    monkeypatch.setattr(jira.requests, "request", mock_request)
+
+    result = json.loads(jira.jira_get_issue("ENG-1", extra_fields=field_id))
+
+    assert result["extra_field_values"] == {
+        field_id: {field_id: [{"id": "1"}], "total": 1}
+    }
+    issue_call = mock_request.call_args_list[2]
+    requested_fields = issue_call.kwargs["params"]["fields"].split(",")
+    assert excluded not in requested_fields
+    assert "*all" in requested_fields
+    for other in jira._GET_ISSUE_CUSTOM_FIELDS_SELECTOR.split(","):
+        if other != excluded:
+            assert other in requested_fields
+    assert issue_call.kwargs["params"]["expand"] == "names"
+
+
+def test_get_issue_raw_fields_requests_no_custom_fields_selector(monkeypatch):
+    # raw_fields keeps the request exactly as it was -- no selector, no
+    # names expansion -- and produces no custom_fields list.
+    raw_issue = {
+        "id": "1",
+        "key": "ENG-1",
+        "fields": {"summary": "ok", "customfield_1": "kept out"},
+    }
+    mock_request = Mock(
+        side_effect=[
+            MockResponse(json_data=[_SITE_A]),
+            MockResponse(json_data=raw_issue),
+        ]
+    )
+    monkeypatch.setattr(jira.requests, "request", mock_request)
+
+    result = json.loads(jira.jira_get_issue("ENG-1", raw_fields=True))
+
+    issue_call = mock_request.call_args_list[1]
+    assert issue_call.kwargs["params"] == {"fields": jira._GET_ISSUE_FIELDS}
+    assert "custom_fields" not in result["issue"]
+    assert "custom_fields_truncated" not in result

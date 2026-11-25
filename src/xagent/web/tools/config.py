@@ -937,6 +937,15 @@ _PROVIDER_DEAD_REFRESH_TOKEN_ERROR_CODES: dict[str, frozenset[str]] = {
     # Assumes, as for Zendesk, that a client change answers invalid_client (the
     # refresh path's default client-rejected code), not invalid_grant.
     "zoom": frozenset({"invalid_grant"}),
+    # Measured on a development store (#2810): a refresh token that is not
+    # active answers 401 invalid_grant. A wrong client secret answers 400
+    # invalid_request and an unknown client id application_cannot_be_found,
+    # so a mistyped secret or id does not clear every connection. Switching
+    # to another valid Shopify app was not measured; its grants are expected
+    # to answer invalid_grant, and example.env already says they must be
+    # reconnected. The refresh token just rotated away is still accepted for
+    # a while, so a lost rotation race does not answer invalid_grant either.
+    "shopify": frozenset({"invalid_grant"}),
 }
 
 
@@ -1042,8 +1051,13 @@ def _is_permanent_oauth_refresh_error(
             error_description=error_description,
             error_subtype=error_subtype,
         )
+    provider = provider_name.lower()
+    if is_shopify_provider(provider):
+        # An admin-created "shopify-*" row refreshes on the same store
+        # endpoint as the builtin one.
+        provider = "shopify"
     return error_code in _PROVIDER_DEAD_REFRESH_TOKEN_ERROR_CODES.get(
-        provider_name.lower(), frozenset()
+        provider, frozenset()
     )
 
 

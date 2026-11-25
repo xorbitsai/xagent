@@ -1355,11 +1355,44 @@ def test_a_token_about_to_become_due_takes_the_store_lock(shopify_db, monkeypatc
     assert posted == []
 
 
-@pytest.mark.parametrize("failure", ["transient", "permanent"])
-def test_a_failed_refresh_releases_the_store(shopify_db, monkeypatch, failure):
+# Shopify's refresh responses, measured on a development store (#2810).
+_SHOPIFY_DEAD_REFRESH_TOKEN = _Response(
+    {
+        "error": "invalid_grant",
+        "error_description": "This request requires an active refresh_token",
+    },
+    status_code=401,
+)
+# A wrong client secret must not read as a dead refresh token, or one bad
+# deploy would clear every Shopify connection.
+_SHOPIFY_WRONG_CLIENT_SECRET = _Response(
+    {
+        "error": "invalid_request",
+        "error_description": "Missing or invalid client secret",
+    },
+    status_code=400,
+)
+
+
+@pytest.mark.parametrize(
+    ("failure", "response"),
+    [
+        pytest.param(
+            "transient",
+            _Response({"errors": "unavailable"}, status_code=503),
+            id="unavailable",
+        ),
+        pytest.param("transient", _SHOPIFY_WRONG_CLIENT_SECRET, id="wrong-secret"),
+        pytest.param("permanent", None, id="no-refresh-token"),
+        pytest.param("permanent", _SHOPIFY_DEAD_REFRESH_TOKEN, id="dead-token"),
+    ],
+)
+def test_a_failed_refresh_releases_the_store(
+    shopify_db, monkeypatch, failure, response
+):
     db, user = shopify_db
     grant = _held_grant(db, user, expires_in=-timedelta(minutes=1))
-    if failure == "permanent":
+    if response is None:
         # No refresh token: the grant can never be refreshed.
         grant.refresh_token = None
         db.commit()
@@ -1374,7 +1407,7 @@ def test_a_failed_refresh_releases_the_store(shopify_db, monkeypatch, failure):
 
         async def post(self, url, **kwargs):
             posted.append(url)
-            return _Response({"errors": "unavailable"}, status_code=503)
+            return response
 
     monkeypatch.setattr(tool_config, "create_public_async_client", FailingAsyncClient)
 
@@ -1382,9 +1415,8 @@ def test_a_failed_refresh_releases_the_store(shopify_db, monkeypatch, failure):
 
     assert resolution.access_token is None
     assert resolution.credential_present is True
-    # A transient failure is retried within the refresh; a missing refresh
-    # token never reaches the provider.
-    assert bool(posted) == (failure == "transient")
+    # A missing refresh token never reaches the provider.
+    assert bool(posted) == (response is not None)
     assert _probe_store_lock(db) is True
     db.expire_all()
     if failure == "permanent":
@@ -1396,6 +1428,23 @@ def test_a_failed_refresh_releases_the_store(shopify_db, monkeypatch, failure):
     else:
         # A transient failure keeps the grant, and with it the store.
         assert _grant(db, user).access_token == "held-access"
+
+
+@pytest.mark.parametrize(
+    ("provider", "dead"),
+    [("shopify", True), ("Shopify-Acme", True), ("shopifylite", False)],
+)
+def test_invalid_grant_is_a_dead_grant_for_the_shopify_family(provider, dead):
+    """An admin-created "shopify-*" row refreshes on the same store endpoint,
+    so it reads Shopify's dead-token answer the same way; an unrelated name
+    that merely starts with "shopify" does not."""
+    assert (
+        tool_config._is_permanent_oauth_refresh_error(provider, 401, "invalid_grant")
+        is dead
+    )
+    assert not tool_config._is_permanent_oauth_refresh_error(
+        provider, 400, "invalid_request"
+    )
 
 
 def test_a_refresh_that_waited_for_the_store_uses_the_newer_token(

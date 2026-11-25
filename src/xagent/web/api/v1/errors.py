@@ -160,7 +160,7 @@ class V1ErrorCode(str, Enum):
     CONNECTOR_NOT_SHARED = "connector_not_shared"
 
     # An agent model slot would be set to a model it cannot take. 400.
-    # ``details.models`` lists each refused slot as ``{"slot", "model_id",
+    # ``details.models`` lists each refused slot as ``{"slot", "id",
     # "reason"}`` with ``reason`` one of ``unavailable``, ``not_llm`` or
     # ``owner_cannot_use``; only ``owner_cannot_use`` adds ``owner_user_id``.
     MODEL_NOT_ASSIGNABLE = "model_not_assignable"

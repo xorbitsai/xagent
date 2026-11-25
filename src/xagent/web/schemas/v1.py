@@ -432,15 +432,20 @@ class V1AgentModelSlots(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    general: Optional[_ModelPk] = Field(default=None, description="The main model.")
+    general: Optional[_ModelPk] = Field(
+        default=None, description="The main model. Omit keeps, null clears."
+    )
     small_fast: Optional[_ModelPk] = Field(
-        default=None, description="The small, fast helper model."
+        default=None,
+        description="The small, fast helper model. Omit keeps, null clears.",
     )
     visual: Optional[_ModelPk] = Field(
-        default=None, description="The model that reads images."
+        default=None,
+        description="The model that reads images. Omit keeps, null clears.",
     )
     compact: Optional[_ModelPk] = Field(
-        default=None, description="The model that compacts long contexts."
+        default=None,
+        description="The model that compacts long contexts. Omit keeps, null clears.",
     )
 
 
@@ -535,9 +540,11 @@ class V1AgentUpdateRequest(BaseModel):
             "returns 400, and a value saved in the web app can hold keys other "
             "than the four slots, or slot values other than null or an integer "
             "from 1 to 2147483647, which return 422. A task resolves "
-            "each slot as the user it runs as; if that user cannot use the "
-            "model, the task silently uses another model, so prefer shared "
-            "models on a team agent."
+            "each slot as the user it runs as. If that user cannot use the "
+            "model, a task started on this agent falls back to a default model "
+            "for that slot without an error; when another agent calls this "
+            "agent, such a `general` model fails the call and such a model in "
+            "another slot is left unused. Prefer shared models on a team agent."
         ),
     )
 
@@ -563,7 +570,7 @@ class V1Model(BaseModel):
         "time. `POST /v1/agents` and `POST /v1/agents/from-template` also accept "
         "a model of another category; `GET /v1/agents/{agent_id}` then lists "
         "that slot in `unresolved_models`, and `PATCH /v1/agents/{agent_id}` "
-        "refuses to set one."
+        "refuses to change a slot to one."
     )
     abilities: list[str] = Field(
         description="The model's abilities, for example `chat` or `vision`. "

@@ -1105,7 +1105,7 @@ def test_update_models_merges_by_slot(stored_kind, request_kind):
     if request_kind == "unchanged-stale" and base.get("compact") != stale:
         _error(resp, 400, "model_not_assignable")
         assert resp.json()["error"]["details"]["models"] == [
-            {"slot": "compact", "model_id": stale, "reason": "unavailable"}
+            {"slot": "compact", "id": stale, "reason": "unavailable"}
         ]
         assert _row(agent_id) == before
         return
@@ -1151,8 +1151,8 @@ def test_two_refused_slots_are_reported_in_slot_order():
 
     error = _error(resp, 400, "model_not_assignable")
     assert error["details"]["models"] == [
-        {"slot": "general", "model_id": image, "reason": "not_llm"},
-        {"slot": "compact", "model_id": 999_999, "reason": "unavailable"},
+        {"slot": "general", "id": image, "reason": "not_llm"},
+        {"slot": "compact", "id": 999_999, "reason": "unavailable"},
     ]
     assert error["message"] == (
         "These model slots cannot use the requested model: "
@@ -1252,7 +1252,7 @@ def test_listing_for_agent_matches_patch(column, cell):
         assert _row(world.agent_id)["models"] == {"general": model_id}
         return
     assert _row(world.agent_id) == before
-    entry = {"slot": "general", "model_id": model_id, "reason": reason}
+    entry = {"slot": "general", "id": model_id, "reason": reason}
     if reason == "owner_cannot_use":
         entry["owner_user_id"] = _agent_owner(world)
     error = _error(resp, 400, "model_not_assignable")
@@ -1317,6 +1317,12 @@ def test_slot_rule_has_one_owner():
 _MODEL_REFUSALS = [
     ("unavailable", {"models": {"general": "m9"}}, 400, "(unavailable)"),
     ("not-llm", {"models": {"general": "m10"}}, 400, "(not_llm)"),
+    (
+        "text-and-model",
+        {"description": "new", "models": {"general": "m9"}},
+        400,
+        "(unavailable)",
+    ),
     ("owner-cannot-use", {"models": {"general": "m1"}}, 400, "(owner_cannot_use)"),
     ("owner-left", {"models": {"general": "m4"}}, 400, "(owner_cannot_use)"),
     ("taken-and-model", {"name": "taken", "models": {"general": "m1"}}, 400, _TAKEN),
@@ -1428,13 +1434,14 @@ def test_concurrent_slot_updates_both_survive(monkeypatch):
         # Each update waits, after reading the agent, until the other has read
         # it too. Under the row lock the second read waits for the first
         # commit, so the first wait runs out and both slots survive; without
-        # the lock both read the old row and one slot is lost.
+        # the lock both read the old row and one slot is lost. The wait is
+        # long so that a second update slow to start still reads the old row.
         barrier = threading.Barrier(2)
         real_changed_slots = agent_management._changed_slots
 
         def read_then_wait(base, requested):
             with contextlib.suppress(threading.BrokenBarrierError):
-                barrier.wait(2)
+                barrier.wait(10)
             return real_changed_slots(base, requested)
 
         errors: list[BaseException] = []
@@ -1459,6 +1466,7 @@ def test_concurrent_slot_updates_both_survive(monkeypatch):
                 thread.start()
             for thread in threads:
                 thread.join(30)
+        assert not any(thread.is_alive() for thread in threads)
         assert errors == []
         with factory() as db:
             stored = db.get(Agent, agent_id).models
@@ -1563,7 +1571,7 @@ def test_batch_client_flow_when_only_one_owner_can_use_the_model():
     assert responses[2].json()["error"]["details"]["models"] == [
         {
             "slot": "visual",
-            "model_id": models["private"],
+            "id": models["private"],
             "reason": "owner_cannot_use",
             "owner_user_id": bob,
         }
@@ -1597,7 +1605,7 @@ def test_batch_client_flow_when_the_owner_left_the_team():
     assert error["details"]["models"] == [
         {
             "slot": "visual",
-            "model_id": models["team-admin"],
+            "id": models["team-admin"],
             "reason": "owner_cannot_use",
             "owner_user_id": bob,
         }

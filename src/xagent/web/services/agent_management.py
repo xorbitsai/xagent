@@ -104,7 +104,7 @@ class ModelSlotsUnusableError(ValueError):
     """Raised when a slot would be set to a model it cannot take.
 
     ``rejections`` has one entry per refused slot, in slot order: ``slot``,
-    ``model_id`` (the model's primary key), ``reason`` and, for
+    ``id`` (the model's primary key), ``reason`` and, for
     ``owner_cannot_use`` only, ``owner_user_id``.
     """
 
@@ -1412,7 +1412,7 @@ def _check_slot_models(
     for slot, pk in changed.items():
         if pk is None:
             continue
-        rejection: dict[str, Any] = {"slot": slot, "model_id": pk}
+        rejection: dict[str, Any] = {"slot": slot, "id": pk}
         if pk not in usable:
             rejection["reason"] = "unavailable"
         elif pk not in holder_ok:

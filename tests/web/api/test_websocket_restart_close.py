@@ -633,3 +633,59 @@ def test_receive_after_our_own_close_is_not_an_error(manager):
     assert manager.was_closed_by_server(gone, RuntimeError("receive after close"))
     assert not manager.was_closed_by_server(live, RuntimeError("real fault"))
     assert not manager.was_closed_by_server(gone, ConnectionError("reset"))
+
+
+@pytest.mark.asyncio
+async def test_close_without_drain_closes_open_sockets_and_keeps_admitting_new_ones(
+    manager,
+):
+    old_a, old_b, sse = FakeSocket(), FakeSocket(), FakeSse()
+    manager.register_connection(old_a, 1)
+    manager.register_connection(old_b, 2)
+    manager.register_connection(sse, 1)
+
+    assert await manager.close_for_restart(drain=False) == 2
+
+    assert old_a.closed == [(1012, "Service Restart")]
+    assert old_b.closed == [(1012, "Service Restart")]
+    assert sse.closed == []
+    # A client that reconnects after its close is kept, not bounced with 1012.
+    late = FakeSocket()
+    manager.register_connection(late, 1)
+    await asyncio.sleep(0.05)
+    assert late.closed == []
+    assert manager.connection_count() == 2  # the SSE sink and the reconnected socket
+
+
+@pytest.mark.asyncio
+async def test_socket_registered_during_a_close_without_drain_is_kept(manager):
+    waiting = FakeSocket()
+    manager.register_connection(waiting, 1)
+    _command_origins.register("cmd-1", waiting, 1)
+    before = manager._restart_drain_generation
+
+    closing = asyncio.create_task(
+        manager.close_for_restart(drain=False, reply_deadline_seconds=5)
+    )
+    await asyncio.sleep(0.1)
+    late = FakeSocket()
+    manager.register_connection(late, 2)
+    await asyncio.sleep(0.05)
+    closing.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await closing
+
+    assert late.closed == []
+    # A cancelled close without a drain has no drain to end: the generation stays.
+    assert manager._restart_drain_generation == before
+
+
+@pytest.mark.asyncio
+async def test_close_without_drain_does_not_move_the_drain_generation(manager):
+    before = manager._restart_drain_generation
+    manager.register_connection(FakeSocket(), 1)
+
+    await manager.close_for_restart(drain=False)
+
+    assert manager._restart_drain_generation == before
+    assert manager._restart_draining is False

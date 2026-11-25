@@ -134,12 +134,24 @@ def _request(
         if len(detail) > MAX_ERROR_RESPONSE_TEXT_CHARS:
             detail = detail[:MAX_ERROR_RESPONSE_TEXT_CHARS] + "... [truncated]"
         if response.status_code == 403 and required_scope:
-            detail = (
-                f"{detail}. This operation requires the Employment Hero OAuth "
-                f"scope {required_scope!r}. Ask an administrator to enable it "
-                "for the OAuth application, then disconnect and reconnect "
-                "Employment Hero."
-            )
+            # A grant missing the scope answers "scope validating failed"; a
+            # granted scope refused for the person's role answers a bare
+            # "403 Forbidden", which reconnecting cannot fix.
+            if "scope" in detail.lower():
+                detail = (
+                    f"{detail}. This operation requires the Employment Hero "
+                    f"OAuth scope {required_scope!r}. Ask an administrator to "
+                    "enable it for the OAuth application, then disconnect and "
+                    "reconnect Employment Hero."
+                )
+            else:
+                detail = (
+                    f"{detail}. Employment Hero does not allow this for the "
+                    "signed-in person's role (for example, staff cannot read "
+                    "leave balances, leave categories, or other employees). Ask an "
+                    "Employment Hero admin or manager to do it; reconnecting "
+                    "will not help."
+                )
         raise RuntimeError(
             f"Employment Hero API error (status {response.status_code}): {detail}"
         )
@@ -319,12 +331,11 @@ def employment_hero_get_current_user() -> str:
     organisation_name, member_id, role, name, and email. Call this first
     when the person asks about themselves ("my leave balance", "submit leave
     for me"), instead of searching the employee directory, which staff
-    without an admin or manager role may not be allowed to list. Use that
-    organisation's member_id as employee_id for reads. Employment Hero
-    documents member_id for the other endpoints but not as the employee
-    id, so before creating a leave request with it, confirm it with
-    employment_hero_get_employee(organisation_id, member_id) and check the
-    name or email matches.
+    without an admin or manager role are not allowed to list. That
+    organisation's member_id is the person's employee_id for the leave
+    tools. Staff (role "employee") may be refused leave balances, leave
+    categories, and employee records, including their own, while still
+    being allowed to list and create their own leave requests.
     """
     try:
         result = _request("GET", "/user_info", required_scope=USER_INFO_SHOW_SCOPE)
@@ -655,9 +666,7 @@ def employment_hero_create_leave_request(
     ambiguous timeout.
     organisation_id: id from employment_hero_list_organisations.
     employee_id: for the person themselves, member_id from
-    employment_hero_get_current_user, only after
-    employment_hero_get_employee(organisation_id, member_id) returned the
-    same person; for anyone else, resolve with
+    employment_hero_get_current_user; for anyone else, resolve with
     employment_hero_list_employees(query=...).
     leave_category_id: id from employment_hero_list_leave_categories.
     start_date, end_date: inclusive YYYY-MM-DD dates.

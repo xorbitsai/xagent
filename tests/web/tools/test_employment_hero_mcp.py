@@ -461,7 +461,7 @@ def test_request_adds_actionable_scope_hint_to_403(monkeypatch):
         "request",
         Mock(
             return_value=MockResponse(
-                status_code=403, json_data={"message": "forbidden"}
+                status_code=403, json_data={"error": "scope validating failed"}
             )
         ),
     )
@@ -476,6 +476,34 @@ def test_request_adds_actionable_scope_hint_to_403(monkeypatch):
     message = str(excinfo.value)
     assert employment_hero.LEAVE_CATEGORIES_LIST_SCOPE in message
     assert "disconnect and reconnect" in message
+
+
+def test_request_403_for_a_staff_role_does_not_suggest_reconnecting(monkeypatch):
+    # Employment Hero's answer when the scope is granted but the signed-in
+    # person's role (e.g. "employee") may not use the endpoint.
+    monkeypatch.setattr(
+        employment_hero.requests,
+        "request",
+        Mock(
+            return_value=MockResponse(
+                status_code=403,
+                json_data={"error": {"errors": [{"message": "403 Forbidden"}]}},
+            )
+        ),
+    )
+
+    with pytest.raises(RuntimeError) as excinfo:
+        employment_hero._request(
+            "GET",
+            "/organisations/org-1/employees/emp-1/leave_balances",
+            required_scope=employment_hero.LEAVE_BALANCES_LIST_SCOPE,
+        )
+
+    message = str(excinfo.value)
+    assert "role" in message
+    assert "admin or manager" in message
+    assert "reconnecting will not help" in message
+    assert "disconnect and reconnect" not in message
 
 
 def test_list_leave_categories_requests_expected_path(monkeypatch):

@@ -2152,7 +2152,8 @@ def _filter_excluded_media_models(
 
     ``allowed_model_ids`` is the positive bound: a model is kept only if its
     ``model_id`` attribute is in it, so a model without one is dropped, and a
-    default outside it is re-picked. Its dict key is never consulted: a model
+    default outside it is re-picked (no default stays none). Its dict key is
+    never consulted: a model
     registered later is gone even when its key says otherwise. ``None`` means
     no bound; an exclusion still applies first.
     """
@@ -2169,8 +2170,9 @@ def _filter_excluded_media_models(
         )
     }
     default_model_id = getattr(default, "model_id", None)
-    if default_model_id not in excluded_model_ids and (
-        allowed_model_ids is None or default_model_id in allowed_model_ids
+    if default is None or (
+        default_model_id not in excluded_model_ids
+        and (allowed_model_ids is None or default_model_id in allowed_model_ids)
     ):
         return kept, default
     replacement = next(
@@ -2588,13 +2590,17 @@ class WebToolConfig(BaseToolConfig):
     ) -> Any | None:
         """Keep a default this task may use, else re-pick it from the remaining models.
 
-        A default that is not excluded and is either inside the allow-list or
-        under no allow-list at all is returned without loading the kind's dict.
+        No default, or one that is not excluded and is either inside the
+        allow-list or under no allow-list at all, is returned without loading
+        the kind's dict.
         """
         default_model_id = getattr(default, "model_id", None)
-        if default_model_id not in self._excluded_model_ids and (
-            self._allowed_model_ids is None
-            or default_model_id in self._allowed_model_ids
+        if default is None or (
+            default_model_id not in self._excluded_model_ids
+            and (
+                self._allowed_model_ids is None
+                or default_model_id in self._allowed_model_ids
+            )
         ):
             return default
         return _filter_excluded_media_models(

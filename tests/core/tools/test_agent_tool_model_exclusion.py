@@ -17,7 +17,7 @@ from xagent.core.tools.adapters.vibe.selection_spec import ToolSelectionSpec
 from xagent.web.models.agent import Agent, AgentStatus
 from xagent.web.models.database import Base
 from xagent.web.models.model import Model
-from xagent.web.models.user import User, UserModel
+from xagent.web.models.user import User, UserDefaultModel, UserModel
 from xagent.web.tools.config import WebToolConfig
 
 pytestmark = pytest.mark.usefixtures("no_resolvable_default_llm")
@@ -198,7 +198,8 @@ LATER_IMAGE_MODEL_ID = "image-registered-later"
 
 
 def _register_an_image_model_after_setup(session_factory: Any, user_id: int) -> None:
-    """Add a shared, active image model the task never saw when it was set up."""
+    """Add a shared, active image model the task never saw when it was set up,
+    and make it the user's default image model."""
     with session_factory() as db:
         later = Model(
             model_id=LATER_IMAGE_MODEL_ID,
@@ -215,6 +216,11 @@ def _register_an_image_model_after_setup(session_factory: Any, user_id: int) -> 
         # Granted to the user, so the model table offers it from now on.
         db.add(
             UserModel(user_id=user_id, model_id=later.id, is_owner=True, is_shared=True)
+        )
+        # Its default too, so the default lookup -- not just the kind's dict --
+        # hands it out after setup.
+        db.add(
+            UserDefaultModel(user_id=user_id, model_id=later.id, config_type="image")
         )
         db.commit()
 
@@ -249,6 +255,11 @@ async def _child_media_after_a_later_registration(
             "xagent.web.services.llm_utils.UserAwareModelStorage"
         ) as mock_storage_class,
         patch("xagent.core.agent.service.AgentService") as mock_agent_service_class,
+        # The default lookup opens its own session; point it at this database.
+        patch(
+            "xagent.web.models.database.get_session_local",
+            return_value=session_factory,
+        ),
     ):
         mock_storage_class.return_value = Mock()
         mock_agent_service_class.return_value.execute_task = AsyncMock(
@@ -308,8 +319,8 @@ async def test_the_child_is_closed_to_a_model_registered_after_the_parent_build(
     )
 
     assert seen["image_models"] == {IMAGE_MODEL_ID}
-    # The default was never configured, so it is re-picked from what survives:
-    # the allowed model, never the one that appeared afterwards.
+    # The default lookup returns the later model; it is outside the allow-list,
+    # so the default is re-picked from what survives: the allowed model.
     generate_model = seen["generate_model"]
     assert generate_model is not None
     assert getattr(generate_model, "model_id", None) == IMAGE_MODEL_ID
@@ -327,3 +338,4 @@ async def test_an_exclusion_alone_leaves_the_later_model_available_to_the_child(
     )
 
     assert seen["image_models"] == {IMAGE_MODEL_ID, LATER_IMAGE_MODEL_ID}
+    assert getattr(seen["generate_model"], "model_id", None) == LATER_IMAGE_MODEL_ID

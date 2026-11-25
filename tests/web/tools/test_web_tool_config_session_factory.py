@@ -3780,3 +3780,26 @@ def test_the_config_reports_its_allow_list():
     assert _media_config(allowed_model_ids=frozenset()).get_allowed_model_ids() == (
         frozenset()
     )
+
+
+def test_no_default_stays_none_under_an_allow_list_without_loading_a_mapping(
+    monkeypatch,
+):
+    allowed = _MediaModel("allowed-id", ("generate",))
+    cfg = _media_config(
+        allowed_model_ids=frozenset({"allowed-id"}),
+        video_models={"allowed-id": allowed},
+        video_model=None,
+    )
+    loads: list[str] = []
+
+    def spy():
+        loads.append("get_video_models")
+        return {"allowed-id": allowed}
+
+    monkeypatch.setattr(cfg, "get_video_models", spy)
+
+    # A kind with no default keeps none: the allow-list bounds which model a
+    # default may be, it does not invent one.
+    assert cfg.get_video_model() is None
+    assert loads == []

@@ -8,6 +8,10 @@ enforce them by default.
 
 No effect on non-SQLite engines (e.g. Postgres handles this with MVCC and
 row-level locks).
+
+:func:`begin_sqlite_write_transaction` takes SQLite's write lock before a
+transaction reads anything, for code that reads, decides and then writes:
+SQLite ignores ``SELECT ... FOR UPDATE``.
 """
 
 from __future__ import annotations
@@ -17,6 +21,7 @@ from pathlib import Path
 
 from sqlalchemy import Engine, event
 from sqlalchemy.engine import make_url
+from sqlalchemy.orm import Session
 
 logger = logging.getLogger(__name__)
 
@@ -100,3 +105,25 @@ def _apply_concurrency_pragmas(cursor, timeout_ms: int) -> None:  # type: ignore
     enabled = cursor.fetchone()
     if enabled is None or int(enabled[0]) != 1:
         raise RuntimeError("SQLite foreign-key enforcement could not be enabled")
+
+
+def begin_sqlite_write_transaction(session: Session) -> None:
+    """Take SQLite's write lock before *session* reads anything.
+
+    SQLite ignores ``SELECT ... FOR UPDATE``, and pysqlite opens a transaction
+    only before the first write, so reads that decide a write are under no
+    lock. ``BEGIN IMMEDIATE`` takes the database's single write lock at once
+    and keeps it until the session commits or rolls back. While another
+    connection holds that lock, this waits for it up to the connection's
+    ``busy_timeout`` and then raises ``OperationalError`` ("database is
+    locked").
+
+    It must be the session's first statement: a session that has begun a
+    transaction is refused with ``RuntimeError``. On any other dialect this
+    does nothing and takes no connection.
+    """
+    if session.get_bind().dialect.name != "sqlite":
+        return
+    if session.in_transaction():
+        raise RuntimeError("BEGIN IMMEDIATE must be the session's first statement")
+    session.connection().exec_driver_sql("BEGIN IMMEDIATE")

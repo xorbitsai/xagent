@@ -287,6 +287,108 @@ async def test_generate_video_keeps_workspace_image_ref_for_xinference(mock_work
 
 
 @pytest.mark.asyncio
+async def test_generate_video_converts_workspace_refs_to_data_urls_for_saas(
+    mock_workspace,
+):
+    image_path = mock_workspace.output_dir / "frame.png"
+    image_path.write_bytes(b"image bytes")
+    mock_workspace.stage_path_for_external_upload = Mock(return_value=image_path)
+    mock_workspace.discard_staged_external_upload = Mock()
+    saas_model = XinferenceVideoModel(model_name="minimax-h3", saas_api=True)
+    saas_model.generate_video = AsyncMock(
+        return_value={"task_id": "t", "status": "succeeded", "video_url": ""}
+    )
+    tool = VideoGenerationToolCore(
+        {"saas": saas_model},
+        workspace=mock_workspace,
+        default_video_model=saas_model,
+    )
+
+    result = await tool.generate_video(
+        "Animate this frame",
+        image_url="file:image-file-id",
+        reference_image_urls=["https://x.test/ref.png"],
+        seconds=4,
+    )
+
+    assert result["success"] is True
+    kwargs = saas_model.generate_video.await_args.kwargs
+    assert kwargs["first_frame_image_url"].startswith("data:image/")
+    assert kwargs["input_reference"] == kwargs["first_frame_image_url"]
+    # The list is left for the model to refuse, not converted or dropped here.
+    assert kwargs["reference_image_urls"] == ["https://x.test/ref.png"]
+    mock_workspace.discard_staged_external_upload.assert_called_once_with(image_path)
+
+
+def _saas_tool(mock_workspace):
+    saas_model = XinferenceVideoModel(model_name="minimax-h3", saas_api=True)
+    saas_model.generate_video = AsyncMock(
+        return_value={"task_id": "t", "status": "succeeded", "video_url": ""}
+    )
+    tool = VideoGenerationToolCore(
+        {"saas": saas_model},
+        workspace=mock_workspace,
+        default_video_model=saas_model,
+    )
+    return tool, saas_model
+
+
+@pytest.mark.asyncio
+async def test_saas_image_with_resolution_alias_sends_no_derived_size(mock_workspace):
+    tool, model = _saas_tool(mock_workspace)
+
+    await tool.generate_video(
+        "Animate", input_reference="https://x.test/a.png", resolution="720p"
+    )
+
+    assert "size" not in model.generate_video.await_args.kwargs
+
+
+@pytest.mark.asyncio
+async def test_saas_text_only_resolution_alias_still_derives_size(mock_workspace):
+    tool, model = _saas_tool(mock_workspace)
+
+    await tool.generate_video("A fox", resolution="720p")
+
+    assert model.generate_video.await_args.kwargs["size"] == "1280x720"
+
+
+@pytest.mark.asyncio
+async def test_saas_image_keeps_an_explicit_size_or_ratio(mock_workspace):
+    tool, model = _saas_tool(mock_workspace)
+
+    await tool.generate_video(
+        "Animate", input_reference="https://x.test/a.png", size="768x1344"
+    )
+    assert model.generate_video.await_args.kwargs["size"] == "768x1344"
+
+    await tool.generate_video(
+        "Animate",
+        input_reference="https://x.test/a.png",
+        resolution="720p",
+        ratio="9:16",
+    )
+    assert model.generate_video.await_args.kwargs["size"] == "720x1280"
+
+
+@pytest.mark.asyncio
+async def test_saas_unloadable_workspace_ref_is_a_categorized_parameter_error(
+    mock_workspace,
+):
+    mock_workspace.stage_path_for_external_upload = Mock(
+        side_effect=ValueError("no such file id")
+    )
+    tool, model = _saas_tool(mock_workspace)
+
+    result = await tool.generate_video("Animate", image_url="file:missing")
+
+    assert result["success"] is False
+    assert result["error_category"] == "invalid_request"
+    assert "Ark" not in result["error"] and "missing" not in result["error"]
+    model.generate_video.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_list_video_models_reports_lightning_by_running_uid(
     monkeypatch, mock_workspace
 ):
@@ -838,112 +940,3 @@ async def test_a_zero_length_is_refused_for_a_model_with_no_known_range(
     assert result["error_category"] == "invalid_request"
     assert "allowed_values" not in result
     xinference_model.generate_video.assert_not_called()
-
-
-def _video_model(*, image_input: bool, result_id: str):
-    model = Mock(spec=BaseVideoModel)
-    model.has_ability = Mock(return_value=True)
-    model.abilities = ["generate"]
-    model.supports_image_input = Mock(return_value=image_input)
-    model.generate_video = AsyncMock(
-        return_value={"task_id": result_id, "status": "succeeded", "video_url": ""}
-    )
-    return model
-
-
-def _routing_tool(mock_workspace):
-    text_only = _video_model(image_input=False, result_id="text-task")
-    zeta = _video_model(image_input=True, result_id="zeta-task")
-    alpha = _video_model(image_input=True, result_id="alpha-task")
-    tool = VideoGenerationToolCore(
-        {"text-only": text_only, "zeta": zeta, "alpha": alpha},
-        workspace=mock_workspace,
-        default_video_model=text_only,
-    )
-    return tool, text_only, zeta, alpha
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "image_args",
-    [
-        {"input_reference": "https://x.test/a.png"},
-        {"image_url": "https://x.test/a.png"},
-        {"image": "https://x.test/a.png"},
-        {"first_frame_image_url": "https://x.test/a.png"},
-        {"last_frame_image_url": "https://x.test/a.png"},
-        {"reference_image_urls": ["https://x.test/a.png"]},
-    ],
-)
-async def test_image_input_switches_a_text_only_default_to_an_image_model(
-    mock_workspace, image_args
-):
-    tool, text_only, zeta, alpha = _routing_tool(mock_workspace)
-
-    result = await tool.generate_video("Animate this", **image_args)
-
-    assert result["success"] is True
-    assert result["model_used"] == "alpha"
-    alpha.generate_video.assert_awaited_once()
-    text_only.generate_video.assert_not_called()
-    zeta.generate_video.assert_not_called()
-
-
-@pytest.mark.asyncio
-async def test_explicit_model_id_is_never_overridden_for_image_input(mock_workspace):
-    tool, text_only, zeta, alpha = _routing_tool(mock_workspace)
-
-    await tool.generate_video(
-        "Animate this", input_reference="https://x.test/a.png", model_id="text-only"
-    )
-
-    assert text_only.generate_video.await_count == 1
-    alpha.generate_video.assert_not_called()
-    zeta.generate_video.assert_not_called()
-
-
-@pytest.mark.asyncio
-async def test_text_only_request_keeps_the_text_only_default(mock_workspace):
-    tool, text_only, zeta, alpha = _routing_tool(mock_workspace)
-
-    result = await tool.generate_video("A plain prompt", reference_image_urls=" ")
-
-    assert result["model_used"] == "text-only"
-    text_only.generate_video.assert_awaited_once()
-    alpha.generate_video.assert_not_called()
-
-
-@pytest.mark.asyncio
-async def test_image_input_without_an_image_model_keeps_the_original_failure(
-    mock_workspace,
-):
-    text_only = _video_model(image_input=False, result_id="text-task")
-    text_only.generate_video = AsyncMock(side_effect=ValueError("no image input"))
-    tool = VideoGenerationToolCore(
-        {"text-only": text_only},
-        workspace=mock_workspace,
-        default_video_model=text_only,
-    )
-
-    result = await tool.generate_video(
-        "Animate", input_reference="https://x.test/a.png"
-    )
-
-    assert result["success"] is False
-    text_only.generate_video.assert_awaited_once()
-
-
-def test_model_list_marks_text_only_models(mock_workspace):
-    tool, *_ = _routing_tool(mock_workspace)
-
-    lines = {
-        line.split(":")[0].removeprefix("- "): line
-        for line in tool._model_info_text.splitlines()
-    }
-    assert "(text-to-video only)" in lines["text-only"]
-    assert "text-to-video only" not in lines["alpha"]
-    assert "text-to-video only" not in lines["zeta"]
-
-
-def test_ark_video_model_accepts_image_input():
-    assert ArkVideoModel(model_name="m", api_key="k").supports_image_input() is True

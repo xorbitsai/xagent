@@ -22,8 +22,12 @@ from ....config import (
     get_media_download_max_bytes,
     get_xinference_saas_video_async_enabled,
 )
-from ...tools.core.media_errors import MediaParameterError, redact_provider_detail
-from ...utils.public_download import download_public_input
+from ...tools.core.media_errors import (
+    _PROVIDER_UNAVAILABLE_STATUSES,
+    MediaParameterError,
+    redact_provider_detail,
+)
+from ...utils.public_download import PublicDownloadError, download_public_input
 from ..chat.token_context import MediaCallType
 from ..media_metering import record_provider_usage
 from ..public_http import create_public_model_aiohttp_session
@@ -318,6 +322,39 @@ def _saas_seed(value: Any) -> int | None:
     return int(value)
 
 
+def _raise_frame_download_error(field: str, exc: PublicDownloadError) -> None:
+    """Keep a fetch that may succeed later apart from an unusable input."""
+    text = str(exc)
+    status_text = text.removeprefix("Remote input returned HTTP ")
+    status = int(status_text) if status_text.isdigit() else None
+    if "timed out" in text:
+        raise TimeoutError(f"The {field} image download timed out") from None
+    if "connection failed" in text or (
+        status is not None
+        and (status >= 500 or status in _PROVIDER_UNAVAILABLE_STATUSES)
+    ):
+        raise ConnectionError(
+            f"The {field} image could not be downloaded: {text}"
+        ) from None
+    raise MediaParameterError(
+        f"The {field} image could not be loaded: {text}", field=field
+    ) from None
+
+
+def _frame_data_url(raw: bytes) -> str:
+    """The server refuses remote URLs, so frames go out as data URLs.
+
+    The subtype is only a label; the server decides from the bytes.
+    """
+    if raw.startswith(b"\x89PNG"):
+        subtype = "png"
+    elif raw[:4] == b"RIFF" and raw[8:12] == b"WEBP":
+        subtype = "webp"
+    else:
+        subtype = "jpeg"
+    return f"data:image/{subtype};base64," + base64.b64encode(raw).decode("ascii")
+
+
 @dataclass
 class _SubmitState:
     """What the submit attempts have left uncertain."""
@@ -340,7 +377,7 @@ class XinferenceVideoModel(BaseVideoModel):
     """Xinference video model client using OpenAI-compatible video endpoints.
 
     With ``saas_api=True`` it targets the xinference-saas prepaid video API
-    (text-to-video only, top-level fields, ``b64_json`` responses). The default
+    (top-level fields, ``b64_json`` responses). The default
     keeps the open-source server contract (``kwargs`` JSON string, image and
     first/last-frame endpoints).
     """
@@ -394,11 +431,6 @@ class XinferenceVideoModel(BaseVideoModel):
     @property
     def abilities(self) -> List[str]:
         return self._abilities
-
-    def supports_image_input(self) -> bool:
-        # The xinference-saas video API is text-to-video only;
-        # _generate_saas_video refuses any image input.
-        return not self.saas_api
 
     def validate_configuration(self) -> None:
         if not self.base_url:
@@ -637,12 +669,42 @@ class XinferenceVideoModel(BaseVideoModel):
         )
         return data, item
 
+    async def _load_saas_frame(
+        self,
+        field: str,
+        value: Optional[str],
+        allowed_local_media_roots: Optional[list[str | Path]],
+        timeout: float,
+    ) -> Optional[str]:
+        """A frame (URL, file, FileRef-resolved path or data URL) as a data URL.
+
+        Image validity is the server's call: it answers 400 for a bad image.
+        """
+        if not value:
+            return None
+        try:
+            raw = await self._read_media_bytes(
+                value,
+                allowed_local_media_roots=allowed_local_media_roots,
+                timeout=timeout,
+            )
+        except PublicDownloadError as exc:
+            _raise_frame_download_error(field, exc)
+        except Exception as exc:  # noqa: BLE001 - classified as bad input
+            raise MediaParameterError(
+                f"The {field} image could not be loaded: {redact_provider_detail(exc)}",
+                field=field,
+            ) from None
+        return _frame_data_url(raw)
+
     async def _generate_saas_video(
         self,
         *,
         prompt: str,
         reference_image: Optional[str],
         last_frame_image_url: Optional[str],
+        allowed_local_media_roots: Optional[list[str | Path]],
+        extra_references: dict[str, Any],
         seconds: Any,
         size: Optional[str],
         resolution: Optional[str],
@@ -651,15 +713,35 @@ class XinferenceVideoModel(BaseVideoModel):
         timeout: float,
     ) -> dict[str, Any]:
         # Every refusal and validation happens before a request is built.
-        if reference_image or last_frame_image_url:
-            raise MediaParameterError(
-                "This Xinference video model supports text-to-video only; "
-                "image-to-video and first/last-frame input are not available",
-                field="input_reference",
-            )
+        for key in (
+            "reference_image_urls",
+            "reference_video_urls",
+            "reference_audio_urls",
+        ):
+            if extra_references.get(key):
+                raise MediaParameterError(
+                    f"This Xinference video model does not accept {key}; use a "
+                    "first frame (input_reference) and optional last frame, or "
+                    "choose another video model",
+                    field=key,
+                )
         duration_value = _saas_duration(seconds)
+        # No size is sent unless the caller named one, so with an image the
+        # server picks the size that matches it.
         dimensions = _saas_dimensions(size)
         seed_value = _saas_seed(seed)
+        first_frame = await self._load_saas_frame(
+            "first_frame_image",
+            reference_image,
+            allowed_local_media_roots,
+            timeout,
+        )
+        last_frame = await self._load_saas_frame(
+            "last_frame_image",
+            last_frame_image_url,
+            allowed_local_media_roots,
+            timeout,
+        )
 
         if get_xinference_saas_video_async_enabled():
             return await self._run_saas_video_job(
@@ -670,6 +752,8 @@ class XinferenceVideoModel(BaseVideoModel):
                 resolution=resolution,
                 ratio=ratio,
                 timeout=timeout,
+                first_frame=first_frame,
+                last_frame=last_frame,
             )
 
         body: dict[str, Any] = {
@@ -684,6 +768,10 @@ class XinferenceVideoModel(BaseVideoModel):
             body["width"], body["height"] = dimensions
         if seed_value is not None:
             body["seed"] = seed_value
+        if first_frame is not None:
+            body["first_frame_image"] = first_frame
+        if last_frame is not None:
+            body["last_frame_image"] = last_frame
 
         result: Any = _NOT_RECEIVED
         try:
@@ -1029,6 +1117,8 @@ class XinferenceVideoModel(BaseVideoModel):
         resolution: Optional[str],
         ratio: Optional[str],
         timeout: float,
+        first_frame: Optional[str] = None,
+        last_frame: Optional[str] = None,
     ) -> dict[str, Any]:
         seconds = math.ceil(duration_value) if duration_value is not None else None
         size = f"{dimensions[0]}x{dimensions[1]}" if dimensions else None
@@ -1039,6 +1129,10 @@ class XinferenceVideoModel(BaseVideoModel):
             body["size"] = size
         if seed_value is not None:
             body["seed"] = seed_value
+        if first_frame is not None:
+            body["input_reference"] = first_frame
+        if last_frame is not None:
+            body["last_frame_reference"] = last_frame
 
         deadline = time.monotonic() + max(timeout, SAAS_VIDEO_MIN_JOB_DEADLINE_SECONDS)
         async with create_public_model_aiohttp_session(
@@ -1247,16 +1341,32 @@ class XinferenceVideoModel(BaseVideoModel):
 
         effective_timeout = timeout if timeout is not None else self.timeout
 
+        has_image = bool(
+            input_reference
+            or image_url
+            or image
+            or first_frame_image_url
+            or last_frame_image_url
+        )
         if self.saas_api:
             return await self._generate_saas_video(
                 prompt=prompt,
-                reference_image=input_reference
+                reference_image=first_frame_image_url
+                or input_reference
                 or image_url
-                or image
-                or first_frame_image_url,
+                or image,
                 last_frame_image_url=last_frame_image_url,
+                allowed_local_media_roots=allowed_local_media_roots,
+                extra_references=kwargs,
                 seconds=seconds if seconds is not None else duration,
-                size=size or _size_from_resolution_ratio(resolution, ratio),
+                # With an image only an explicit size is sent; the server
+                # picks the one that matches the picture.
+                size=size
+                or (
+                    None
+                    if has_image
+                    else _size_from_resolution_ratio(resolution, ratio)
+                ),
                 resolution=resolution,
                 ratio=ratio,
                 seed=kwargs.get("seed"),

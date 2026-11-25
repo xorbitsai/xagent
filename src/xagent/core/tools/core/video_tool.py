@@ -36,8 +36,10 @@ from ...workspace import TaskWorkspace
 from .media_errors import (
     INVALID_REQUEST,
     PROVIDER_UNAVAILABLE,
+    MediaParameterError,
     media_error_fields,
     media_failure_fields,
+    redact_provider_detail,
 )
 
 logger = logging.getLogger(__name__)
@@ -206,7 +208,7 @@ Parameters:
 - reference_image_urls / reference_video_urls / reference_audio_urls (optional): public URLs used as references. Audio references require at least one image or video reference.
 - poll_interval (optional): polling interval in seconds while waiting. Defaults to 30.
 - timeout (optional): maximum wait time in seconds.
-- model_id (optional): model ID from the list above. Omit to use the default model marked with ⭐[DEFAULT]. Models marked "text-to-video only" reject image input; when model_id is omitted and the request has image input, an image-capable model is used automatically.
+- model_id (optional): model ID from the list above. Omit to use the default model marked with ⭐[DEFAULT].
 
 Provider notes:
 - For Volcengine/BytePlus Ark Seedance models, prefer resolution + ratio instead of arbitrary size. Valid ratios are "16:9", "4:3", "1:1", "3:4", "9:16", "21:9", and "adaptive".
@@ -214,6 +216,7 @@ Provider notes:
 - Ark resolutions include "480p", "720p", "1080p", and "4k" depending on the model. Seedance 2.0 Fast and Mini do not support 1080p, and 4k is only for Seedance 2.0.
 - Ark image references may be http(s) URLs, data URLs, asset:// IDs, or workspace file references such as file:file_id. Workspace image references are converted to base64 data URLs automatically.
 - Xinference/OpenAI-compatible video models can use size and seconds directly when those parameters are supported by the model.
+- The Xinference SaaS model (MiniMax-H3) takes text plus a first frame (image_url or input_reference) and an optional last_frame_image_url. It refuses reference_image_urls / reference_video_urls / reference_audio_urls; for reference lists pass an explicit model_id of a model that supports them (for example Seedance). A frame's aspect ratio must match the video size; omit size to let the first frame pick it.
 
 The generated video URL is temporary on the provider side, so completed videos are automatically downloaded and saved to the workspace.
     """.strip()
@@ -250,8 +253,6 @@ The generated video URL is temporary on the provider side, so completed videos a
             description = self._model_descriptions.get(model_id, "")
             is_default = model_id == default_video_id
             default_marker = " ⭐[DEFAULT]" if is_default else ""
-            if not self._accepts_image_input(model):
-                default_marker = f" (text-to-video only){default_marker}"
 
             if description:
                 line = f"- {model_id}: {description}{default_marker}"
@@ -288,21 +289,6 @@ The generated video URL is temporary on the provider side, so completed videos a
             if hasattr(model, "has_ability") and model.has_ability("generate"):
                 return model
 
-        return None
-
-    @staticmethod
-    def _accepts_image_input(model: BaseVideoModel) -> bool:
-        check = getattr(model, "supports_image_input", None)
-        return bool(check()) if callable(check) else True
-
-    def _image_capable_fallback(
-        self, current: BaseVideoModel
-    ) -> Optional[tuple[str, BaseVideoModel]]:
-        """Pick, by sorted id, a generate-capable model that accepts images."""
-        for candidate_id in sorted(self._available_generate_model_ids()):
-            candidate = self._video_models[candidate_id]
-            if candidate is not current and self._accepts_image_input(candidate):
-                return candidate_id, candidate
         return None
 
     def _available_generate_model_ids(self) -> list[str]:
@@ -574,7 +560,7 @@ The generated video URL is temporary on the provider side, so completed videos a
         return f"data:{mime_type};base64,{encoded}"
 
     async def _prepare_ark_image_references(
-        self, generate_params: dict[str, Any]
+        self, generate_params: dict[str, Any], *, convert_reference_list: bool = True
     ) -> None:
         converted_refs: dict[str, str] = {}
 
@@ -589,7 +575,7 @@ The generated video URL is temporary on the provider side, so completed videos a
                 generate_params[key] = await convert_ref(generate_params[key])
 
         reference_image_urls = generate_params.get("reference_image_urls")
-        if reference_image_urls:
+        if reference_image_urls and convert_reference_list:
             generate_params["reference_image_urls"] = [
                 await convert_ref(url) for url in reference_image_urls
             ]
@@ -746,30 +732,6 @@ The generated video URL is temporary on the provider side, so completed videos a
                     "video_path": None,
                     "model_used": actual_model_id,
                 }
-            if (
-                not model_id
-                and not self._accepts_image_input(video_model)
-                and any(
-                    _has_value(value)
-                    for value in (
-                        input_reference,
-                        image_url,
-                        image,
-                        first_frame_image_url,
-                        last_frame_image_url,
-                        self._normalize_url_list(reference_image_urls),
-                    )
-                )
-            ):
-                fallback = self._image_capable_fallback(video_model)
-                if fallback:
-                    logger.info(
-                        "Video model %s is text-to-video only; using %s for "
-                        "image input",
-                        self._model_id_for_model(video_model),
-                        fallback[0],
-                    )
-                    video_model = fallback[1]
             actual_model_id = self._model_id_for_model(video_model)
             inner_video_model = getattr(video_model, "_inner", video_model)
             effective_ratio = ratio or "16:9"
@@ -879,6 +841,27 @@ The generated video URL is temporary on the provider side, so completed videos a
             effective_size = size or self._size_from_resolution_ratio(
                 resolution, effective_ratio
             )
+            # The SaaS model sizes an image-to-video clip from the image, so a
+            # size derived from the default ratio and a resolution alias would
+            # only force a landscape canvas on a portrait picture. Only an
+            # explicit size or ratio is the caller's choice.
+            if (
+                not size
+                and not explicit_ratio
+                and isinstance(inner_video_model, XinferenceVideoModel)
+                and inner_video_model.saas_api
+                and any(
+                    _has_value(value)
+                    for value in (
+                        input_reference,
+                        image_url,
+                        image,
+                        first_frame_image_url,
+                        last_frame_image_url,
+                    )
+                )
+            ):
+                effective_size = None
             if effective_size:
                 generate_params["size"] = effective_size
                 derived_ratio = self._ratio_from_size(effective_size)
@@ -934,6 +917,38 @@ The generated video URL is temporary on the provider side, so completed videos a
             generate_params.update(kwargs)
             if isinstance(inner_video_model, ArkVideoModel):
                 await self._prepare_ark_image_references(generate_params)
+            elif isinstance(inner_video_model, XinferenceVideoModel) and (
+                inner_video_model.saas_api
+            ):
+                # Workspace file references become data URLs through the same
+                # staging as Ark; the reference list is left for the model to
+                # refuse, since it only takes keyframes.
+                try:
+                    await self._prepare_ark_image_references(
+                        generate_params, convert_reference_list=False
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "Could not load the image reference: %s",
+                        redact_provider_detail(e),
+                    )
+                    return {
+                        "success": False,
+                        **media_failure_fields(
+                            MediaParameterError(
+                                "The image reference could not be loaded; use an "
+                                "http(s) image URL, a data URL or an image file "
+                                "in the workspace",
+                                field="input_reference",
+                            ),
+                            logger=logger,
+                            action=(
+                                f"Video generation failed (model={actual_model_id})"
+                            ),
+                            model=video_model,
+                        ),
+                        "video_path": None,
+                    }
             if self._workspace and isinstance(inner_video_model, XinferenceVideoModel):
                 generate_params["allowed_local_media_roots"] = [
                     self._workspace.workspace_dir

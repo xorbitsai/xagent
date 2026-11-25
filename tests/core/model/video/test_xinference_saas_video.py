@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 from typing import Any
 
@@ -148,25 +149,6 @@ async def test_saas_rejects_bad_seed(transport):
     assert transport["json"] == []
 
 
-@pytest.mark.parametrize(
-    "extra",
-    [
-        {"input_reference": "https://x.test/a.png"},
-        {"image_url": "https://x.test/a.png"},
-        {"first_frame_image_url": "https://x.test/a.png"},
-        {"last_frame_image_url": "https://x.test/b.png"},
-        {
-            "first_frame_image_url": "https://x.test/a.png",
-            "last_frame_image_url": "https://x.test/b.png",
-        },
-    ],
-)
-async def test_saas_refuses_image_and_frame_input_before_any_request(transport, extra):
-    with pytest.raises(MediaParameterError):
-        await _build().generate_video(prompt="a fox", **extra)
-    assert transport["json"] == [] and transport["form"] == []
-
-
 async def test_saas_records_usage_from_video_seconds(transport):
     transport["response"] = {
         "data": [{"b64_json": "dmlkZW8="}],
@@ -277,12 +259,145 @@ def test_observation_omits_inline_data_urls():
     assert "inline video/mp4 data omitted" in text
 
 
-async def test_saas_video_model_reports_text_to_video_only():
-    assert _build().supports_image_input() is False
+# Image-to-video: frames go out as data URLs; the server validates the images.
+
+PNG = base64.b64encode(b"\x89PNG\r\n\x1a\n-first").decode()
+FIRST = f"data:image/png;base64,{PNG}"
+LAST = "data:image/jpeg;base64," + base64.b64encode(b"\xff\xd8-last").decode()
 
 
-async def test_self_hosted_xinference_video_accepts_image_input():
-    model = XinferenceVideoModel(
-        model_name="m", base_url="http://localhost:9997", saas_api=False
+async def test_saas_video_model_supports_image_input():
+    assert _build().supports_image_input() is True
+
+
+async def test_saas_sync_first_frame_and_no_size(transport):
+    await _build().generate_video(prompt="a fox", input_reference=FIRST)
+    body = transport["json"][0]["body"]
+    assert body["first_frame_image"] == FIRST
+    assert "last_frame_image" not in body
+    assert "width" not in body and "height" not in body
+
+
+async def test_saas_sync_first_and_last_frame(transport):
+    await _build().generate_video(
+        prompt="a fox", first_frame_image_url=FIRST, last_frame_image_url=LAST
     )
-    assert model.supports_image_input() is True
+    body = transport["json"][0]["body"]
+    assert body["first_frame_image"] == FIRST
+    assert body["last_frame_image"] == LAST
+
+
+async def test_saas_remote_url_is_downloaded_and_sent_as_data_url(
+    transport, monkeypatch
+):
+    async def fake_download(url, **kwargs):
+        class _R:
+            content = b"\x89PNG\r\n\x1a\n-first"
+
+        return _R()
+
+    monkeypatch.setattr(
+        "xagent.core.model.video.xinference.download_public_input", fake_download
+    )
+    await _build().generate_video(
+        prompt="a fox", input_reference="https://x.test/a.png"
+    )
+    assert transport["json"][0]["body"]["first_frame_image"] == FIRST
+
+
+async def test_saas_server_400_is_surfaced(monkeypatch):
+    async def bad_request(self, session, path, body):
+        from multidict import CIMultiDict, CIMultiDictProxy
+        from yarl import URL
+
+        url = URL("https://cloud.test/v1/video/generations")
+        raise aiohttp.ClientResponseError(
+            aiohttp.RequestInfo(url, "POST", CIMultiDictProxy(CIMultiDict()), url),
+            (),
+            status=400,
+            message="video_frame_aspect_ratio",
+        )
+
+    monkeypatch.setattr(XinferenceVideoModel, "_post_video_json", bad_request)
+    with pytest.raises(RuntimeError) as err:
+        await _build().generate_video(prompt="a fox", input_reference=FIRST)
+    from xagent.core.tools.core.media_errors import (
+        INVALID_REQUEST,
+        classify_media_failure,
+    )
+
+    assert "video_frame_aspect_ratio" in str(err.value)
+    assert classify_media_failure(err.value) == INVALID_REQUEST
+
+
+@pytest.mark.parametrize(
+    "key", ["reference_image_urls", "reference_video_urls", "reference_audio_urls"]
+)
+async def test_saas_refuses_reference_lists_instead_of_dropping_them(transport, key):
+    with pytest.raises(MediaParameterError) as err:
+        await _build().generate_video(prompt="a fox", **{key: ["https://x.test/r"]})
+    assert err.value.field == key
+    assert transport["json"] == []
+
+
+@pytest.mark.parametrize(
+    ("message", "expected"),
+    [
+        ("Remote input download timed out", TimeoutError),
+        ("Remote input connection failed", ConnectionError),
+        ("Remote input returned HTTP 503", ConnectionError),
+        ("Remote input returned HTTP 425", ConnectionError),
+        ("Remote input returned HTTP 404", MediaParameterError),
+        (
+            "Remote input violated the public-network, redirect or size policy",
+            MediaParameterError,
+        ),
+    ],
+)
+async def test_saas_frame_download_failures_keep_their_category(
+    transport, monkeypatch, message, expected
+):
+    from xagent.core.tools.core.media_errors import (
+        INVALID_REQUEST,
+        PROVIDER_UNAVAILABLE,
+        classify_media_failure,
+    )
+    from xagent.core.utils.public_download import PublicDownloadError
+
+    async def failing(url, **kwargs):
+        raise PublicDownloadError(message)
+
+    monkeypatch.setattr(
+        "xagent.core.model.video.xinference.download_public_input", failing
+    )
+    with pytest.raises(expected) as err:
+        await _build().generate_video(
+            prompt="a fox", input_reference="https://x.test/a.png"
+        )
+    expected_category = (
+        INVALID_REQUEST if expected is MediaParameterError else PROVIDER_UNAVAILABLE
+    )
+    assert classify_media_failure(err.value) == expected_category
+    assert transport["json"] == []
+
+
+async def test_saas_image_ignores_resolution_and_ratio_for_size(transport):
+    await _build().generate_video(
+        prompt="a fox", input_reference=FIRST, resolution="720p", ratio="16:9"
+    )
+    body = transport["json"][0]["body"]
+    assert "width" not in body and "height" not in body
+
+
+async def test_saas_explicit_size_is_still_sent_with_an_image(transport):
+    await _build().generate_video(
+        prompt="a fox", input_reference=FIRST, size="768x1344"
+    )
+    body = transport["json"][0]["body"]
+    assert (body["width"], body["height"]) == (768, 1344)
+
+
+async def test_saas_resolution_still_derives_size_without_an_image(transport):
+    await _build().generate_video(prompt="a fox", resolution="720p", ratio="16:9")
+    body = transport["json"][0]["body"]
+    assert (body["width"], body["height"]) == (1344, 768)

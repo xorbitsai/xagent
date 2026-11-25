@@ -259,6 +259,31 @@ async def test_minimal_body_omits_unset_fields(server):
     assert server.calls[0][3] == {"model": "minimax-h3", "prompt": "a fox"}
 
 
+FIRST = "data:image/png;base64," + base64.b64encode(b"\x89PNG\r\n\x1a\n-a").decode()
+LAST = "data:image/jpeg;base64," + base64.b64encode(b"\xff\xd8-b").decode()
+
+
+async def test_job_first_frame_is_sent_as_input_reference_without_size(server):
+    server.post_replies = [accepted()]
+    server.get_replies = [completed()]
+    await _build().generate_video(prompt="a fox", input_reference=FIRST)
+    body = server.calls[0][3]
+    assert body["input_reference"] == FIRST
+    assert "last_frame_reference" not in body
+    assert "size" not in body
+
+
+async def test_job_first_and_last_frame_are_sent(server):
+    server.post_replies = [accepted()]
+    server.get_replies = [completed()]
+    await _build().generate_video(
+        prompt="a fox", first_frame_image_url=FIRST, last_frame_image_url=LAST
+    )
+    body = server.calls[0][3]
+    assert body["input_reference"] == FIRST
+    assert body["last_frame_reference"] == LAST
+
+
 async def test_usage_falls_back_to_requested_seconds(server):
     server.post_replies = [accepted()]
     server.get_replies = [job("completed")]
@@ -575,7 +600,7 @@ async def test_validation_still_runs_before_any_request(server):
         {"seconds": 3},
         {"size": "banana"},
         {"n": 2},
-        {"input_reference": "https://x.test/a.png"},
+        {"reference_image_urls": ["https://x.test/a.png"]},
     ):
         with pytest.raises(MediaParameterError):
             await _build().generate_video(prompt="a fox", **kwargs)

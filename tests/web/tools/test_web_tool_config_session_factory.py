@@ -3803,3 +3803,26 @@ def test_no_default_stays_none_under_an_allow_list_without_loading_a_mapping(
     # default may be, it does not invent one.
     assert cfg.get_video_model() is None
     assert loads == []
+
+
+def test_a_default_inside_the_allow_list_is_kept_without_loading_a_mapping(
+    monkeypatch,
+):
+    default = _MediaModel("allowed-id", ("generate",))
+    other = _MediaModel("other-allowed-id", ("generate",))
+    cfg = _media_config(
+        allowed_model_ids=frozenset({"allowed-id", "other-allowed-id"}),
+        # The other allowed model comes first: a re-pick would return it.
+        video_models={"other-allowed-id": other, "allowed-id": default},
+        video_model=default,
+    )
+    loads: list[str] = []
+
+    def spy():
+        loads.append("get_video_models")
+        return {"other-allowed-id": other, "allowed-id": default}
+
+    monkeypatch.setattr(cfg, "get_video_models", spy)
+
+    assert cfg.get_video_model() is default
+    assert loads == []

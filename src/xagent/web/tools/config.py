@@ -2138,7 +2138,22 @@ def _load_tool_runtime_policy_snapshot(
 _APP_LOCALE_TO_BROWSER_LOCALE = {"en": "en-US", "zh": "zh-CN"}
 
 
-def _filter_excluded_media_models(
+def _media_model_permitted(
+    model_id: Any,
+    excluded_model_ids: frozenset[str],
+    allowed_model_ids: frozenset[str] | None,
+) -> bool:
+    """Whether a media model with this ``model_id`` may serve the task.
+
+    It must not be excluded and, under an allow-list, must be in it. The filter
+    and the default's early return both ask this one question.
+    """
+    return model_id not in excluded_model_ids and (
+        allowed_model_ids is None or model_id in allowed_model_ids
+    )
+
+
+def _filter_media_models(
     models: Mapping[str, Any],
     default: Any | None,
     excluded_model_ids: frozenset[str],
@@ -2146,16 +2161,17 @@ def _filter_excluded_media_models(
     ability: str | None = None,
     allowed_model_ids: frozenset[str] | None = None,
 ) -> tuple[Dict[str, Any], Any | None]:
-    """Drop excluded media models and re-pick a dropped default.
+    """Keep the media models the task may use and re-pick a dropped default.
 
-    The re-pick uses the media dict's own order (DB row order) and checks ``ability``.
+    The re-pick uses the media dict's own order (DB row order) and checks
+    ``ability``; a kind with no default keeps none.
 
-    ``allowed_model_ids`` is the positive bound: a model is kept only if its
-    ``model_id`` attribute is in it, so a model without one is dropped, and a
-    default outside it is re-picked (no default stays none). Its dict key is
-    never consulted: a model
-    registered later is gone even when its key says otherwise. ``None`` means
-    no bound; an exclusion still applies first.
+    An exclusion matches a model's dict key or its ``model_id``. The allow-list
+    (``None`` for no bound) matches ``model_id`` only, so a model without one is
+    dropped and a model registered later is gone whatever its key says. The ASR
+    and TTS dicts are keyed by model name, not id: names that work as exclusions
+    match nothing in an allow-list, which then empties those kinds and the audio
+    tool is not built. Pass model ids.
     """
     if not excluded_model_ids and allowed_model_ids is None:
         return dict(models), default
@@ -2163,16 +2179,12 @@ def _filter_excluded_media_models(
         key: model
         for key, model in models.items()
         if key not in excluded_model_ids
-        and getattr(model, "model_id", None) not in excluded_model_ids
-        and (
-            allowed_model_ids is None
-            or getattr(model, "model_id", None) in allowed_model_ids
+        and _media_model_permitted(
+            getattr(model, "model_id", None), excluded_model_ids, allowed_model_ids
         )
     }
-    default_model_id = getattr(default, "model_id", None)
-    if default is None or (
-        default_model_id not in excluded_model_ids
-        and (allowed_model_ids is None or default_model_id in allowed_model_ids)
+    if default is None or _media_model_permitted(
+        getattr(default, "model_id", None), excluded_model_ids, allowed_model_ids
     ):
         return kept, default
     replacement = next(
@@ -2574,14 +2586,14 @@ class WebToolConfig(BaseToolConfig):
             loader=loader,
             terminal_neutral={},
         )
-        return _filter_excluded_media_models(
+        return _filter_media_models(
             dict(resolved),
             None,
             self._excluded_model_ids,
             allowed_model_ids=self._allowed_model_ids,
         )[0]
 
-    def _repick_excluded_media_default(
+    def _repick_media_default(
         self,
         default: Any | None,
         models: Callable[[], Mapping[str, Any]],
@@ -2590,20 +2602,16 @@ class WebToolConfig(BaseToolConfig):
     ) -> Any | None:
         """Keep a default this task may use, else re-pick it from the remaining models.
 
-        No default, or one that is not excluded and is either inside the
-        allow-list or under no allow-list at all, is returned without loading
-        the kind's dict.
+        No default, or one the task may use, is returned without loading the
+        kind's dict.
         """
-        default_model_id = getattr(default, "model_id", None)
-        if default is None or (
-            default_model_id not in self._excluded_model_ids
-            and (
-                self._allowed_model_ids is None
-                or default_model_id in self._allowed_model_ids
-            )
+        if default is None or _media_model_permitted(
+            getattr(default, "model_id", None),
+            self._excluded_model_ids,
+            self._allowed_model_ids,
         ):
             return default
-        return _filter_excluded_media_models(
+        return _filter_media_models(
             models(),
             default,
             self._excluded_model_ids,
@@ -2643,7 +2651,7 @@ class WebToolConfig(BaseToolConfig):
 
     def get_image_generate_model(self) -> Optional[Any]:
         """Get default image generation model from database."""
-        return self._repick_excluded_media_default(
+        return self._repick_media_default(
             self._get_factory_model_value(
                 load_flag="load_image",
                 field_name="image_generate_model",
@@ -2656,7 +2664,7 @@ class WebToolConfig(BaseToolConfig):
 
     def get_image_edit_model(self) -> Optional[Any]:
         """Get default image editing model from database."""
-        return self._repick_excluded_media_default(
+        return self._repick_media_default(
             self._get_factory_model_value(
                 load_flag="load_image",
                 field_name="image_edit_model",
@@ -2669,7 +2677,7 @@ class WebToolConfig(BaseToolConfig):
 
     def get_video_model(self) -> Optional[Any]:
         """Get default video generation model from database."""
-        return self._repick_excluded_media_default(
+        return self._repick_media_default(
             self._get_factory_model_value(
                 load_flag="load_video",
                 field_name="video_model",
@@ -3993,7 +4001,7 @@ class WebToolConfig(BaseToolConfig):
 
     def get_asr_model(self) -> Optional[Any]:
         """Get default ASR model from database."""
-        return self._repick_excluded_media_default(
+        return self._repick_media_default(
             self._get_factory_model_value(
                 load_flag="load_audio",
                 field_name="asr_model",
@@ -4039,7 +4047,7 @@ class WebToolConfig(BaseToolConfig):
 
     def get_tts_model(self) -> Optional[Any]:
         """Get default TTS model from database."""
-        return self._repick_excluded_media_default(
+        return self._repick_media_default(
             self._get_factory_model_value(
                 load_flag="load_audio",
                 field_name="tts_model",
@@ -4071,7 +4079,7 @@ class WebToolConfig(BaseToolConfig):
 
     def get_sound_effect_model(self) -> Optional[Any]:
         """Get the user's default sound effect model."""
-        return self._repick_excluded_media_default(
+        return self._repick_media_default(
             self._get_factory_model_value(
                 load_flag="load_audio",
                 field_name="sound_effect_model",
@@ -4113,7 +4121,7 @@ class WebToolConfig(BaseToolConfig):
 
     def get_music_model(self) -> Optional[Any]:
         """Get the user's default music model."""
-        return self._repick_excluded_media_default(
+        return self._repick_media_default(
             self._get_factory_model_value(
                 load_flag="load_audio",
                 field_name="music_model",

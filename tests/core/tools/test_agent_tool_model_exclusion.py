@@ -339,3 +339,46 @@ async def test_an_exclusion_alone_leaves_the_later_model_available_to_the_child(
 
     assert seen["image_models"] == {IMAGE_MODEL_ID, LATER_IMAGE_MODEL_ID}
     assert getattr(seen["generate_model"], "model_id", None) == LATER_IMAGE_MODEL_ID
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("allowed", [frozenset({IMAGE_MODEL_ID}), None])
+async def test_delegated_child_and_its_agent_tools_inherit_the_allow_list(
+    published_agent_db: Any, allowed: frozenset[str] | None
+) -> None:
+    session_factory, user_id, agent_id = published_agent_db
+    tools = get_published_agents_tools(
+        session_factory=session_factory,
+        user_id=user_id,
+        task_id="parent-task",
+        allowed_model_ids=allowed,
+    )
+    tool = next(t for t in _agent_tools(tools) if t._agent_id == agent_id)
+
+    seen: dict[str, Any] = {}
+
+    async def run_child(**_: Any) -> dict[str, Any]:
+        # The child config is closed after the run, so read it while it runs.
+        child_config = mock_agent_service_class.call_args.kwargs["tool_config"]
+        seen["allowed"] = child_config.get_allowed_model_ids()
+        seen["grandchildren"] = await create_agent_tools(child_config)
+        return {"output": "done", "file_outputs": []}
+
+    with (
+        patch(
+            "xagent.web.services.llm_utils.UserAwareModelStorage"
+        ) as mock_storage_class,
+        patch("xagent.core.agent.service.AgentService") as mock_agent_service_class,
+    ):
+        mock_storage_class.return_value = Mock()
+        mock_agent_service_class.return_value.execute_task = AsyncMock(
+            side_effect=run_child
+        )
+        await tool.run_json_async({"task": "draw something"})
+
+    # Two hops: the child's config, and the agent tools that config builds for
+    # its own delegations.
+    assert seen["allowed"] == allowed
+    assert all(
+        t._allowed_model_ids == allowed for t in _agent_tools(seen["grandchildren"])
+    )

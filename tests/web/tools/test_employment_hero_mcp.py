@@ -507,11 +507,15 @@ def test_list_leave_requests_supports_manager_filters(monkeypatch):
     assert call.kwargs["params"] == {
         "page_index": 2,
         "item_per_page": 50,
-        "statuses": ["pending", "approved"],
+        "statuses[]": ["pending", "approved"],
         "start_date": "2026-11-01",
         "end_date": "2026-11-30",
         "leave_category_id": "category/1",
     }
+    prepared = employment_hero.requests.Request(
+        "GET", call.kwargs["url"], params=call.kwargs["params"]
+    ).prepare()
+    assert "statuses%5B%5D=pending&statuses%5B%5D=approved" in str(prepared.url)
 
 
 def test_list_leave_requests_normalizes_and_validates_statuses(monkeypatch):
@@ -525,7 +529,7 @@ def test_list_leave_requests_normalizes_and_validates_statuses(monkeypatch):
     )
 
     assert result["status"] == "success"
-    assert mock_request.call_args.kwargs["params"]["statuses"] == [
+    assert mock_request.call_args.kwargs["params"]["statuses[]"] == [
         "pending",
         "declined",
     ]

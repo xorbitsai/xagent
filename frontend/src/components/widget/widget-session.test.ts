@@ -1,7 +1,7 @@
 import { act, renderHook } from "@testing-library/react"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 
-import { useWidgetSession } from "./use-widget-session"
+import { useWidgetSession, WS_CLOSE_RECONNECT_JITTER_MAX_MS } from "./use-widget-session"
 import { evaluateWidgetScript } from "@/test-utils/widget-script"
 
 export const HOST = "https://chat.example"
@@ -1516,6 +1516,7 @@ describe("widget session mode", () => {
 
   it("honors Retry-After on 429 at most twice", async () => {
     vi.useFakeTimers()
+    vi.mocked(Math.random).mockReturnValue(0) // no spread: pin the exact Retry-After
     const errorSpy = vi.spyOn(console, "error").mockImplementation(() => undefined)
     fetchMock.mockImplementation(() => Promise.resolve(
       jsonResponse(429, { error: { code: "rate_limited" } }, { "Retry-After": "3" }),
@@ -1560,6 +1561,7 @@ describe("widget session mode", () => {
 
   it("honors an HTTP-date Retry-After value", async () => {
     vi.useFakeTimers()
+    vi.mocked(Math.random).mockReturnValue(0) // no spread: pin the exact Retry-After
     vi.setSystemTime(new Date("2026-07-27T00:00:00Z"))
     fetchMock.mockImplementation(() => Promise.resolve(jsonResponse(
       429,
@@ -1581,6 +1583,7 @@ describe("widget session mode", () => {
     ["a missing value", undefined],
   ])("uses the retry fallback for %s", async (_case, retryAfter) => {
     vi.useFakeTimers()
+    vi.mocked(Math.random).mockReturnValue(0) // no spread: pin the exact Retry-After
     fetchMock.mockImplementation(() => Promise.resolve(jsonResponse(
       429,
       { error: { code: "rate_limited" } },
@@ -2228,6 +2231,8 @@ describe("widget session mode", () => {
     expect(result.current.status).toBe("active")
 
     act(() => result.current.requestReconnect("ws_closed"))
+    // The request waits out its jitter first: 7.5 s at a random of 0.5.
+    await vi.advanceTimersByTimeAsync(WS_CLOSE_RECONNECT_JITTER_MAX_MS / 2)
     expect(bridge.parent.postMessage.mock.calls.filter(
       ([message]) => message.type === "reconnect_request",
     )).toHaveLength(1)
@@ -2452,6 +2457,7 @@ describe("widget session mode", () => {
 
   it("does not shorten a server-requested rate-limit wait", async () => {
     vi.useFakeTimers()
+    vi.mocked(Math.random).mockReturnValue(0) // no spread: pin the exact Retry-After
     fetchMock.mockImplementation(() => Promise.resolve(jsonResponse(
       429,
       { error: { code: "rate_limited" } },
@@ -2462,6 +2468,78 @@ describe("widget session mode", () => {
 
     window.dispatchEvent(new Event("online"))
     await vi.advanceTimersByTimeAsync(2_999)
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+    await vi.advanceTimersByTimeAsync(1)
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+  })
+
+  it.each([
+    ["the low", 0, 2_000],
+    ["the middle", 0.5, 2_500],
+    ["the high", 0.999_999, 2_999],
+  ])("spreads a 503 retry past Retry-After by a random share at %s end", async (_end, random, delay) => {
+    vi.useFakeTimers()
+    vi.mocked(Math.random).mockReturnValue(random)
+    fetchMock.mockImplementation(() => Promise.resolve(jsonResponse(
+      503,
+      { error: { code: "service_unavailable" } },
+      { "Retry-After": "2" },
+    )))
+    runWidget({ "data-encrypted-context": GRANT })
+
+    await vi.advanceTimersByTimeAsync(delay - 1)
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+    await vi.advanceTimersByTimeAsync(1)
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+  })
+
+  it.each([
+    ["the low", 0, 3_000],
+    ["the middle", 0.5, 3_750],
+    ["the high", 0.999_999, 4_499],
+  ])("spreads a 429 retry past Retry-After by a random share at %s end", async (_end, random, delay) => {
+    vi.useFakeTimers()
+    vi.mocked(Math.random).mockReturnValue(random)
+    fetchMock.mockImplementation(() => Promise.resolve(jsonResponse(
+      429,
+      { error: { code: "rate_limited" } },
+      { "Retry-After": "3" },
+    )))
+    runWidget({ "data-encrypted-context": GRANT })
+
+    await vi.advanceTimersByTimeAsync(delay - 1)
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+    await vi.advanceTimersByTimeAsync(1)
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+  })
+
+  it("keeps a spread 429 wait under the 30 s give-up bound", async () => {
+    vi.useFakeTimers()
+    vi.mocked(Math.random).mockReturnValue(0.999_999)
+    fetchMock.mockImplementation(() => Promise.resolve(jsonResponse(
+      429,
+      { error: { code: "rate_limited" } },
+      { "Retry-After": "29" },
+    )))
+    runWidget({ "data-encrypted-context": GRANT })
+
+    await vi.advanceTimersByTimeAsync(29_998)
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+    await vi.advanceTimersByTimeAsync(1)
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+  })
+
+  it("spreads a Retry-After of 0 instead of retrying every client at once", async () => {
+    vi.useFakeTimers()
+    vi.mocked(Math.random).mockReturnValue(0.5)
+    fetchMock.mockImplementation(() => Promise.resolve(jsonResponse(
+      429,
+      { error: { code: "rate_limited" } },
+      { "Retry-After": "0" },
+    )))
+    runWidget({ "data-encrypted-context": GRANT })
+
+    await vi.advanceTimersByTimeAsync(249)
     expect(fetchMock).toHaveBeenCalledTimes(1)
     await vi.advanceTimersByTimeAsync(1)
     expect(fetchMock).toHaveBeenCalledTimes(2)

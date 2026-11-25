@@ -1430,6 +1430,10 @@ class ReActPattern(AgentPattern):
             answer_streamer: ReActFinalAnswerStreamer | None = None
             protocol_retry_performed = False
             response_already_traced = False
+            # Set when a forced turn that required an explicit outcome kept
+            # the model's plain-text answer instead (see
+            # _structured_final_answer_plain_text_fallback).
+            plain_text_fallback_outcome: str | None = None
             try:
                 requested_tool_choice = (
                     "required"
@@ -1729,17 +1733,34 @@ class ReActPattern(AgentPattern):
                     reject_mixed_control_calls=recover_full_tool_set,
                     allowed_tool_names=frozenset(self._schema_tool_names(tool_schemas)),
                 ):
-                    return await self._invalid_tool_protocol_result(
-                        runtime=runtime,
-                        context=context,
-                        iteration=iteration,
-                        answer_streamer=answer_streamer,
-                        stream_failure_message=INVALID_TOOL_PROTOCOL_AFTER_RETRY_REASON,
-                        empty_final_answer=(
-                            self._empty_final_answer_call(normalized) is not None
-                        ),
-                        response=response,
-                    )
+                    if (
+                        recovery_reason == "structured_final_answer_required"
+                        and self._structured_final_answer_plain_text_fallback(
+                            normalized, context
+                        )
+                    ):
+                        logger.warning(
+                            "ReAct forced turn answered in plain text twice "
+                            "instead of calling final_answer; keeping the text "
+                            "as a partial answer. execution_id=%s iteration=%s "
+                            "model=%s",
+                            context.execution_id,
+                            iteration,
+                            llm_metadata.get("selected_model"),
+                        )
+                        plain_text_fallback_outcome = "partial"
+                    else:
+                        return await self._invalid_tool_protocol_result(
+                            runtime=runtime,
+                            context=context,
+                            iteration=iteration,
+                            answer_streamer=answer_streamer,
+                            stream_failure_message=INVALID_TOOL_PROTOCOL_AFTER_RETRY_REASON,
+                            empty_final_answer=(
+                                self._empty_final_answer_call(normalized) is not None
+                            ),
+                            response=response,
+                        )
             original_tool_calls = normalized.get("tool_calls") or []
             kept_tool_calls, stripped_final_answers = (
                 self._strip_final_answer_bundled_with_work_tools(original_tool_calls)
@@ -1813,10 +1834,11 @@ class ReActPattern(AgentPattern):
 
             await runtime.checkpoint("after_llm", context=context, pattern=self)
             if normalized.get("done", True):
-                return await self._finalize_success(
+                return await self._finalize_outcome(
                     context=context,
                     runtime=runtime,
                     response=assistant_content or normalized.get("raw"),
+                    outcome=plain_text_fallback_outcome or "completed",
                 )
 
         # A DAG step cannot declare the parent task partially delivered: its
@@ -2636,7 +2658,15 @@ class ReActPattern(AgentPattern):
             allowed_tool_names=frozenset(self._schema_tool_names(tools)),
         )
         end_metadata = dict(metadata)
-        if retry_is_invalid:
+        if (
+            retry_is_invalid
+            and recovery_reason == "structured_final_answer_required"
+            and self._structured_final_answer_plain_text_fallback(normalized, context)
+        ):
+            # The caller keeps this text as the answer; tracing it as
+            # discarded would contradict what the user receives.
+            end_metadata.update(phase="structured_final_answer_plain_text_fallback")
+        elif retry_is_invalid:
             end_metadata.update(
                 success=False,
                 phase="discarded_invalid_tool_protocol_retry",
@@ -2704,6 +2734,43 @@ class ReActPattern(AgentPattern):
         return self._empty_final_answer_call(
             normalized
         ) is not None or self._empty_plain_text_response(normalized)
+
+    @staticmethod
+    def _structured_final_answer_plain_text_fallback(
+        normalized: dict[str, Any],
+        context: Any,
+    ) -> bool:
+        """Whether a plain-text reply can stand in for a required final_answer.
+
+        A forced turn whose tool evidence was compacted asks for final_answer
+        so the run records an explicit outcome. Some models ignore
+        ``tool_choice="required"`` and answer in plain text, again after the
+        repair prompt. Failing the run then discards a usable answer -- for a
+        scheduled check-in often the exact text the run was told to return --
+        and the user sees a generic error. The caller keeps such text with
+        outcome=partial, so no completed claim rests on evidence that was
+        removed.
+
+        Like iteration-limit delivery, this does not apply to a DAG step: the
+        DAG reads only a step's success, so a partial step would let the root
+        finish as completed on unconfirmed text. Unlike that delivery, the
+        text is kept verbatim with no "not a completed task" prefix, so a
+        control reply such as ``NO_REPLY`` still reaches its caller as is.
+
+        Only a complete, non-empty answer qualifies: no tool calls, no
+        provider protocol error, and no truncated output.
+        """
+        if context.metadata.get("dag_step_id"):
+            return False
+        if normalized.get("tool_calls"):
+            return False
+        raw = normalized.get("raw")
+        if get_tool_protocol_error(raw) is not None:
+            return False
+        if response_finish_reason(raw) in {"length", "max_tokens"}:
+            return False
+        content = normalized.get("content")
+        return isinstance(content, str) and bool(content.strip())
 
     @staticmethod
     def _empty_plain_text_response(normalized: dict[str, Any]) -> bool:

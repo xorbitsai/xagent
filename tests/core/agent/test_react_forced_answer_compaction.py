@@ -1126,3 +1126,121 @@ async def test_a_skipped_compaction_that_overflows_fails_the_run_cleanly() -> No
         assistants_before
     )
     assert context.metadata[KEY] is False
+
+
+# --------------------------------------------------------------------------
+# Plain-text answer on a turn that required an explicit outcome
+# --------------------------------------------------------------------------
+
+
+class _PhaseRecorder:
+    """Keeps the phase of every LLM end event the run traces."""
+
+    def __init__(self) -> None:
+        self.phases: list[tuple[Any, Any]] = []
+
+    async def trace_event(
+        self, event_type: Any, *, data: dict[str, Any] | None = None, **_: Any
+    ) -> str:
+        if getattr(event_type, "value", str(event_type)) == "action_end_llm":
+            data = data or {}
+            self.phases.append((data.get("phase"), data.get("success")))
+        return str(len(self.phases))
+
+
+async def _run_forced_turn_without_evidence(
+    responses: list[dict[str, Any]],
+    state: str = "removed",
+    dag_step_id: str | None = None,
+) -> tuple[dict[str, Any], ScriptedLLM, _PhaseRecorder]:
+    context = build_context(observations=2, threshold=500)
+    apply_state(context, state)
+    if dag_step_id is not None:
+        context.metadata["dag_step_id"] = dag_step_id
+    llm = ScriptedLLM(responses)
+    pattern = ReActPattern(max_iterations=1)
+    pattern.force_final_answer_next = True
+    tracer = _PhaseRecorder()
+    result = await pattern.run(
+        context=context,
+        tools=[],
+        llm=llm,
+        runtime=PatternRuntime(execution_id=context.execution_id, tracer=tracer),
+        compact_llm=CompactingLLM(),
+    )
+    return result, llm, tracer
+
+
+def _plain_text(content: str, finish_reason: str = "stop") -> dict[str, Any]:
+    return {"content": content, "tool_calls": [], "finish_reason": finish_reason}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("state", ["removed", "unknown"])
+async def test_plain_text_after_the_outcome_repair_is_kept_as_partial(
+    state: str,
+) -> None:
+    """A model that ignores the required final_answer twice still answers.
+
+    Production case: a scheduled Slack check-in replied ``NO_REPLY`` as plain
+    text on both attempts and the run failed with a generic error, although
+    the reply was exactly what the run was told to return.
+    """
+    result, llm, tracer = await _run_forced_turn_without_evidence(
+        [_plain_text("NO_REPLY"), _plain_text("NO_REPLY")], state
+    )
+
+    assert len(llm.calls) == 2
+    assert result["success"] is True
+    assert result["output"] == "NO_REPLY"
+    # No completed claim rests on evidence the run no longer holds.
+    assert result["completion_outcome"] == "partial"
+    assert tracer.phases == [
+        ("discarded_invalid_tool_protocol", False),
+        ("structured_final_answer_plain_text_fallback", True),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_a_final_answer_on_the_repair_keeps_its_own_outcome() -> None:
+    result, llm, _ = await _run_forced_turn_without_evidence(
+        [_plain_text("NO_REPLY"), final_answer_call()]
+    )
+
+    assert len(llm.calls) == 2
+    assert result["success"] is True
+    assert result["completion_outcome"] == "completed"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "retry",
+    [
+        pytest.param(_plain_text("NO_RE", finish_reason="length"), id="truncated"),
+        pytest.param(_plain_text("   "), id="blank"),
+    ],
+)
+async def test_an_unusable_plain_text_repair_still_fails_the_run(
+    retry: dict[str, Any],
+) -> None:
+    result, llm, tracer = await _run_forced_turn_without_evidence(
+        [_plain_text("NO_REPLY"), retry]
+    )
+
+    assert len(llm.calls) == 2
+    assert result["success"] is False
+    assert result["status"] == "invalid_tool_protocol"
+    assert tracer.phases[-1] == ("discarded_invalid_tool_protocol_retry", False)
+
+
+@pytest.mark.asyncio
+async def test_a_dag_step_does_not_keep_a_plain_text_repair() -> None:
+    """The DAG reads only a step's success, so a partial step must still fail."""
+    result, llm, tracer = await _run_forced_turn_without_evidence(
+        [_plain_text("NO_REPLY"), _plain_text("NO_REPLY")], dag_step_id="step-1"
+    )
+
+    assert len(llm.calls) == 2
+    assert result["success"] is False
+    assert result["status"] == "invalid_tool_protocol"
+    assert tracer.phases[-1] == ("discarded_invalid_tool_protocol_retry", False)

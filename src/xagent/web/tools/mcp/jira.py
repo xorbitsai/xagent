@@ -1875,17 +1875,18 @@ def _summarize_full_issue(issue: dict[str, Any]) -> dict[str, Any]:
 
 
 #: Fields requested for jira_get_issue. Keep this in lockstep with every
-#: `fields.get(...)` call inside _summarize_full_issue below: Jira's API
-#: returns ONLY this subset once any `fields` param is passed, so a key
-#: _summarize_full_issue reads but this list omits will silently and
-#: permanently come back as None. test_get_issue_requests_exact_field_list
-#: in test_jira_mcp.py pins this constant's value so a change here shows
-#: up in review, but it does not by itself verify the two stay matched --
-#: check _summarize_full_issue's fields.get(...) calls by hand when
-#: editing either. The summarized request appends
-#: _GET_ISSUE_CUSTOM_FIELDS_SELECTOR to this list (raw_fields does not),
-#: so the customfield_* keys it reads for issue.custom_fields are not
-#: individually named here.
+#: `fields.get(...)` call inside _summarize_full_issue below: raw_fields
+#: requests this list and nothing else, and Jira's API then returns ONLY
+#: this subset, so a key _summarize_full_issue reads but this list omits
+#: comes back as None there. The summarized request appends
+#: _GET_ISSUE_CUSTOM_FIELDS_SELECTOR on top (it fetches every field
+#: again), which is why the customfield_* keys issue.custom_fields reads
+#: are not named here -- but every key the summary reads has to be listed
+#: all the same, so both modes can read it.
+#: test_get_issue_requests_exact_field_list in test_jira_mcp.py pins this
+#: constant's value so a change here shows up in review, but it does not
+#: by itself verify the two stay matched -- check _summarize_full_issue's
+#: fields.get(...) calls by hand when editing either.
 _GET_ISSUE_FIELDS = (
     "summary,description,status,assignee,reporter,creator,"
     "priority,issuetype,project,parent,resolution,labels,"
@@ -1927,13 +1928,16 @@ def _custom_fields_selector(requested_ids: Iterable[str]) -> str:
     named in extra_fields must not stay excluded, though: Jira's `-field`
     would drop it from the response, leaving the very value the caller
     asked for missing, so its exclusion is removed (matched case-
-    insensitively, the same way the default-set dedup matches ids).
+    insensitively, the same way the default-set dedup matches ids). Only
+    the `-field` entries are compared: a token that happens to be the
+    field name "all" is not `*all`'s exclusion, and reading it as one
+    would drop the whole selector.
     """
     named = {field_id.casefold() for field_id in requested_ids}
     return ",".join(
         entry
         for entry in _GET_ISSUE_CUSTOM_FIELDS_SELECTOR.split(",")
-        if entry[1:].casefold() not in named
+        if not (entry.startswith("-") and entry[1:].casefold() in named)
     )
 
 
@@ -2107,23 +2111,28 @@ def jira_get_issue(
     Get one issue's details -- description, status, assignee,
     reporter/creator, priority, components, fix versions, due date, and
     its dependencies (issue_links -- e.g. blocks/is blocked by/relates to
-    -- and subtasks). Only the fields listed here are fetched by default;
-    other Jira fields (attachments, worklog, votes, watchers, time
-    tracking, affected versions, security level, sprint/epic link) are
-    not requested and will not appear in the result unless named via
-    extra_fields. The exception is custom fields: the summary lists every
-    custom field this issue has a value for under issue.custom_fields, as
-    [{id, name, value}] (empty ones are left out; values are simplified --
+    -- and subtasks). Only the fields listed here are summarized; other
+    standard Jira fields (attachments, worklog, votes, watchers, time
+    tracking, affected versions, security level) do not appear in the
+    result unless named via extra_fields. The exception is custom fields
+    (on Jira Cloud this includes Sprint and Epic Link): the summary lists
+    every custom field this issue has a value for under issue.custom_fields,
+    as [{id, name, value}] (empty ones are left out; values are simplified --
     rich text to plain text, an option to its option value, a user to
     their display name, a version/sprint and the like to its name -- and
-    each value is at most 1,000 characters). So to answer "which custom
-    fields does this issue have" or "what is this custom field's value",
-    just call this tool and read custom_fields; there is no need to call
+    each value is at most 1,000 characters; a value over that is cut, and
+    a list/dict value cut that way comes back as truncated JSON text, not
+    in its original shape). So to answer "which custom fields does this
+    issue have" or "what is this custom field's value", just call this
+    tool and read custom_fields; there is no need to call
     jira_list_fields first. An empty list genuinely means the issue has no
-    custom field with a value. A top-level custom_fields_truncated true
-    means some value was cut, or the list was shortened to fit the output
-    limit; name the fields you need in extra_fields to get their full
-    value.
+    custom field with a value. The list is sorted by name and, when it
+    has to be shortened to fit the output limit, loses entries from the
+    end: a top-level custom_fields_truncated true says some value was cut
+    or the list was shortened, and in rare cases only the top-level
+    truncated true is set -- either one means the list may be incomplete.
+    Find the field you need with jira_list_fields, then name it in
+    extra_fields for its full value.
     issue_key: an issue key (e.g. "ENG-123") or its numeric id.
     extra_fields: optional comma-separated Jira fields not in the default
     set above -- standard or custom, named either by field id (e.g.

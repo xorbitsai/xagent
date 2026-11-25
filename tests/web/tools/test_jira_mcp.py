@@ -6004,7 +6004,7 @@ def test_get_issue_lists_the_custom_fields_with_values_by_default(monkeypatch):
         "fields": {
             "summary": "ok",
             "customfield_10116": "https://github.com/example/repo/issues/1",
-            "customfield_10019": "0|i00001:",
+            "customfield_10019": 5,
         },
     }
     mock_request = Mock(
@@ -6048,7 +6048,7 @@ def test_get_issue_lists_the_custom_fields_with_values_by_default(monkeypatch):
         {
             "id": "customfield_10019",
             "name": "Story Points",
-            "value": "0|i00001:",
+            "value": 5,
         },
     ]
     assert "custom_fields_truncated" not in result
@@ -6350,7 +6350,7 @@ def test_get_issue_does_not_repeat_an_extra_fields_field_in_custom_fields(
         "fields": {
             "summary": "ok",
             "customfield_10116": "https://github.com/example/repo/issues/1",
-            "customfield_10019": "0|i00001:",
+            "customfield_10019": 5,
         },
     }
     mock_request = Mock(
@@ -6370,7 +6370,7 @@ def test_get_issue_does_not_repeat_an_extra_fields_field_in_custom_fields(
         {
             "id": "customfield_10019",
             "name": "Story Points",
-            "value": "0|i00001:",
+            "value": 5,
         }
     ]
     issue_call = mock_request.call_args_list[1]
@@ -6422,13 +6422,56 @@ def test_get_issue_does_not_exclude_a_field_named_in_extra_fields(
     assert issue_call.kwargs["params"]["expand"] == "names"
 
 
+def test_get_issue_keeps_the_all_selector_for_a_field_named_all(monkeypatch):
+    # A field literally named "all" is not the `*all` selector. When the
+    # field table can't be consulted the token is passed through as an id,
+    # and matching it against the selector entries by name alone used to
+    # drop `*all` itself -- leaving the summary in the exact state the
+    # feature exists to avoid (no custom fields, no explanation).
+    raw_issue = {
+        "id": "1",
+        "key": "ENG-1",
+        "names": {"customfield_10116": "GitHub Issue URL"},
+        "fields": {
+            "summary": "ok",
+            "customfield_10116": "https://github.com/example/repo/issues/1",
+        },
+    }
+    mock_request = Mock(
+        side_effect=[
+            MockResponse(json_data=[_SITE_A]),
+            requests.ConnectionError("boom"),
+            MockResponse(json_data=raw_issue),
+        ]
+    )
+    monkeypatch.setattr(jira.requests, "request", mock_request)
+
+    result = json.loads(jira.jira_get_issue("ENG-1", extra_fields="all"))
+
+    assert result["status"] == "success"
+    assert mock_request.call_count == 3
+    issue_call = mock_request.call_args_list[2]
+    requested_fields = issue_call.kwargs["params"]["fields"].split(",")
+    assert "*all" in requested_fields
+    for excluded in ("-comment", "-worklog", "-attachment"):
+        assert excluded in requested_fields
+    # The custom fields still come back as usual.
+    assert result["issue"]["custom_fields"] == [
+        {
+            "id": "customfield_10116",
+            "name": "GitHub Issue URL",
+            "value": "https://github.com/example/repo/issues/1",
+        }
+    ]
+
+
 def test_get_issue_raw_fields_requests_no_custom_fields_selector(monkeypatch):
     # raw_fields keeps the request exactly as it was -- no selector, no
     # names expansion -- and produces no custom_fields list.
     raw_issue = {
         "id": "1",
         "key": "ENG-1",
-        "fields": {"summary": "ok", "customfield_1": "kept out"},
+        "fields": {"summary": "ok", "customfield_1": "raw value"},
     }
     mock_request = Mock(
         side_effect=[

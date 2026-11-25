@@ -2132,10 +2132,11 @@ def jira_get_issue(
     which appears under extra_field_values instead. The list is sorted by
     name and, when it has to be shortened to fit the output limit, loses
     entries from the end: a top-level custom_fields_truncated true says
-    some value was cut or the list was shortened, and in rare cases only
-    the top-level truncated true is set -- either one means the list may
-    be incomplete. Find the field you need with jira_list_fields, then
-    name it in extra_fields for its full value.
+    some value was cut or the list was shortened; the bare top-level
+    truncated true stands in for it only when the output limit is too
+    small to hold even that flag. Either one means the list may be
+    incomplete. Find the field you need with jira_list_fields, then name
+    it in extra_fields for its full value.
     issue_key: an issue key (e.g. "ENG-123") or its numeric id.
     extra_fields: optional comma-separated Jira fields not in the default
     set above -- standard or custom, named either by field id (e.g.
@@ -2339,61 +2340,81 @@ def jira_get_issue(
                 extra_field_values_truncated
             )
         top_level_extra.update(resolved_extras)
-        # success_with_capped_dict already tries the full response first
-        # and only shrinks `issue` if that doesn't fit -- no need to
-        # separately build and measure a plain response here first.
-        response = success_with_capped_dict(
-            "issue", issue, extra_fields=top_level_extra
-        )
-        # description_truncated (computed above) and extra_field_values_
-        # truncated (computed in the loop above, when requested_extra is
-        # non-empty) each only reflect what happened BEFORE this call --
-        # neither says anything about success_with_capped_dict's OWN
-        # shrink phases, which can still drop "description" from `issue`
-        # (its whole-key-dropping phase, or the final id-only/empty
-        # fallback -- never its largest-collection-first phase, since
-        # description is always a plain string by this point, not a list
-        # or dict) when the overall response still doesn't fit after
-        # that. Separately, when `issue` plus extra_field_values still
-        # doesn't fit even with `issue` shrunk to nothing,
-        # success_with_capped_dict's last-resort with_extras=False
-        # fallback drops the WHOLE extras dict -- extra_field_values,
-        # its own _truncated flag, and the extra_field_ids/
-        # unresolved_extra_fields bookkeeping alongside it -- reporting a
-        # plain "success" with no sign any of it was ever requested.
-        # Re-check the actual serialized result so the flag cannot report
-        # "not truncated" -- or simply vanish along with its own data --
-        # while the underlying field is silently gone, and so the small
-        # bookkeeping (a name's id, a token that resolved to nothing) is
-        # put back when it still fits: it is a few dozen bytes next to
-        # the values that were just dropped, and without it a caller
-        # cannot even tell which field it lost. This reparse is skipped
-        # only when description is already flagged and nothing else can
-        # need checking -- no extra field requested or resolved, and no
-        # custom fields listed -- so a call that lists custom fields
-        # parses the response once every time, to see whether the list
-        # came back shortened.
-        # Shrinking `issue` shrinks issue.custom_fields before anything
-        # else on the summary does (it is the one list the common case
-        # actually populates), so a caller can receive fewer custom
-        # fields than it started with and no sign of it. custom_fields is
-        # a list, so success_with_capped_dict halves it or drops it
-        # whole; either way the length comes back shorter than what was
-        # built, and that is the condition patched as _truncated below.
-        if (
-            not description_truncated
-            or requested_extra
-            or resolved_extras
-            or custom_fields
-        ):
+
+        def build_response(top_level_extra: dict[str, Any]) -> tuple[str, bool]:
+            """Bound the response, then patch in the flags it still needs.
+
+            Returns the response and whether custom_fields came back
+            shortened with no room left for its own flag. That flag is a
+            top-level extra, so counting its bytes while shrinking `issue`
+            is the only way to keep it: patching it in afterwards can
+            overflow a budget the response had just filled. Only this one
+            flag is reported back -- description_truncated and
+            extra_field_values_truncated keep their existing "keep the
+            unpatched response when the patch does not fit" rule.
+            """
+            # success_with_capped_dict already tries the full response
+            # first and only shrinks `issue` if that doesn't fit -- no need
+            # to separately build and measure a plain response here first.
+            response = success_with_capped_dict(
+                "issue", issue, extra_fields=top_level_extra
+            )
+            # description_truncated (computed above) and
+            # extra_field_values_truncated (computed in the loop above,
+            # when requested_extra is non-empty) each only reflect what
+            # happened BEFORE this call -- neither says anything about
+            # success_with_capped_dict's OWN shrink phases, which can
+            # still drop "description" from `issue` (its whole-key-
+            # dropping phase, or the final id-only/empty fallback -- never
+            # its largest-collection-first phase, since description is
+            # always a plain string by this point, not a list or dict)
+            # when the overall response still doesn't fit after that.
+            # Separately, when `issue` plus extra_field_values still
+            # doesn't fit even with `issue` shrunk to nothing,
+            # success_with_capped_dict's last-resort with_extras=False
+            # fallback drops the WHOLE extras dict -- extra_field_values,
+            # its own _truncated flag, and the extra_field_ids/
+            # unresolved_extra_fields bookkeeping alongside it -- reporting
+            # a plain "success" with no sign any of it was ever requested.
+            # Re-check the actual serialized result so the flag cannot
+            # report "not truncated" -- or simply vanish along with its own
+            # data -- while the underlying field is silently gone, and so
+            # the small bookkeeping (a name's id, a token that resolved to
+            # nothing) is put back when it still fits: it is a few dozen
+            # bytes next to the values that were just dropped, and without
+            # it a caller cannot even tell which field it lost. This
+            # reparse is skipped only when description is already flagged
+            # and nothing else can need checking -- no extra field
+            # requested or resolved, and no custom fields listed -- so a
+            # call that lists custom fields parses the response once every
+            # time, to see whether the list came back shortened.
+            # Shrinking `issue` shrinks issue.custom_fields before anything
+            # else on the summary does (it is the one list the common case
+            # actually populates), so a caller can receive fewer custom
+            # fields than it started with and no sign of it. custom_fields
+            # is a list, so success_with_capped_dict halves it or drops it
+            # whole; either way the length comes back shorter than what was
+            # built, and that is the condition patched as _truncated below.
+            if not (
+                not description_truncated
+                or requested_extra
+                or resolved_extras
+                or custom_fields
+            ):
+                return response, False
             parsed = json.loads(response)
             patched = False
+            custom_fields_flag_needed = False
             if not description_truncated and "description" not in parsed.get(
                 "issue", {}
             ):
                 parsed["description_truncated"] = True
                 patched = True
-            if custom_fields and not custom_fields_truncated:
+            if (
+                custom_fields
+                and not custom_fields_truncated
+                and not top_level_extra.get("custom_fields_truncated")
+            ):
                 returned_custom_fields = _as_dict(parsed.get("issue")).get(
                     "custom_fields"
                 )
@@ -2402,6 +2423,7 @@ def jira_get_issue(
                 ) < len(custom_fields):
                     parsed["custom_fields_truncated"] = True
                     patched = True
+                    custom_fields_flag_needed = True
             if requested_extra and "extra_field_values" not in parsed:
                 parsed["extra_field_values_truncated"] = True
                 patched = True
@@ -2421,7 +2443,23 @@ def jira_get_issue(
                 # invalid, over-budget JSON the docstring promises never
                 # happens.
                 if len(patched_response) <= get_tool_max_output_length():
-                    response = patched_response
+                    return patched_response, False
+            return response, custom_fields_flag_needed
+
+        response, custom_fields_flag_needed = build_response(top_level_extra)
+        if custom_fields_flag_needed:
+            # A response this tight has no room to add the flag after the
+            # fact (one short custom field and a description that just
+            # fills the budget leave fewer bytes than the flag needs), and
+            # returning an empty custom_fields list with only the generic
+            # truncated true would read as "this issue has no such field".
+            # Rebuild once with the flag reserved up front, so the shrink
+            # that shortened the list already pays for reporting it; only
+            # a budget too small to keep any extras at all loses it. The
+            # list is expected to come back shorter still -- the flag is
+            # itself part of what has to fit.
+            top_level_extra["custom_fields_truncated"] = True
+            response, _ = build_response(top_level_extra)
         return _restore_extra_field_bookkeeping(response, resolved_extras)
     except Exception as e:
         safe_message = _safe_text(e)

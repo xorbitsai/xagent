@@ -6488,3 +6488,95 @@ def test_get_issue_raw_fields_requests_no_custom_fields_selector(monkeypatch):
     assert issue_call.kwargs["params"] == {"fields": jira._GET_ISSUE_FIELDS}
     assert "custom_fields" not in result["issue"]
     assert "custom_fields_truncated" not in result
+
+
+# The flag that reports a shortened custom_fields list has to fit inside
+# the same budget it reports on: a response sized to the cap must not come
+# back with the list dropped and only the generic truncated flag, which
+# reads as "this issue has no custom field with a value".
+
+
+def _issue_at_the_output_cap(description_length, custom_field_count):
+    names = {}
+    fields = {"summary": "ok", "description": "d" * description_length}
+    for index in range(custom_field_count):
+        field_id = f"customfield_{10000 + index}"
+        names[field_id] = f"Field {index:02d}"
+        fields[field_id] = f"value-{index:02d}"
+    return {"id": "1", "key": "ENG-1", "names": names, "fields": fields}
+
+
+def test_get_issue_reports_one_custom_field_shortened_at_the_output_cap(
+    monkeypatch,
+):
+    # One short custom field and a description that fills the rest of the
+    # 2,000-character budget: by the time the shrink pass has to give up
+    # the list, fewer characters are left than the custom_fields_truncated
+    # key itself takes, so patching the flag in afterwards used to fail
+    # and hand back a bare "custom_fields": [] with no field-specific
+    # marker -- which the tool contract reads as "no such field". The
+    # description length where that happens depends on the other summary
+    # fields, so scan the length across the budget rather than pinning one
+    # value that an unrelated change could move out of the window.
+    monkeypatch.setattr(jira, "get_tool_max_output_length", lambda: 2000)
+    monkeypatch.setattr(jira_mcp_utils, "get_tool_max_output_length", lambda: 2000)
+
+    shortened = 0
+    for description_length in range(1200, 2001):
+        monkeypatch.setattr(
+            jira.requests,
+            "request",
+            Mock(
+                side_effect=[
+                    MockResponse(json_data=[_SITE_A]),
+                    MockResponse(
+                        json_data=_issue_at_the_output_cap(description_length, 1)
+                    ),
+                ]
+            ),
+        )
+
+        raw_response = jira.jira_get_issue("ENG-1")
+        result = json.loads(raw_response)
+
+        assert len(raw_response) <= 2000
+        returned = (result.get("issue") or {}).get("custom_fields")
+        if not isinstance(returned, list) or len(returned) < 1:
+            assert result.get("custom_fields_truncated") is True
+            shortened += 1
+    assert shortened > 0
+
+
+def test_get_issue_reports_many_custom_fields_shortened_at_the_output_cap(
+    monkeypatch,
+):
+    # Same scan with ten populated fields: the list now shrinks in
+    # halving steps instead of disappearing in one, and every one of those
+    # steps still has to be reported within the same cap.
+    monkeypatch.setattr(jira, "get_tool_max_output_length", lambda: 2000)
+    monkeypatch.setattr(jira_mcp_utils, "get_tool_max_output_length", lambda: 2000)
+
+    shortened = 0
+    for description_length in range(1200, 2001):
+        monkeypatch.setattr(
+            jira.requests,
+            "request",
+            Mock(
+                side_effect=[
+                    MockResponse(json_data=[_SITE_A]),
+                    MockResponse(
+                        json_data=_issue_at_the_output_cap(description_length, 10)
+                    ),
+                ]
+            ),
+        )
+
+        raw_response = jira.jira_get_issue("ENG-1")
+        result = json.loads(raw_response)
+
+        assert len(raw_response) <= 2000
+        returned = (result.get("issue") or {}).get("custom_fields")
+        if not isinstance(returned, list) or len(returned) < 10:
+            assert result.get("custom_fields_truncated") is True
+            shortened += 1
+    assert shortened > 0

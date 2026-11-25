@@ -290,6 +290,12 @@ _REGISTERED_CALLS = frozenset(
         ("web/tools/config.py", "WebToolConfig._build_mcp_server_config"),
         ("web/services/mcp_runtime.py", "build_mcp_runtime_connection"),
         ("web/services/mcp_oauth.py", "resolve_mcp_oauth_runtime_auth"),
+        # Only for a team-member flow, and only to pick the page a repeated
+        # OAuth callback lands on; no token is read or sent (#3941).
+        (
+            "web/services/mcp_oauth_repeated_callback.py",
+            "repeated_callback_outcome",
+        ),
         ("web/api/mcp.py", "list_mcp_apps"),
         ("web/services/mcp_server_management.py", "_authorization"),
         ("web/services/mcp_server_management.py", "_project_mcp_server"),

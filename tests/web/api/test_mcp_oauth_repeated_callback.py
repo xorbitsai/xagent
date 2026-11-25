@@ -43,7 +43,7 @@ from xagent.web.api.mcp import mcp_oauth_callback
 from xagent.web.builtin_mcp_registry import ATLASSIAN_MCP_OAUTH_SCOPE
 from xagent.web.models import MCPOAuthFlowState, MCPOAuthGrant
 from xagent.web.models.database import Base
-from xagent.web.models.mcp import MCPServer
+from xagent.web.models.mcp import MCPServer, UserMCPServer
 from xagent.web.models.user import User
 
 STATE = "state-repeated"
@@ -351,19 +351,37 @@ async def test_an_unclaimed_flow_still_needs_its_cookie(flow_db, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_a_repeated_team_member_callback_lands_on_success(flow_db, monkeypatch):
+@pytest.mark.parametrize(
+    ("access_path", "expected"),
+    [
+        ("team_member", SUCCESS),
+        # The same grant through an association flow: a caller without an
+        # association counts such a grant only on the team-member path.
+        ("association", {"mcp_oauth_error": ["state_already_consumed"]}),
+    ],
+    ids=["team-member-flow", "association-flow"],
+)
+async def test_a_member_without_an_association_counts_only_on_the_team_member_path(
+    flow_db, monkeypatch, access_path, expected
+):
     db, user = flow_db
     exchanged = _record_exchanges(monkeypatch)
     owner = f"xagent:user:{user.id}"
     flow = _flow(db)
-    flow.access_path = "team_member"
-    flow.association_lifecycle_generation = None
+    flow.access_path = access_path
+    if access_path == "team_member":
+        flow.association_lifecycle_generation = None
     flow.resource_owner_key = owner
+    db.commit()
+    # A real team member holds no association row for the server; with one,
+    # the selector would count the grant whatever the flow's path.
+    db.query(UserMCPServer).filter(UserMCPServer.user_id == user.id).delete()
     db.commit()
     flow = _mark_consumed(db)
     _add_grant(db, flow, owner=owner)
 
     repeat = await mcp_oauth_callback(_cookieless_request(STATE), db)
 
-    assert _redirect_query(repeat) == SUCCESS
+    query = _redirect_query(repeat)
+    assert {key: query[key] for key in expected} == expected
     assert exchanged == []

@@ -223,35 +223,76 @@
     return {
       transportRetries: 0,
       rateLimited: 0,
-      unreachableHintLogged: false
+      unreachableHintLogged: false,
+      // Date.now() before which a server's Retry-After (rate_limited or a 503)
+      // asked for no new attempt, and that wait's length, which bounds the
+      // hold if the clock goes back.
+      notBefore: 0,
+      notBeforeMs: 0
     };
   }
 
-  // The lineage carries the back-off position and the rate-limit budget across
-  // operations. Exchange owns its lineage at controller scope so bfcache can
-  // replace a network operation without restarting the back-off.
+  // The Retry-After of a 503, or null. Only whole non-negative seconds count:
+  // an HTTP date depends on the visitor's clock, and an unreadable value must
+  // leave the transport back-off (and its wake) as it was. retryAfterMs keeps
+  // its own fallback for rate_limited, which the link page copies verbatim.
+  function serverRetryAfterMs(result) {
+    var value = result && result.status === 503 && result.retryAfter && result.retryAfter.trim();
+    return value && /^\d+$/.test(value) ? Number(value) * 1000 : null;
+  }
+
+  // The lineage carries the back-off position, the rate-limit budget and the
+  // server's not-before deadline across operations. Exchange owns its lineage
+  // at controller scope, and reconnect keeps one per reconnect token, so
+  // bfcache can replace a network operation without restarting the back-off
+  // or skipping the server's wait.
   function withRetry(makeRequest, policy, signal, onRetry, lineage, wake) {
     var retry = lineage || createRetryLineage();
 
-    function retryAfter(wait, code, retryWake) {
+    // A rate_limited wait: the server asked for it, so no wake shortens it.
+    function retryAfter(wait, code) {
       if (onRetry) onRetry(code);
-      return sessionDelay(wait, signal, retryWake).then(run);
+      return sessionDelay(wait, signal, null).then(run);
+    }
+
+    // Waits `floorMs`, which no wake shortens, then the rest of `waitMs`,
+    // which a wake may end; a wake during the floor ends the rest as soon as
+    // the floor is over. Aborting the operation ends either.
+    function delayWithFloor(floorMs, waitMs) {
+      if (!(floorMs > 0)) return sessionDelay(waitMs, signal, wake);
+      var woke = false;
+      var unsubscribe = wake ? wake.subscribe(function () { woke = true; }) : null;
+      function stopListening() {
+        if (unsubscribe) unsubscribe();
+      }
+      return sessionDelay(floorMs, signal, null).then(function () {
+        stopListening();
+        if (woke || waitMs <= floorMs) return undefined;
+        return sessionDelay(waitMs - floorMs, signal, wake);
+      }, function (error) {
+        stopListening();
+        throw error;
+      });
     }
 
     // Never gives up. A wake runs the next attempt at once; if it fails, the
-    // back-off continues where it was.
+    // back-off continues where it was. An overloaded server answers 503 with
+    // Retry-After, how long to stay away: that wait (up to the rate-limit
+    // cap) is a floor no wake shortens, and when it is the longer term the
+    // clients refused together are spread beyond it, a part a wake may end.
+    // This relies on such a 503 having done no work, so the reconnect token it
+    // was sent with is still good after the wait.
     function retryTransport(mayHaveReachedServer, result) {
       retry.transportRetries += 1;
       var wait = sessionRetryDelayMs(policy, retry.transportRetries, Math.random());
-      if (result && result.status === 503 && result.retryAfter) {
-        // An overloaded server answers 503 with Retry-After, how long to stay away; honour
-        // it (up to the rate-limit cap) and spread the clients that were
-        // refused together.
-        var asked = Math.min(retryAfterMs(result), policy.maxRateLimitWaitMs);
-        if (asked > wait) wait = sessionSpreadDelayMs(policy, asked, Math.random());
-      }
+      var asked = serverRetryAfterMs(result);
+      var floor = asked === null ? 0 : Math.min(asked, policy.maxRateLimitWaitMs);
+      if (floor > wait) wait = sessionSpreadDelayMs(policy, floor, Math.random());
       if (mayHaveReachedServer) wait = Math.min(wait, policy.maxDelayAfterTimeoutMs);
-      return retryAfter(wait, 'network_unavailable', wake);
+      retry.notBefore = floor > 0 ? Date.now() + floor : 0;
+      retry.notBeforeMs = floor;
+      if (onRetry) onRetry('network_unavailable');
+      return delayWithFloor(floor, wait).then(run);
     }
 
     // A fetch the browser rejects outright looks the same whether the backend
@@ -281,12 +322,15 @@
             return result;
           }
           retry.rateLimited += 1;
-          // The server asked for at least this wait, and a wake does not
-          // shorten it. The spread stays under maxRateLimitWaitMs so that a
-          // wait the check above accepted never exceeds the give-up bound.
+          // The server asked for at least this wait; neither a wake nor an
+          // operation that replaces this one (bfcache) shortens it. The spread
+          // stays under maxRateLimitWaitMs so that a wait the check above
+          // accepted never exceeds the give-up bound.
+          retry.notBefore = Date.now() + wait;
+          retry.notBeforeMs = wait;
           var room = policy.maxRateLimitWaitMs - 1 - wait;
           var spread = sessionSpreadDelayMs(policy, wait, Math.random()) - wait;
-          return retryAfter(wait + Math.max(0, Math.min(spread, room)), 'rate_limited', null);
+          return retryAfter(wait + Math.max(0, Math.min(spread, room)), 'rate_limited');
         }
         if (!isKnownSessionErrorCode(code) && result.status >= 500) {
           return retryTransport(result.status === 504, result);
@@ -300,7 +344,10 @@
       });
     }
 
-    return run();
+    // An operation that replaces one still inside a server's Retry-After (a
+    // bfcache restore) waits only what is left of it.
+    var heldMs = Math.min(retry.notBefore - Date.now(), retry.notBeforeMs);
+    return heldMs > 0 ? sessionDelay(heldMs, signal, null).then(run) : run();
   }
 
   // Single mode branch point: a delegated context grant switches the whole

@@ -290,7 +290,7 @@ export function createLinkSessionHost(deps: LinkSessionHostDeps): LinkSessionHos
     stabilityTimer = timer
   }
 
-  // Circuit breaker, copied from widget.js runRecoveryFlow (widget.js:1535-1561):
+  // Circuit breaker, copied from widget.js runRecoveryFlow (widget.js:1606-1633):
   // a renew already running absorbs the new request without counting it; every
   // other request first voids the unfinished stability timer, then ends the
   // session if three rapid recoveries already happened, and otherwise counts.

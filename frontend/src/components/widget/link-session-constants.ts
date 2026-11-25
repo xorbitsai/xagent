@@ -26,13 +26,13 @@ export const RETRY_JITTER = 0.2
 export const MAX_RATE_LIMIT_RETRIES = 2
 // widget.js:56 SESSION_RETRY_POLICY.maxRateLimitWaitMs.
 export const MAX_RATE_LIMIT_WAIT_MS = 30000
-// widget.js:65 SESSION_RETRY_AFTER_FALLBACK_MS.
+// widget.js:70 SESSION_RETRY_AFTER_FALLBACK_MS.
 export const RETRY_AFTER_FALLBACK_MS = 1000
-// widget.js:66 SESSION_REFRESH_THRESHOLD_MS.
+// widget.js:71 SESSION_REFRESH_THRESHOLD_MS.
 export const SESSION_REFRESH_THRESHOLD_MS = 60000
-// widget.js:75 SESSION_STABLE_CONNECTION_MS.
+// widget.js:80 SESSION_STABLE_CONNECTION_MS.
 export const STABLE_CONNECTION_MS = 60000
-// widget.js:1547 `state.rapidRecoveries >= 3` in runRecoveryFlow: the fourth
+// widget.js:1618 `state.rapidRecoveries >= 3` in runRecoveryFlow: the fourth
 // rapid recovery inside one stability window trips the breaker.
 export const MAX_RAPID_RECOVERIES = 3
 

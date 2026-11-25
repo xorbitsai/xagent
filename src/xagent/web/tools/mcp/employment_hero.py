@@ -575,7 +575,10 @@ def employment_hero_list_leave_requests(
                     f"{', '.join(invalid_statuses)}; expected only "
                     f"{', '.join(LEAVE_REQUEST_STATUSES)}"
                 )
-            params["statuses"] = normalized_statuses
+            # Employment Hero types this filter as an array (enum<string>[])
+            # and rejects a bare repeated key (`statuses=pending`) with
+            # 400 "statuses is invalid", so it needs the bracketed array form.
+            params["statuses[]"] = normalized_statuses
         if normalized_start:
             params["start_date"] = normalized_start
         if normalized_end:

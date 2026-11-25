@@ -1875,7 +1875,7 @@ class _MediaModel:
     abilities: tuple[str, ...] = ("generate",)
 
 
-def _media_config(*, excluded_model_ids=(), **snapshot_values):
+def _media_config(*, excluded_model_ids=(), allowed_model_ids=None, **snapshot_values):
     from xagent.web.tools.config import (
         _ToolFactoryRuntimeLoadPlan,
         _ToolFactoryRuntimeSnapshot,
@@ -1900,6 +1900,7 @@ def _media_config(*, excluded_model_ids=(), **snapshot_values):
         request=None,
         user_id=1,
         excluded_model_ids=frozenset(excluded_model_ids),
+        allowed_model_ids=allowed_model_ids,
     )
     cfg._factory_runtime_snapshot = _ToolFactoryRuntimeSnapshot(
         plan=plan, **snapshot_values
@@ -3554,3 +3555,228 @@ def test_custom_api_config_loader_propagates_runtime_view_resolution_error(monke
 
     assert exc_info.value.code == ERROR_CONNECTOR_RUNTIME_UNAVAILABLE
     assert isinstance(exc_info.value.__cause__, RuntimeError)
+
+
+@pytest.mark.parametrize(
+    ("getter_name", "snapshot_field", "keys_are_model_ids"),
+    [
+        ("get_image_models", "image_models", True),
+        ("get_video_models", "video_models", True),
+        ("get_asr_models", "asr_models", False),
+        ("get_tts_models", "tts_models", False),
+        ("get_music_models", "music_models", True),
+        ("get_sound_effect_models", "sound_effect_models", True),
+    ],
+)
+def test_only_the_allowed_model_survives_in_each_media_dict(
+    getter_name, snapshot_field, keys_are_model_ids
+):
+    allowed = _MediaModel("allowed-id")
+    other = _MediaModel("other-id")
+
+    def key(model):
+        # ASR/TTS dicts are legacy-keyed by model name, not by model id.
+        return model.model_id if keys_are_model_ids else f"name-{model.model_id}"
+
+    cfg = _media_config(
+        allowed_model_ids={"allowed-id"},
+        **{snapshot_field: {key(allowed): allowed, key(other): other}},
+    )
+
+    models = getattr(cfg, getter_name)()
+    assert models == {key(allowed): allowed}
+    assert other not in models.values()
+
+
+@pytest.mark.parametrize(
+    ("getter_name", "models_field", "default_field", "ability"),
+    [
+        ("get_video_model", "video_models", "video_model", "generate"),
+        ("get_asr_model", "asr_models", "asr_model", "asr"),
+        ("get_tts_model", "tts_models", "tts_model", "tts"),
+        ("get_music_model", "music_models", "music_model", "generate"),
+        (
+            "get_sound_effect_model",
+            "sound_effect_models",
+            "sound_effect_model",
+            "generate",
+        ),
+    ],
+)
+def test_a_default_outside_the_allow_list_is_repicked_from_it(
+    getter_name, models_field, default_field, ability
+):
+    unlisted_default = _MediaModel("default-id", (ability,))
+    allowed = _MediaModel("allowed-id", (ability,))
+    cfg = _media_config(
+        allowed_model_ids={"allowed-id"},
+        **{
+            models_field: {
+                unlisted_default.model_id: unlisted_default,
+                allowed.model_id: allowed,
+            },
+            default_field: unlisted_default,
+        },
+    )
+    assert getattr(cfg, getter_name)() is allowed
+
+
+@pytest.mark.parametrize(
+    ("getter_name", "ability", "wrong_ability"),
+    [
+        ("get_image_generate_model", "generate", "edit"),
+        ("get_image_edit_model", "edit", "generate"),
+    ],
+)
+def test_an_image_default_outside_the_allow_list_keeps_the_ability_check(
+    getter_name, ability, wrong_ability
+):
+    unlisted_default = _MediaModel("default-id", (ability,))
+    wrong = _MediaModel("wrong-ability", (wrong_ability,))
+    right = _MediaModel("right-ability", (ability,))
+    cfg = _media_config(
+        # Both survivors are allowed; only one of them can serve this default,
+        # and the wrong one comes first.
+        allowed_model_ids={"wrong-ability", "right-ability"},
+        image_models={"wrong": wrong, "right": right},
+        image_generate_model=unlisted_default,
+        image_edit_model=unlisted_default,
+    )
+    assert getattr(cfg, getter_name)() is right
+
+
+def test_a_default_outside_the_allow_list_without_a_capable_model_is_none():
+    unlisted_default = _MediaModel("default-id", ("generate",))
+    edit_only = _MediaModel("edit-only", ("edit",))
+    cfg = _media_config(
+        allowed_model_ids={"edit-only"},
+        image_models={"edit-only": edit_only},
+        image_generate_model=unlisted_default,
+    )
+    assert cfg.get_image_generate_model() is None
+    assert cfg.get_image_models() == {"edit-only": edit_only}
+
+
+def test_an_empty_allow_list_leaves_every_media_kind_empty():
+    image = _MediaModel("image-id", ("generate", "edit"))
+    video = _MediaModel("video-id", ("generate",))
+    asr = _MediaModel("asr-id", ("asr",))
+    tts = _MediaModel("tts-id", ("tts",))
+    music = _MediaModel("music-id", ("generate",))
+    sound_effect = _MediaModel("sound-id", ("generate",))
+    cfg = _media_config(
+        allowed_model_ids=frozenset(),
+        image_models={"image-id": image},
+        image_generate_model=image,
+        image_edit_model=image,
+        video_models={"video-id": video},
+        video_model=video,
+        asr_models={"name-asr": asr},
+        asr_model=asr,
+        tts_models={"name-tts": tts},
+        tts_model=tts,
+        music_models={"music-id": music},
+        music_model=music,
+        sound_effect_models={"sound-id": sound_effect},
+        sound_effect_model=sound_effect,
+    )
+
+    for models_getter in (
+        cfg.get_image_models,
+        cfg.get_video_models,
+        cfg.get_asr_models,
+        cfg.get_tts_models,
+        cfg.get_music_models,
+        cfg.get_sound_effect_models,
+    ):
+        assert models_getter() == {}
+    for default_getter in (
+        cfg.get_image_generate_model,
+        cfg.get_image_edit_model,
+        cfg.get_video_model,
+        cfg.get_asr_model,
+        cfg.get_tts_model,
+        cfg.get_music_model,
+        cfg.get_sound_effect_model,
+    ):
+        assert default_getter() is None
+
+
+def test_a_none_allow_list_never_loads_a_kind_mapping(monkeypatch):
+    snapshot, _ = _factory_model_snapshot("no-bound")
+    cfg = WebToolConfig(db=object(), request=None, user_id=1, allowed_model_ids=None)
+    cfg._factory_runtime_snapshot = snapshot
+
+    loads: list[str] = []
+
+    def make_spy(name):
+        def spy():
+            loads.append(name)
+            return {}
+
+        return spy
+
+    for name in (
+        "get_image_models",
+        "get_video_models",
+        "get_asr_models",
+        "get_tts_models",
+        "get_music_models",
+        "get_sound_effect_models",
+    ):
+        monkeypatch.setattr(cfg, name, make_spy(name))
+
+    for default_getter in (
+        cfg.get_image_generate_model,
+        cfg.get_image_edit_model,
+        cfg.get_video_model,
+        cfg.get_asr_model,
+        cfg.get_tts_model,
+        cfg.get_music_model,
+        cfg.get_sound_effect_model,
+    ):
+        default_getter()
+
+    assert loads == []
+
+
+def test_an_exclusion_still_wins_when_the_allow_list_names_the_same_model():
+    both = _MediaModel("both-id", ("generate",))
+    allowed_only = _MediaModel("allowed-id", ("generate",))
+    cfg = _media_config(
+        excluded_model_ids={"both-id"},
+        allowed_model_ids={"both-id", "allowed-id"},
+        music_models={"both-id": both, "allowed-id": allowed_only},
+        music_model=both,
+    )
+
+    assert cfg.get_music_models() == {"allowed-id": allowed_only}
+    # The default is on both lists: excluded wins, so it is re-picked too.
+    assert cfg.get_music_model() is allowed_only
+
+
+def test_a_dict_key_alone_never_earns_a_place_in_the_allow_list():
+    # The key names an allowed id, but the model's own model_id does not match;
+    # the other model is allowed under a key that says nothing about it.
+    key_names_allowed = _MediaModel("absent-id")
+    allowed_under_another_key = _MediaModel("allowed-id")
+    cfg = _media_config(
+        allowed_model_ids={"allowed-id"},
+        image_models={
+            "allowed-id": key_names_allowed,
+            "some-other-key": allowed_under_another_key,
+        },
+    )
+
+    assert cfg.get_image_models() == {"some-other-key": allowed_under_another_key}
+
+
+def test_the_config_reports_its_allow_list():
+    unset = WebToolConfig(db=object(), request=None, user_id=1)
+    assert unset.get_allowed_model_ids() is None
+    assert _media_config(allowed_model_ids={"image-id"}).get_allowed_model_ids() == (
+        frozenset({"image-id"})
+    )
+    assert _media_config(allowed_model_ids=frozenset()).get_allowed_model_ids() == (
+        frozenset()
+    )

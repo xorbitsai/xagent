@@ -498,13 +498,14 @@ def test_web_tool_config_actor_parameters_are_appended_after_voice() -> None:
 
     # Later parameters are appended after these, never inserted before
     # them, so positional callers keep binding the same values.
-    assert parameters[-6:] == [
+    assert parameters[-7:] == [
         "voice",
         "mcp_actor_stdio_connection_adapter",
         "mcp_actor_execution_identity",
         "knowledge_base_team_id",
         "excluded_model_ids",
         "mcp_team_member_grants_allowed",
+        "allowed_model_ids",
     ]
 
 
@@ -1529,3 +1530,40 @@ async def test_execution_scoped_config_fails_closed_without_session_consumer() -
     assert tools[0].unavailability_reason == (  # type: ignore[attr-defined]
         ACTOR_STDIO_SESSION_RUNTIME_UNAVAILABLE_REASON
     )
+
+
+@pytest.mark.asyncio
+async def test_create_default_tools_forwards_allowed_model_ids(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from xagent.web.services.agent_service_manager import create_default_tools
+
+    captured: list[dict[str, object]] = []
+
+    class _FakeToolConfig:
+        def __init__(self, **kwargs: object) -> None:
+            captured.append(kwargs)
+
+        def set_task_runtime_contribution(self, _contribution: object) -> None:
+            pass
+
+    async def create_tools(_config: object) -> list[object]:
+        return []
+
+    monkeypatch.setattr("xagent.web.tools.config.WebToolConfig", _FakeToolConfig)
+    monkeypatch.setattr("xagent.web.models.database._SessionLocal", object())
+    monkeypatch.setattr(ToolFactory, "create_all_tools", create_tools)
+
+    allowed = frozenset({"img-1"})
+    for selection in ({"allowed_model_ids": allowed}, {}):
+        await create_default_tools(
+            None,
+            user=SimpleNamespace(id=USER_ID, is_admin=False),
+            task_id="91",
+            **selection,
+        )
+
+    assert captured[0]["allowed_model_ids"] == allowed
+    # A caller that names no bound reaches the config as None, not as an
+    # empty allow-list that would leave this task without media models.
+    assert captured[1]["allowed_model_ids"] is None

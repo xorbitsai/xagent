@@ -2144,20 +2144,34 @@ def _filter_excluded_media_models(
     excluded_model_ids: frozenset[str],
     *,
     ability: str | None = None,
+    allowed_model_ids: frozenset[str] | None = None,
 ) -> tuple[Dict[str, Any], Any | None]:
-    """Drop excluded media models and re-pick an excluded default.
+    """Drop excluded media models and re-pick a dropped default.
 
     The re-pick uses the media dict's own order (DB row order) and checks ``ability``.
+
+    ``allowed_model_ids`` is the positive bound: a model is kept only if its
+    ``model_id`` attribute is in it, so a model without one is dropped, and a
+    default outside it is re-picked. Its dict key is never consulted: a model
+    registered later is gone even when its key says otherwise. ``None`` means
+    no bound; an exclusion still applies first.
     """
-    if not excluded_model_ids:
+    if not excluded_model_ids and allowed_model_ids is None:
         return dict(models), default
     kept = {
         key: model
         for key, model in models.items()
         if key not in excluded_model_ids
         and getattr(model, "model_id", None) not in excluded_model_ids
+        and (
+            allowed_model_ids is None
+            or getattr(model, "model_id", None) in allowed_model_ids
+        )
     }
-    if default is None or getattr(default, "model_id", None) not in excluded_model_ids:
+    default_model_id = getattr(default, "model_id", None)
+    if default_model_id not in excluded_model_ids and (
+        allowed_model_ids is None or default_model_id in allowed_model_ids
+    ):
         return kept, default
     replacement = next(
         (
@@ -2230,10 +2244,16 @@ class WebToolConfig(BaseToolConfig):
         # Closed by default; the task builder passes the task-source gate's
         # verdict for the task this config serves.
         mcp_team_member_grants_allowed: bool = False,
+        allowed_model_ids: frozenset[str] | None = None,
     ):
         # Media model ids this task excludes; the getters drop them from the
         # kind's dict and re-pick an excluded default (see the filter helper).
         self._excluded_model_ids = frozenset(excluded_model_ids)
+        # Media model ids this task may use, or None for no bound; the getters
+        # keep only these and re-pick a default outside the set.
+        self._allowed_model_ids = (
+            None if allowed_model_ids is None else frozenset(allowed_model_ids)
+        )
         # ``tool_selection_spec`` accepts :class:`ToolSelectionSpec` from
         # the tools adapter package; typed as ``Any`` here to avoid an
         # import cycle (web.tools → core.tools.adapters). The factory
@@ -2553,7 +2573,10 @@ class WebToolConfig(BaseToolConfig):
             terminal_neutral={},
         )
         return _filter_excluded_media_models(
-            dict(resolved), None, self._excluded_model_ids
+            dict(resolved),
+            None,
+            self._excluded_model_ids,
+            allowed_model_ids=self._allowed_model_ids,
         )[0]
 
     def _repick_excluded_media_default(
@@ -2563,16 +2586,23 @@ class WebToolConfig(BaseToolConfig):
         *,
         ability: str | None = None,
     ) -> Any | None:
-        """Keep a default unless excluded, then re-pick it from the remaining models.
+        """Keep a default this task may use, else re-pick it from the remaining models.
 
-        Not excluded (or no exclusions) returns it without loading the kind's dict.
+        A default that is not excluded and is either inside the allow-list or
+        under no allow-list at all is returned without loading the kind's dict.
         """
-        if default is None or (
-            getattr(default, "model_id", None) not in self._excluded_model_ids
+        default_model_id = getattr(default, "model_id", None)
+        if default_model_id not in self._excluded_model_ids and (
+            self._allowed_model_ids is None
+            or default_model_id in self._allowed_model_ids
         ):
             return default
         return _filter_excluded_media_models(
-            models(), default, self._excluded_model_ids, ability=ability
+            models(),
+            default,
+            self._excluded_model_ids,
+            ability=ability,
+            allowed_model_ids=self._allowed_model_ids,
         )[1]
 
     def get_vision_model(self) -> Optional[Any]:
@@ -3720,6 +3750,10 @@ class WebToolConfig(BaseToolConfig):
     def get_excluded_model_ids(self) -> frozenset[str]:
         """Get media model ids this task excludes (inherited by sub-agents)."""
         return self._excluded_model_ids
+
+    def get_allowed_model_ids(self) -> frozenset[str] | None:
+        """Get media model ids this task allows, or None (inherited by sub-agents)."""
+        return self._allowed_model_ids
 
     def get_excluded_agent_id(self) -> Optional[int]:
         """Get agent ID to exclude from agent tools (to prevent self-calls)."""

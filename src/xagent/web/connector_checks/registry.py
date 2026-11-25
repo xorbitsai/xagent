@@ -2102,6 +2102,7 @@ CONNECTOR_CHECKS: Mapping[str, ConnectorChecks] = {
         exemptions=_exemptions(
             issue=_TIER_2,
             reads=(
+                "employment_hero_get_current_user",
                 "employment_hero_get_employee",
                 "employment_hero_get_leave_balances",
                 "employment_hero_list_employees",

@@ -53,6 +53,9 @@ LEAVE_BALANCES_LIST_SCOPE = "leave_balances:list"
 LEAVE_REQUESTS_LIST_SCOPE = "leave_requests:list"
 LEAVE_REQUESTS_CREATE_SCOPE = "leave_requests:create"
 LEAVE_REQUESTS_APPROVE_SCOPE = "leave_requests:approve"
+# Same resource:action convention as the hints above. Not yet in the app
+# row's oauth_scopes: the vendor identifier for /user_info is unconfirmed.
+USER_INFO_SHOW_SCOPE = "user_info:show"
 
 
 def _error(message: str) -> str:
@@ -131,12 +134,24 @@ def _request(
         if len(detail) > MAX_ERROR_RESPONSE_TEXT_CHARS:
             detail = detail[:MAX_ERROR_RESPONSE_TEXT_CHARS] + "... [truncated]"
         if response.status_code == 403 and required_scope:
-            detail = (
-                f"{detail}. This operation requires the Employment Hero OAuth "
-                f"scope {required_scope!r}. Ask an administrator to enable it "
-                "for the OAuth application, then disconnect and reconnect "
-                "Employment Hero."
-            )
+            # A grant missing the scope answers "scope validating failed"; a
+            # granted scope refused for the person's role answers a bare
+            # "403 Forbidden", which reconnecting cannot fix.
+            if "scope" in detail.lower():
+                detail = (
+                    f"{detail}. This operation requires the Employment Hero "
+                    f"OAuth scope {required_scope!r}. Ask an administrator to "
+                    "enable it for the OAuth application, then disconnect and "
+                    "reconnect Employment Hero."
+                )
+            else:
+                detail = (
+                    f"{detail}. Employment Hero does not allow this for the "
+                    "signed-in person's role (for example, staff cannot read "
+                    "leave balances, leave categories, or other employees). Ask an "
+                    "Employment Hero admin or manager to do it; reconnecting "
+                    "will not help."
+                )
         raise RuntimeError(
             f"Employment Hero API error (status {response.status_code}): {detail}"
         )
@@ -289,7 +304,8 @@ def employment_hero_list_organisations(
     List the organisations this connection can access, with each
     organisation's id, name, and country. Call this first -- every other
     tool in this connector needs an organisation_id, and this is how to find
-    one.
+    one -- unless the person asks about themselves: then call
+    employment_hero_get_current_user, which returns the organisation_id too.
     page_index: 1-based page number.
     item_per_page: results per page (max 100).
     """
@@ -304,6 +320,30 @@ def employment_hero_list_organisations(
         )
     except Exception as e:
         logger.error(f"Error listing Employment Hero organisations: {e}")
+        return _error(str(e))
+
+
+@mcp.tool(annotations=READ_ONLY)
+def employment_hero_get_current_user() -> str:
+    """
+    Identify the person this connection signed in as: their Employment Hero
+    user id and every active membership, each with organisation_id,
+    organisation_name, member_id, role, name, and email. Call this first
+    when the person asks about themselves ("my leave balance", "submit leave
+    for me"), instead of searching the employee directory, which staff
+    without an admin or manager role are not allowed to list. That
+    organisation's member_id is the person's employee_id for the leave
+    tools. Staff (role "employee") may be refused leave balances, leave
+    categories, and employee records, including their own, while still
+    being allowed to list and create their own leave requests.
+    """
+    try:
+        result = _request("GET", "/user_info", required_scope=USER_INFO_SHOW_SCOPE)
+        return success_with_capped_dict(
+            "current_user", _record_payload(result, "current user")
+        )
+    except Exception as e:
+        logger.error(f"Error getting the current Employment Hero user: {e}")
         return _error(str(e))
 
 
@@ -513,7 +553,9 @@ def employment_hero_get_leave_balances(
     this endpoint for organisations using HR Leave with Leave Balance data;
     payroll-connected organisations are not supported by the vendor.
     organisation_id: id from employment_hero_list_organisations.
-    employee_id: resolve with employment_hero_list_employees(query=...).
+    employee_id: for the person themselves, member_id from
+    employment_hero_get_current_user; for anyone else, resolve with
+    employment_hero_list_employees(query=...).
     page_index: 1-based page number.
     item_per_page: results per page (max 100).
     """
@@ -549,7 +591,9 @@ def employment_hero_list_leave_requests(
     List leave requests. Leave employee_id empty for an organisation-wide
     manager/approver view, or provide it for one employee's requests.
     organisation_id: id from employment_hero_list_organisations.
-    employee_id: optional id from employment_hero_list_employees(query=...).
+    employee_id: optional; for the person's own requests, member_id from
+    employment_hero_get_current_user; for anyone else, an id from
+    employment_hero_list_employees(query=...).
     statuses: optional request status filters: pending, approved, or declined.
     start_date, end_date: optional inclusive YYYY-MM-DD range boundaries.
     leave_category_id: optional id from employment_hero_list_leave_categories.
@@ -624,7 +668,9 @@ def employment_hero_create_leave_request(
     comment with the user before calling, and do not blindly retry after an
     ambiguous timeout.
     organisation_id: id from employment_hero_list_organisations.
-    employee_id: resolve with employment_hero_list_employees(query=...).
+    employee_id: for the person themselves, member_id from
+    employment_hero_get_current_user; for anyone else, resolve with
+    employment_hero_list_employees(query=...).
     leave_category_id: id from employment_hero_list_leave_categories.
     start_date, end_date: inclusive YYYY-MM-DD dates.
     comment: optional comment for the request.

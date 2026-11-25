@@ -1,4 +1,4 @@
-"""``GET /v1/models``: the models the key holder can use, over /v1.
+"""``GET /v1/models`` and ``GET /v1/agents/{id}/assignable-models``, over /v1.
 
 The list is ``usable_models`` for the holder, so it must agree with what the
 create path accepts and with what ``GET /v1/agents/{id}`` reports as
@@ -19,6 +19,7 @@ from sqlalchemy.orm import sessionmaker
 
 from tests.shared.postgres_disposable import disposable_database_factory
 from xagent.web import models as _all_models  # noqa: F401  (registers every table)
+from xagent.web.api.v1.agents import list_agent_assignable_models
 from xagent.web.api.v1.models import list_models
 from xagent.web.models.agent import Agent
 from xagent.web.models.database import Base
@@ -77,9 +78,12 @@ def _reset_hooks():
     set_agent_team_scope_hook(None)
 
 
-def _list(key: str, agent_id: Any = None):
-    params = {} if agent_id is None else {"agent_id": agent_id}
-    return client.get("/v1/models", headers=_bearer(key), params=params)
+def _list(key: str):
+    return client.get("/v1/models", headers=_bearer(key))
+
+
+def _list_for_agent(key: str, agent_id: Any):
+    return client.get(f"/v1/agents/{agent_id}/assignable-models", headers=_bearer(key))
 
 
 def _set_columns(model_pk: int, **columns: Any) -> None:
@@ -284,14 +288,14 @@ def test_agent_listing_query_count_does_not_grow_with_models():
     holder_id = _seed_shared_json_models(factory, 0, 3)
     agent_id = _owned_by_another_user(factory, holder_id)
     rows, small_count = _statements(
-        factory.kw["bind"], lambda: _call_list(holder_id, agent_id)
+        factory.kw["bind"], lambda: _call_list_for_agent(holder_id, agent_id)
     )
     assert [row.category for row in rows] == ["llm", "llm"]
     assert [row.owner_can_use for row in rows] == [True, True]
 
     _seed_shared_json_models(factory, 3, 30)
     rows, large_count = _statements(
-        factory.kw["bind"], lambda: _call_list(holder_id, agent_id)
+        factory.kw["bind"], lambda: _call_list_for_agent(holder_id, agent_id)
     )
 
     assert len(rows) == 15
@@ -303,7 +307,7 @@ def test_agent_listing_query_count_does_not_grow_with_models():
 
 @pytest.mark.parametrize("kind", _KEY_KINDS)
 def test_agent_listing_accepts_only_a_live_personal_key(kind):
-    resp = client.get("/v1/models?agent_id=1", headers=_headers_for(kind))
+    resp = client.get("/v1/agents/1/assignable-models", headers=_headers_for(kind))
 
     _error(resp, 401, "invalid_api_key")
 
@@ -313,7 +317,7 @@ def test_agent_listing_marks_what_the_owner_can_use(holder_is_owner):
     world = _build_world(holder_is_owner)
     named = {pk: name for name, pk in world.models.items()}
 
-    resp = _list(world.key, world.agent_id)
+    resp = _list_for_agent(world.key, world.agent_id)
 
     assert resp.status_code == 200, resp.text
     rows = resp.json()
@@ -334,17 +338,17 @@ def test_agent_listing_marks_what_the_owner_can_use(holder_is_owner):
 @pytest.mark.parametrize("bad", ["0", "-1", str(2**31), "abc"])
 def test_agent_listing_refuses_an_id_out_of_range(bad):
     world = _build_world(False)
-    _error(_list(world.key, bad), 422, "invalid_input")
+    _error(_list_for_agent(world.key, bad), 422, "invalid_input")
 
 
 def test_an_agent_the_holder_cannot_manage_is_not_found():
     world = _build_world(False)
     someone_elses = _seed_agent(_user_id("tess"))
 
-    hidden = _list(world.key, someone_elses)
+    hidden = _list_for_agent(world.key, someone_elses)
 
     assert hidden.status_code == 404 and hidden.json() == NOT_FOUND
-    assert hidden.content == _list(world.key, 999_999).content
+    assert hidden.content == _list_for_agent(world.key, 999_999).content
 
 
 # ===== read failures are errors, not empty answers =====
@@ -427,16 +431,23 @@ def _seed_shared_json_models(factory: Any, start: int, stop: int) -> int:
         return users["holder"]
 
 
-def _call_list(holder_id: int, agent_id: int | None = None) -> list[Any]:
+def _call_list(holder_id: int) -> list[Any]:
     return asyncio.run(
         list_models(
-            agent_id=agent_id,
             authed=(
                 SimpleNamespace(id=holder_id),
                 SimpleNamespace(key_prefix="xag_personal_t"),
-            ),
+            )
         )
     )
+
+
+def _call_list_for_agent(holder_id: int, agent_id: int) -> list[Any]:
+    authed = (
+        SimpleNamespace(id=holder_id),
+        SimpleNamespace(key_prefix="xag_personal_t"),
+    )
+    return asyncio.run(list_agent_assignable_models(agent_id=agent_id, authed=authed))
 
 
 def _read_shared_json_models(factory: Any) -> None:

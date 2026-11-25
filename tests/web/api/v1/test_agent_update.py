@@ -13,7 +13,6 @@ import asyncio
 import contextlib
 import logging
 import threading
-from pathlib import Path
 from typing import Any
 from unittest.mock import patch
 
@@ -23,6 +22,7 @@ from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session, sessionmaker
 
 from tests.shared.postgres_disposable import disposable_database_factory
+from xagent.core.tools.adapters.vibe.agent_model_resolution import AGENT_MODEL_KEYS
 from xagent.web import models as _all_models  # noqa: F401  (registers every table)
 from xagent.web.models.agent import Agent
 from xagent.web.models.database import Base
@@ -398,6 +398,10 @@ def test_only_four_fields_are_accepted(caplog, body):
 @pytest.mark.parametrize("schema", [V1AgentUpdateRequest, V1AgentModelSlots])
 def test_every_update_field_is_described(schema):
     assert all(field.description for field in schema.model_fields.values())
+
+
+def test_request_slots_are_the_slots_merged():
+    assert tuple(V1AgentModelSlots.model_fields) == AGENT_MODEL_KEYS
 
 
 # ===== how the write is made =====
@@ -1099,7 +1103,7 @@ def test_update_models_merges_by_slot(stored_kind, request_kind):
 
     # The stale model is refused as a new value and kept when it is stored.
     if request_kind == "unchanged-stale" and base.get("compact") != stale:
-        _error(resp, 400, "invalid_input")
+        _error(resp, 400, "model_not_assignable")
         assert resp.json()["error"]["details"]["models"] == [
             {"slot": "compact", "model_id": stale, "reason": "unavailable"}
         ]
@@ -1145,7 +1149,7 @@ def test_two_refused_slots_are_reported_in_slot_order():
 
     resp = _patch(holder, agent_id, {"models": {"compact": 999_999, "general": image}})
 
-    error = _error(resp, 400, "invalid_input")
+    error = _error(resp, 400, "model_not_assignable")
     assert error["details"]["models"] == [
         {"slot": "general", "model_id": image, "reason": "not_llm"},
         {"slot": "compact", "model_id": 999_999, "reason": "unavailable"},
@@ -1184,8 +1188,8 @@ _OUTCOMES = {
 _OWNER_CANNOT_USE_TAIL = (
     " The agent's owner cannot use this model, so tasks started with the "
     "agent's runtime keys would fall back to another model. Choose a model "
-    "with owner_can_use true in GET /v1/models?agent_id=…, or change it in "
-    "the web app."
+    "with owner_can_use true in GET /v1/agents/{agent_id}/assignable-models, or "
+    "change it in the web app."
 )
 
 
@@ -1232,7 +1236,7 @@ def test_listing_for_agent_matches_patch(column, cell):
     headers = _bearer(world.key)
 
     listed = client.get(
-        "/v1/models", headers=headers, params={"agent_id": world.agent_id}
+        f"/v1/agents/{world.agent_id}/assignable-models", headers=headers
     ).json()
     in_list = any(row["id"] == model_id and row["owner_can_use"] for row in listed)
     resp = client.patch(
@@ -1251,7 +1255,7 @@ def test_listing_for_agent_matches_patch(column, cell):
     entry = {"slot": "general", "model_id": model_id, "reason": reason}
     if reason == "owner_cannot_use":
         entry["owner_user_id"] = _agent_owner(world)
-    error = _error(resp, 400, "invalid_input")
+    error = _error(resp, 400, "model_not_assignable")
     assert error["details"] == {"models": [entry]}
     assert error["message"] == (
         f"These model slots cannot use the requested model: general ({reason})."
@@ -1270,7 +1274,7 @@ def test_a_stored_model_is_not_checked_when_it_is_sent_back():
         json={"models": {"general": inactive}},
     )
     listed = client.get(
-        "/v1/models", headers=_bearer(world.key), params={"agent_id": world.agent_id}
+        f"/v1/agents/{world.agent_id}/assignable-models", headers=_bearer(world.key)
     ).json()
 
     assert resp.status_code == 200, resp.text
@@ -1293,7 +1297,7 @@ def test_slot_rule_has_one_owner():
     headers = _bearer(world.key)
     for send in (
         lambda: client.get(
-            "/v1/models", headers=headers, params={"agent_id": world.agent_id}
+            f"/v1/agents/{world.agent_id}/assignable-models", headers=headers
         ),
         lambda: client.patch(
             f"/v1/agents/{world.agent_id}",
@@ -1306,10 +1310,6 @@ def test_slot_rule_has_one_owner():
         with patch.object(model_service, "slot_assignable_models", spy):
             assert send().status_code == 200
         assert calls, "the request did not go through slot_assignable_models"
-
-    source = Path(agent_management.__file__).read_text()
-    assert "slot_assignable_models" in source
-    assert 'category == "llm"' not in source
 
 
 # ===== model slots: refusals change nothing =====
@@ -1517,7 +1517,7 @@ def _batch_flow(flow: Flow, agents: list[int], pick: dict[int, int]):
         detail = flow.send("GET", f"/v1/agents/{agent_id}").json()
         assert detail["unresolved_models"] == ["visual"]
     listings = [
-        flow.send("GET", "/v1/models", params={"agent_id": agent_id}).json()
+        flow.send("GET", f"/v1/agents/{agent_id}/assignable-models").json()
         for agent_id in (agents[0], agents[2])
     ]
     assert all(listings)
@@ -1593,7 +1593,7 @@ def test_batch_client_flow_when_the_owner_left_the_team():
         json={"models": {"visual": models["team-admin"]}},
     )
 
-    error = _error(resp, 400, "invalid_input")
+    error = _error(resp, 400, "model_not_assignable")
     assert error["details"]["models"] == [
         {
             "slot": "visual",

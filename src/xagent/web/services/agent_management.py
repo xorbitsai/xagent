@@ -1374,6 +1374,20 @@ def _changed_slots(
     return changed
 
 
+def _owner_assignable_ids(
+    db: Session, holder_id: int, owner_id: int, holder_ok: set[int]
+) -> set[int]:
+    """The ids in *holder_ok*, the holder's slot models, the owner can use too."""
+    from .model_service import slot_assignable_models
+
+    if owner_id == holder_id:
+        return holder_ok
+    return {
+        int(m.id)
+        for m in slot_assignable_models(db, owner_id, among_ids=sorted(holder_ok))
+    }
+
+
 def _check_slot_models(
     db: Session, holder_id: int, owner_id: int, changed: dict[str, int | None]
 ) -> None:
@@ -1390,12 +1404,10 @@ def _check_slot_models(
     if not ids:
         return
     usable = {m.id for m in usable_models(db, holder_id, among_ids=ids)}
-    holder_ok = {m.id for m in slot_assignable_models(db, holder_id, among_ids=ids)}
-    owner_ok = (
-        holder_ok
-        if owner_id == holder_id
-        else {m.id for m in slot_assignable_models(db, owner_id, among_ids=ids)}
-    )
+    holder_ok = {
+        int(m.id) for m in slot_assignable_models(db, holder_id, among_ids=ids)
+    }
+    owner_ok = _owner_assignable_ids(db, holder_id, owner_id, holder_ok)
     rejections: list[dict[str, Any]] = []
     for slot, pk in changed.items():
         if pk is None:
@@ -1695,17 +1707,9 @@ class AgentManagementRuntime:
             if agent is None:
                 return None
             holder = slot_assignable_models(db, user_id)
-            if int(agent.user_id) == user_id:
-                owner_ok = {int(m.id) for m in holder}
-            else:
-                owner_ok = {
-                    int(m.id)
-                    for m in slot_assignable_models(
-                        db,
-                        int(agent.user_id),
-                        among_ids=[int(m.id) for m in holder],
-                    )
-                }
+            owner_ok = _owner_assignable_ids(
+                db, user_id, int(agent.user_id), {int(m.id) for m in holder}
+            )
             return tuple(
                 UsableModelForAgentSnapshot(
                     **asdict(snapshot),

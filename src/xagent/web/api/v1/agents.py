@@ -20,6 +20,7 @@ from ...schemas.v1 import (
     V1AgentSummary,
     V1AgentTemplateCreateRequest,
     V1AgentUpdateRequest,
+    V1ModelForAgent,
 )
 from ...services.agent_management import (
     AgentConnectorsNotSharedError,
@@ -288,8 +289,8 @@ def _unusable_models_message(rejections: list[dict[str, Any]]) -> str:
         message += (
             " The agent's owner cannot use this model, so tasks started with the "
             "agent's runtime keys would fall back to another model. Choose a model "
-            "with owner_can_use true in GET /v1/models?agent_id=\u2026, or change "
-            "it in the web app."
+            "with owner_can_use true in GET /v1/agents/{agent_id}/assignable-models, "
+            "or change it in the web app."
         )
     return message
 
@@ -336,7 +337,7 @@ async def update_agent(
         )
     except ModelSlotsUnusableError as e:
         raise V1ApiError(
-            V1ErrorCode.INVALID_INPUT,
+            V1ErrorCode.MODEL_NOT_ASSIGNABLE,
             400,
             _unusable_models_message(e.rejections),
             details={"models": e.rejections},
@@ -344,6 +345,31 @@ async def update_agent(
     if detail is None:
         raise V1ApiError(V1ErrorCode.AGENT_NOT_FOUND, 404)
     return _agent_detail(detail)
+
+
+@router.get("/{agent_id}/assignable-models", response_model=list[V1ModelForAgent])
+async def list_agent_assignable_models(
+    # ``agents.id`` is a 32-bit integer column.
+    agent_id: int = Path(gt=0, le=2**31 - 1),
+    authed: tuple[UserPrincipalSnapshot, PersonalApiKeySnapshot] = Depends(
+        get_user_from_personal_key
+    ),
+) -> list[V1ModelForAgent]:
+    """List the models the key holder can put in a slot of an agent it can see.
+
+    Only ``llm`` models are listed, each with ``owner_can_use``; a model the
+    agent's owner cannot use is marked, not left out. Order is not guaranteed.
+    """
+    user, _key = authed
+    models = await AgentManagementRuntime().list_models_for_agent(
+        user_id=int(user.id), agent_id=agent_id
+    )
+    if models is None:
+        raise V1ApiError(V1ErrorCode.AGENT_NOT_FOUND, 404)
+    return [
+        V1ModelForAgent.model_validate(snapshot, from_attributes=True)
+        for snapshot in models
+    ]
 
 
 @router.post("/{agent_id}/api-key", response_model=RuntimeKeyResponse)

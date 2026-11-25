@@ -1149,10 +1149,14 @@ class _PhaseRecorder:
 
 
 async def _run_forced_turn_without_evidence(
-    responses: list[dict[str, Any]], state: str = "removed"
+    responses: list[dict[str, Any]],
+    state: str = "removed",
+    dag_step_id: str | None = None,
 ) -> tuple[dict[str, Any], ScriptedLLM, _PhaseRecorder]:
     context = build_context(observations=2, threshold=500)
     apply_state(context, state)
+    if dag_step_id is not None:
+        context.metadata["dag_step_id"] = dag_step_id
     llm = ScriptedLLM(responses)
     pattern = ReActPattern(max_iterations=1)
     pattern.force_final_answer_next = True
@@ -1221,6 +1225,19 @@ async def test_an_unusable_plain_text_repair_still_fails_the_run(
 ) -> None:
     result, llm, tracer = await _run_forced_turn_without_evidence(
         [_plain_text("NO_REPLY"), retry]
+    )
+
+    assert len(llm.calls) == 2
+    assert result["success"] is False
+    assert result["status"] == "invalid_tool_protocol"
+    assert tracer.phases[-1] == ("discarded_invalid_tool_protocol_retry", False)
+
+
+@pytest.mark.asyncio
+async def test_a_dag_step_does_not_keep_a_plain_text_repair() -> None:
+    """The DAG reads only a step's success, so a partial step must still fail."""
+    result, llm, tracer = await _run_forced_turn_without_evidence(
+        [_plain_text("NO_REPLY"), _plain_text("NO_REPLY")], dag_step_id="step-1"
     )
 
     assert len(llm.calls) == 2

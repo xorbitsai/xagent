@@ -1736,7 +1736,7 @@ class ReActPattern(AgentPattern):
                     if (
                         recovery_reason == "structured_final_answer_required"
                         and self._structured_final_answer_plain_text_fallback(
-                            normalized
+                            normalized, context
                         )
                     ):
                         logger.warning(
@@ -2661,7 +2661,7 @@ class ReActPattern(AgentPattern):
         if (
             retry_is_invalid
             and recovery_reason == "structured_final_answer_required"
-            and self._structured_final_answer_plain_text_fallback(normalized)
+            and self._structured_final_answer_plain_text_fallback(normalized, context)
         ):
             # The caller keeps this text as the answer; tracing it as
             # discarded would contradict what the user receives.
@@ -2738,6 +2738,7 @@ class ReActPattern(AgentPattern):
     @staticmethod
     def _structured_final_answer_plain_text_fallback(
         normalized: dict[str, Any],
+        context: Any,
     ) -> bool:
         """Whether a plain-text reply can stand in for a required final_answer.
 
@@ -2747,12 +2748,20 @@ class ReActPattern(AgentPattern):
         repair prompt. Failing the run then discards a usable answer -- for a
         scheduled check-in often the exact text the run was told to return --
         and the user sees a generic error. The caller keeps such text with
-        outcome=partial, the same fallback iteration-limit delivery uses, so
-        no completed claim rests on evidence that was removed.
+        outcome=partial, so no completed claim rests on evidence that was
+        removed.
+
+        Like iteration-limit delivery, this does not apply to a DAG step: the
+        DAG reads only a step's success, so a partial step would let the root
+        finish as completed on unconfirmed text. Unlike that delivery, the
+        text is kept verbatim with no "not a completed task" prefix, so a
+        control reply such as ``NO_REPLY`` still reaches its caller as is.
 
         Only a complete, non-empty answer qualifies: no tool calls, no
         provider protocol error, and no truncated output.
         """
+        if context.metadata.get("dag_step_id"):
+            return False
         if normalized.get("tool_calls"):
             return False
         raw = normalized.get("raw")

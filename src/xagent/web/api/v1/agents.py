@@ -355,7 +355,7 @@ async def list_agent_assignable_models(
         get_user_from_personal_key
     ),
 ) -> list[V1ModelForAgent]:
-    """List the models the key holder can put in a slot of an agent it can see.
+    """List the slot models the key holder can use, for an agent it can see.
 
     Only ``llm`` models are listed, each with ``owner_can_use``; a model the
     agent's owner cannot use is marked, not left out. Order is not guaranteed.

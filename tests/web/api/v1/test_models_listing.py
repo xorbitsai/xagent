@@ -1,8 +1,8 @@
 """``GET /v1/models`` and ``GET /v1/agents/{id}/assignable-models``, over /v1.
 
-The list is ``usable_models`` for the holder, so it must agree with what the
-create path accepts and with what ``GET /v1/agents/{id}`` reports as
-unresolved.
+``GET /v1/models`` is ``usable_models`` for the holder, so it must agree with
+what the create path accepts and with what ``GET /v1/agents/{id}`` reports as
+unresolved. The listing for one agent is ``slot_assignable_models``.
 """
 
 from __future__ import annotations

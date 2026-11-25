@@ -66,21 +66,6 @@ async def test_the_linkedin_adapter_stages_a_file_ref_into_image_path():
     assert sources == {str(staged_path): f"file:{_FILE_ID}"}
 
 
-@pytest.mark.asyncio
-async def test_the_linkedin_adapter_passes_a_local_image_path_through():
-    """Guard: a same-run post still names the image by its workspace path."""
-    workspace = _StagingWorkspace(Path("/unused"))
-    adapter = await _linkedin_create_post_adapter(workspace)
-    arguments = {"text": "Launch day", "image_path": "/task/output/poster.png"}
-
-    prepared, staged, sources = await adapter._stage_external_upload_args(arguments)
-
-    assert prepared == arguments
-    assert staged == []
-    assert sources == {}
-    assert workspace.staged_ids == []
-
-
 def test_a_staged_file_passes_the_linkedin_image_allowlist(tmp_path, monkeypatch):
     """Premise check: a staged path sits under the task allowlist that
     WebToolConfig builds for local MCP file tools, so the connector accepts

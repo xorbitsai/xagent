@@ -374,6 +374,7 @@ def _jira_checks() -> ConnectorChecks:
                     ),
                     IsType(("issue", "summary"), "string"),
                     IsType(("issue", "description"), "string"),
+                    IsType(("issue", "custom_fields"), "array"),
                 ),
             ),
             ReadCheck(

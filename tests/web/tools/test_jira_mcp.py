@@ -6385,6 +6385,7 @@ def test_get_issue_does_not_repeat_an_extra_fields_field_in_custom_fields(
     [
         ("comment", "Comment", "-comment"),
         ("worklog", "Worklog", "-worklog"),
+        ("attachment", "Attachment", "-attachment"),
     ],
 )
 def test_get_issue_does_not_exclude_a_field_named_in_extra_fields(

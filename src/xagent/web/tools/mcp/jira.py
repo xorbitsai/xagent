@@ -2117,22 +2117,25 @@ def jira_get_issue(
     result unless named via extra_fields. The exception is custom fields
     (on Jira Cloud this includes Sprint and Epic Link): the summary lists
     every custom field this issue has a value for under issue.custom_fields,
-    as [{id, name, value}] (empty ones are left out; values are simplified --
-    rich text to plain text, an option to its option value, a user to
-    their display name, a version/sprint and the like to its name -- and
-    each value is at most 1,000 characters; a value over that is cut, and
-    a list/dict value cut that way comes back as truncated JSON text, not
-    in its original shape). So to answer "which custom fields does this
-    issue have" or "what is this custom field's value", just call this
-    tool and read custom_fields; there is no need to call
+    as [{id, name, value}] (empty ones are left out; name is null when Jira
+    has no display name for the field -- identify that field by its id, or
+    look its name up with jira_list_fields; values are simplified -- rich
+    text to plain text, an option to its option value, a user to their
+    display name, a version/sprint and the like to its name -- and each
+    value is capped at about 1,000 characters; a value over that is cut,
+    and a list/dict value cut that way comes back as truncated JSON text,
+    not in its original shape). So to answer "which custom fields does
+    this issue have" or "what is this custom field's value", just call
+    this tool and read custom_fields; there is no need to call
     jira_list_fields first. An empty list genuinely means the issue has no
-    custom field with a value. The list is sorted by name and, when it
-    has to be shortened to fit the output limit, loses entries from the
-    end: a top-level custom_fields_truncated true says some value was cut
-    or the list was shortened, and in rare cases only the top-level
-    truncated true is set -- either one means the list may be incomplete.
-    Find the field you need with jira_list_fields, then name it in
-    extra_fields for its full value.
+    custom field with a value, apart from any field named in extra_fields,
+    which appears under extra_field_values instead. The list is sorted by
+    name and, when it has to be shortened to fit the output limit, loses
+    entries from the end: a top-level custom_fields_truncated true says
+    some value was cut or the list was shortened, and in rare cases only
+    the top-level truncated true is set -- either one means the list may
+    be incomplete. Find the field you need with jira_list_fields, then
+    name it in extra_fields for its full value.
     issue_key: an issue key (e.g. "ENG-123") or its numeric id.
     extra_fields: optional comma-separated Jira fields not in the default
     set above -- standard or custom, named either by field id (e.g.
@@ -2364,10 +2367,12 @@ def jira_get_issue(
         # bookkeeping (a name's id, a token that resolved to nothing) is
         # put back when it still fits: it is a few dozen bytes next to
         # the values that were just dropped, and without it a caller
-        # cannot even tell which field it lost. Reparsing only happens on
-        # this otherwise-rare path (both flags were already true and no
-        # extra fields were requested, or the response fit without
-        # shrinking at all, in the common case).
+        # cannot even tell which field it lost. This reparse is skipped
+        # only when description is already flagged and nothing else can
+        # need checking -- no extra field requested or resolved, and no
+        # custom fields listed -- so a call that lists custom fields
+        # parses the response once every time, to see whether the list
+        # came back shortened.
         # Shrinking `issue` shrinks issue.custom_fields before anything
         # else on the summary does (it is the one list the common case
         # actually populates), so a caller can receive fewer custom

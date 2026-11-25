@@ -1,5 +1,7 @@
 """SDK management endpoints for user-owned agents."""
 
+from typing import Any
+
 from fastapi import APIRouter, Depends, Path, Query, Request
 
 from ...schemas.v1 import (
@@ -18,6 +20,7 @@ from ...schemas.v1 import (
     V1AgentSummary,
     V1AgentTemplateCreateRequest,
     V1AgentUpdateRequest,
+    V1ModelForAgent,
 )
 from ...services.agent_management import (
     AgentConnectorsNotSharedError,
@@ -34,6 +37,7 @@ from ...services.agent_management import (
     InvalidAgentModelConfigError,
     InvalidAgentSkillNamesError,
     InvalidKnowledgeBaseError,
+    ModelSlotsUnusableError,
     RuntimeKeySnapshot,
     TemplateNotFoundError,
     WorkforceTemplateNotSupportedError,
@@ -275,6 +279,22 @@ def _reject_null_fields(request: V1AgentUpdateRequest) -> None:
             )
 
 
+def _unusable_models_message(rejections: list[dict[str, Any]]) -> str:
+    message = (
+        "These model slots cannot use the requested model: "
+        + ", ".join(f"{r['slot']} ({r['reason']})" for r in rejections)
+        + "."
+    )
+    if any(r["reason"] == "owner_cannot_use" for r in rejections):
+        message += (
+            " The agent's owner cannot use this model, so tasks started with the "
+            "agent's runtime keys would fall back to another model. Choose a model "
+            "with owner_can_use true in GET /v1/agents/{agent_id}/assignable-models, "
+            "or change it in the web app."
+        )
+    return message
+
+
 @router.patch("/{agent_id}", response_model=V1AgentDetail)
 async def update_agent(
     request: V1AgentUpdateRequest,
@@ -284,15 +304,19 @@ async def update_agent(
         get_user_from_personal_key
     ),
 ) -> V1AgentDetail:
-    """Change the name, description or instructions of an agent the holder can see.
+    """Change the name, description, instructions or model slots of an agent.
 
-    Only the fields sent are changed. The response is the configuration after
-    the change, read again once it is stored. It is 404 if the holder can no
-    longer see the agent by then, although the change is stored.
+    Only the fields sent are changed, and of ``models`` only the slots named.
+    The response is the configuration after the change, read again once it is
+    stored. It is 404 if the holder can no longer see the agent by then,
+    although the change is stored.
     """
     user, key = authed
     _reject_null_fields(request)
     changes = request.model_dump(exclude_unset=True)
+    if changes.get("models") == {}:
+        # Naming no slot changes nothing, as an empty body does.
+        del changes["models"]
     try:
         detail = await AgentManagementRuntime().update_agent(
             user_id=int(user.id),
@@ -311,9 +335,41 @@ async def update_agent(
         raise V1ApiError(
             V1ErrorCode.INVALID_INPUT, 400, "Agent with this name already exists."
         )
+    except ModelSlotsUnusableError as e:
+        raise V1ApiError(
+            V1ErrorCode.MODEL_NOT_ASSIGNABLE,
+            400,
+            _unusable_models_message(e.rejections),
+            details={"models": e.rejections},
+        )
     if detail is None:
         raise V1ApiError(V1ErrorCode.AGENT_NOT_FOUND, 404)
     return _agent_detail(detail)
+
+
+@router.get("/{agent_id}/assignable-models", response_model=list[V1ModelForAgent])
+async def list_agent_assignable_models(
+    # ``agents.id`` is a 32-bit integer column.
+    agent_id: int = Path(gt=0, le=2**31 - 1),
+    authed: tuple[UserPrincipalSnapshot, PersonalApiKeySnapshot] = Depends(
+        get_user_from_personal_key
+    ),
+) -> list[V1ModelForAgent]:
+    """List the slot models the key holder can use, for an agent it can see.
+
+    Only ``llm`` models are listed, each with ``owner_can_use``; a model the
+    agent's owner cannot use is marked, not left out. Order is not guaranteed.
+    """
+    user, _key = authed
+    models = await AgentManagementRuntime().list_models_for_agent(
+        user_id=int(user.id), agent_id=agent_id
+    )
+    if models is None:
+        raise V1ApiError(V1ErrorCode.AGENT_NOT_FOUND, 404)
+    return [
+        V1ModelForAgent.model_validate(snapshot, from_attributes=True)
+        for snapshot in models
+    ]
 
 
 @router.post("/{agent_id}/api-key", response_model=RuntimeKeyResponse)

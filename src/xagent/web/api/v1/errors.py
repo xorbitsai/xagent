@@ -159,6 +159,12 @@ class V1ErrorCode(str, Enum):
     # ``reason`` one of ``not_shared``, ``disabled`` or ``unresolved``.
     CONNECTOR_NOT_SHARED = "connector_not_shared"
 
+    # An agent model slot would be set to a model it cannot take. 400.
+    # ``details.models`` lists each refused slot as ``{"slot", "id",
+    # "reason"}`` with ``reason`` one of ``unavailable``, ``not_llm`` or
+    # ``owner_cannot_use``; only ``owner_cannot_use`` adds ``owner_user_id``.
+    MODEL_NOT_ASSIGNABLE = "model_not_assignable"
+
     # The agent has never had its tools chosen and uses the default tool
     # set, so there is no selection to read connectors from or replace. 409.
     AGENT_TOOLS_UNCONFIGURED = "agent_tools_unconfigured"
@@ -306,6 +312,7 @@ _DEFAULT_MESSAGES: dict[V1ErrorCode, str] = {
     V1ErrorCode.CONNECTOR_NOT_SHARED: (
         "The agent would select connectors its team cannot use."
     ),
+    V1ErrorCode.MODEL_NOT_ASSIGNABLE: "An agent slot cannot use this model.",
     V1ErrorCode.AGENT_TOOLS_UNCONFIGURED: (
         "This agent uses the default tool set; choose its tools in the web app first."
     ),

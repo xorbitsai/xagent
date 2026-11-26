@@ -9,8 +9,6 @@ from typing import Any, Dict, List, Literal, Optional, cast
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, Field
-from sqlalchemy import String
-from sqlalchemy import cast as sql_cast
 from sqlalchemy import func, or_
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -34,7 +32,7 @@ from ..models.agent import Agent, AgentOrigin, AgentStatus
 from ..models.chat_message import TaskChatMessage
 from ..models.database import get_db, release_db_connection_if_clean
 from ..models.model import Model as DBModel
-from ..models.task import Task
+from ..models.task import Task, preview_task_agent_matches, preview_task_flag
 from ..models.user import User
 from ..schemas.agent import PromptContextFieldDeclaration, PromptContextFieldList
 from ..schemas.agent_api_key import (
@@ -1069,6 +1067,7 @@ def get_agent_preview_task(
     user_id = int(current_user.id)
     if AgentStore(db).get_owned_agent(user_id, agent_id) is None:
         raise HTTPException(status_code=404, detail="Agent not found")
+    postgresql = db.get_bind().dialect.name == "postgresql"
     task = (
         db.query(Task)
         .filter(
@@ -1086,12 +1085,14 @@ def get_agent_preview_task(
             # Compare serialized JSON scalars, never cast client JSON to an
             # integer/bool: malformed legacy values must not break PostgreSQL
             # history reads. SQLite serializes JSON true as 1.
-            sql_cast(Task.agent_config["is_preview"], String).in_(("true", "1")),
+            preview_task_flag(postgresql=postgresql),
             or_(
-                sql_cast(Task.agent_config["preview_agent_id"], String)
-                == str(agent_id),
-                sql_cast(Task.agent_config["preview_history_agent_id"], String)
-                == str(agent_id),
+                preview_task_agent_matches(
+                    "preview_agent_id", agent_id, postgresql=postgresql
+                ),
+                preview_task_agent_matches(
+                    "preview_history_agent_id", agent_id, postgresql=postgresql
+                ),
             ),
         )
         .order_by(Task.id.desc())

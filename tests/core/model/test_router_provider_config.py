@@ -123,6 +123,58 @@ def test_openrouter_non_auto_is_not_router_llm():
     assert isinstance(getattr(llm, "_inner", llm), OpenRouterLLM)
 
 
+def test_openrouter_model_config_passes_regional_endpoint_policy_to_adapter():
+    config = ChatModelConfig(
+        id="or-deepseek-us",
+        model_provider="openrouter",
+        model_name="deepseek/deepseek-v4.1-flash-1017",
+        base_url="https://us.openrouter.ai/api/v1",
+        openrouter_provider_only=["together/fp8", "inference-net/fp8"],
+        openrouter_zdr=True,
+        openrouter_data_collection="deny",
+    )
+
+    llm = create_base_llm(config)
+    inner = getattr(llm, "_inner", llm)
+
+    assert isinstance(inner, OpenRouterLLM)
+    assert inner.base_url == "https://us.openrouter.ai/api/v1"
+    assert inner._provider_only == ("together/fp8", "inference-net/fp8")
+    assert inner._require_zdr is True
+    assert inner._data_collection == "deny"
+
+
+@pytest.mark.parametrize(
+    ("provider", "provider_only", "message"),
+    [
+        ("openrouter", [], "non-empty slugs"),
+        ("openrouter", ["together/fp8", "together/fp8"], "duplicates"),
+        ("openai", ["together/fp8"], "requires the openrouter provider"),
+    ],
+)
+def test_openrouter_model_config_rejects_invalid_endpoint_policy(
+    provider, provider_only, message
+):
+    with pytest.raises(ValueError, match=message):
+        ChatModelConfig(
+            id="invalid-provider-policy",
+            model_provider=provider,
+            model_name="deepseek/deepseek-v4.1-flash-1017",
+            openrouter_provider_only=provider_only,
+        )
+
+
+def test_openrouter_model_config_rejects_privacy_policy_on_other_provider():
+    with pytest.raises(ValueError, match="requires the openrouter provider"):
+        ChatModelConfig(
+            id="invalid-privacy-policy",
+            model_provider="openai",
+            model_name="gpt-5.5",
+            openrouter_zdr=True,
+            openrouter_data_collection="deny",
+        )
+
+
 @pytest.mark.parametrize(
     ("provider", "expected_base_url"),
     [

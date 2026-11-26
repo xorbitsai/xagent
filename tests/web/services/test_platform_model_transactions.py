@@ -58,6 +58,37 @@ def test_default_platform_create_remains_active_and_committed(sessions):
         assert observed.managed_by == PLATFORM_MODEL_MANAGER
 
 
+def test_platform_openrouter_endpoint_policy_round_trips(sessions):
+    config = ChatModelConfig(
+        id="platform/openrouter-deepseek-us",
+        model_provider="openrouter",
+        model_name="deepseek/deepseek-v4.1-flash-1017",
+        api_key="platform-key",
+        base_url="https://us.openrouter.ai/api/v1",
+        openrouter_provider_only=["together/fp8", "inference-net/fp8"],
+        openrouter_zdr=True,
+        openrouter_data_collection="deny",
+        abilities=["chat", "tool_calling"],
+    )
+
+    with sessions() as db:
+        created = PlatformModelStore(db).create(config)
+        loaded = CoreStorage(db, Model).load(config.id)
+
+    assert created.openrouter_provider_only == [
+        "together/fp8",
+        "inference-net/fp8",
+    ]
+    assert isinstance(loaded, ChatModelConfig)
+    assert loaded.base_url == "https://us.openrouter.ai/api/v1"
+    assert loaded.openrouter_provider_only == [
+        "together/fp8",
+        "inference-net/fp8",
+    ]
+    assert loaded.openrouter_zdr is True
+    assert loaded.openrouter_data_collection == "deny"
+
+
 def test_staged_catalog_commits_model_link_and_default_together(sessions):
     with sessions() as db, sessions() as observer:
         created = PlatformModelStore(db).create(

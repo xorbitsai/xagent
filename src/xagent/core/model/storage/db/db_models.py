@@ -44,6 +44,9 @@ def create_model_table(Base: Type[Any]) -> Type[Any]:
         context_window = Column(
             Integer, nullable=True
         )  # Total context window in tokens
+        openrouter_provider_only = Column(JSON, nullable=True)
+        openrouter_zdr = Column(Boolean, nullable=True)
+        openrouter_data_collection = Column(String(16), nullable=True)
         bedrock_region = Column(String(64), nullable=True)
         bedrock_auth_mode = Column(String(32), nullable=True)
         language = Column(String(64), nullable=True)

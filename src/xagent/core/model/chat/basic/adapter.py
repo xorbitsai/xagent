@@ -124,6 +124,13 @@ def create_base_llm(
         # an explicit-credentials config must never end up on those.
         raise ValueError("An explicit, non-placeholder api_key is required")
 
+    if (
+        model.openrouter_provider_only is not None
+        or model.openrouter_zdr
+        or model.openrouter_data_collection is not None
+    ) and provider != "openrouter":
+        raise ValueError("OpenRouter routing policy requires the openrouter provider")
+
     if is_auto_router_model(provider, model.model_name):
         # Pick a concrete model via xrouter-llm. Legacy OpenRouter Auto clones
         # its own provider config; configured Auto injects saved model bindings.
@@ -179,6 +186,9 @@ def create_base_llm(
             default_max_tokens=model.default_max_tokens,
             timeout=model.timeout,
             abilities=model.abilities,
+            provider_only=model.openrouter_provider_only,
+            require_zdr=model.openrouter_zdr,
+            data_collection=model.openrouter_data_collection,
         )
     elif provider in {
         "dashscope",

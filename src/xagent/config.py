@@ -1415,14 +1415,24 @@ def _connector_oauth_callback_owned_origins() -> set[str]:
     fallback can be the default development localhost, which must not make a
     local callback eligible to move to a production origin. The public API and
     app origins are already empty unless explicitly set.
+
+    A configured base that strict public-origin matching cannot represent is
+    skipped, not fatal: an internal frontend such as ``http://xagent_web:3000``
+    or a bracketed IPv6 frontend is no source of its own, but it must not stop
+    an eligible public API origin from being recognized.
     """
     origins: set[str] = set()
     if public_entries_configured():
         origins.update(entry.origin for entry in get_public_entries())
     for value in (get_public_api_base_url(), get_app_base_url()):
-        if value:
-            parts = urlsplit(value)
-            origins.add(normalize_public_origin(f"{parts.scheme}://{parts.netloc}"))
+        if not value:
+            continue
+        parts = urlsplit(value)
+        try:
+            origin = normalize_public_origin(f"{parts.scheme}://{parts.netloc}")
+        except ValueError:
+            continue
+        origins.add(origin)
     return origins
 
 

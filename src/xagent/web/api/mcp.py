@@ -1155,11 +1155,16 @@ def _team_member_mcp_oauth_definition_refusal(
     # A blank value means unset here, as it does when the flow starts. A set
     # value must be the advertised callback or this deployment's own one.
     configured_redirect_uri = _configured_mcp_oauth_value(None, auth, "redirect_uri")
+    # Resolve the deployment callback the way a stored flow spelling does, so a
+    # legacy-origin value still compares equal; the advertised one stays as is.
     if configured_redirect_uri and get_connector_oauth_callback_uri(
         configured_redirect_uri, callback_path=MCP_OAUTH_CALLBACK_PATH
     ) not in {
         _default_mcp_oauth_redirect_uri(),
-        _mcp_oauth_callback_site_redirect_uri(),
+        get_connector_oauth_callback_uri(
+            _mcp_oauth_callback_site_redirect_uri(),
+            callback_path=MCP_OAUTH_CALLBACK_PATH,
+        ),
     }:
         return HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,

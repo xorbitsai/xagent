@@ -63,6 +63,48 @@ def test_public_api_origin_is_moved(monkeypatch):
     )
 
 
+@pytest.mark.parametrize(
+    ("frontend_base", "uri", "expected"),
+    [
+        (
+            "http://xagent_web:3000",
+            "https://api.tobybot.ai/api/mcp/oauth/callback",
+            "https://cloud.tobybot.ai/api/mcp/oauth/callback",
+        ),
+        (
+            "http://[::1]:3000",
+            "https://api.tobybot.ai/api/mcp/oauth/callback",
+            "https://cloud.tobybot.ai/api/mcp/oauth/callback",
+        ),
+        (
+            "http://xagent_web:3000",
+            "http://xagent_web:3000/api/mcp/oauth/callback",
+            "http://xagent_web:3000/api/mcp/oauth/callback",
+        ),
+        (
+            "http://[::1]:3000",
+            "http://[::1]:3000/api/mcp/oauth/callback",
+            "http://[::1]:3000/api/mcp/oauth/callback",
+        ),
+        (
+            "http://xagent_web:3000",
+            "https://customer.example/api/mcp/oauth/callback",
+            "https://customer.example/api/mcp/oauth/callback",
+        ),
+    ],
+)
+def test_unmatchable_frontend_base_does_not_abort_owned_sources(
+    monkeypatch, frontend_base, uri, expected
+):
+    monkeypatch.setenv("XAGENT_PUBLIC_API_BASE_URL", "https://api.tobybot.ai")
+    monkeypatch.setenv("XAGENT_APP_BASE_URL", frontend_base)
+    monkeypatch.setenv(
+        "XAGENT_CONNECTOR_OAUTH_CALLBACK_BASE_URL", "https://cloud.tobybot.ai"
+    )
+
+    assert rewrite(uri) == expected
+
+
 def test_each_trusted_public_entry_is_a_source(monkeypatch):
     monkeypatch.setenv("XAGENT_APP_BASE_URL", "https://cloud.tobybot.ai")
     monkeypatch.setenv(

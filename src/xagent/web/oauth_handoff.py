@@ -388,6 +388,22 @@ def redeem_handoff(
         assert flow is not None and client is not None
         if mcp._mcp_oauth_flow_state_error(db, flow) is not None:
             reject()
+        # Re-read both rows in one statement: a concurrent connect can backfill
+        # a legacy flow's NULL URI or move the shared client, so the identity
+        # map may hold stale values. populate_existing forces the refresh.
+        pair = (
+            db.query(MCPOAuthFlowState, MCPOAuthClient)
+            .join(
+                MCPOAuthClient,
+                MCPOAuthClient.id == MCPOAuthFlowState.mcp_oauth_client_id,
+            )
+            .filter(MCPOAuthFlowState.id == flow.id)
+            .populate_existing()
+            .one_or_none()
+        )
+        if pair is None:
+            reject()
+        flow, client = pair
         params = {
             "response_type": "code",
             "client_id": str(client.client_id),

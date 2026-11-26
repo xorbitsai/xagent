@@ -14,7 +14,7 @@ from uuid import uuid4
 import httpx
 import pytest
 from fastapi import HTTPException
-from sqlalchemy import create_engine, event
+from sqlalchemy import create_engine, event, inspect
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Query, sessionmaker
 from starlette.requests import Request
@@ -6339,3 +6339,154 @@ async def test_regional_bootstrap_moves_proof_without_changing_flow_client(
     with pytest.raises(HTTPException) as exc:
         redeem_handoff("au", bootstrap, db)
     assert exc.value.status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_regional_handoff_uses_one_coherent_snapshot_across_client_cutover(
+    db_session, monkeypatch
+):
+    """A legacy flow's original callback survives a concurrent connect cutover.
+
+    The handoff session consumes the ticket and revalidates the flow, which
+    reloads its NULL redirect snapshot. A concurrent connect then commits one
+    transaction that backfills that flow's original callback and moves the
+    shared client to the new one. The authorization request must still carry
+    the original callback from one persisted row pair, never the reloaded NULL
+    paired with the client's new URI. This is the URI the callback later
+    exchanges with.
+    """
+    from fastapi import FastAPI
+
+    from xagent.web.oauth_handoff import (
+        OAuthHandoffContext,
+        issue_handoff,
+        redeem_handoff,
+    )
+
+    old = "https://xagent.example.com"
+    new = "https://new.example.com"
+    original_callback = old + "/api/mcp/oauth/callback"
+    new_callback = new + "/api/mcp/oauth/callback"
+    monkeypatch.setenv("XAGENT_APP_BASE_URL", old)
+    monkeypatch.setenv("XAGENT_DUAL_ENTRY_OAUTH_ENABLED", "true")
+    monkeypatch.setenv(
+        "XAGENT_PUBLIC_ENTRIES_JSON",
+        json.dumps(
+            [
+                {
+                    "origin": origin,
+                    "region_cookie_domain": None,
+                    "google_oidc_redirect_uri": origin
+                    + "/api/auth/oidc/google/callback",
+                }
+                for origin in [old, new]
+            ]
+        ),
+    )
+    db, user, _ = db_session
+    server, client, flow = _add_callback_client_and_state(
+        db, user, state="handoff-cutover", redirect_after="/auth/mcp-complete"
+    )
+    # A flow created before the redirect snapshot existed; the shared client
+    # still carries the callback that flow's authorization must use.
+    assert flow.redirect_uri is None
+    assert client.redirect_uri == original_callback
+    flow_id, client_id = int(flow.id), int(client.id)
+    state_value, public_client_id = flow.state, client.client_id
+
+    class Adapter:
+        def context(self, request):
+            return OAuthHandoffContext("xagent", "prod", "au", old)
+
+        def set_route_cookie(self, response, *, state, kind, provider):
+            assert kind == "mcp" and provider is None
+            response.set_cookie("scoped-mcp", "au")
+
+    app = FastAPI()
+    app.state.oauth_handoff_adapter = Adapter()
+    launch_request = _request("/", headers=[(b"host", b"new.example.com")])
+    launch_request.scope["app"] = app
+    launch = issue_handoff(
+        launch_request,
+        user,
+        kind="mcp",
+        resource={
+            "state": state_value,
+            "client_id": client_id,
+            "server_id": int(server.id),
+        },
+    )
+    step_one = _request(
+        launch["authorization_url"], headers=[(b"host", b"xagent.example.com")]
+    )
+    step_one.scope["app"] = app
+    page = redeem_handoff("au", step_one, db)
+    assert page.status_code == 200
+    href = html.unescape(re.search(r'href="([^"]+)"', page.body.decode())[1])
+    confirm_cookie = page.headers["set-cookie"].split(";", 1)[0]
+
+    SessionLocal = sessionmaker(bind=db.get_bind(), autoflush=False, autocommit=False)
+    real_flow_state_error = mcp_api._mcp_oauth_flow_state_error
+    cutovers: list[bool] = []
+
+    def commit_cutover_after_post_consume_revalidation(db_, flow_):
+        # The ticket consume committed and expired this session's rows, so the
+        # reloaded flow still reads NULL here. A concurrent connect commits its
+        # cutover right after that read, pinning the flow's original callback
+        # and moving the shared client in one transaction.
+        expired = inspect(flow_).expired
+        error = real_flow_state_error(db_, flow_)
+        if expired:
+            with SessionLocal() as concurrent_db:
+                pinned = (
+                    concurrent_db.query(MCPOAuthFlowState)
+                    .filter(
+                        MCPOAuthFlowState.id == flow_id,
+                        MCPOAuthFlowState.redirect_uri.is_(None),
+                    )
+                    .update(
+                        {MCPOAuthFlowState.redirect_uri: original_callback},
+                        synchronize_session=False,
+                    )
+                )
+                moved = (
+                    concurrent_db.query(MCPOAuthClient)
+                    .filter(MCPOAuthClient.id == client_id)
+                    .update(
+                        {MCPOAuthClient.redirect_uri: new_callback},
+                        synchronize_session=False,
+                    )
+                )
+                assert (pinned, moved) == (1, 1)
+                concurrent_db.commit()
+            cutovers.append(True)
+        return error
+
+    monkeypatch.setattr(
+        mcp_api,
+        "_mcp_oauth_flow_state_error",
+        commit_cutover_after_post_consume_revalidation,
+    )
+
+    step_two = _request(
+        launch["authorization_url"].split("?", 1)[0] + href,
+        headers=[
+            (b"host", b"xagent.example.com"),
+            (b"cookie", confirm_cookie.encode()),
+        ],
+    )
+    step_two.scope["app"] = app
+    released = redeem_handoff("au", step_two, db)
+
+    assert cutovers == [True]
+    assert released.status_code == 303
+    query = _redirect_query(released)
+    assert query["redirect_uri"] == [original_callback]
+    assert query["client_id"] == [public_client_id]
+    # The authorization used the same persisted snapshot the callback will
+    # exchange with, even though the shared client already moved on.
+    with SessionLocal() as fresh_db:
+        assert (
+            fresh_db.get(MCPOAuthFlowState, flow_id).redirect_uri == original_callback
+        )
+        assert fresh_db.get(MCPOAuthClient, client_id).redirect_uri == new_callback

@@ -635,6 +635,37 @@ describe("widget session mode", () => {
     expect(fetchMock).toHaveBeenCalledTimes(2)
   })
 
+  it("keeps the rapid recovery budget after a 50-second 1001 close and 15-second delay", async () => {
+    vi.useFakeTimers()
+    let exchanges = 0
+    fetchMock.mockImplementation(() => Promise.resolve(jsonResponse(200, exchangeBody({
+      reconnect_token: `rt_${exchanges++}`,
+    }))))
+    runWidget({ "data-encrypted-context": GRANT })
+    const post = spyOnIframePostMessage()
+    await vi.advanceTimersByTimeAsync(0)
+    fromIframe("ready")
+    for (let i = 0; i < 3; i += 1) {
+      fromIframe("reconnect_request", { reason: "ws_closed" })
+      await vi.advanceTimersByTimeAsync(0)
+    }
+    const deliveryId = post.mock.calls.filter(([message]) => message.type === "session_update")
+      .at(-1)?.[0].session_delivery_id
+    fromIframe("session_connection_open", { session_delivery_id: deliveryId })
+    await vi.advanceTimersByTimeAsync(50_000)
+    fromIframe("session_connection_closed", { session_delivery_id: "stale" })
+    fromIframe("session_connection_closed", { session_delivery_id: deliveryId })
+    await vi.advanceTimersByTimeAsync(15_000)
+    expect(fetchMock).toHaveBeenCalledTimes(4)
+    fromIframe("reconnect_request", { reason: "ws_closed" })
+    await vi.advanceTimersByTimeAsync(0)
+    expect(fetchMock).toHaveBeenCalledTimes(4)
+    expect(post).toHaveBeenCalledWith(
+      expect.objectContaining({ type: "session_terminal", code: "network_unavailable" }),
+      HOST,
+    )
+  })
+
   it.each([
     [59_999, 2],
     [60_000, 3],

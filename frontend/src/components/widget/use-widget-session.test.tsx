@@ -413,6 +413,12 @@ describe("useWidgetSession", () => {
       expect(result.current.session).toBeNull()
       expect(result.current.agent?.name).toBe("Support Agent")
       expect(reconnectRequests(postMessage)).toEqual([])
+      expect(postMessage).toHaveBeenCalledWith({
+        xagent: true,
+        v: 1,
+        type: "session_connection_closed",
+        session_delivery_id: "delivery-a",
+      }, PARENT_ORIGIN)
 
       act(() => vi.advanceTimersByTime(GOING_AWAY_RECONNECT_MAX_DELAY_MS / 2 - 1))
       expect(reconnectRequests(postMessage)).toEqual([])

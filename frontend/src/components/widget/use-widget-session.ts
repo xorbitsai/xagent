@@ -401,6 +401,16 @@ export function useWidgetSession() {
     // dropped connection, but after a random delay, because every other widget
     // behind the same proxy or server got the same close at the same moment.
     if (event.code === 1001) {
+      const deliveryId = activeDeliveryIdRef.current
+      const targetOrigin = targetOriginRef.current
+      if (activeSessionGenerationRef.current !== null && deliveryId && targetOrigin && mountedRef.current) {
+        window.parent.postMessage({
+          xagent: true,
+          v: 1,
+          type: "session_connection_closed",
+          session_delivery_id: deliveryId,
+        }, targetOrigin)
+      }
       startReconnect("ws_closed", Math.round(Math.random() * GOING_AWAY_RECONNECT_MAX_DELAY_MS))
       return "handled"
     }

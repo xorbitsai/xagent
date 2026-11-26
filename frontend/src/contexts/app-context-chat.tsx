@@ -7328,6 +7328,19 @@ export function AppProvider({
         })
         break
 
+      case "task_started":
+        console.trace('Original message:', JSON.stringify(message), 'Handler: handleMessage (task_started)')
+        dispatch({
+          type: "UPDATE_TASK_STATUS",
+          payload: {
+            status: controlEnvelope.status || "running",
+            runId: controlEnvelope.runId,
+            stateVersion: controlEnvelope.stateVersion,
+            controlState: controlEnvelope.controlState || "running",
+          },
+        })
+        break
+
       case "agent_error":
         console.trace('Original message:', JSON.stringify(message), 'Handler: handleMessage (agent_error)')
         const agentErrorCode = getWebSocketErrorCode(message)

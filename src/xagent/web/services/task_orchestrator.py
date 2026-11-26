@@ -18,8 +18,11 @@ its own adapter):
   - response shapes / error envelopes
     (``{"detail": ...}`` for ``/api/*`` vs ``{"error": {"code", "message"}}``
     for ``/v1/*``)
-  - live broadcast events (WS sends ``task_started`` / ``task_completed``;
-    SDK doesn't)
+
+Live broadcast events go through ``task_events.publish_task_event`` to
+whatever sink the host registered. This module publishes some of them
+itself, among them ``task_started`` from ``_schedule_bg`` when the caller
+passes both the lease and the claimed state version.
 
 Background context — why we replaced the older ``task_execution.py``
 helper with this orchestrator:
@@ -63,6 +66,7 @@ from ...config import (
 from ...core.agent.context.execution import CLOCK_TIMEZONE_METADATA_KEY
 from ...core.agent.interruption import InterruptionReason
 from ...core.execution_scope import resolve_execution_scope
+from ...core.runtime_performance import increment_counter
 from ...core.tools.adapters.vibe.config import RequiredMCPUnavailableError
 from ...core.tools.adapters.vibe.connector_runtime import ConnectorRuntimeError
 from ..models.task import Task, TaskStatus
@@ -800,6 +804,7 @@ async def _schedule_committed_turn(
             context=context,
             before_message_id=claimed.before_message_id,
             mcp_runtime_authorization_policy=mcp_runtime_authorization_policy,
+            claimed_state_version=claimed.state_version,
         )
     except BaseException as schedule_error:
         # Schedule failed after the claim committed -> force FAILED so the row
@@ -2615,6 +2620,7 @@ def _schedule_bg(
     before_message_id: Optional[int] = None,
     mcp_runtime_authorization_policy: MCPBuiltinOAuthActorPolicy | None = None,
     channel_command: ClaimedTaskCommand | None = None,
+    claimed_state_version: int | None = None,
 ) -> "asyncio.Task[None]":
     """Lease-aware bg scheduler.
 
@@ -2643,6 +2649,12 @@ def _schedule_bg(
         lease lifecycle. A SQLAlchemy pool checkout timeout is the deliberate
         exception: heartbeat stops, the exact lease remains intact, and TTL
         recovery reconciles it without an immediate second checkout.
+
+    When the caller supplies both ``task_lease`` and ``claimed_state_version``
+    (the state version committed with the claim), the run announces itself with
+    a ``task_started`` frame before its first trace event, so clients learn the
+    new run id before any of its events arrive. Callers that omit either one
+    publish nothing.
 
     Takes primitives only (``task_id`` / ``task_owner_user_id`` /
     ``task_source``); the
@@ -2757,6 +2769,33 @@ def _schedule_bg(
                             user_id=task_owner_user_id,
                             turn_id=payload.turn_id,
                         )
+                    if task_lease is not None and claimed_state_version is not None:
+                        # Announce the run before any of its trace events so
+                        # clients that filter by run id learn the new id first.
+                        # The frame carries its own state tuple; a failed
+                        # publish must not fail the run.
+                        try:
+                            from .task_events import publish_task_event
+
+                            await publish_task_event(
+                                {
+                                    "type": "task_started",
+                                    "task_id": task_id,
+                                    "run_id": lease.run_id,
+                                    "state_version": claimed_state_version,
+                                    "control_state": "running",
+                                    "status": "running",
+                                    "timestamp": datetime.now(timezone.utc).timestamp(),
+                                },
+                                task_id,
+                            )
+                        except Exception:
+                            logger.warning(
+                                "task_started publish failed for task %s",
+                                task_id,
+                                exc_info=True,
+                            )
+                            increment_counter("xagent.task.started_publish.failed")
                     # Snapshot and scope resolution each own a short Session in a
                     # worker. Drain either worker if cancellation arrives so final
                     # settlement never races an abandoned pool checkout.

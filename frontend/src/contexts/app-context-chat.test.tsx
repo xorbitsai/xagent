@@ -1233,6 +1233,62 @@ describe("AppProvider websocket message routing", () => {
     expect(screen.getByTestId("stream-recovery").textContent).toBe("1")
   })
 
+  describe("a new run announced by task_started", () => {
+    const runFrame = (eventType: string, runId: string, text: string) => {
+      const data = eventType === "user_message"
+        ? { message: text, turn_id: `turn-${runId}` }
+        : eventType === "ai_message"
+          ? { status: "completed", content: text, pattern: "react", execution_id: `x-${runId}` }
+          : { success: true, result: { output: text, meta_marker: text } }
+      return {
+        type: "trace_event", event_type: eventType, stream_run_id: runId,
+        data: { event_id: `${eventType}-${runId}`, data },
+      }
+    }
+    const setup = () => {
+      render(<AppProvider token="token"><SeedRunningTask /><StateProbe /></AppProvider>)
+      const send = (message: Record<string, unknown>) => act(() => {
+        webSocketOptions.current?.onMessage?.({
+          task_id: 1, timestamp: "2026-05-27T05:00:00Z", ...message,
+        } as never)
+      })
+      send({ type: "task_started", run_id: "run-a", state_version: 1, status: "running", control_state: "running" })
+      send({ type: "task_completed", run_id: "run-a", state_version: 2, status: "completed",
+        control_state: "completed", task: { id: 1, status: "completed" }, success: true })
+      return send
+    }
+
+    it.each(["user_message", "ai_message", "task_completion"])(
+      "processes a later run's %s event after its task_started",
+      (eventType) => {
+        const send = setup()
+        // task_started carries no stream_run_id (the lease context binds later).
+        send({ type: "task_started", run_id: "run-b", state_version: 3, status: "running", control_state: "running" })
+        expect(screen.getByTestId("task-status").textContent).toBe("running")
+        send(runFrame(eventType, "run-b", "RUN B TEXT"))
+        // A completion renders as non-string content, so assert a bubble exists.
+        const messages = JSON.parse(screen.getByTestId("messages").textContent || "[]")
+        expect(messages.length).toBeGreaterThan(0)
+        if (eventType !== "task_completion") {
+          expect(JSON.stringify(messages)).toContain("RUN B TEXT")
+        }
+      },
+    )
+
+    it("drops the later run's events when no task_started announced it", () => {
+      const send = setup()
+      send(runFrame("ai_message", "run-b", "UNANNOUNCED"))
+      expect(screen.getByTestId("messages").textContent).toBe("[]")
+    })
+
+    it("still drops a late event of the previous run", () => {
+      const send = setup()
+      send({ type: "task_started", run_id: "run-b", state_version: 3, status: "running", control_state: "running" })
+      send(runFrame("ai_message", "run-a", "LATE RUN A"))
+      expect(screen.getByTestId("messages").textContent).not.toContain("LATE RUN A")
+    })
+  })
+
   it("reconciles a gapped shared stream without appending later deltas or accepting an old run", () => {
     render(<AppProvider token="token"><SeedRunningTask /><StateProbe /></AppProvider>)
     const send = (message: Partial<TestWebSocketMessage>) => act(() => {

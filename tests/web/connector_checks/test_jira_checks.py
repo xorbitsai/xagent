@@ -41,7 +41,7 @@ FIXTURES = {
 VERDICTS = {"jira_create_issue": "deny", "jira_delete_issue": "deny"}
 NAMED = re.compile(r"xagent-smoke-[0-9]{12}-[0-9a-f]{6}-issue")
 _JQL = re.compile(r"project = (?P<project>[A-Z]+) ORDER BY (key|created) ASC")
-_ISSUE = re.compile(r"/rest/api/2/issue/(?P<key>[^/]+)(?P<comments>/comment)?")
+_ISSUE = re.compile(r"/rest/api/2/issue/(?P<key>[^/]+)(?P<suffix>/comment|/changelog)?")
 # The site's field table, in the shape Jira's /rest/api/2/field answers with:
 # one system field and one custom field, the custom one with the JQL names
 # and schema a real custom field carries.
@@ -156,7 +156,21 @@ class Site:
         if match is None or match["key"] not in self.issues:
             raise RuntimeError("404 Client Error: Not Found")
         key = match["key"]
-        if match["comments"]:
+        if match["suffix"] == "/changelog":
+            history = [
+                {
+                    "created": "2026-11-11T00:00:00.000+0000",
+                    "items": [
+                        {"field": "status", "fromString": "Open", "toString": "To Do"}
+                    ],
+                }
+            ]
+            start = params["startAt"]
+            return {
+                "total": len(history),
+                "values": history[start : start + params["maxResults"]],
+            }
+        if match["suffix"] == "/comment":
             comments = self.comments.get(key, [])
             return {"comments": comments, "total": len(comments), "startAt": 0}
         if method == "GET":
@@ -178,6 +192,7 @@ _TOOLS = (
     "jira_create_issue",
     "jira_update_issue",
     "jira_list_transitions",
+    "jira_list_status_changes",
     "jira_transition_issue",
     "jira_list_comments",
     "jira_add_comment",
@@ -240,6 +255,7 @@ _CHECKS = (
     "jira.l3_probe",
     "jira.search_issues",
     "jira.list_comments",
+    "jira.list_status_changes",
     "jira.get_issue",
     "jira.list_fields",
     "jira.current_user",
@@ -258,6 +274,7 @@ def test_jira_checks_the_tools_that_carry_its_calls() -> None:
         "jira_list_accessible_sites",
         "jira_search_issues",
         "jira_list_comments",
+        "jira_list_status_changes",
         "jira_get_issue",
         "jira_list_fields",
         "jira_get_current_user",

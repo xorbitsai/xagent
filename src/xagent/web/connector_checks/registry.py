@@ -356,6 +356,19 @@ def _jira_checks() -> ConnectorChecks:
                 ),
             ),
             ReadCheck(
+                "jira.list_status_changes",
+                "jira_list_status_changes",
+                {"cloud_id": tenant, "issue_key": seeded_issue},
+                assertions=(
+                    StatusSuccess(),
+                    HasKeys(
+                        (),
+                        ("status_changes", "total_history_count", "previous_start_at"),
+                    ),
+                    EachHasKeys(("status_changes",), ("at", "from", "to")),
+                ),
+            ),
+            ReadCheck(
                 "jira.get_issue",
                 "jira_get_issue",
                 {"cloud_id": tenant, "issue_key": seeded_issue},

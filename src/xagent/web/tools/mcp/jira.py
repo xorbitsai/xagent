@@ -2610,7 +2610,9 @@ def jira_list_status_changes(
     By default fetch the latest page. Each result gives previous_start_at;
     pass it as start_at to inspect older history until the requested time
     window is covered. A page may have no status changes even when older
-    pages do. This is historical data, unlike jira_list_transitions, which
+    pages do. If latest_page_complete is false, fetch next_start_at before
+    paging backward: the history changed during this read. This is historical
+    data, unlike jira_list_transitions, which
     lists transitions currently available to perform.
     """
     try:
@@ -2618,7 +2620,8 @@ def jira_list_status_changes(
         if start_at is not None and (not isinstance(start_at, int) or start_at < 0):
             return _error("start_at must be a non-negative integer")
         path = _issue_path(issue_key, "/changelog")
-        if start_at is None:
+        latest_requested = start_at is None
+        if latest_requested:
             first = _request(
                 "GET", cloud_id, path, params={"startAt": 0, "maxResults": 1}
             )
@@ -2628,12 +2631,29 @@ def jira_list_status_changes(
         else:
             offset = start_at
 
-        result = _request(
-            "GET", cloud_id, path,
-            params={"startAt": offset, "maxResults": page_size},
+        for relocation in range(3 if latest_requested else 1):
+            result = _request(
+                "GET",
+                cloud_id,
+                path,
+                params={"startAt": offset, "maxResults": page_size},
+            )
+            if (
+                not isinstance(result, dict)
+                or not isinstance(result.get("values"), list)
+                or not isinstance(result.get("total"), int)
+            ):
+                return _error("Unexpected response format from Jira changelog API")
+            desired_offset = max(0, result["total"] - page_size)
+            if not latest_requested or desired_offset == offset or relocation == 2:
+                break
+            offset = desired_offset
+
+        latest_page_complete = (
+            offset + len(result["values"]) >= result["total"]
+            if latest_requested
+            else None
         )
-        if not isinstance(result, dict) or not isinstance(result.get("values"), list):
-            return _error("Unexpected response format from Jira changelog API")
         changes = [
             {
                 "at": history.get("created"),
@@ -2652,10 +2672,16 @@ def jira_list_status_changes(
             returned_history_count=len(result["values"]),
             total_history_count=result.get("total"),
             previous_start_at=max(0, offset - page_size) if offset else None,
+            latest_page_complete=latest_page_complete,
+            next_start_at=(offset + len(result["values"]))
+            if latest_requested and not latest_page_complete
+            else None,
         )
     except Exception as e:
         safe_message = _safe_text(e)
-        logger.error(f"Error listing Jira status history for {issue_key}: {safe_message}")
+        logger.error(
+            f"Error listing Jira status history for {issue_key}: {safe_message}"
+        )
         return _error(safe_message)
 
 

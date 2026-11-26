@@ -1,11 +1,16 @@
 """Builder history reuses owner-scoped tasks and their persisted transcript."""
 
 import asyncio
+from threading import Event
+from unittest.mock import MagicMock
 
 import pytest
+from fastapi import FastAPI
+from httpx import ASGITransport, AsyncClient
 from sqlalchemy.orm import Session
 
 from tests.shared.postgres_disposable import disposable_database_factory
+from xagent.web.api import agents
 from xagent.web.api.agents import get_agent_preview_task
 from xagent.web.models.agent import Agent
 from xagent.web.models.chat_message import TaskChatMessage
@@ -345,7 +350,7 @@ def test_postgresql_preview_query_ignores_malformed_metadata():
                 )
             )
             db.commit()
-            result = asyncio.run(get_agent_preview_task(agent.id, user, db))
+            result = get_agent_preview_task(agent.id, user, db)
             assert result is not None
             assert result.task_id == task.id
             assert result.message == "Sample"
@@ -356,10 +361,9 @@ def test_postgresql_preview_query_ignores_malformed_metadata():
                 "preview_history_agent_id": agent.id,
             }
             db.commit()
-            assert (
-                asyncio.run(get_agent_preview_task(agent.id, user, db)).task_id
-                == task.id
-            )
+            bound = get_agent_preview_task(agent.id, user, db)
+            assert bound is not None
+            assert bound.task_id == task.id
 
 
 def test_legacy_preview_without_snapshot_is_not_current_config():
@@ -388,3 +392,42 @@ def test_deleted_preview_is_not_returned():
         client.get(f"/api/agents/{agent['id']}/preview-task", headers=headers).json()
         is None
     )
+
+
+def test_slow_preview_query_does_not_block_other_requests(monkeypatch):
+    query_started = Event()
+    release_query = Event()
+    db = MagicMock(spec=Session)
+
+    def slow_query():
+        query_started.set()
+        assert release_query.wait(timeout=5), "query outlasted the probe"
+        return None
+
+    db.query.return_value.filter.return_value.order_by.return_value.first.side_effect = slow_query
+    monkeypatch.setattr(agents.AgentStore, "get_owned_agent", lambda *_: object())
+    app = FastAPI()
+    app.include_router(agents.router)
+    app.dependency_overrides[agents.get_current_user] = lambda: User(id=1)
+    app.dependency_overrides[agents.get_db] = lambda: db
+
+    @app.get("/probe")
+    async def probe():
+        return {"ok": True}
+
+    async def check():
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as browser:
+            preview = asyncio.create_task(browser.get("/api/agents/1/preview-task"))
+            try:
+                assert await asyncio.to_thread(query_started.wait, 3)
+                assert (await browser.get("/probe")).json() == {"ok": True}
+                assert not preview.done(), "the probe must finish during the query"
+            finally:
+                release_query.set()
+                response = await preview
+            assert response.status_code == 200
+            assert response.json() is None
+
+    asyncio.run(check())

@@ -1999,16 +1999,14 @@ export function projectAppState(state: AppState, action: AppAction): AppState {
         }
       }
 
-      // One assistant question can be delivered twice -- live, then replayed
-      // from the transcript after a reconnect -- under one event identity but
-      // with different text, because the replayed copy carries the rendered
-      // interaction list. Identity decides, never text: #2250 is the record
-      // of what text matching costs. The mounted bubble is kept rather than
-      // replaced so an open clarification form is not remounted under the
-      // visitor; the re-delivery only fills in what the bubble lacks. Content
-      // is deliberately not among those fields: one event id is one question,
-      // and the replayed copy differs only by the rendered interaction list
-      // the form already draws.
+      // A message with one event identity can be delivered twice: live, then
+      // replayed after a reconnect. A replayed question carries the rendered
+      // interaction list; a replayed answer can carry rewritten file links.
+      // Identity decides, never text: #2250 is the record of what text
+      // matching costs. The mounted bubble is kept rather than replaced so an
+      // open clarification form is not remounted under the visitor; the
+      // re-delivery only fills in what the bubble lacks. Content is
+      // deliberately not among those fields: one event id is one message.
       if (messageToAdd.role === "assistant" && isStableAssistantMessageId(messageToAdd.id)) {
         const deliveredIndex = state.messages.findIndex(
           message => message.role === "assistant" && message.id === messageToAdd.id,
@@ -4780,6 +4778,14 @@ export function AppProvider({
                 message.event_id || traceEventData.event_id || eventData.event_id,
               )
               : null
+            // An ai_message gets its own identity variable on purpose:
+            // agentMessageId also gates the refusal and result-card content
+            // dedup exemptions below, which an ai_message must not gain.
+            const aiMessageId = isAiMessage
+              ? stableAssistantMessageId(
+                message.event_id || traceEventData.event_id || eventData.event_id,
+              )
+              : null
             // Identical refusals can belong to different turns. The persisted
             // message ID also pairs the live refusal with its history replay.
             const identifiedRefusal = eventData.message_type === "input_review_rejected"
@@ -4792,7 +4798,7 @@ export function AppProvider({
             )) {
               return
             }
-            const msgId = canonicalMessageId ?? agentMessageId ?? generateMessageId("msg-agent")
+            const msgId = canonicalMessageId ?? agentMessageId ?? aiMessageId ?? generateMessageId("msg-agent")
             dispatch({
               type: "ADD_MESSAGE",
               payload: {

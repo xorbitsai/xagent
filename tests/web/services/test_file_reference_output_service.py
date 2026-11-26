@@ -1678,3 +1678,28 @@ def test_a_container_of_strings_raises_rather_than_reading_as_empty(container):
         list(iter_markdown_file_references(container))
     with pytest.raises(TypeError):
         replace_markdown_file_references(container, lambda reference: "x")
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "Ready: [generated_video.mp4](file:real-id)",
+        "Ready: [generated_video.mp4](file:invented-id)",
+        "Ready: [other.mp4](file:missing-id)",
+    ],
+    ids=["canonical", "repaired", "fake"],
+)
+def test_reconcile_is_idempotent(content):
+    db, user, task = _create_context()
+    try:
+        _add_file(db, user, task, file_id="real-id", filename="generated_video.mp4")
+
+        def reconcile(text):
+            return reconcile_assistant_file_references(
+                db, task_id=int(task.id), user_id=int(user.id), content=text
+            )
+
+        once = reconcile(content)
+        assert reconcile(once) == once
+    finally:
+        db.close()

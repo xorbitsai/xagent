@@ -14893,3 +14893,220 @@ describe("session message queue", () => {
     })
   })
 })
+
+describe("assistant answer identity across live delivery and replay", () => {
+  const ANSWER = "The refund was issued."
+  const SECOND = "A different question."
+
+  beforeEach(() => {
+    webSocketOptions.current = null
+    webSocketOptions.all = []
+    wsHarness.isConnected = true
+    wsHarness.connectionPhase = "connected"
+    apiRequestMock.mockReset()
+    localStorage.clear()
+    ;(window as typeof window & { clearDuplicateMessageCache?: () => void })
+      .clearDuplicateMessageCache?.()
+    vi.useFakeTimers()
+  })
+
+  afterEach(() => {
+    cleanup()
+    localStorage.clear()
+    vi.useRealTimers()
+  })
+
+  const mount = () => render(
+    <AppProvider token="token"><SeedRunningTask /><StateProbe /></AppProvider>,
+  )
+
+  const deliver = (frame: Record<string, unknown>) => act(() => {
+    webSocketOptions.current?.onMessage?.({
+      type: "trace_event", task_id: 1, timestamp: "2026-05-27T05:00:00Z", ...frame,
+    } as never)
+  })
+
+  const aiMessage = (event_id: string, content = ANSWER, extra: Record<string, unknown> = {}) => deliver({
+    event_type: "ai_message", event_id,
+    data: { content, status: "completed", ...extra },
+  })
+
+  // The transcript copy of an answer: an agent_message row that carries its
+  // own event id, different from the trace row's.
+  const chatRecord = (event_id: string, content = ANSWER, extra: Record<string, unknown> = {}) => deliver({
+    event_type: "agent_message", event_id,
+    data: {
+      message: content, role: "assistant", source: "chat_history", display: "chat",
+      expect_response: false, ...extra,
+    },
+  })
+
+  const elapse = (ms: number) => act(() => { vi.advanceTimersByTime(ms) })
+
+  const shown = (content: string) => (
+    JSON.parse(screen.getByTestId("messages").textContent || "[]") as Array<{
+      id: string; role: string; content: string
+    }>
+  ).filter(message => message.role === "assistant" && message.content === content)
+
+  // The replayed copy of an answer can carry rewritten file links, so the two
+  // deliveries of one event differ in text. The first delivery stays mounted.
+  const LIVE_COPY = "Report ready: file:abc"
+  const REPLAY_COPY = "Report ready: /files/abc"
+
+  it("keeps the live copy when its replay with rewritten links arrives later", () => {
+    mount()
+    aiMessage("event-1", LIVE_COPY)
+    elapse(31_000)
+    aiMessage("event-1", REPLAY_COPY)
+    expect(shown(LIVE_COPY)).toHaveLength(1)
+    expect(shown(REPLAY_COPY)).toHaveLength(0)
+  })
+
+  it("keeps the replayed copy when the live frame with original links arrives later", () => {
+    mount()
+    act(() => { webSocketOptions.current?.onConnect?.() })
+    aiMessage("event-1", REPLAY_COPY)
+    elapse(31_000)
+    aiMessage("event-1", LIVE_COPY)
+    expect(shown(REPLAY_COPY)).toHaveLength(1)
+    expect(shown(LIVE_COPY)).toHaveLength(0)
+  })
+
+  it("shows one answer when the live frame arrives before an identical replay", () => {
+    mount()
+    aiMessage("event-1")
+    elapse(31_000)
+    aiMessage("event-1")
+    expect(shown(ANSWER)).toHaveLength(1)
+  })
+
+  it("shows one answer after consecutive reconnect replays", () => {
+    mount()
+    aiMessage("event-1")
+    for (let reconnect = 0; reconnect < 4; reconnect += 1) {
+      elapse(31_000)
+      aiMessage("event-1")
+    }
+    expect(shown(ANSWER)).toHaveLength(1)
+  })
+
+  it("keeps two answers with identical text that are more than 30 seconds apart", () => {
+    mount()
+    aiMessage("event-1")
+    elapse(31_000)
+    aiMessage("event-2")
+    expect(shown(ANSWER)).toHaveLength(2)
+  })
+
+  it("keeps the content dedup for a trace row plus an identical transcript row", () => {
+    mount()
+    aiMessage("trace-row-1")
+    chatRecord("chat-row-1")
+    expect(shown(ANSWER)).toHaveLength(1)
+  })
+
+  it("keeps the content dedup when the transcript row arrives first", () => {
+    mount()
+    chatRecord("chat-row-1")
+    aiMessage("trace-row-1")
+    expect(shown(ANSWER)).toHaveLength(1)
+  })
+
+  it("keeps ai_message under the content dedup when it carries a result card", () => {
+    mount()
+    const card = {
+      title: "Query · top customers", items: ["Contoso Ltd · $182,400"],
+      source: { name: "Cosmos", app_id: "cosmos", logo: { mark: "C", bg: "#0078D4", fg: "#fff", icon_url: null } },
+      footnote: "1 of 1", created_at: "2026-11-17T06:00:00Z",
+    }
+    const cardExtra = {
+      message_type: "result_card", display: "chat",
+      metadata: { display: "result_card", result_card: card },
+    }
+    aiMessage("trace-row-1", card.title, cardExtra)
+    // The same answer delivered twice under one identity is one bubble even
+    // though it carries a card.
+    elapse(31_000)
+    aiMessage("trace-row-1", card.title, cardExtra)
+    expect(shown(card.title)).toHaveLength(1)
+    // A transcript row for the card is an agent_message and keeps its own
+    // card-identity exemption from the content dedup, as it did before.
+    chatRecord("chat-row-1", card.title, cardExtra)
+    expect(shown(card.title)).toHaveLength(2)
+  })
+
+  it("shows one result card when it is delivered live and then replayed under the same identity", () => {
+    mount()
+    const card = {
+      title: "Query · top customers", items: ["Contoso Ltd · $182,400"],
+      source: { name: "Cosmos", app_id: "cosmos", logo: { mark: "C", bg: "#0078D4", fg: "#fff", icon_url: null } },
+      footnote: "1 of 1", created_at: "2026-11-17T06:00:00Z",
+    }
+    const cardExtra = {
+      message_type: "result_card", display: "chat", expect_response: false,
+      metadata: { display: "result_card", result_card: card },
+    }
+    const cardFrame = () => deliver({
+      event_type: "agent_message", event_id: "card-event-1",
+      data: { message: card.title, ...cardExtra },
+    })
+    cardFrame()
+    elapse(31_000)
+    cardFrame()
+    expect(shown(card.title)).toHaveLength(1)
+  })
+
+  it("keeps a repeat of the same ai_message identity as one answer without a turn identity on the user", () => {
+    mount()
+    const user = (event_id: string) => deliver({
+      event_type: "user_message", event_id, data: { message: "refund please" },
+    })
+    user("user-event-1")
+    aiMessage("event-1")
+    elapse(31_000)
+    user("user-event-1")
+    aiMessage("event-1")
+    const messages = JSON.parse(screen.getByTestId("messages").textContent || "[]") as Array<{ role: string }>
+    expect(messages.filter(message => message.role === "user")).toHaveLength(1)
+    expect(shown(ANSWER)).toHaveLength(1)
+  })
+
+  it("keeps the streamed answer under its final_answer_ identity", () => {
+    mount()
+    const raw = (message: Record<string, unknown>) => act(() => {
+      webSocketOptions.current?.onMessage?.({
+        task_id: 1, timestamp: "2026-05-27T05:00:00Z", ...message,
+      } as never)
+    })
+    raw({ type: "final_answer_start", message_id: "final_answer_s1" })
+    raw({ type: "final_answer_end", message_id: "final_answer_s1", content: ANSWER })
+    aiMessage("event-1", ANSWER, { stream_message_id: "final_answer_s1" })
+    elapse(31_000)
+    aiMessage("event-1", ANSWER, { stream_message_id: "final_answer_s1" })
+    const answers = shown(ANSWER)
+    expect(answers).toHaveLength(1)
+    expect(answers[0].id).toBe("final_answer_s1")
+  })
+
+  it("new frontend with an old backend: differing live and replay ids inside 30 seconds still show one answer", () => {
+    mount()
+    aiMessage("random-live-uuid")
+    elapse(5_000)
+    aiMessage("persisted-row-id")
+    expect(shown(ANSWER)).toHaveLength(1)
+  })
+
+  // New backend with an old frontend is not expressible here: the code under
+  // test is always the new frontend. The old frontend's merge-by-id handling of
+  // user messages, question messages and step records is not changed by this
+  // PR and is covered by the existing cases in this file.
+
+  it("does not merge a different answer into an earlier one", () => {
+    mount()
+    aiMessage("event-1")
+    aiMessage("event-2", SECOND)
+    expect(shown(ANSWER)).toHaveLength(1)
+    expect(shown(SECOND)).toHaveLength(1)
+  })
+})

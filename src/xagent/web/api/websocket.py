@@ -287,7 +287,9 @@ async def send_message_delivery(
 
 
 CHECKPOINT_EVENT_TYPE_NAME = str(CHECKPOINT_EVENT_TYPE)
-_QUESTION_DISPLAY_VERSION = 1
+# Bump when the rules that decide what a replayed message displays change
+# (for example how assistant text is reconciled), so cached replays rebuild.
+_QUESTION_DISPLAY_VERSION = 2
 
 
 # Exception text can carry file paths, SQL fragments, provider payloads and
@@ -3466,6 +3468,51 @@ def _load_historical_stream_snapshot_sync(
                 trace_data_by_event_id=normalized_trace_data_by_event_id,
             )
 
+            # A transcript row is stored with its file references already
+            # reconciled, while a trace row keeps the model's raw text. Reconcile
+            # the trace text here, with the same path map and file records, so
+            # the transcript twin of an answer is recognised and the surviving
+            # trace frame displays the reconciled text.
+            reconciled_trace_text_by_event_id: Dict[str, str] = {}
+            for trace_event in trace_events:
+                if trace_event.event_type not in {"agent_message", "ai_message"}:
+                    continue
+                trace_data = normalized_trace_data_by_event_id.get(
+                    str(trace_event.event_id), trace_event.data
+                )
+                if not isinstance(trace_data, dict) or _is_audit_only_trace_data(
+                    trace_data
+                ):
+                    continue
+                raw_text = trace_data.get("message") or trace_data.get("content")
+                if not isinstance(raw_text, str) or not raw_text.strip():
+                    continue
+                reconciled_text = raw_text
+                if historical_path_to_file_id:
+                    reconciled_text = _rewrite_file_links_to_file_id(
+                        reconciled_text, historical_path_to_file_id
+                    )
+                reconciled_text = reconcile_assistant_file_references(
+                    db,
+                    task_id=int(task_id),
+                    user_id=int(task.user_id),
+                    content=reconciled_text,
+                    records=transcript.file_reference_records,
+                )
+                reconciled_trace_text_by_event_id[str(trace_event.event_id)] = (
+                    reconciled_text
+                )
+                if reconciled_text.strip() != raw_text.strip():
+                    trace_message_keys.add(
+                        (
+                            "assistant",
+                            reconciled_text.strip(),
+                            _attachment_fingerprint(
+                                trace_data.get("files") or trace_data.get("attachments")
+                            ),
+                        )
+                    )
+
             for trace_event in trace_events:
                 normalized_event_data = normalized_trace_data_by_event_id.get(
                     str(trace_event.event_id), trace_event.data
@@ -3493,6 +3540,13 @@ def _load_historical_stream_snapshot_sync(
                     str(trace_event.event_type),
                     normalized_event_data,
                 )
+                display_text = reconciled_trace_text_by_event_id.get(
+                    str(trace_event.event_id)
+                )
+                if display_text is not None and isinstance(public_event_data, dict):
+                    for text_field in ("content", "message"):
+                        if text_field in public_event_data:
+                            public_event_data[text_field] = display_text
                 historical_events.append(
                     {
                         "type": "trace_event",

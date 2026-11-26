@@ -20,7 +20,10 @@ from sqlalchemy.pool import StaticPool
 
 from xagent.core.agent.transcript import build_assistant_transcript_content
 from xagent.web.api.conversation_logs import _serialize_transcript_with_events
-from xagent.web.api.websocket import send_historical_data_as_stream
+from xagent.web.api.websocket import (
+    _QUESTION_DISPLAY_VERSION,
+    send_historical_data_as_stream,
+)
 from xagent.web.models.chat_message import TaskChatMessage
 from xagent.web.models.database import Base
 from xagent.web.models.task import Task, TaskStatus
@@ -365,7 +368,7 @@ async def test_replay_rebuilds_pre_projection_cache_and_keeps_waiting_text_consi
         db.close()
     cache = {}
     await _replay(monkeypatch, SessionLocal, task_id, user_id, cache=cache)
-    assert cache["value"]["question_display_version"] == 1
+    assert cache["value"]["question_display_version"] == _QUESTION_DISPLAY_VERSION
     # A pre-deploy cache has all the same row watermarks, but the wrong display.
     cache["value"].pop("question_display_version")
     cache["value"]["events"] = []
@@ -450,3 +453,182 @@ async def test_an_assistant_answer_is_not_touched_by_question_pairing(
     assert len(answers) == 1
     assert answers[0]["event_id"] == "final-1"
     assert answers[0]["event_type"] == "ai_message"
+
+
+# --- An answer stored as both a trace row and a transcript row -------------
+#
+# The trace row keeps the model's raw text; the transcript row is stored with
+# its file references reconciled. Replay must recognise them as one answer and
+# display the reconciled text.
+
+_FAKE_FILE_ID = "123e4567-e89b-12d3-a456-426614174000"
+
+
+def _output_file(db: Session, user_id: int, task_id: int, name: str, rel: str):
+    import uuid
+
+    from xagent.web.models.uploaded_file import UploadedFile
+
+    file_id = str(uuid.uuid4())
+    db.add(
+        UploadedFile(
+            file_id=file_id,
+            user_id=user_id,
+            task_id=task_id,
+            filename=name,
+            storage_path=f"/store/{file_id}/{name}",
+            workspace_relative_path=rel,
+            workspace_category="output",
+            storage_status="committed",
+        )
+    )
+    db.commit()
+    return file_id
+
+
+def _answer_frames(sent: list[dict]) -> list[dict]:
+    return [
+        event
+        for event in sent
+        if event.get("type") == "trace_event"
+        and event.get("event_type") in {"ai_message", "agent_message"}
+    ]
+
+
+def _frame_text(frame: dict) -> str:
+    data = frame["data"]
+    return data.get("content") or data.get("message")
+
+
+_ANSWER_CELLS = {
+    "plain": ("ai_message", "Your report is ready.", False),
+    "valid": ("ai_message", "Your report is ready: [report.pdf](file:{fid})", False),
+    "fake": (
+        "ai_message",
+        f"Your report is ready: [x.pdf](file:{_FAKE_FILE_ID})",
+        False,
+    ),
+    "repairable": (
+        "ai_message",
+        f"Your report is ready: [report.pdf](file:{_FAKE_FILE_ID})",
+        False,
+    ),
+    "path": (
+        "ai_message",
+        "Your report is ready: [report.pdf](output/report.pdf)",
+        True,
+    ),
+    "unpaired_agent_message_fake": (
+        "agent_message",
+        f"Your report is ready: [x.pdf](file:{_FAKE_FILE_ID})",
+        False,
+    ),
+    "streamed_repairable": (
+        "ai_message",
+        f"Your report is ready: [report.pdf](file:{_FAKE_FILE_ID})",
+        False,
+    ),
+}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cell", list(_ANSWER_CELLS))
+async def test_answer_stored_as_trace_and_transcript_row_replays_once(
+    monkeypatch, cell
+) -> None:
+    from datetime import timedelta
+
+    from xagent.web.api.websocket import _normalize_file_outputs
+    from xagent.web.services.chat_history_service import (
+        persist_assistant_message_no_commit,
+    )
+    from xagent.web.services.task_execution import _rewrite_file_links_to_file_id
+
+    event_type, template, with_file_outputs = _ANSWER_CELLS[cell]
+    SessionLocal, db, task = _make_task(f"answer-{cell}")
+    task_id, user_id = int(task.id), int(task.user_id)
+    when = datetime(2026, 11, 25, tzinfo=timezone.utc)
+    file_id = _output_file(db, user_id, task_id, "report.pdf", "output/report.pdf")
+    raw = template.replace("{fid}", file_id)
+
+    data: dict = {"content": raw, "status": "completed"}
+    if event_type == "agent_message":
+        data = {"message": raw, "display": "chat", "expect_response": False}
+    if cell == "streamed_repairable":
+        data["stream_message_id"] = "final_answer_abc"
+    db.add(
+        DatabaseTraceEvent(
+            task_id=task_id,
+            event_id="answer-1",
+            event_type=event_type,
+            timestamp=when,
+            data=data,
+        )
+    )
+    path_map: dict = {}
+    if with_file_outputs:
+        outputs = [
+            {
+                "file_id": file_id,
+                "filename": "report.pdf",
+                "relative_path": "output/report.pdf",
+            }
+        ]
+        db.add(
+            DatabaseTraceEvent(
+                task_id=task_id,
+                event_id="completion-1",
+                event_type="task_completion",
+                timestamp=when + timedelta(milliseconds=1),
+                data={
+                    "result": {"content": raw, "file_outputs": outputs},
+                    "success": True,
+                    "file_outputs": outputs,
+                },
+            )
+        )
+        _, path_map = _normalize_file_outputs(db, task_id, user_id, outputs)
+    # The real finishing path rewrites path links, then lets the store
+    # reconcile the text because the caller does not declare it reconciled.
+    persist_assistant_message_no_commit(
+        db,
+        task_id=task_id,
+        user_id=user_id,
+        content=_rewrite_file_links_to_file_id(raw, path_map),
+        message_type="assistant_response",
+    )
+    db.commit()
+    stored = (
+        db.query(TaskChatMessage).filter(TaskChatMessage.task_id == task_id).one()
+    ).content
+    db.close()
+
+    frames = _answer_frames(await _replay(monkeypatch, SessionLocal, task_id, user_id))
+
+    assert len(frames) == 1
+    assert _frame_text(frames[0]) == stored
+    assert not [f for f in frames if f["data"].get("source") == "chat_history"]
+
+
+@pytest.mark.asyncio
+async def test_transcript_only_answer_still_replays(monkeypatch) -> None:
+    from xagent.web.services.chat_history_service import (
+        persist_assistant_message_no_commit,
+    )
+
+    SessionLocal, db, task = _make_task("answer-transcript-only")
+    task_id, user_id = int(task.id), int(task.user_id)
+    persist_assistant_message_no_commit(
+        db,
+        task_id=task_id,
+        user_id=user_id,
+        content="Only in the transcript.",
+        message_type="assistant_response",
+    )
+    db.commit()
+    db.close()
+
+    frames = _answer_frames(await _replay(monkeypatch, SessionLocal, task_id, user_id))
+
+    assert [_frame_text(frame) for frame in frames] == ["Only in the transcript."]
+    assert frames[0]["data"].get("source") == "chat_history"

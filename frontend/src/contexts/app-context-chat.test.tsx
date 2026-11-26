@@ -15036,6 +15036,23 @@ describe("assistant answer identity across live delivery and replay", () => {
     expect(shown(card.title)).toHaveLength(2)
   })
 
+  it("shows one result card when it is delivered live and then replayed under the same identity", () => {
+    mount()
+    const card = {
+      title: "Query · top customers", items: ["Contoso Ltd · $182,400"],
+      source: { name: "Cosmos", app_id: "cosmos", logo: { mark: "C", bg: "#0078D4", fg: "#fff", icon_url: null } },
+      footnote: "1 of 1", created_at: "2026-11-17T06:00:00Z",
+    }
+    const cardExtra = {
+      message_type: "result_card", display: "chat", expect_response: false,
+      metadata: { display: "result_card", result_card: card },
+    }
+    chatRecord("card-event-1", card.title, cardExtra)
+    elapse(31_000)
+    chatRecord("card-event-1", card.title, cardExtra)
+    expect(shown(card.title)).toHaveLength(1)
+  })
+
   it("keeps a repeat of the same ai_message identity as one answer without a turn identity on the user", () => {
     mount()
     const user = (event_id: string) => deliver({

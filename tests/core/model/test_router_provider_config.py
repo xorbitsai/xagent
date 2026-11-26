@@ -1,3 +1,5 @@
+from types import SimpleNamespace
+
 import pytest
 
 from xagent.core.model import ChatModelConfig
@@ -45,6 +47,32 @@ def test_openrouter_auto_returns_router_llm():
 
     assert isinstance(llm, RouterLLM)
     assert llm.model_name == "auto"
+
+
+@pytest.mark.parametrize(
+    "policy",
+    [
+        {"openrouter_provider_only": ["together/fp8"]},
+        {"openrouter_zdr": True},
+        {"openrouter_data_collection": "deny"},
+    ],
+)
+def test_openrouter_auto_rejects_each_saved_policy_before_building_client(
+    mocker, policy
+):
+    router_factory = mocker.patch("xagent.core.model.chat.basic.adapter.RouterLLM")
+    config = ChatModelConfig(
+        id="legacy-auto",
+        model_provider="openrouter",
+        model_name="auto",
+        api_key="test-key",
+        **policy,
+    )
+
+    with pytest.raises(ValueError, match="Auto models do not support routing policy"):
+        create_base_llm(config)
+
+    router_factory.assert_not_called()
 
 
 def test_configured_auto_returns_router_with_explicit_bindings(monkeypatch):
@@ -142,6 +170,57 @@ def test_openrouter_model_config_passes_regional_endpoint_policy_to_adapter():
     assert inner._provider_only == ("together/fp8", "inference-net/fp8")
     assert inner._require_zdr is True
     assert inner._data_collection == "deny"
+
+
+@pytest.mark.asyncio
+async def test_configured_auto_concrete_openrouter_candidate_emits_saved_policy(mocker):
+    mock_client = mocker.AsyncMock()
+    mock_client.chat.completions.create.return_value = SimpleNamespace(
+        choices=[
+            SimpleNamespace(message=SimpleNamespace(content="Hello", tool_calls=None))
+        ],
+        usage=None,
+        model_dump=lambda: {"id": "regional-openrouter"},
+    )
+    client_factory = mocker.patch(
+        "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+        return_value=mock_client,
+    )
+    concrete = ChatModelConfig(
+        id="regional-deepseek",
+        model_provider="openrouter",
+        model_name="deepseek/deepseek-v4.1-flash-1017",
+        api_key="test-key",
+        base_url="https://us.openrouter.ai/api/v1",
+        context_window=128000,
+        openrouter_provider_only=["together/fp8"],
+        openrouter_zdr=True,
+        openrouter_data_collection="deny",
+    )
+    auto = ChatModelConfig(
+        id="configured-auto",
+        model_provider="router",
+        model_name="auto",
+        router_mode="sequential_failover",
+        router_candidate_models=["regional-deepseek"],
+    )
+    llm = create_base_llm(
+        auto, downstream_resolver=lambda _id: create_base_llm(concrete)
+    )
+
+    await llm.chat([{"role": "user", "content": "Hello"}])
+
+    assert client_factory.call_args.kwargs["base_url"] == (
+        "https://us.openrouter.ai/api/v1"
+    )
+    assert mock_client.chat.completions.create.call_args.kwargs["extra_body"][
+        "provider"
+    ] == {
+        "only": ["together/fp8"],
+        "allow_fallbacks": False,
+        "zdr": True,
+        "data_collection": "deny",
+    }
 
 
 @pytest.mark.parametrize(

@@ -140,6 +140,13 @@ def create_base_chat_model(
     provider = canonical_provider_name(model.model_provider)
     compatibility = provider_compatibility_for_provider(provider)
 
+    if provider == "openrouter" and (
+        model.openrouter_provider_only is not None
+        or model.openrouter_zdr
+        or model.openrouter_data_collection is not None
+    ):
+        raise ValueError("LangChain adapter does not support OpenRouter routing policy")
+
     if provider == "deepseek":
         return ChatOpenAI(
             model=model.model_name,

@@ -132,6 +132,12 @@ def create_base_llm(
         raise ValueError("OpenRouter routing policy requires the openrouter provider")
 
     if is_auto_router_model(provider, model.model_name):
+        if (
+            model.openrouter_provider_only is not None
+            or model.openrouter_zdr
+            or model.openrouter_data_collection is not None
+        ):
+            raise ValueError("OpenRouter Auto models do not support routing policy")
         # Pick a concrete model via xrouter-llm. Legacy OpenRouter Auto clones
         # its own provider config; configured Auto injects saved model bindings.
         router = RouterLLM(

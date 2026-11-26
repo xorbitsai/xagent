@@ -2018,14 +2018,16 @@ async def test_preregistered_client_keeps_the_deployment_callback(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "connector_base",
+    ["https://cloud.tobybot.ai", "http://[::1]:8765", "http://[::1]:80"],
+)
 async def test_connector_callback_base_moves_a_preregistered_client(
-    db_session, monkeypatch
+    db_session, monkeypatch, connector_base
 ):
     db, user, _ = db_session
     monkeypatch.setenv("XAGENT_PUBLIC_API_BASE_URL", "https://api.xagent.test")
-    monkeypatch.setenv(
-        "XAGENT_CONNECTOR_OAUTH_CALLBACK_BASE_URL", "https://cloud.tobybot.ai"
-    )
+    monkeypatch.setenv("XAGENT_CONNECTOR_OAUTH_CALLBACK_BASE_URL", connector_base)
     server = _add_mcp_oauth_server(db, user, redirect_uri=None)
 
     async def fake_discover(*args, **kwargs):
@@ -2044,7 +2046,7 @@ async def test_connector_callback_base_moves_a_preregistered_client(
         db,
     )
 
-    advertised = "https://cloud.tobybot.ai/api/mcp/oauth/callback"
+    advertised = f"{connector_base}/api/mcp/oauth/callback"
     query = parse_qs(urlparse(response.headers["location"]).query)
     assert query["client_id"] == ["client-123"]
     assert query["redirect_uri"] == [advertised]
@@ -2054,15 +2056,17 @@ async def test_connector_callback_base_moves_a_preregistered_client(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "connector_base",
+    ["https://cloud.tobybot.ai", "http://[::1]:8765", "http://[::1]:80"],
+)
 async def test_connector_callback_base_wins_for_dynamic_registration(
-    db_session, monkeypatch
+    db_session, monkeypatch, connector_base
 ):
     db, user, _ = db_session
     monkeypatch.setenv("XAGENT_PUBLIC_API_BASE_URL", "https://api.xagent.test")
     monkeypatch.setenv("XAGENT_MCP_OAUTH_CALLBACK_BASE_URL", "https://legacy-mcp.test")
-    monkeypatch.setenv(
-        "XAGENT_CONNECTOR_OAUTH_CALLBACK_BASE_URL", "https://cloud.tobybot.ai"
-    )
+    monkeypatch.setenv("XAGENT_CONNECTOR_OAUTH_CALLBACK_BASE_URL", connector_base)
     server = _add_mcp_oauth_server(
         db,
         user,
@@ -2092,7 +2096,7 @@ async def test_connector_callback_base_wins_for_dynamic_registration(
         db,
     )
 
-    advertised = "https://cloud.tobybot.ai/api/mcp/oauth/callback"
+    advertised = f"{connector_base}/api/mcp/oauth/callback"
     assert registration_calls == [advertised]
     query = parse_qs(urlparse(response.headers["location"]).query)
     assert query["redirect_uri"] == [advertised]
@@ -3734,6 +3738,146 @@ async def test_callback_exchanges_code_and_stores_encrypted_grant(
     assert decrypt_value(grant.access_token) == "plain-access-token"
     assert decrypt_value(grant.refresh_token) == "plain-refresh-token"
     assert db.query(MCPOAuthFlowState).one().consumed_at is not None
+
+
+@pytest.mark.asyncio
+async def test_callback_reads_backfilled_redirect_for_a_stale_legacy_flow(
+    db_session, monkeypatch
+):
+    """A legacy flow's original callback survives a concurrent connect.
+
+    The callback session loads the NULL snapshot before the connect
+    transaction backfills it and updates the shared static client. The later
+    client read sees the new URI at READ COMMITTED, while the identity-mapped
+    flow still reads NULL. The callback must exchange with the backfilled
+    original URI, and the connect's own flow must keep the new one.
+    """
+    old = "https://xagent.example.com/api/mcp/oauth/callback"
+    new = "https://cloud.tobybot.ai/api/mcp/oauth/callback"
+    for name in (
+        "XAGENT_PUBLIC_ENTRIES_JSON",
+        "XAGENT_MCP_OAUTH_CALLBACK_BASE_URL",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("XAGENT_PUBLIC_API_BASE_URL", "https://xagent.example.com")
+    monkeypatch.setenv(
+        "XAGENT_CONNECTOR_OAUTH_CALLBACK_BASE_URL", "https://cloud.tobybot.ai"
+    )
+    db, user, _ = db_session
+    server, client, _ = _add_callback_client_and_state(db, user, state="legacy-state")
+    client_id = int(client.id)
+
+    async def fake_discover(*args, **kwargs):
+        return _discovery()
+
+    async def fail_dcr(*args, **kwargs):
+        raise AssertionError("a pre-registered client must not register")
+
+    monkeypatch.setattr(mcp_api, "discover_mcp_oauth_metadata", fake_discover)
+    monkeypatch.setattr(mcp_api, "register_mcp_oauth_public_client", fail_dcr)
+
+    exchange_redirect_uris: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        form = parse_qs(request.content.decode())
+        exchange_redirect_uris.append(form["redirect_uri"][0])
+        return httpx.Response(
+            200,
+            json={
+                "access_token": "plain-access-token",
+                "token_type": "Bearer",
+                "expires_in": 3600,
+                "scope": "records.read",
+            },
+        )
+
+    monkeypatch.setattr(
+        mcp_api,
+        "create_mcp_oauth_http_client",
+        lambda *args, **kwargs: httpx.AsyncClient(
+            transport=httpx.MockTransport(handler)
+        ),
+    )
+
+    SessionLocal = sessionmaker(bind=db.get_bind(), autoflush=False, autocommit=False)
+    with SessionLocal() as callback_db:
+        stale_flow = (
+            callback_db.query(MCPOAuthFlowState)
+            .filter(MCPOAuthFlowState.state == "legacy-state")
+            .one()
+        )
+        assert stale_flow.redirect_uri is None
+
+        await connect_mcp_oauth(
+            server.id,
+            MCPOAuthConnectRequest(redirect_after="/settings/mcp"),
+            user,
+            db,
+        )
+        db.expire_all()
+        assert (
+            db.query(MCPOAuthFlowState)
+            .filter(MCPOAuthFlowState.state == "legacy-state")
+            .one()
+            .redirect_uri
+            == old
+        )
+        new_flow = (
+            db.query(MCPOAuthFlowState)
+            .filter(MCPOAuthFlowState.state != "legacy-state")
+            .one()
+        )
+        assert new_flow.redirect_uri == new
+        # The callback's later client read sees the new URI even though the
+        # identity-mapped flow snapshot is still NULL.
+        assert (
+            callback_db.query(MCPOAuthClient)
+            .filter(MCPOAuthClient.id == client_id)
+            .one()
+            .redirect_uri
+            == new
+        )
+        assert stale_flow.redirect_uri is None
+
+        response = await mcp_oauth_callback(
+            _request("/api/mcp/oauth/callback?code=auth-code&state=legacy-state"),
+            callback_db,
+        )
+
+    assert exchange_redirect_uris == [old]
+    assert response.status_code == 307
+    assert db.query(MCPOAuthGrant).one().mcp_oauth_client_id == client_id
+    assert new_flow.consumed_at is None
+
+
+@pytest.mark.asyncio
+async def test_callback_tolerates_flow_deleted_before_the_snapshot_reread(
+    db_session, monkeypatch
+):
+    db, user, _ = db_session
+    _add_callback_client_and_state(db, user, state="deleted-before-reread")
+    SessionLocal = sessionmaker(bind=db.get_bind(), autoflush=False, autocommit=False)
+
+    def delete_flow_then_validate(*args, **kwargs):
+        with SessionLocal() as delete_db:
+            delete_db.query(MCPOAuthFlowState).filter(
+                MCPOAuthFlowState.state == "deleted-before-reread"
+            ).delete(synchronize_session=False)
+            delete_db.commit()
+
+    # Runs after the flow and client are loaded, exactly where the NULL
+    # snapshot is re-read. A missing row must read as NULL, not raise.
+    monkeypatch.setattr(
+        mcp_api, "_validate_mcp_oauth_callback_issuer", delete_flow_then_validate
+    )
+
+    response = await mcp_oauth_callback(
+        _request("/api/mcp/oauth/callback?code=auth-code&state=deleted-before-reread"),
+        db,
+    )
+
+    assert response.status_code == 307
+    assert _redirect_query(response)["mcp_oauth_error"] == ["state_already_consumed"]
 
 
 @pytest.mark.asyncio

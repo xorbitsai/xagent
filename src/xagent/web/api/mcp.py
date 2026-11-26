@@ -7315,10 +7315,26 @@ async def mcp_oauth_callback(
     resource = str(flow_state.resource)
     # A later authorization can update a shared static client's redirect URI.
     # Exchange this code with the URI the provider saw for this flow. Rows
-    # from a release before this snapshot fall back to their client row.
+    # from a release before this snapshot fall back to their client row, but a
+    # concurrent connect can backfill this legacy row's original URI in the
+    # same transaction that updates the shared client. This session loaded the
+    # row before that commit, so its identity-mapped value can still be NULL
+    # even though the client read above sees the new URI. Re-read just the
+    # column to observe the committed backfill; a row deleted concurrently
+    # reads as NULL here, and the claim below reports the consumed state.
     pinned_redirect_uri = (
         str(flow_state.redirect_uri) if flow_state.redirect_uri else None
     )
+    if pinned_redirect_uri is None:
+        saved_redirect_uri = (
+            db.query(MCPOAuthFlowState.redirect_uri)
+            .filter(
+                MCPOAuthFlowState.id == flow_state.id,
+                MCPOAuthFlowState.state == state_value,
+            )
+            .scalar()
+        )
+        pinned_redirect_uri = str(saved_redirect_uri) if saved_redirect_uri else None
     # The claim commit expires ORM instances. Keep the provider-facing client
     # snapshot detached so a concurrent server deletion cannot make token
     # exchange or compensation reload stale ORM state.

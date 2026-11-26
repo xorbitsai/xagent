@@ -105,6 +105,48 @@ def test_unconfigured_localhost_fallback_is_not_trusted(monkeypatch):
     assert rewrite(uri) == uri
 
 
+def test_ipv6_loopback_destination_is_moved(monkeypatch):
+    monkeypatch.setenv("XAGENT_PUBLIC_API_BASE_URL", "https://api.tobybot.ai")
+    monkeypatch.setenv("XAGENT_CONNECTOR_OAUTH_CALLBACK_BASE_URL", "http://[::1]:8765")
+
+    assert get_connector_oauth_callback_base_url() == "http://[::1]:8765"
+    assert (
+        rewrite("https://api.tobybot.ai/api/mcp/oauth/callback")
+        == "http://[::1]:8765/api/mcp/oauth/callback"
+    )
+
+
+def test_external_source_is_unchanged_with_an_ipv6_destination(monkeypatch):
+    monkeypatch.setenv("XAGENT_CONNECTOR_OAUTH_CALLBACK_BASE_URL", "http://[::1]:8765")
+    uri = "https://customer.example/api/mcp/oauth/callback"
+
+    assert rewrite(uri) == uri
+
+
+def test_equal_origin_keeps_the_current_value(monkeypatch):
+    monkeypatch.setenv("XAGENT_APP_BASE_URL", "https://APP.TOBYBOT.AI:443/")
+    monkeypatch.setenv(
+        "XAGENT_CONNECTOR_OAUTH_CALLBACK_BASE_URL", "https://app.tobybot.ai"
+    )
+    uri = "https://APP.TOBYBOT.AI:443/api/mcp/oauth/callback"
+
+    assert rewrite(uri) == uri
+
+
+def test_ipv6_base_keeps_its_configured_presentation(monkeypatch):
+    base = "https://[0:0:0:0:0:0:0:1]:443"
+    monkeypatch.setenv("XAGENT_PUBLIC_API_BASE_URL", "https://api.tobybot.ai")
+    monkeypatch.setenv("XAGENT_CONNECTOR_OAUTH_CALLBACK_BASE_URL", base)
+
+    # The origin dynamic registration advertises is exactly the one the
+    # static-client rewrite applies, including the configured IPv6 spelling.
+    assert get_connector_oauth_callback_base_url() == base
+    assert (
+        rewrite("https://api.tobybot.ai/api/mcp/oauth/callback")
+        == f"{base}/api/mcp/oauth/callback"
+    )
+
+
 @pytest.mark.parametrize(
     "uri",
     [

@@ -1391,6 +1391,23 @@ def get_connector_oauth_callback_base_url() -> str | None:
     return _oauth_callback_base_origin(CONNECTOR_OAUTH_CALLBACK_BASE_URL)
 
 
+def _oauth_callback_destination_origin(base: str) -> str:
+    """Canonical destination origin, keeping an accepted bracketed IPv6 base.
+
+    ``normalize_public_origin`` accepts only DNS and IPv4 hosts, while
+    ``_oauth_callback_base_origin`` also accepts a bracketed IPv6 literal. Keep
+    that configured spelling, which is what dynamic registration advertises;
+    ``urlsplit`` validates the literal and reading ``port`` enforces its range.
+    """
+    parts = urlsplit(base)
+    if ":" in (parts.hostname or "") and re.fullmatch(
+        r"\[[^\]]+\](?::[0-9]+)?", parts.netloc
+    ):
+        parts.port  # An out-of-range port is a ValueError.
+        return base
+    return normalize_public_origin(base)
+
+
 def _connector_oauth_callback_owned_origins() -> set[str]:
     """Exact origins this deployment configures for its own callbacks.
 
@@ -1449,7 +1466,7 @@ def get_connector_oauth_callback_uri(current_uri: str, *, callback_path: str) ->
         return current_uri
     try:
         source_origin = normalize_public_origin(f"{current.scheme}://{current.netloc}")
-        destination_origin = normalize_public_origin(base)
+        destination_origin = _oauth_callback_destination_origin(base)
     except ValueError:
         return current_uri
     if source_origin not in _connector_oauth_callback_owned_origins():

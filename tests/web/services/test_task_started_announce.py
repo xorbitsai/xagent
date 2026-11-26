@@ -109,6 +109,10 @@ class _Run:
                 "xagent.web.services.task_execution.execute_task_background",
                 new=execute,
             ),
+            patch(
+                "xagent.web.services.shared_channel_execution.execute_channel_background",
+                new=execute,
+            ),
             patch.object(orchestrator, "settle_task_lease_isolated"),
             patch.object(orchestrator, "_get_agent_manager", return_value=MagicMock()),
             patch.object(background_task_manager, "register_task"),
@@ -331,13 +335,29 @@ async def test_no_frame_without_a_prefetched_lease(db_session) -> None:
 
 
 @pytest.mark.asyncio
-async def test_no_frame_when_the_prefetched_lease_is_lost(db_session) -> None:
+async def test_channel_run_announces_before_the_channel_execution(db_session) -> None:
+    run = _Run()
+    task_events.set_task_event_sink(run.sink)
+    claimed = await _run_scheduled(db_session, run, channel_command=Mock())
+    assert run.events == ["published", "snapshot", "execute"]
+    assert run.frames[0]["run_id"] == claimed.run_id
+    assert run.frames[0]["state_version"] == claimed.state_version
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "state",
+    [TaskLeaseRefreshState.LOST, TaskLeaseRefreshState.SETTLEMENT_READY],
+)
+async def test_no_frame_when_the_prefetched_lease_is_not_runnable(
+    db_session, state
+) -> None:
     run = _Run()
     task_events.set_task_event_sink(run.sink)
     with patch.object(
         orchestrator,
         "validate_preacquired_task_lease_isolated",
-        return_value=TaskLeaseRefreshState.LOST,
+        return_value=state,
     ):
         await _run_scheduled(db_session, run)
     assert run.events == []

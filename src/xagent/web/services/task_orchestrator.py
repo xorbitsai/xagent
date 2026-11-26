@@ -20,9 +20,9 @@ its own adapter):
     for ``/v1/*``)
 
 Live broadcast events go through ``task_events.publish_task_event`` to
-whatever sink the host registered. This module itself publishes
-``task_started`` (from ``_schedule_bg``, when the caller passes both the lease
-and the claimed state version) and ``task_paused``.
+whatever sink the host registered. This module publishes some of them
+itself, among them ``task_started`` from ``_schedule_bg`` when the caller
+passes both the lease and the claimed state version.
 
 Background context — why we replaced the older ``task_execution.py``
 helper with this orchestrator:

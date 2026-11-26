@@ -867,6 +867,36 @@ describe("useWidgetSession capabilities", () => {
     expect(result.current.status).toBe("active")
     expect(result.current.session?.capabilities).toBeUndefined()
   })
+
+  const processViewCapabilitiesFor = (capabilities: unknown) => {
+    const { result } = renderHook(() => useWidgetSession())
+    dispatchFromParent(updateMessage({ capabilities }))
+    expect(result.current.status).toBe("active")
+    return result.current.session?.capabilities
+  }
+
+  it.each([
+    ["collapsed", { process_view: "collapsed" }, { processView: "collapsed" }],
+    ["hidden", { process_view: "hidden" }, { processView: "hidden" }],
+    ["hidden next to voice", { process_view: "hidden", voice: true }, { voice: true, processView: "hidden" }],
+    ["an unknown value next to voice", { process_view: "bogus", voice: true }, { voice: true }],
+  ])("parses process_view %s", (_label, capabilities, expected) => {
+    expect(processViewCapabilitiesFor(capabilities)).toStrictEqual(expected)
+  })
+
+  it.each([
+    ["show", { process_view: "show" }],
+    ["upper case", { process_view: "HIDDEN" }],
+    ["an empty string", { process_view: "" }],
+    ["a number", { process_view: 1 }],
+    ["a boolean", { process_view: true }],
+    ["null", { process_view: null }],
+    ["an object", { process_view: {} }],
+    ["an array", { process_view: ["hidden"] }],
+    ["a missing key", {}],
+  ])("reads process_view as %s as no capabilities", (_label, capabilities) => {
+    expect(processViewCapabilitiesFor(capabilities)).toBeUndefined()
+  })
 })
 
 describe("useWidgetSession capability parsing is per capability", () => {

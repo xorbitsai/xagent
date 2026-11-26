@@ -217,6 +217,9 @@ interface TraceEventRendererProps {
   onOpenExecutionPlan?: () => void;
   onAgentExecutionClick?: (execution: AgentExecutionSummary) => void;
   defaultExpandSteps?: boolean;
+  // Steps that would open on mount (running, failed, paused, interrupted) start
+  // folded instead. `defaultExpandSteps` still wins for a caller that sets both.
+  collapseSteps?: boolean;
 }
 
 export interface AgentExecutionSummary {
@@ -1801,6 +1804,7 @@ interface StepItemProps {
   onAgentClick?: (agentId: string, agentName: string) => void;
   onAgentExecutionClick?: (execution: AgentExecutionSummary) => void;
   defaultExpanded?: boolean;
+  startCollapsed?: boolean;
 }
 
 function StepItem({
@@ -1813,13 +1817,19 @@ function StepItem({
   onAgentClick,
   onAgentExecutionClick,
   defaultExpanded = false,
+  startCollapsed = false,
 }: StepItemProps) {
   const { t } = useI18n();
   const isCompleted = step.status === 'completed';
   const isFailed = step.status === 'failed';
   const isPaused = step.status === 'paused' || step.status === 'waiting_for_user';
   const isInterrupted = step.status === 'interrupted';
-  const [isExpanded, setIsExpanded] = useState(() => defaultExpanded || !isCompleted);
+  // `defaultExpanded` always opens the step; otherwise a step that is not
+  // completed opens unless the caller asked for folded steps. Evaluated once at
+  // mount: a step that is already open is not folded when the mode changes.
+  const [isExpanded, setIsExpanded] = useState(
+    () => defaultExpanded || (!startCollapsed && !isCompleted),
+  );
   const wasCompletedRef = useRef(isCompleted);
   const rawTitle = filesDisabled
     ? sanitizeFilesDisabledPresentationText(step.description || step.stepName)
@@ -1969,7 +1979,7 @@ function StepItem({
 }
 
 // Main TraceEventRenderer Component
-export function TraceEventRenderer({ events, taskStatus, onOpenExecutionPlan, onAgentExecutionClick, defaultExpandSteps = false }: TraceEventRendererProps) {
+export function TraceEventRenderer({ events, taskStatus, onOpenExecutionPlan, onAgentExecutionClick, defaultExpandSteps = false, collapseSteps = false }: TraceEventRendererProps) {
   const { t } = useI18n();
   const { filesDisabled, openFilePreview, dispatch } = useApp();
   const sanitizedEvents = useMemo(() => sanitizeTraceEvents(events), [events]);
@@ -2135,6 +2145,7 @@ export function TraceEventRenderer({ events, taskStatus, onOpenExecutionPlan, on
               onAgentClick={handleAgentClick}
               onAgentExecutionClick={onAgentExecutionClick}
               defaultExpanded={defaultExpandSteps}
+              startCollapsed={collapseSteps}
             />
           ))}
         </div>

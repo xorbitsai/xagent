@@ -28,7 +28,9 @@ vi.mock("./TraceEventRenderer", async () => {
   )
   return {
     ...actual,
-    TraceEventRenderer: () => <div data-testid="trace-renderer" />,
+    TraceEventRenderer: ({ collapseSteps }: { collapseSteps?: boolean }) => (
+      <div data-testid="trace-renderer" data-collapse-steps={String(!!collapseSteps)} />
+    ),
   }
 })
 
@@ -488,5 +490,66 @@ describe("ChatMessage failure task reference", () => {
 
     fireEvent.click(screen.getByTitle("common.copy"))
     expect(writeText).toHaveBeenCalledWith(`common.errors.taskFailed\n${REFERENCE}`)
+  })
+})
+
+describe("collapsed steps leave the rest unchanged", () => {
+  const SCENARIOS: Array<[string, Partial<React.ComponentProps<typeof ChatMessage>>]> = [
+    ["a running turn", {
+      content: null,
+      traceEvents: TRACE_EVENTS,
+      showEmptyStatus: true,
+      taskStatus: "running",
+    }],
+    ["a failed turn with a body", {
+      content: RAW_ERROR,
+      traceEvents: FAILED_TRACE_EVENTS,
+      processStatus: "failed",
+      failureTaskId: 42,
+    }],
+    ["a failed turn without a body", {
+      content: null,
+      traceEvents: FAILED_TRACE_EVENTS,
+      showEmptyStatus: true,
+      taskStatus: "failed",
+    }],
+    ["a stopped turn without an answer", {
+      content: null,
+      traceEvents: TRACE_EVENTS,
+      showEmptyStatus: true,
+      taskStatus: "interrupted",
+      processStatus: "interrupted",
+    }],
+  ]
+
+  const renderScenario = (props: Partial<React.ComponentProps<typeof ChatMessage>>, collapse: boolean) => {
+    const { container, unmount } = render(
+      <ChatMessage
+        role="assistant"
+        content={null}
+        showProcessView={true}
+        collapseProcessSteps={collapse}
+        {...props}
+      />
+    )
+    const trace = screen.queryByTestId("trace-renderer")
+    const snapshot = {
+      text: container.textContent,
+      copyTitles: Array.from(container.querySelectorAll("button")).map((button) => button.title),
+      collapseSteps: trace?.getAttribute("data-collapse-steps") ?? null,
+    }
+    unmount()
+    return snapshot
+  }
+
+  it.each(SCENARIOS)("renders the status line, failure text and copy button of %s the same", (_label, props) => {
+    const open = renderScenario(props, false)
+    const collapsed = renderScenario(props, true)
+
+    expect(collapsed.text).toBe(open.text)
+    expect(collapsed.copyTitles).toEqual(open.copyTitles)
+    // The only difference is what the trace renderer is told.
+    expect(open.collapseSteps).toBe("false")
+    expect(collapsed.collapseSteps).toBe("true")
   })
 })

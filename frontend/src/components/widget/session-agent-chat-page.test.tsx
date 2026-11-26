@@ -748,6 +748,61 @@ describe("SessionAgentChatPage", () => {
       expect(app.provider?.transport?.session?.files).toBe("disabled")
     },
   )
+  describe("process view", () => {
+    const panelProcessView = () => [
+      app.panelProps?.showProcessView,
+      app.panelProps?.collapseProcessSteps,
+    ]
+    const withProcessView = (processView?: "collapsed" | "hidden") => activeSession(
+      processView ? { capabilities: { processView } } : {},
+    )
+
+    it.each([
+      ["no advertisement", undefined, [true, false]],
+      ["collapsed", "collapsed", [true, true]],
+      ["hidden", "hidden", [false, false]],
+    ] as const)("passes process view %s to the conversation panel", (_label, processView, expected) => {
+      setBridge("active", withProcessView(processView))
+      app.state.taskId = 71
+      render(<SessionAgentChatPage />)
+
+      expect(panelProcessView()).toEqual(expected)
+    })
+
+    it("holds a value that arrives mid-session through the next refresh", () => {
+      setBridge("active", withProcessView())
+      app.state.taskId = 71
+      const { rerender } = render(<SessionAgentChatPage />)
+      expect(panelProcessView()).toEqual([true, false])
+
+      setBridge("active", withProcessView("hidden"))
+      rerender(<SessionAgentChatPage />)
+      expect(panelProcessView()).toEqual([false, false])
+
+      setBridge("refreshing", null)
+      bridge.value.agent = activeSession().agent
+      rerender(<SessionAgentChatPage />)
+      expect(panelProcessView()).toEqual([false, false])
+    })
+
+    it("keeps the last value while refreshing and follows the next advertisement", () => {
+      setBridge("active", withProcessView("hidden"))
+      app.state.taskId = 71
+      const { rerender } = render(<SessionAgentChatPage />)
+      expect(panelProcessView()).toEqual([false, false])
+
+      setBridge("refreshing", null)
+      bridge.value.agent = activeSession().agent
+      rerender(<SessionAgentChatPage />)
+      expect(panelProcessView()).toEqual([false, false])
+
+      // A session that advertises nothing means "show": the server stopped hiding.
+      setBridge("active", withProcessView())
+      rerender(<SessionAgentChatPage />)
+      expect(panelProcessView()).toEqual([true, false])
+    })
+  })
+
   describe("file attachments", () => {
     const withUploads = (overrides: Record<string, unknown> = {}) => activeSession({
       capabilities: {

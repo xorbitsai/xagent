@@ -29,7 +29,7 @@ const appState = vi.hoisted(() => ({
   dagExecution: null,
   steps: [],
 }))
-const realChatMessage = vi.hoisted(() => ({ enabled: false }))
+const realChatMessage = vi.hoisted(() => ({ enabled: false, virtualRenders: 0 }))
 const personaAccentColorMock = vi.hoisted(() => vi.fn())
 const openFilePreviewMock = vi.hoisted(() => vi.fn())
 const sendMessageMock = vi.hoisted(() => vi.fn())
@@ -255,8 +255,10 @@ vi.mock("@/components/chat/ChatMessage", async () => {
   // Tests that assert on the real trace rendering opt in through realChatMessage.
   return {
     ...actual,
-    ChatMessage: (props: React.ComponentProps<typeof actual.ChatMessage>) =>
-      realChatMessage.enabled ? <actual.ChatMessage {...props} /> : <MockChatMessage {...(props as React.ComponentProps<typeof MockChatMessage>)} />,
+    ChatMessage: (props: React.ComponentProps<typeof actual.ChatMessage>) => {
+      if (realChatMessage.enabled && props.isVirtual) realChatMessage.virtualRenders += 1
+      return realChatMessage.enabled ? <actual.ChatMessage {...props} /> : <MockChatMessage {...(props as React.ComponentProps<typeof MockChatMessage>)} />
+    },
   }
 })
 
@@ -391,6 +393,7 @@ describe("TaskConversationPanel", () => {
     cleanup()
     vi.restoreAllMocks()
     realChatMessage.enabled = false
+    realChatMessage.virtualRenders = 0
     appState.messages = []
     appState.traceEvents = []
     appState.stoppedTurnAnchorIds = []
@@ -2210,6 +2213,132 @@ describe("TaskConversationPanel", () => {
       expect(container.querySelector(".animate-spin")).toBeNull()
     })
   })
+  describe("collapsed process steps", () => {
+    const traceEvent = (
+      id: string,
+      type: string,
+      stepId: string,
+      timestamp: number,
+      data: Record<string, unknown> = {},
+    ) => ({ event_id: id, event_type: type, step_id: stepId, timestamp: String(timestamp), data })
+    const task = (status: string) => ({
+      id: "42",
+      title: "Task",
+      description: "Task",
+      status,
+      createdAt: "2026-01-01T00:00:00Z",
+      updatedAt: "2026-01-01T00:00:00Z",
+    })
+    const question = { id: "u1", role: "user", content: "First", timestamp: "1000" }
+    // A DAG run with two steps: step A is done, step B is still running. (A
+    // react_task_end would mark the whole process completed, so the first step
+    // is closed by a dag_step_end instead.)
+    const stepA = [
+      traceEvent("root-start", "dag_execute_start", "root", 1100),
+      traceEvent("a-start", "dag_step_start", "s1", 1200, { step_name: "Step one" }),
+      traceEvent("a-end", "dag_step_end", "s1", 1300, { step_name: "Step one", result: "ok" }),
+    ]
+    const stepBRunning = [
+      traceEvent("b-start", "dag_step_start", "s2", 2000, { step_name: "Step two" }),
+      traceEvent("b-tool", "tool_execution_start", "s2", 2100, { tool_name: "web_search" }),
+    ]
+    const stepBEnd = [
+      traceEvent("b-end", "dag_step_end", "s2", 2200, { step_name: "Step two", result: "ok" }),
+      traceEvent("root-end", "dag_execute_end", "root", 2250),
+    ]
+    const answer = { id: "r1", role: "assistant", content: "done", timestamp: "2300", isResult: true }
+
+    const startRun = () => {
+      appState.messages = [question]
+      appState.traceEvents = [...stepA, ...stepBRunning]
+      appState.currentTask = task("running")
+      appState.isProcessing = true
+    }
+    const finishRun = () => {
+      appState.messages = [question, answer]
+      appState.traceEvents = [...stepA, ...stepBRunning, ...stepBEnd]
+      appState.currentTask = task("completed")
+      appState.isProcessing = false
+    }
+    const toggles = () => screen.getAllByRole("button", { name: /^traceEventRenderer\.(show|hide)Process$/ })
+    const labels = () => toggles().map((toggle) => toggle.textContent)
+    const SHOW = "traceEventRenderer.showProcess"
+    const HIDE = "traceEventRenderer.hideProcess"
+
+    beforeEach(() => {
+      realChatMessage.enabled = true
+    })
+
+    it("starts the running turn's steps collapsed, and open without the option", () => {
+      startRun()
+
+      const { unmount } = render(<TaskConversationPanel mode="page" collapseProcessSteps />)
+      expect(labels()).toEqual([SHOW, SHOW])
+      unmount()
+
+      render(<TaskConversationPanel mode="page" />)
+      expect(labels()).toEqual([SHOW, HIDE])
+    })
+
+    it("keeps a finished turn's steps collapsed when the run ends", () => {
+      // The running turn is drawn by the timeline only: a second ChatMessage
+      // for the same events would be a second set of step toggles.
+      startRun()
+      const { rerender } = render(<TaskConversationPanel mode="page" collapseProcessSteps />)
+      expect(realChatMessage.virtualRenders).toBe(0)
+      expect(toggles()).toHaveLength(2)
+      const stepBTitle = screen.getByRole("button", { name: /Step two/ })
+
+      finishRun()
+      rerender(<TaskConversationPanel mode="page" collapseProcessSteps />)
+      expect(labels()).toEqual([SHOW, SHOW])
+      expect(realChatMessage.virtualRenders).toBe(0)
+      // The same DOM node survives the end of the run: the steps are not remounted.
+      expect(screen.getByRole("button", { name: /Step two/ })).toBe(stepBTitle)
+      expect(stepBTitle.isConnected).toBe(true)
+    })
+
+    it.each([
+      ["never opened", () => undefined, [SHOW, SHOW]],
+      [
+        "opened while it was running",
+        () => fireEvent.click(toggles()[1]),
+        // The step finishing folds it again.
+        [SHOW, SHOW],
+      ],
+      [
+        "opened after it had finished while the run goes on",
+        () => fireEvent.click(toggles()[0]),
+        [HIDE, SHOW],
+      ],
+    ])("ends a run with a step %s", (_label, act_, expected) => {
+      startRun()
+      const { rerender } = render(<TaskConversationPanel mode="page" collapseProcessSteps />)
+      act_()
+
+      finishRun()
+      rerender(<TaskConversationPanel mode="page" collapseProcessSteps />)
+
+      expect(labels()).toEqual(expected)
+    })
+
+    it("keeps a step opened after the run ended open", () => {
+      startRun()
+      const { rerender } = render(<TaskConversationPanel mode="page" collapseProcessSteps />)
+      finishRun()
+      rerender(<TaskConversationPanel mode="page" collapseProcessSteps />)
+      fireEvent.click(toggles()[1])
+      expect(labels()).toEqual([SHOW, HIDE])
+
+      // An unrelated event in the conversation does not fold it again.
+      appState.messages = [question, answer, { id: "u2", role: "user", content: "Second", timestamp: "3000" }]
+      appState.currentTask = task("running")
+      appState.isProcessing = true
+      rerender(<TaskConversationPanel mode="page" collapseProcessSteps />)
+      expect(labels()).toEqual([SHOW, HIDE])
+    })
+  })
+
   describe("a turn the visitor stopped", () => {
     const traceEvent = (id: string, type: string, stepId: string, timestamp: number, data: Record<string, unknown> = {}) => (
       { event_id: id, event_type: type, step_id: stepId, timestamp: String(timestamp), data }

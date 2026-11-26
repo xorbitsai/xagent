@@ -1,7 +1,7 @@
 """Snapshot the authorization callback URI on each OAuth flow and grant.
 
 Revision ID: 20261126_connector_oauth_redirect_uri
-Revises: 20261119_shopify_store_locks
+Revises: 20261126_openrouter_routing
 
 Why two nullable columns:
 
@@ -36,7 +36,7 @@ from xagent.migrations.ddl_lock_retry import (
 )
 
 revision = "20261126_connector_oauth_redirect_uri"
-down_revision = "20261119_shopify_store_locks"
+down_revision = "20261126_openrouter_routing"
 branch_labels = None
 depends_on = None
 

@@ -7316,7 +7316,9 @@ async def mcp_oauth_callback(
     # A later authorization can update a shared static client's redirect URI.
     # Exchange this code with the URI the provider saw for this flow. Rows
     # from a release before this snapshot fall back to their client row.
-    pinned_redirect_uri = flow_state.redirect_uri
+    pinned_redirect_uri = (
+        str(flow_state.redirect_uri) if flow_state.redirect_uri else None
+    )
     # The claim commit expires ORM instances. Keep the provider-facing client
     # snapshot detached so a concurrent server deletion cannot make token
     # exchange or compensation reload stale ORM state.

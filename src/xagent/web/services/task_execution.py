@@ -141,7 +141,12 @@ from .task_lease_service import (
     task_lease_attempt_predicate,
 )
 from .task_settlement_report import RecordedInterruption, SettlementReport
-from .turn_settlement import TurnFacts, report_turn_settled, settled_outcome
+from .turn_settlement import (
+    TurnFacts,
+    bind_settlement_turn,
+    report_turn_settled,
+    settled_outcome,
+)
 
 if TYPE_CHECKING:
     from .task_setup_snapshot import TaskSetupSnapshot
@@ -4700,6 +4705,9 @@ async def execute_resume_background(
             UserContext(task_owner_user_id),
             ExecutionScopeContext(execution_scope),
             bind_task_lease_context(lease),
+            # While this run executes, live input is told the turn this run's
+            # settlement reports.
+            bind_settlement_turn(task_id, lease.run_id, history_turn_id or None),
         ):
             result = await run_while_task_lease_owned(
                 agent_service.resume_execution_by_id(

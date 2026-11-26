@@ -160,7 +160,12 @@ from .task_runtime import (
 )
 from .task_settlement_report import RecordedInterruption, SettlementReport
 from .task_setup_snapshot import load_task_setup_snapshot_sync
-from .turn_settlement import TurnFacts, report_turn_settled, settled_outcome
+from .turn_settlement import (
+    TurnFacts,
+    bind_settlement_turn,
+    report_turn_settled,
+    settled_outcome,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -2830,35 +2835,40 @@ def _schedule_bg(
                     # binds fails the turn before the run is invoked.
                     nonlocal execution_started
                     execution_started = True
-                    if channel_command is not None:
-                        from .shared_channel_execution import execute_channel_background
+                    # While this run executes, live input is told the turn
+                    # this run's settlement reports.
+                    with bind_settlement_turn(task_id, lease.run_id, payload.turn_id):
+                        if channel_command is not None:
+                            from .shared_channel_execution import (
+                                execute_channel_background,
+                            )
 
-                        await execute_channel_background(
-                            command=channel_command,
-                            lease=lease,
-                            heartbeat_task=hb_task,
-                            snapshot=snapshot,
-                            payload=payload,
-                            turn_facts=facts,
-                        )
-                    else:
-                        await execute_task_background(
-                            task_id=task_id,
-                            user_message=payload.transcript_message,
-                            context=execution_context,
-                            agent_manager=_get_agent_manager(),
-                            task_owner_user_id=task_owner_user_id,
-                            before_message_id=before_message_id,
-                            llm_user_message=payload.execution_message,
-                            task_setup_snapshot=snapshot,
-                            expected_run_id=lease.run_id,
-                            task_lease=lease,
-                            resolved_execution_scope=scope,
-                            mcp_runtime_authorization_policy=(
-                                mcp_runtime_authorization_policy
-                            ),
-                            turn_facts=facts,
-                        )
+                            await execute_channel_background(
+                                command=channel_command,
+                                lease=lease,
+                                heartbeat_task=hb_task,
+                                snapshot=snapshot,
+                                payload=payload,
+                                turn_facts=facts,
+                            )
+                        else:
+                            await execute_task_background(
+                                task_id=task_id,
+                                user_message=payload.transcript_message,
+                                context=execution_context,
+                                agent_manager=_get_agent_manager(),
+                                task_owner_user_id=task_owner_user_id,
+                                before_message_id=before_message_id,
+                                llm_user_message=payload.execution_message,
+                                task_setup_snapshot=snapshot,
+                                expected_run_id=lease.run_id,
+                                task_lease=lease,
+                                resolved_execution_scope=scope,
+                                mcp_runtime_authorization_policy=(
+                                    mcp_runtime_authorization_policy
+                                ),
+                                turn_facts=facts,
+                            )
 
                 await run_while_task_lease_owned(
                     execute_owned_run(),

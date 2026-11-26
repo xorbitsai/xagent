@@ -29,8 +29,10 @@ from __future__ import annotations
 import asyncio
 import inspect
 import logging
+import threading
 import uuid
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Iterator, Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
@@ -254,6 +256,48 @@ def set_turn_settled_hook(hook: TurnSettledHook | None) -> None:
     """
     global _turn_settled_hook
     _turn_settled_hook = hook
+
+
+# The turn id each executing run's settlement will report, keyed by task and
+# run. The value carries a token so that a block leaving removes only its own
+# entry, whichever of two overlapping blocks for the same run leaves first.
+_settlement_turns: dict[tuple[int, str], tuple[object, str | None]] = {}
+_settlement_turns_lock = threading.Lock()
+
+
+@contextmanager
+def bind_settlement_turn(
+    task_id: int, run_id: str | None, turn_id: str | None
+) -> Iterator[None]:
+    """Record, while a run executes, the turn id its settlement will report.
+
+    ``turn_id`` is None when the settlement will not know it until the run
+    ends. With no ``run_id`` nothing is recorded. Leaving the block removes
+    only this block's own entry.
+    """
+    if run_id is None:
+        yield
+        return
+    key = (task_id, run_id)
+    token = object()
+    with _settlement_turns_lock:
+        _settlement_turns[key] = (token, turn_id)
+    try:
+        yield
+    finally:
+        with _settlement_turns_lock:
+            entry = _settlement_turns.get(key)
+            if entry is not None and entry[0] is token:
+                del _settlement_turns[key]
+
+
+def settlement_turn_for_run(task_id: int, run_id: str | None) -> str | None:
+    """The turn id the executing run ``run_id`` of ``task_id`` will report, or None."""
+    if run_id is None:
+        return None
+    with _settlement_turns_lock:
+        entry = _settlement_turns.get((task_id, run_id))
+    return entry[1] if entry is not None else None
 
 
 def build_error_code(raw: Any) -> str | None:

@@ -57,6 +57,7 @@ from xagent.web.services.task_command_transport import (
     stage_task_command,
 )
 from xagent.web.services.task_event_context_service import load_task_event_context
+from xagent.web.services.turn_settlement import bind_settlement_turn
 
 canonical = canonical_fixture
 engine = engine_fixture
@@ -427,7 +428,7 @@ async def test_claim_cancelled_while_its_worker_runs_settles_by_its_outcome(
         assert await first.claim() is LiveInputClaim.CLAIMED
     if not withdraw_works:
         monkeypatch.setattr(
-            lic, "withdraw_pending_user_message_delivery_sync", lambda *a: False
+            lic, "withdraw_pending_user_message_delivery_no_commit", lambda *a: False
         )
     host = BlockingHost(task.user_id if owned else None, error)
     admission = lic.DeliveryLedgerAdmission(payload_for(task), host)
@@ -870,7 +871,7 @@ async def test_finish_after_claim_settles_the_row(
     assert await admission.claim() is LiveInputClaim.CLAIMED
     if not withdraw_works:
         monkeypatch.setattr(
-            lic, "withdraw_pending_user_message_delivery_sync", lambda *a: False
+            lic, "withdraw_pending_user_message_delivery_no_commit", lambda *a: False
         )
     await admission.finish(result)
     await settle()
@@ -912,3 +913,400 @@ async def test_executor_branches(
     await settle()
     assert outcome == {"result": result}
     assert [f["reason"] for f in published] == ([reason] if reason else [])
+
+
+# ---------------------------------------------------------------------------
+# Claim hooks: a host that stages rows of its own with the claim.
+# ---------------------------------------------------------------------------
+
+SENTINEL = "claim-hook-sentinel"
+
+
+class HookedHost(FakeHost):
+    """A host implementing the three claim hooks.
+
+    ``stage_claim`` adds an assistant row as the host's own row, in the
+    session it is given; ``discard_claim`` deletes it. Each can be made to
+    fail. With ``invalid_row`` the staged row violates NOT NULL, so the hook
+    itself does not fail: the failure happens when the session flushes.
+    """
+
+    def __init__(
+        self,
+        owner: int | None,
+        *,
+        stage_error: BaseException | None = None,
+        discard_error: BaseException | None = None,
+        settle_error: BaseException | None = None,
+        invalid_row: bool = False,
+    ) -> None:
+        super().__init__(owner)
+        self.stage_error = stage_error
+        self.discard_error = discard_error
+        self.settle_error = settle_error
+        self.invalid_row = invalid_row
+        self.authorize_dbs: list[Any] = []
+        self.stage_dbs: list[Any] = []
+        self.settlement_turn_ids: list[str | None] = []
+        self.discarded: list[lic.LiveInputPayload] = []
+        self.settled: list[lic.LiveInputPayload] = []
+        self.calls: list[str] = []
+
+    def authorize(self, db: Any, payload: lic.LiveInputPayload) -> int | None:
+        self.authorize_dbs.append(db)
+        return super().authorize(db, payload)
+
+    def stage_claim(
+        self,
+        db: Any,
+        payload: lic.LiveInputPayload,
+        *,
+        settlement_turn_id: str | None,
+    ) -> None:
+        self.stage_dbs.append(db)
+        self.settlement_turn_ids.append(settlement_turn_id)
+        if self.stage_error is not None:
+            raise self.stage_error
+        if self.invalid_row:
+            db.add(
+                TaskChatMessage(
+                    task_id=payload.task_id,
+                    user_id=self.owner,
+                    role="assistant",
+                    message_type="sentinel",
+                )
+            )
+            return
+        db.add(
+            TaskChatMessage(
+                task_id=payload.task_id,
+                user_id=self.owner,
+                role="assistant",
+                content=SENTINEL,
+                message_type="sentinel",
+            )
+        )
+
+    def discard_claim(self, db: Any, payload: lic.LiveInputPayload) -> None:
+        self.discarded.append(payload)
+        if self.discard_error is not None:
+            raise self.discard_error
+        db.query(TaskChatMessage).filter_by(
+            task_id=payload.task_id, content=SENTINEL
+        ).delete(synchronize_session=False)
+
+    def settle_claim(self, payload: lic.LiveInputPayload) -> None:
+        self.calls.append("settle_claim")
+        self.settled.append(payload)
+        if self.settle_error is not None:
+            raise self.settle_error
+
+    def record_applied(self, payload: lic.LiveInputPayload) -> None:
+        self.calls.append("record_applied")
+        super().record_applied(payload)
+
+
+def sentinels(db: Any, task: Any) -> list[TaskChatMessage]:
+    return [r for r in rows(db, task) if r.content == SENTINEL]
+
+
+def ledger_rows(db: Any, task: Any) -> list[TaskChatMessage]:
+    return [r for r in rows(db, task) if r.role == "user"]
+
+
+async def test_claim_hooks_stage_in_the_claim_transaction(
+    db: Any, task: Any, published: list
+) -> None:
+    host = HookedHost(task.user_id)
+    admission = lic.DeliveryLedgerAdmission(payload_for(task), host)
+    assert await admission.claim() is LiveInputClaim.CLAIMED
+    # Re-read after a rollback: only committed rows are left.
+    db.rollback()
+    assert [r.delivery_status for r in ledger_rows(db, task)] == [DELIVERY_PENDING]
+    assert len(sentinels(db, task)) == 1
+    assert len(host.stage_dbs) == 1 and len(host.authorize_dbs) == 1
+    assert host.stage_dbs[0] is host.authorize_dbs[0]
+
+
+@pytest.mark.parametrize("failure", ["hook_raises", "flush_fails"])
+async def test_claim_hook_failure_leaves_nothing_and_returns_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+    db: Any,
+    task: Any,
+    published: list,
+    failure: str,
+) -> None:
+    counted: list[str] = []
+    monkeypatch.setattr(
+        lic, "increment_counter", lambda name, *a, **kw: counted.append(name)
+    )
+    if failure == "hook_raises":
+        host = HookedHost(task.user_id, stage_error=RuntimeError("stage failed"))
+    else:
+        host = HookedHost(task.user_id, invalid_row=True)
+    admission = lic.DeliveryLedgerAdmission(payload_for(task), host)
+    assert await admission.claim() is LiveInputClaim.UNAVAILABLE
+    assert admission._wrote is False
+    await admission.finish(LiveInputResult.RETURNED)
+    await settle()
+    db.rollback()
+    assert rows(db, task) == []
+    assert counted == ["xagent.live_input.claim_hook_errors"]
+    assert [f["reason"] for f in published] == ["run_ended"]
+
+
+@pytest.mark.parametrize(
+    "case", ["taken_existing_row", "authorize_refused", "authorize_read_error"]
+)
+async def test_claim_hooks_not_called_unless_claimed(
+    task: Any, published: list, case: str
+) -> None:
+    if case == "taken_existing_row":
+        first = lic.DeliveryLedgerAdmission(payload_for(task), FakeHost(task.user_id))
+        assert await first.claim() is LiveInputClaim.CLAIMED
+        host = HookedHost(task.user_id)
+        expected = LiveInputClaim.TAKEN
+    elif case == "authorize_refused":
+        host = HookedHost(None)
+        expected = LiveInputClaim.UNAVAILABLE
+    else:
+        host = HookedHost(task.user_id)
+        host.error = OperationalError("select", {}, Exception("down"))
+        expected = LiveInputClaim.UNAVAILABLE
+    admission = lic.DeliveryLedgerAdmission(payload_for(task), host)
+    assert await admission.claim() is expected
+    assert host.stage_dbs == [] and host.discarded == [] and host.settled == []
+
+
+@pytest.mark.parametrize(
+    "case,discard_fails,sentinel_left,status,reason,discards",
+    [
+        ("returned_after_claim", False, 0, None, "not_applied", 1),
+        (
+            "returned_after_claim",
+            True,
+            1,
+            DELIVERY_OUTCOME_UNKNOWN,
+            "outcome_unknown",
+            1,
+        ),
+        ("failed_commit", False, 0, None, "not_applied", 1),
+        # The row left ``pending`` before the withdrawal: nothing is removed, the
+        # row keeps its status (``dispatched`` cannot move to ``outcome_unknown``)
+        # and the browser is told the outcome is unknown.
+        ("row_already_dispatched", False, 1, DELIVERY_DISPATCHED, "outcome_unknown", 0),
+    ],
+    ids=[
+        "returned-ok",
+        "returned-discard-raises",
+        "failed-commit-ok",
+        "already-dispatched",
+    ],
+)
+async def test_withdrawal_runs_discard_hook_atomically(
+    monkeypatch: pytest.MonkeyPatch,
+    db: Any,
+    task: Any,
+    published: list,
+    case: str,
+    discard_fails: bool,
+    sentinel_left: int,
+    status: str | None,
+    reason: str,
+    discards: int,
+) -> None:
+    host = HookedHost(
+        task.user_id,
+        discard_error=RuntimeError("discard failed") if discard_fails else None,
+    )
+    if case == "failed_commit":
+        real = lic.claim_user_message_delivery_no_commit
+
+        def claim_then_commit_and_fail(db_: Any, *args: Any, **kwargs: Any) -> Any:
+            claim = real(db_, *args, **kwargs)
+            real_commit = db_.commit
+
+            def commit_then_raise() -> None:
+                # The commit lands, then reports an error.
+                real_commit()
+                raise RuntimeError("commit reported an error")
+
+            db_.commit = commit_then_raise
+            return claim
+
+        monkeypatch.setattr(
+            lic, "claim_user_message_delivery_no_commit", claim_then_commit_and_fail
+        )
+    admission = lic.DeliveryLedgerAdmission(payload_for(task), host)
+    claimed = await admission.claim()
+    if case == "failed_commit":
+        assert claimed is LiveInputClaim.UNAVAILABLE
+    else:
+        assert claimed is LiveInputClaim.CLAIMED
+    if case == "row_already_dispatched":
+        assert (
+            mark_user_message_delivery_sync(task.id, TURN, DELIVERY_DISPATCHED).outcome
+            == "updated"
+        )
+    await admission.finish(LiveInputResult.RETURNED)
+    await settle()
+    db.rollback()
+    assert [r.delivery_status for r in ledger_rows(db, task)] == (
+        [] if status is None else [status]
+    )
+    assert len(sentinels(db, task)) == sentinel_left
+    assert len(host.discarded) == discards
+    assert [f["reason"] for f in published] == [reason]
+
+
+def _host_with(*names: str) -> Any:
+    """A host that implements ``authorize`` and only the named claim hooks."""
+
+    def hook(self: Any, *args: Any, **kwargs: Any) -> None:
+        return None
+
+    methods = {name: hook for name in names}
+    return type("PartialHost", (FakeHost,), methods)(1)
+
+
+PARTIAL_HOOKS = [
+    ("discard_claim", "settle_claim"),
+    ("stage_claim", "settle_claim"),
+    ("stage_claim", "discard_claim"),
+    ("stage_claim",),
+]
+
+
+@pytest.mark.parametrize(
+    "names",
+    PARTIAL_HOOKS,
+    ids=["no-stage", "no-discard", "no-settle", "only-stage"],
+)
+def test_register_refuses_a_host_with_some_claim_hooks(names: tuple[str, ...]) -> None:
+    assert lic.registered_live_input_host() is None
+    with pytest.raises(ValueError):
+        lic.register_live_input_host(_host_with(*names))
+    assert lic.registered_live_input_host() is None
+
+
+@pytest.mark.parametrize(
+    "names,expected",
+    [
+        ((), None),
+        (("stage_claim", "discard_claim", "settle_claim"), "host"),
+        (("stage_claim",), ValueError),
+        (("stage_claim", "discard_claim"), ValueError),
+    ],
+    ids=["none", "all", "one", "two"],
+)
+def test_claim_hooks_resolution(names: tuple[str, ...], expected: Any) -> None:
+    host = _host_with(*names)
+    if expected is ValueError:
+        with pytest.raises(ValueError):
+            lic._claim_hooks(host)
+    elif expected == "host":
+        assert lic._claim_hooks(host) is host
+    else:
+        assert lic._claim_hooks(host) is None
+
+
+@pytest.mark.parametrize(
+    "setup,result,settles",
+    [
+        ("claimed", LiveInputResult.APPLIED, 1),
+        ("claimed", LiveInputResult.REFUSED, 1),
+        ("claimed", LiveInputResult.CONFLICT, 1),
+        ("claimed", LiveInputResult.RETURNED, 0),
+        ("claimed", LiveInputResult.UNKNOWN, 0),
+        ("taken", LiveInputResult.TAKEN, 0),
+        ("unclaimed", LiveInputResult.RETURNED, 0),
+    ],
+    ids=[
+        "applied",
+        "refused",
+        "conflict",
+        "returned-after-claim",
+        "unknown",
+        "taken",
+        "returned-unclaimed",
+    ],
+)
+async def test_settle_claim_called_for_decided_outcomes(
+    task: Any, published: list, setup: str, result: LiveInputResult, settles: int
+) -> None:
+    if setup == "taken":
+        first = lic.DeliveryLedgerAdmission(payload_for(task), FakeHost(task.user_id))
+        assert await first.claim() is LiveInputClaim.CLAIMED
+    host = HookedHost(None if setup == "unclaimed" else task.user_id)
+    admission = lic.DeliveryLedgerAdmission(payload_for(task), host)
+    await admission.claim()
+    await admission.finish(result)
+    await settle()
+    assert len(host.settled) == settles
+    if result is LiveInputResult.APPLIED:
+        assert host.calls == ["settle_claim", "record_applied"]
+
+
+@pytest.mark.parametrize(
+    "result,status,reasons,applied",
+    [
+        (LiveInputResult.APPLIED, DELIVERY_COMPLETED, [], 1),
+        (LiveInputResult.REFUSED, DELIVERY_FAILED, ["refused"], 0),
+    ],
+)
+async def test_settle_claim_failure_is_logged_only(
+    monkeypatch: pytest.MonkeyPatch,
+    db: Any,
+    task: Any,
+    published: list,
+    result: LiveInputResult,
+    status: str,
+    reasons: list[str],
+    applied: int,
+) -> None:
+    counted: list[str] = []
+    monkeypatch.setattr(
+        lic, "increment_counter", lambda name, *a, **kw: counted.append(name)
+    )
+    host = HookedHost(task.user_id, settle_error=RuntimeError("settle failed"))
+    admission = lic.DeliveryLedgerAdmission(payload_for(task), host)
+    assert await admission.claim() is LiveInputClaim.CLAIMED
+    await admission.finish(result)
+    await settle()
+    assert [r.delivery_status for r in ledger_rows(db, task)] == [status]
+    assert [f["reason"] for f in published] == reasons
+    assert len(host.applied) == applied
+    assert counted == ["xagent.live_input.settle_hook_errors"]
+
+
+@pytest.mark.parametrize(
+    "bound_run,bound_turn,expected",
+    [
+        (RUN, "O", "O"),
+        (RUN, None, None),
+        (None, None, None),
+        ("other-run", "O", None),
+    ],
+    ids=["bound", "bound-none", "unbound", "other-run"],
+)
+async def test_stage_claim_receives_the_bound_settlement_turn(
+    task: Any,
+    manager: Any,
+    running_tasks: dict,
+    published: list,
+    bound_run: str | None,
+    bound_turn: str | None,
+    expected: str | None,
+) -> None:
+    host = HookedHost(task.user_id)
+    lic.register_live_input_host(host)
+    try:
+        manager.cache(task.id, RUN)
+        with bind_settlement_turn(task.id, bound_run, bound_turn):
+            result = await lic.execute_live_input_command(command(task))
+        assert result == {"result": "queued"}
+        admission = manager.offers[0]["admission"]
+        assert await admission.claim() is LiveInputClaim.CLAIMED
+        assert host.settlement_turn_ids == [expected]
+    finally:
+        lic.unregister_live_input_host()

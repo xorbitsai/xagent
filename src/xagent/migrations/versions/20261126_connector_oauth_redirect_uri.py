@@ -53,10 +53,12 @@ _LOCK_TIMEOUT = "5s"
 _LOCK_RETRY_DELAYS = (2.0, 4.0)
 
 
+def _has_table(inspector: sa.Inspector, table: str) -> bool:
+    return table in inspector.get_table_names()
+
+
 def _has_column(inspector: sa.Inspector, table: str) -> bool:
-    return table in inspector.get_table_names() and COLUMN in {
-        column["name"] for column in inspector.get_columns(table)
-    }
+    return COLUMN in {column["name"] for column in inspector.get_columns(table)}
 
 
 def _add_column(table: str) -> None:
@@ -70,7 +72,11 @@ def _add_column(table: str) -> None:
         else:
             op.add_column(table, _column())
         return
-    if _has_column(sa.inspect(op.get_bind()), table):
+    inspector = sa.inspect(op.get_bind())
+    if not _has_table(inspector, table):
+        # Legacy partial schemas may omit either relation; skip just that one.
+        return
+    if _has_column(inspector, table):
         return
     if context.dialect.name == "postgresql":
         run_ddl_with_lock_retry(
@@ -94,7 +100,11 @@ def _drop_column(table: str) -> None:
         else:
             op.drop_column(table, COLUMN)
         return
-    if not _has_column(sa.inspect(op.get_bind()), table):
+    inspector = sa.inspect(op.get_bind())
+    if not _has_table(inspector, table):
+        # Legacy partial schemas may omit either relation; skip just that one.
+        return
+    if not _has_column(inspector, table):
         return
     if context.dialect.name == "postgresql":
         run_ddl_with_lock_retry(

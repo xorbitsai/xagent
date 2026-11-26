@@ -692,6 +692,60 @@ class TestResolveLLMAdapter:
 
         assert isinstance(adapter, Runnable)
 
+    def test_resolve_unrestricted_openrouter_with_langchain_adapter(
+        self, monkeypatch: pytest.MonkeyPatch, mocker
+    ) -> None:
+        config = ChatModelConfig(
+            id="ordinary-openrouter",
+            model_name="deepseek/deepseek-v4.1-flash-1017",
+            model_provider="openrouter",
+            api_key="test-key",
+        )
+        stub_hub = _StubHub({config.id: config})
+        monkeypatch.setattr(model_resolver, "_get_or_init_model_hub", lambda: stub_hub)
+        client_factory = mocker.patch("xagent.core.model.chat.langchain.ChatOpenAI")
+
+        resolved, adapter = model_resolver.resolve_llm_adapter(
+            model_id=config.id, use_langchain_adapter=True
+        )
+
+        assert resolved.id == config.id
+        assert adapter is not None
+        client_factory.assert_called_once()
+
+    @pytest.mark.parametrize(
+        "policy",
+        [
+            {"openrouter_provider_only": ["together/fp8"]},
+            {"openrouter_zdr": True},
+            {"openrouter_data_collection": "deny"},
+        ],
+    )
+    def test_resolve_langchain_openrouter_policy_fails_without_env_fallback(
+        self, monkeypatch: pytest.MonkeyPatch, mocker, policy
+    ) -> None:
+        config = ChatModelConfig(
+            id="regional-deepseek",
+            model_name="deepseek/deepseek-v4.1-flash-1017",
+            model_provider="openrouter",
+            api_key="test-key",
+            **policy,
+        )
+        stub_hub = _StubHub({config.id: config})
+        monkeypatch.setattr(model_resolver, "_get_or_init_model_hub", lambda: stub_hub)
+        env_fallback = mocker.patch.object(model_resolver, "_create_llm_from_env")
+        client_factory = mocker.patch("xagent.core.model.chat.langchain.ChatOpenAI")
+
+        with pytest.raises(RagCoreException, match="Failed to create adapter") as error:
+            model_resolver.resolve_llm_adapter(
+                model_id=config.id, use_langchain_adapter=True
+            )
+
+        assert error.value.details["error_type"] == "ValueError"
+        assert "OpenRouter routing policy" in error.value.details["error"]
+        env_fallback.assert_not_called()
+        client_factory.assert_not_called()
+
 
 class TestModelHubEngineHideParameters:
     """The model hub engine points at the same database as the shared web

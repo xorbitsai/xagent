@@ -4,7 +4,7 @@ import logging
 import os
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Callable, List, Optional, Tuple, Union, cast
+from typing import Any, Callable, List, Literal, Optional, Tuple, Union, cast
 
 from sqlalchemy.orm import Session, joinedload
 
@@ -93,6 +93,9 @@ def _create_llm_instance(db_model: Model) -> BaseLLM:
             base_url=db_model.base_url,
             default_temperature=db_model.temperature,
             context_window=db_model.context_window,
+            openrouter_provider_only=db_model.openrouter_provider_only,
+            openrouter_zdr=bool(db_model.openrouter_zdr),
+            openrouter_data_collection=db_model.openrouter_data_collection,
             abilities=db_model.abilities,
             description=db_model.description,
             bedrock_region=db_model.bedrock_region,
@@ -163,6 +166,9 @@ class CoreStorage:
                 default_temperature=db_model.temperature,
                 default_max_tokens=db_model.max_tokens,
                 context_window=db_model.context_window,
+                openrouter_provider_only=db_model.openrouter_provider_only,
+                openrouter_zdr=bool(db_model.openrouter_zdr),
+                openrouter_data_collection=db_model.openrouter_data_collection,
                 bedrock_region=db_model.bedrock_region,
                 bedrock_auth_mode=_web_bedrock_auth_mode(
                     cast(Optional[str], db_model.bedrock_auth_mode)
@@ -269,6 +275,9 @@ class CoreStorage:
                     "temperature": model.default_temperature,
                     "max_tokens": model.default_max_tokens,
                     "context_window": model.context_window,
+                    "openrouter_provider_only": model.openrouter_provider_only,
+                    "openrouter_zdr": model.openrouter_zdr,
+                    "openrouter_data_collection": model.openrouter_data_collection,
                     "category": "llm",
                 }
             )
@@ -435,6 +444,9 @@ class CoreStorage:
         abilities: Optional[List[str]] = None,
         description: Optional[str] = None,
         category: str = "llm",
+        openrouter_provider_only: Optional[List[str]] = None,
+        openrouter_zdr: bool = False,
+        openrouter_data_collection: Optional[Literal["deny"]] = None,
     ) -> None:
         """Add a new model to storage"""
         # Strip whitespace from string fields
@@ -459,6 +471,9 @@ class CoreStorage:
                 api_key=api_key,
                 base_url=base_url,
                 default_temperature=temperature,
+                openrouter_provider_only=openrouter_provider_only,
+                openrouter_zdr=openrouter_zdr,
+                openrouter_data_collection=openrouter_data_collection,
                 abilities=abilities,
                 description=description,
             )

@@ -1,7 +1,7 @@
 from enum import Enum
-from typing import Dict, List, Optional
+from typing import Dict, List, Literal, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 MODEL_ID_MAX_LENGTH = 100
 MODEL_NAME_MAX_LENGTH = 2048
@@ -43,6 +43,12 @@ class ChatModelConfig(ModelConfig):
     default_max_tokens: Optional[int] = None
     context_window: Optional[int] = None  # Total context window in tokens
     thinking_mode: bool = False
+    # OpenRouter endpoint slugs that this saved model may use. ``None`` keeps
+    # the provider's normal routing behavior; a configured list is enforced
+    # by the adapter with ``allow_fallbacks=False`` on every request.
+    openrouter_provider_only: Optional[List[str]] = None
+    openrouter_zdr: bool = False
+    openrouter_data_collection: Optional[Literal["deny"]] = None
     # Runtime-only settings for a configured router model. They are populated
     # from the user's Auto configuration and are intentionally not stored on a
     # concrete provider model row.
@@ -92,6 +98,36 @@ class ChatModelConfig(ModelConfig):
     # process-global bearer-token state.
     bedrock_region: Optional[str] = None
     bedrock_auth_mode: str = "auto"
+
+    @field_validator("openrouter_provider_only")
+    @classmethod
+    def validate_openrouter_provider_only(
+        cls, value: Optional[List[str]]
+    ) -> Optional[List[str]]:
+        if value is None:
+            return None
+        normalized = [provider.strip() for provider in value]
+        if not normalized or any(not provider for provider in normalized):
+            raise ValueError("openrouter_provider_only must contain non-empty slugs")
+        if len(normalized) != len(set(normalized)):
+            raise ValueError("openrouter_provider_only must not contain duplicates")
+        return normalized
+
+    @model_validator(mode="after")
+    def validate_openrouter_provider(self) -> "ChatModelConfig":
+        has_openrouter_policy = (
+            self.openrouter_provider_only is not None
+            or self.openrouter_zdr
+            or self.openrouter_data_collection is not None
+        )
+        if (
+            has_openrouter_policy
+            and self.model_provider.strip().lower() != "openrouter"
+        ):
+            raise ValueError(
+                "OpenRouter routing policy requires the openrouter provider"
+            )
+        return self
 
 
 class ImageModelConfig(ModelConfig):

@@ -535,6 +535,180 @@ async def test_openrouter_deepseek_uses_official_provider(
     }
 
 
+@pytest.mark.asyncio
+async def test_openrouter_model_allowlist_uses_regional_url_and_preserves_privacy(
+    mocker, monkeypatch
+):
+    """A saved endpoint policy wins without dropping stricter caller policy."""
+
+    monkeypatch.setenv("XAGENT_OPENROUTER_OFFICIAL_PROVIDERS_ONLY", "true")
+    mock_client = mocker.AsyncMock()
+    mock_client.chat.completions.create.return_value = SimpleNamespace(
+        choices=[
+            SimpleNamespace(
+                message=SimpleNamespace(content="Hello World", tool_calls=None)
+            )
+        ],
+        usage=None,
+        model_dump=lambda: {"id": "regional-openrouter"},
+    )
+    client_factory = mocker.patch(
+        "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+        return_value=mock_client,
+    )
+    llm = OpenRouterLLM(
+        model_name="deepseek/deepseek-v4.1-flash-1017",
+        api_key="test-key",
+        base_url="https://us.openrouter.ai/api/v1",
+        provider_only=["together/fp8", "inference-net/fp8"],
+        require_zdr=True,
+        data_collection="deny",
+    )
+
+    await llm.chat(
+        [{"role": "user", "content": "Hello"}],
+        extra_body={
+            "provider": {
+                "only": ["unapproved/global"],
+                "allow_fallbacks": True,
+                "zdr": True,
+                "data_collection": "deny",
+            }
+        },
+    )
+
+    assert client_factory.call_args.kwargs["base_url"] == (
+        "https://us.openrouter.ai/api/v1"
+    )
+    provider = mock_client.chat.completions.create.call_args.kwargs["extra_body"][
+        "provider"
+    ]
+    assert provider == {
+        "only": ["together/fp8", "inference-net/fp8"],
+        "allow_fallbacks": False,
+        "zdr": True,
+        "data_collection": "deny",
+    }
+
+
+@pytest.mark.asyncio
+async def test_openrouter_model_allowlist_survives_compatibility_retry(
+    mocker,
+):
+    completion = SimpleNamespace(
+        choices=[
+            SimpleNamespace(
+                message=SimpleNamespace(content="Hello World", tool_calls=None)
+            )
+        ],
+        usage=None,
+        model_dump=lambda: {"id": "regional-openrouter-retry"},
+    )
+    mock_client = mocker.AsyncMock()
+    mock_client.chat.completions.create.side_effect = [
+        RuntimeError(_OPENROUTER_TOOL_CHOICE_ERROR),
+        completion,
+    ]
+    mocker.patch(
+        "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+        return_value=mock_client,
+    )
+    llm = OpenRouterLLM(
+        model_name="deepseek/deepseek-v4.1-flash-1017",
+        api_key="test-key",
+        base_url="https://us.openrouter.ai/api/v1",
+        provider_only=["together/fp8"],
+        require_zdr=True,
+        data_collection="deny",
+    )
+
+    await llm.chat(
+        [{"role": "user", "content": "score?"}],
+        tools=_two_tool_schema(),
+        tool_choice="required",
+    )
+
+    assert mock_client.chat.completions.create.await_count == 2
+    for call in mock_client.chat.completions.create.call_args_list:
+        assert call.kwargs["extra_body"]["provider"] == {
+            "only": ["together/fp8"],
+            "allow_fallbacks": False,
+            "zdr": True,
+            "data_collection": "deny",
+        }
+
+
+@pytest.mark.asyncio
+async def test_openrouter_model_allowlist_streams_through_regional_url(mocker):
+    async def empty_stream():
+        if False:
+            yield None
+
+    mock_client = mocker.AsyncMock()
+    mock_client.chat.completions.create.return_value = empty_stream()
+    client_factory = mocker.patch(
+        "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+        return_value=mock_client,
+    )
+    llm = OpenRouterLLM(
+        model_name="deepseek/deepseek-v4.1-flash-1017",
+        api_key="test-key",
+        base_url="https://us.openrouter.ai/api/v1",
+        provider_only=["together/fp8"],
+        require_zdr=True,
+        data_collection="deny",
+    )
+
+    assert [
+        chunk async for chunk in llm.stream_chat([{"role": "user", "content": "Hi"}])
+    ] == []
+
+    assert client_factory.call_args.kwargs["base_url"] == (
+        "https://us.openrouter.ai/api/v1"
+    )
+    assert mock_client.chat.completions.create.call_args.kwargs["extra_body"][
+        "provider"
+    ] == {
+        "only": ["together/fp8"],
+        "allow_fallbacks": False,
+        "zdr": True,
+        "data_collection": "deny",
+    }
+
+
+@pytest.mark.asyncio
+async def test_openrouter_model_allowlist_fails_without_eligible_endpoint(mocker):
+    mock_client = mocker.AsyncMock()
+    mock_client.chat.completions.create.side_effect = RuntimeError(
+        "No endpoints found matching provider preferences"
+    )
+    mocker.patch(
+        "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+        return_value=mock_client,
+    )
+    llm = OpenRouterLLM(
+        model_name="deepseek/deepseek-v4.1-flash-1017",
+        api_key="test-key",
+        base_url="https://us.openrouter.ai/api/v1",
+        provider_only=["together/fp8"],
+        require_zdr=True,
+        data_collection="deny",
+    )
+
+    with pytest.raises(RuntimeError, match="No endpoints found"):
+        await llm.chat([{"role": "user", "content": "Hello"}])
+
+    assert mock_client.chat.completions.create.await_count == 1
+    assert mock_client.chat.completions.create.call_args.kwargs["extra_body"][
+        "provider"
+    ] == {
+        "only": ["together/fp8"],
+        "allow_fallbacks": False,
+        "zdr": True,
+        "data_collection": "deny",
+    }
+
+
 def test_openrouter_official_provider_mapping_covers_auto_router_authors(
     monkeypatch,
 ):
@@ -595,6 +769,19 @@ async def test_openrouter_provider_override_is_preserved(
         "reasoning": {"enabled": False},
         "thinking": {"type": "disabled"},
     }
+
+
+def test_openrouter_legacy_non_mapping_provider_override_is_preserved(monkeypatch):
+    """An unrelated saved-policy change must not rewrite legacy caller input."""
+
+    monkeypatch.setenv("XAGENT_OPENROUTER_OFFICIAL_PROVIDERS_ONLY", "true")
+    llm = OpenRouterLLM(
+        model_name="deepseek/deepseek-v4-flash",
+        api_key="test-key",
+    )
+    extra_body = {"provider": "legacy-routing-value", "trace_id": "manual"}
+
+    assert llm._prepare_extra_body(extra_body) is extra_body
 
 
 @pytest.mark.asyncio

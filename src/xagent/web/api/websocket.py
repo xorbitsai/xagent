@@ -3470,9 +3470,12 @@ def _load_historical_stream_snapshot_sync(
 
             # A transcript row is stored with its file references already
             # reconciled, while a trace row keeps the model's raw text. Reconcile
-            # the trace text here, with the same path map and file records, so
-            # the transcript twin of an answer is recognised and the surviving
-            # trace frame displays the reconciled text.
+            # the trace text here so the transcript twin of an answer is
+            # recognised and the surviving trace frame displays the reconciled
+            # text. Replay uses the path map merged over the whole task and the
+            # task's current file records, whereas storage used the map of the
+            # one run; when two runs output files with the same name the two
+            # sides can disagree, and the twin is then sent as well.
             reconciled_trace_text_by_event_id: Dict[str, str] = {}
             for trace_event in trace_events:
                 if trace_event.event_type not in {"agent_message", "ai_message"}:

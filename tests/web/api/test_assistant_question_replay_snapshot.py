@@ -518,7 +518,7 @@ _ANSWER_CELLS = {
         "Your report is ready: [report.pdf](output/report.pdf)",
         True,
     ),
-    "unpaired_agent_message_fake": (
+    "result_card_fake": (
         "agent_message",
         f"Your report is ready: [x.pdf](file:{_FAKE_FILE_ID})",
         False,
@@ -550,10 +550,20 @@ async def test_answer_stored_as_trace_and_transcript_row_replays_once(
     when = datetime(2026, 11, 25, tzinfo=timezone.utc)
     file_id = _output_file(db, user_id, task_id, "report.pdf", "output/report.pdf")
     raw = template.replace("{fid}", file_id)
+    is_card = event_type == "agent_message"
 
     data: dict = {"content": raw, "status": "completed"}
     if event_type == "agent_message":
-        data = {"message": raw, "display": "chat", "expect_response": False}
+        card = {"title": raw, "items": ["a"], "source": {"name": "Cosmos"}}
+        data = {
+            "event_id": "answer-1",
+            "message": raw,
+            "message_type": "result_card",
+            "expect_response": False,
+            "display": "chat",
+            "visible": True,
+            "metadata": {"display": "result_card", "result_card": card},
+        }
     if cell == "streamed_repairable":
         data["stream_message_id"] = "final_answer_abc"
     db.add(
@@ -595,7 +605,9 @@ async def test_answer_stored_as_trace_and_transcript_row_replays_once(
         task_id=task_id,
         user_id=user_id,
         content=_rewrite_file_links_to_file_id(raw, path_map),
-        message_type="assistant_response",
+        message_type="result_card" if is_card else "assistant_response",
+        message_metadata=data["metadata"] if is_card else None,
+        source_event_id="answer-1" if is_card else None,
     )
     db.commit()
     stored = (

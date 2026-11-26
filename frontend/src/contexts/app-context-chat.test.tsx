@@ -15047,9 +15047,13 @@ describe("assistant answer identity across live delivery and replay", () => {
       message_type: "result_card", display: "chat", expect_response: false,
       metadata: { display: "result_card", result_card: card },
     }
-    chatRecord("card-event-1", card.title, cardExtra)
+    const cardFrame = () => deliver({
+      event_type: "agent_message", event_id: "card-event-1",
+      data: { message: card.title, ...cardExtra },
+    })
+    cardFrame()
     elapse(31_000)
-    chatRecord("card-event-1", card.title, cardExtra)
+    cardFrame()
     expect(shown(card.title)).toHaveLength(1)
   })
 

@@ -1999,16 +1999,14 @@ export function projectAppState(state: AppState, action: AppAction): AppState {
         }
       }
 
-      // One assistant question or answer can be delivered twice -- live, then
-      // replayed from the transcript after a reconnect -- under one event
-      // identity but with different text, because the replayed copy carries
-      // the rendered interaction list. Identity decides, never text: #2250 is the record
-      // of what text matching costs. The mounted bubble is kept rather than
-      // replaced so an open clarification form is not remounted under the
-      // visitor; the re-delivery only fills in what the bubble lacks. Content
-      // is deliberately not among those fields: one event id is one message,
-      // and the replayed copy differs only by the rendered interaction list
-      // the form already draws.
+      // A message with one event identity can be delivered twice: live, then
+      // replayed after a reconnect. A replayed question carries the rendered
+      // interaction list; a replayed answer can carry rewritten file links.
+      // Identity decides, never text: #2250 is the record of what text
+      // matching costs. The mounted bubble is kept rather than replaced so an
+      // open clarification form is not remounted under the visitor; the
+      // re-delivery only fills in what the bubble lacks. Content is
+      // deliberately not among those fields: one event id is one message.
       if (messageToAdd.role === "assistant" && isStableAssistantMessageId(messageToAdd.id)) {
         const deliveredIndex = state.messages.findIndex(
           message => message.role === "assistant" && message.id === messageToAdd.id,

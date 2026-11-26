@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import uuid
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -20,12 +21,12 @@ from xagent.web.services.task_event_trace_handler import TaskEventTraceHandler
 TASK_ID = 4242
 
 
-def _ai_message_event() -> TraceEvent:
+def _ai_message_event(task_id: int = TASK_ID) -> TraceEvent:
     return TraceEvent(
         event_type=TraceEventType(
             TraceScope.TASK, TraceAction.UPDATE, TraceCategory.MESSAGE
         ),
-        task_id=str(TASK_ID),
+        task_id=str(task_id),
         data={"content": "hello"},
     )
 
@@ -54,14 +55,52 @@ def published(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, Any]]:
 @pytest.mark.asyncio
 async def test_non_authoritative_live_frame_uses_persisted_event_id(
     published: list[dict[str, Any]],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    event = _ai_message_event()
+    from sqlalchemy import create_engine, select
+    from sqlalchemy.orm import Session
 
-    await TaskEventTraceHandler(TASK_ID).handle_event(event)
+    from xagent.web.models.database import Base
+    from xagent.web.models.task import Task
+    from xagent.web.models.task import TraceEvent as TraceEventRow
+    from xagent.web.models.user import User
+    from xagent.web.services import trace_handlers
+    from xagent.web.services.trace_database import TraceDatabaseRuntime
 
+    source = create_engine(f"sqlite:///{tmp_path / 'trace.db'}")
+    Base.metadata.create_all(source)
+    with Session(source) as db:
+        user = User(username="trace-event-id", password_hash="unused")
+        db.add(user)
+        db.flush()
+        task = Task(user_id=user.id, title="Event id")
+        db.add(task)
+        db.flush()
+        task_id = task.id
+        db.commit()
+    runtime = TraceDatabaseRuntime(source, use_async=True, limit=4)
+    monkeypatch.setattr(trace_handlers, "get_trace_database_runtime", lambda: runtime)
+    event = _ai_message_event(task_id)
+    try:
+        # The same event object goes to both handlers, as the tracer does.
+        await trace_handlers.DatabaseTraceHandler(task_id).handle_event(event)
+        await TaskEventTraceHandler(task_id).handle_event(event)
+        with Session(source) as db:
+            persisted = list(
+                db.scalars(
+                    select(TraceEventRow.event_id).where(
+                        TraceEventRow.task_id == task_id
+                    )
+                )
+            )
+    finally:
+        await runtime.close()
+        source.dispose()
+
+    assert persisted == [str(event.id)]
     assert len(published) == 1
-    # The persisted row is written with event_id=str(event.id).
-    assert published[0]["event_id"] == str(event.id)
+    assert published[0]["event_id"] == persisted[0]
 
 
 @pytest.mark.asyncio

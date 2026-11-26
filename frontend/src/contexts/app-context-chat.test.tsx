@@ -14949,17 +14949,32 @@ describe("assistant answer identity across live delivery and replay", () => {
     }>
   ).filter(message => message.role === "assistant" && message.content === content)
 
-  it("shows one answer when the live frame arrives before its replay", () => {
+  // The replayed copy of an answer can carry rewritten file links, so the two
+  // deliveries of one event differ in text. The first delivery stays mounted.
+  const LIVE_COPY = "Report ready: file:abc"
+  const REPLAY_COPY = "Report ready: /files/abc"
+
+  it("keeps the live copy when its replay with rewritten links arrives later", () => {
     mount()
-    aiMessage("event-1")
+    aiMessage("event-1", LIVE_COPY)
     elapse(31_000)
-    aiMessage("event-1")
-    expect(shown(ANSWER)).toHaveLength(1)
+    aiMessage("event-1", REPLAY_COPY)
+    expect(shown(LIVE_COPY)).toHaveLength(1)
+    expect(shown(REPLAY_COPY)).toHaveLength(0)
   })
 
-  it("shows one answer when the replay arrives before the live frame", () => {
+  it("keeps the replayed copy when the live frame with original links arrives later", () => {
     mount()
     act(() => { webSocketOptions.current?.onConnect?.() })
+    aiMessage("event-1", REPLAY_COPY)
+    elapse(31_000)
+    aiMessage("event-1", LIVE_COPY)
+    expect(shown(REPLAY_COPY)).toHaveLength(1)
+    expect(shown(LIVE_COPY)).toHaveLength(0)
+  })
+
+  it("shows one answer when the live frame arrives before an identical replay", () => {
+    mount()
     aiMessage("event-1")
     elapse(31_000)
     aiMessage("event-1")
@@ -15061,10 +15076,10 @@ describe("assistant answer identity across live delivery and replay", () => {
     expect(shown(ANSWER)).toHaveLength(1)
   })
 
-  // New backend with an old frontend cannot be expressed here: the frontend
-  // under test is always the new one, and the old frontend's behaviour (no id
-  // for ai_message, so ordinary answers are never merged by id) is the
-  // pre-change code path that the cases above already supersede.
+  // New backend with an old frontend is not expressible here: the code under
+  // test is always the new frontend. The old frontend's merge-by-id handling of
+  // user messages, question messages and step records is not changed by this
+  // PR and is covered by the existing cases in this file.
 
   it("does not merge a different answer into an earlier one", () => {
     mount()

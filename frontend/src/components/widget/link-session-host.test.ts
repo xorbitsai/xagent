@@ -750,6 +750,25 @@ describe("link session host renew accounting", () => {
     expect(h.navs).toEqual(["/widget/chat/link/ended?reason=network"])
   })
 
+  it("does not credit a 50-second connection as stable during a delayed 1001 reconnect", () => {
+    const h = makeHost()
+    const worker = connect(h)
+    iframeSays(h, "ready")
+    for (let i = 0; i < 3; i += 1) renewCycle(h, worker)
+    const id = (lastUpdate(h) as { session_delivery_id: string }).session_delivery_id
+    iframeSays(h, "session_connection_open", { session_delivery_id: id })
+    vi.advanceTimersByTime(50_000)
+    iframeSays(h, "session_connection_closed", { session_delivery_id: "stale" })
+    expect(h.host.getState().rapidRecoveries).toBe(3)
+    iframeSays(h, "session_connection_closed", { session_delivery_id: id })
+    vi.advanceTimersByTime(15_000)
+    expect(h.host.getState().rapidRecoveries).toBe(3)
+    expect(worker.count("renew")).toBe(3)
+    iframeSays(h, "reconnect_request")
+    expect(worker.count("renew")).toBe(3)
+    expect(h.navs).toEqual(["/widget/chat/link/ended?reason=network"])
+  })
+
   it("voids an unfinished stability timer when a new count starts, so an old delivery cannot reset it", () => {
     const h = makeHost()
     const worker = connect(h)

@@ -434,6 +434,9 @@ export function createLinkSessionHost(deps: LinkSessionHostDeps): LinkSessionHos
       case "session_connection_open":
         if (isNonBlankString(data.session_delivery_id)) beginStability(data.session_delivery_id)
         return
+      case "session_connection_closed":
+        if (data.session_delivery_id === state.awaitedDeliveryId) invalidateStability()
+        return
       case "session_terminal_reached":
         terminate(endReasonForChatTerminal(data.code))
         return

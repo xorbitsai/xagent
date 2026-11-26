@@ -337,7 +337,7 @@ describe("useWidgetSession", () => {
     },
   )
 
-  it.each([4401, 1006, 1001, 4500])(
+  it.each([4401, 1006, 4500])(
     "owns abnormal WebSocket close %s and requests one parent reconnect",
     (code) => {
       vi.useFakeTimers()
@@ -1505,6 +1505,23 @@ describe("useWidgetSession reconnect jitter", () => {
 
   it("keeps the jitter bound under the thresholds that lose a session", () => {
     expect(WS_CLOSE_RECONNECT_JITTER_MAX_MS).toBeLessThanOrEqual(30_000)
+  })
+
+  it.each([1001, 1006])("reports a correlated %i close before delaying reconnect", (code) => {
+    vi.spyOn(Math, "random").mockReturnValue(0.5)
+    const { result, postMessage } = mountActive()
+
+    act(() => result.current.handleConnectionClose(new CloseEvent("close", { code })))
+
+    expect(postMessage).toHaveBeenCalledWith({
+      xagent: true,
+      v: 1,
+      type: "session_connection_closed",
+      session_delivery_id: "delivery-a",
+    }, PARENT_ORIGIN)
+    expect(reconnectRequests(postMessage)).toHaveLength(0)
+    act(() => vi.advanceTimersByTime(WS_CLOSE_RECONNECT_JITTER_MAX_MS / 2))
+    expect(reconnectRequests(postMessage)).toHaveLength(1)
   })
 
   it("sends the delayed request at once when a caller needs a session", () => {

@@ -344,6 +344,19 @@ export function useWidgetSession() {
 
   const requestReconnect = useCallback((reason: WidgetSessionReconnectReason) => {
     if (!mountedRef.current || terminalRef.current || recoveryInFlightRef.current) return
+    // The parent must stop counting this delivery as stable before the
+    // reconnect jitter starts; otherwise its 60-second timer can reset the
+    // rapid-recovery budget while the socket is already closed.
+    const deliveryId = activeDeliveryIdRef.current
+    const targetOrigin = targetOriginRef.current
+    if (reason === "ws_closed" && activeSessionGenerationRef.current !== null && deliveryId && targetOrigin) {
+      window.parent.postMessage({
+        xagent: true,
+        v: 1,
+        type: "session_connection_closed",
+        session_delivery_id: deliveryId,
+      }, targetOrigin)
+    }
     activeSessionGenerationRef.current = null
     issueReconnectRequest(reason)
   }, [issueReconnectRequest])

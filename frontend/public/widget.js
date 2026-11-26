@@ -1674,6 +1674,8 @@
       } else if (data.type === 'session_connection_open') {
         if (!isNonBlankString(data.session_delivery_id)) return;
         beginStability(data.session_delivery_id);
+      } else if (data.type === 'session_connection_closed') {
+        if (data.session_delivery_id === state.awaitedDeliveryId) invalidateStability();
       }
     }
 

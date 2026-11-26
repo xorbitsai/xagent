@@ -9,6 +9,11 @@ execution reaches a safe point and asks to claim the message.
 
 Who the sender is and whether they may still spend quota is decided by the
 registered ``LiveInputHost``; this module never inspects identities.
+
+A host may also implement the claim hooks of ``LiveInputClaimHooks``: it then
+stages rows of its own in the claim transaction, removes them in the
+withdrawal transaction, and settles them once the outcome is decided. A host
+implements all three hooks or none.
 """
 
 from __future__ import annotations
@@ -39,11 +44,12 @@ from .chat_history_service import (
     claim_user_message_delivery_no_commit,
     inspect_user_message_delivery,
     mark_user_message_delivery_sync,
-    withdraw_pending_user_message_delivery_sync,
+    withdraw_pending_user_message_delivery_no_commit,
 )
 from .db_runtime import run_db_io_cancellation_safe
 from .task_command_transport import LIVE_INPUT_COMMAND_PREFIX, ClaimedTaskCommand
 from .task_events import publish_task_event
+from .turn_settlement import settlement_turn_for_run
 
 logger = logging.getLogger(__name__)
 
@@ -99,6 +105,58 @@ class LiveInputHost(Protocol):
         """Meter one message that was written into the run (best effort)."""
 
 
+class LiveInputClaimHooks(Protocol):
+    """What a host adds to record side effects together with the claim.
+
+    Not part of ``LiveInputHost``: a host implements all three methods or none
+    of them, and ``_claim_hooks`` is the only place that tells which.
+    """
+
+    def stage_claim(
+        self,
+        db: Session,
+        payload: LiveInputPayload,
+        *,
+        settlement_turn_id: str | None,
+    ) -> None:
+        """Stage the host's rows for a message being claimed, in the claim's
+        transaction, before its commit. ``settlement_turn_id`` is the turn id
+        the run will report when it settles, or None when that is not known
+        yet; it is a label only and not a basis for authorization. Raising
+        fails the claim and leaves nothing behind. The hook must not commit or
+        roll back."""
+
+    def discard_claim(self, db: Session, payload: LiveInputPayload) -> None:
+        """Remove what ``stage_claim`` staged, in the transaction that deletes
+        the message's still-pending delivery row, only when that delete
+        removed the row. Raising rolls the withdrawal back."""
+
+    def settle_claim(self, payload: LiveInputPayload) -> None:
+        """Called once a claimed message's outcome is decided and its delivery
+        row stays: applied, refused or conflict. The host opens its own
+        session. Best effort: an error is logged and changes nothing."""
+
+
+_CLAIM_HOOK_NAMES = ("stage_claim", "discard_claim", "settle_claim")
+
+
+def _claim_hooks(host: LiveInputHost) -> LiveInputClaimHooks | None:
+    """The host's claim hooks, or None when it implements none of them.
+
+    Raises ``ValueError`` when it implements only some: such a host would
+    leave rows it can no longer withdraw or release.
+    """
+    present = [callable(getattr(host, name, None)) for name in _CLAIM_HOOK_NAMES]
+    if not any(present):
+        return None
+    if not all(present):
+        raise ValueError(
+            "A live input host must implement stage_claim, discard_claim and "
+            "settle_claim, or none of them"
+        )
+    return host  # type: ignore[return-value]
+
+
 _host_lock = threading.Lock()
 _host: LiveInputHost | None = None
 
@@ -112,6 +170,7 @@ def register_live_input_host(host: LiveInputHost) -> None:
             return
         if _host is not None:
             raise ValueError("A live input host is already registered")
+        _claim_hooks(host)
         _host = host
 
 
@@ -174,11 +233,24 @@ class DeliveryLedgerAdmission:
     holds the run's cancellation back (``LIVE_INPUT_CANCEL_GRACE_SECONDS``).
     The injection's checkpoint is written under the run's task lease and is
     refused once the lease has moved to another runner.
+
+    Rows the host stages with its claim hooks are written in the claim
+    transaction and withdrawn in the withdrawal transaction, like the ledger
+    row itself.
     """
 
-    def __init__(self, payload: LiveInputPayload, host: LiveInputHost) -> None:
+    def __init__(
+        self,
+        payload: LiveInputPayload,
+        host: LiveInputHost,
+        *,
+        settlement_turn_id: str | None = None,
+    ) -> None:
         self._payload = payload
         self._host = host
+        # The turn id the run reports when it settles, handed to the host's
+        # claim hook; None when the run does not know it yet.
+        self._settlement_turn_id = settlement_turn_id
         # True once this admission has staged a row of its own for the
         # commit. Only then may it change the state of the row under its turn
         # id; before that, any row there belongs to another delivery.
@@ -255,6 +327,20 @@ class DeliveryLedgerAdmission:
             if not claim.claimed:
                 db.rollback()
                 return _ClaimOutcome(LiveInputClaim.TAKEN)
+            try:
+                hooks = _claim_hooks(self._host)
+                if hooks is not None:
+                    hooks.stage_claim(
+                        db, payload, settlement_turn_id=self._settlement_turn_id
+                    )
+                    # The session does not autoflush: write the host's rows
+                    # here, so their failure fails the claim before it commits.
+                    db.flush()
+            except Exception:
+                logger.warning("live input host claim staging failed", exc_info=True)
+                increment_counter("xagent.live_input.claim_hook_errors")
+                db.rollback()
+                return _ClaimOutcome(LiveInputClaim.UNAVAILABLE)
             self._wrote = True
             try:
                 db.commit()
@@ -270,9 +356,7 @@ class DeliveryLedgerAdmission:
     def _after_failed_commit(self) -> _ClaimOutcome:
         payload = self._payload
         try:
-            withdrawn = withdraw_pending_user_message_delivery_sync(
-                payload.task_id, payload.turn_id
-            )
+            withdrawn = _withdraw_claimed_sync(payload, self._host)
             if not withdrawn:
                 from ..models.database import get_session_local
 
@@ -340,13 +424,28 @@ class DeliveryLedgerAdmission:
         payload = self._payload
         try:
             return await run_db_io_cancellation_safe(
-                lambda: withdraw_pending_user_message_delivery_sync(
-                    payload.task_id, payload.turn_id
-                )
+                lambda: _withdraw_claimed_sync(payload, self._host)
             )
         except Exception:
             logger.warning("live input withdrawal failed", exc_info=True)
             return False
+
+    async def _settle(self) -> None:
+        """Tell the host this claimed message's outcome is decided.
+
+        Only for a message whose row stays; a failure changes nothing.
+        """
+        if not self._wrote:
+            return
+        payload = self._payload
+        try:
+            hooks = _claim_hooks(self._host)
+            if hooks is None:
+                return
+            await run_db_io_cancellation_safe(lambda: hooks.settle_claim(payload))
+        except Exception:
+            logger.warning("live input host settle failed", exc_info=True)
+            increment_counter("xagent.live_input.settle_hook_errors")
 
     async def _record_applied(self) -> None:
         payload = self._payload
@@ -377,6 +476,7 @@ class DeliveryLedgerAdmission:
             # it to ``outcome_unknown`` or ``failed``, the mark is a conflict
             # and that status is kept.
             await self._mark(DELIVERY_COMPLETED)
+            await self._settle()
             await self._record_applied()
         elif result is LiveInputResult.RETURNED:
             if not self._claimed:
@@ -389,9 +489,11 @@ class DeliveryLedgerAdmission:
             self._notify("taken")
         elif result is LiveInputResult.REFUSED:
             await self._mark(DELIVERY_FAILED)
+            await self._settle()
             self._notify("refused")
         elif result is LiveInputResult.CONFLICT:
             await self._mark(DELIVERY_FAILED)
+            await self._settle()
             self._notify("conflict")
         else:
             await self._finish_unknown()
@@ -414,6 +516,27 @@ class DeliveryLedgerAdmission:
             return LiveInputResult.UNKNOWN
         self._adopt(outcome)
         return result_without_injection(outcome.claim)
+
+
+def _withdraw_claimed_sync(payload: LiveInputPayload, host: LiveInputHost) -> bool:
+    """Withdraw the claimed message's pending row and the host's rows together.
+
+    One transaction: the host's ``discard_claim`` runs only when the row was
+    removed, and a failure in it rolls the withdrawal back. Returns whether
+    the row was removed.
+    """
+    from ..models.database import get_session_local
+
+    with get_session_local()() as db:
+        removed = withdraw_pending_user_message_delivery_no_commit(
+            db, payload.task_id, payload.turn_id
+        )
+        if removed:
+            hooks = _claim_hooks(host)
+            if hooks is not None:
+                hooks.discard_claim(db, payload)
+        db.commit()
+        return removed
 
 
 def _done(result: str) -> dict[str, Any]:
@@ -453,7 +576,13 @@ async def execute_live_input_command(
             execution_message=payload.message,
             display_message=payload.message,
             turn_id=payload.turn_id,
-            admission=DeliveryLedgerAdmission(payload, host),
+            admission=DeliveryLedgerAdmission(
+                payload,
+                host,
+                settlement_turn_id=settlement_turn_for_run(
+                    payload.task_id, command.target_run_id
+                ),
+            ),
         )
         if offer in (LiveInputOffer.QUEUED, LiveInputOffer.ALREADY_QUEUED):
             return _done("queued")

@@ -50,7 +50,7 @@ def test_missing_row_passes_then_row_decides(db, monkeypatch) -> None:
     assert set_serving_generation("blue", None)
     assert serving_generation() == "blue"
     assert not is_serving()
-    assert not start_allowed("x")
+    assert start_allowed("x")
     monkeypatch.setenv(generation.GENERATION_ENV, "blue")
     assert is_serving()
     assert start_allowed("x")
@@ -143,18 +143,30 @@ async def test_lease_recovery_and_auto_resume_loops_honor_the_record(
 
 
 @pytest.mark.asyncio
-async def test_singleton_starters_refuse_when_another_generation_serves(
+async def test_singleton_starters_start_dormant_when_another_generation_serves(
     db, monkeypatch
 ) -> None:
     from xagent.web import app as app_module
+    from xagent.web.services import task_execution_host
 
     monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
     monkeypatch.setenv(generation.GENERATION_ENV, "green")
     assert set_serving_generation("blue", None)
+    monkeypatch.setattr(task_execution_host, "consumes_task_commands", lambda: True)
     monkeypatch.setattr(app_module, "get_trigger_dispatcher_enabled", lambda: True)
-    assert app_module.start_trigger_dispatcher_task(app_module.app) is None
-    assert app_module.start_task_lease_recovery_task(app_module.app) is None
-    assert app_module.start_task_auto_resume_task(app_module.app) is None
+    tasks = [
+        app_module.start_trigger_dispatcher_task(app_module.app),
+        app_module.start_task_lease_recovery_task(app_module.app),
+        app_module.start_task_auto_resume_task(app_module.app),
+    ]
+    assert all(task is not None for task in tasks)
+    assert not await tick_allowed("trigger-dispatcher")
+    for task in tasks:
+        task.cancel()
+    await asyncio.gather(*tasks, return_exceptions=True)
+    app_module.app.state.trigger_dispatcher_task = None
+    app_module.app.state.task_lease_recovery_task = None
+    app_module.app.state.task_auto_resume_task = None
 
 
 def test_generations_off_never_reads_the_database(monkeypatch) -> None:
@@ -168,6 +180,9 @@ def test_generations_off_never_reads_the_database(monkeypatch) -> None:
     assert is_serving()
     assert start_allowed("x")
     assert asyncio.run(tick_allowed("x"))
+    assert generation.is_serving_cached()
+    assert generation.serving_status()["serving"] is True
+    assert asyncio.run(generation.refresh_serving())
 
 
 def test_generations_off_logs_nothing(monkeypatch, caplog) -> None:
@@ -180,3 +195,81 @@ def test_generations_off_logs_nothing(monkeypatch, caplog) -> None:
         start_allowed("x")
         asyncio.run(tick_allowed("x"))
     assert caplog.records == []
+
+
+def test_cached_serving_expires_and_read_failure_closes(monkeypatch) -> None:
+    monkeypatch.setenv(generation.GENERATION_ENV, "green")
+    record = {"value": "green"}
+
+    def read() -> str | None:
+        value = record["value"]
+        if isinstance(value, Exception):
+            raise value
+        return value
+
+    monkeypatch.setattr(generation, "serving_generation", read)
+    assert generation.is_serving_cached(max_age=0)
+    record["value"] = RuntimeError("database down")
+    assert not generation.is_serving_cached(max_age=0)
+    assert generation.serving_status()["serving"] is None
+    record["value"] = "blue"
+    assert not generation.is_serving_cached(max_age=0)
+    assert generation.serving_status()["serving"] is False
+
+
+def test_cached_serving_rechecks_after_max_age(monkeypatch) -> None:
+    monkeypatch.setenv(generation.GENERATION_ENV, "green")
+    monkeypatch.setattr(generation, "_cached_at", float("-inf"))
+    clock = {"now": 10.0}
+    record = {"value": "green", "reads": 0}
+    monkeypatch.setattr(generation.time, "monotonic", lambda: clock["now"])
+
+    def read() -> str:
+        record["reads"] += 1
+        return record["value"]
+
+    monkeypatch.setattr(generation, "serving_generation", read)
+    assert generation.is_serving_cached()
+    record["value"] = "blue"
+    clock["now"] = 11.9
+    assert generation.is_serving_cached()
+    assert record["reads"] == 1
+    clock["now"] = 12.0
+    assert not generation.is_serving_cached()
+    assert record["reads"] == 2
+
+
+@pytest.mark.asyncio
+async def test_refresh_wakes_dormant_waiter_and_rechecks_record(monkeypatch) -> None:
+    monkeypatch.setenv(generation.GENERATION_ENV, "green")
+    record = {"value": "blue"}
+    monkeypatch.setattr(generation, "serving_generation", lambda: record["value"])
+    waiter = asyncio.create_task(generation.wait_tick("test", 30))
+    await asyncio.sleep(0)
+    assert not waiter.done()
+    record["value"] = "green"
+    assert await generation.refresh_serving()
+    await asyncio.wait_for(waiter, timeout=1)
+    assert generation.serving_status()["serving"] is True
+
+
+@pytest.mark.asyncio
+async def test_refresh_between_failed_guard_and_wait_is_not_lost(monkeypatch) -> None:
+    monkeypatch.setenv(generation.GENERATION_ENV, "green")
+    record = {"value": "blue"}
+    monkeypatch.setattr(generation, "serving_generation", lambda: record["value"])
+    assert not await tick_allowed("test")
+    record["value"] = "green"
+    assert await generation.refresh_serving()
+    await asyncio.wait_for(generation.wait_tick("test", 30), timeout=1)
+
+
+@pytest.mark.asyncio
+async def test_dormant_wait_preserves_shutdown_signal(monkeypatch) -> None:
+    monkeypatch.setenv(generation.GENERATION_ENV, "green")
+    monkeypatch.setattr(generation, "serving_generation", lambda: "blue")
+    stop = asyncio.Event()
+    waiter = asyncio.create_task(generation.wait_tick("test", 30, stop_event=stop))
+    await asyncio.sleep(0)
+    stop.set()
+    await asyncio.wait_for(waiter, timeout=1)

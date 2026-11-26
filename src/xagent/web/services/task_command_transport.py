@@ -996,11 +996,15 @@ _OPEN_COMMAND_AND_REPLY_PRESENCE = select(
 
 
 def _command_routing_predicate(runner_id: str, now: datetime) -> Any:
-    if release_hold.finishing:
-        # Finish-only mode: only commands of tasks whose lease this process
-        # holds, controls included. Never a task nobody or another process
-        # owns, and never one whose lease has lapsed (lease recovery is stopped
-        # here, so the serving generation takes those over).
+    from .generation import current_generation, is_serving_cached
+
+    if release_hold.finishing or (
+        current_generation() is not None and not is_serving_cached()
+    ):
+        # Finishing or dormant generation: only commands of tasks whose lease
+        # this process holds, controls included. Never a task nobody or another
+        # process owns, and never one whose lease has lapsed. The serving
+        # generation recovers expired leases.
         #
         # Every kind of an owned task stays claimable, START, RESUME_INPUT and
         # MESSAGE included (the closed-cap ``active_ids`` branch passes them):

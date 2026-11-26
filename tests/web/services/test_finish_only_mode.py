@@ -15,6 +15,7 @@ from xagent.web import app as app_module
 from xagent.web.models import database
 from xagent.web.models.task import Task, TaskStatus
 from xagent.web.models.task_command import TaskExecutionCommand
+from xagent.web.services import generation
 from xagent.web.services import release_hold as release_hold_module
 from xagent.web.services import task_command_transport as transport
 from xagent.web.services import task_event_bridge
@@ -130,6 +131,60 @@ def test_serving_generation_claims_everything_new_and_not_the_live_owner(
     assert ids["old_live"] not in new
     # Not finishing keeps today's rule for the lapsed lease of the same runner.
     assert ids["old_expired"] in claimable(factory, OLD, finishing=False)
+
+
+@pytest.mark.parametrize("shared", [False, True])
+def test_dormant_generation_claims_only_its_live_lease(
+    factory, task_id, monkeypatch, shared
+):
+    ids = seed(factory, task_id)
+    monkeypatch.setattr(transport, "get_shared_task_execution_enabled", lambda: shared)
+    monkeypatch.setenv(generation.GENERATION_ENV, "green")
+    record = {"value": "blue"}
+    monkeypatch.setattr(generation, "serving_generation", lambda: record["value"])
+    monkeypatch.setattr(generation, "_cached_at", float("-inf"))
+    assert claimable(factory, NEW, finishing=False) == {ids["new_live"]}
+    record["value"] = "green"
+    assert asyncio.run(generation.refresh_serving())
+    expected = {
+        ids["unowned"],
+        ids["old_expired"],
+        ids["new_live"],
+    }
+    if not shared:
+        # The legacy non-shared route accepts an untargeted command even when
+        # its task has a live owner; dormant mode must still exclude it.
+        expected.add(ids["old_live"])
+    assert claimable(factory, NEW, finishing=False) == expected
+
+
+def test_dormant_generation_read_error_fails_closed(factory, task_id, monkeypatch):
+    ids = seed(factory, task_id)
+    monkeypatch.setenv(generation.GENERATION_ENV, "green")
+    monkeypatch.setattr(generation, "_cached_at", float("-inf"))
+
+    def unreadable():
+        raise RuntimeError("database down")
+
+    monkeypatch.setattr(generation, "serving_generation", unreadable)
+    assert claimable(factory, NEW, finishing=False) == {ids["new_live"]}
+
+
+def test_dormant_generation_cannot_claim_unowned_command(factory, task_id, monkeypatch):
+    ids = seed(factory, task_id)
+    monkeypatch.setattr(transport, "consumes_task_commands", lambda: True)
+    monkeypatch.setattr(transport, "get_shared_task_execution_enabled", lambda: False)
+    monkeypatch.setenv(generation.GENERATION_ENV, "green")
+    monkeypatch.setattr(generation, "serving_generation", lambda: "blue")
+    monkeypatch.setattr(generation, "_cached_at", float("-inf"))
+    with factory() as db:
+        claimed = transport.claim_task_command(
+            db, runner_id=NEW, command_db_id=ids["unowned"]
+        )
+    assert claimed is None
+    with factory() as db:
+        row = db.get(TaskExecutionCommand, ids["unowned"])
+        assert row.status == "pending" and row.claimed_by is None
 
 
 def test_a_closed_but_not_finishing_process_still_claims_foreign_controls(

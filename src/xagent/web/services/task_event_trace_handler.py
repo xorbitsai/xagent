@@ -615,8 +615,14 @@ class TaskEventTraceHandler(TraceHandler):
         event_type_str, data = normalize_public_trace_event(event_type_str, data)
 
         # Create the base stream event
+        # Reuse the persisted row's event id so a live frame and the replay of
+        # the same row carry the same identity.
         stream_event = create_stream_event(
-            event_type_str, self.task_id, data, event.timestamp
+            event_type_str,
+            self.task_id,
+            data,
+            event.timestamp,
+            event_id=str(event.id),
         )
 
         # Add step_id if present (required for tool/LLM events)

@@ -2754,9 +2754,13 @@ def _summarize_comment(
 
 
 def _build_comments_response(
-    comments: list[dict[str, Any]], total: int, next_start_at: int | None
+    comments: list[dict[str, Any]],
+    total: int,
+    next_start_at: int | None,
+    issue_key: str = "",
 ) -> str:
     return _success(
+        **({"issue_key": issue_key} if issue_key else {}),
         total=total,
         returned_count=len(comments),
         truncated=next_start_at is not None,
@@ -2772,6 +2776,7 @@ def _fit_comments_page(
     has_more_raw: bool,
     max_output_length: int,
     *,
+    issue_key: str = "",
     raw_fields: bool = False,
 ) -> str | None:
     """Build a whole-comment prefix (each comment already body-capped by
@@ -2849,7 +2854,9 @@ def _fit_comments_page(
 
     def response_for(count: int) -> str:
         comments = [comment for _, comment in kept[:count]]
-        return _build_comments_response(comments, total, next_start_at_for(count))
+        return _build_comments_response(
+            comments, total, next_start_at_for(count), issue_key
+        )
 
     # Try every kept comment first, then halve the count until the
     # response fits -- the same halving strategy utils.py's
@@ -2903,7 +2910,9 @@ def _fit_comments_page(
             comment = dict(template)
             comment["body"] = flattened_body
             comment["body_truncated"] = _cap_text_field(comment, "body", body_max_chars)
-            return _build_comments_response([comment], total, next_start_at_for(1))
+            return _build_comments_response(
+                [comment], total, next_start_at_for(1), issue_key
+            )
 
         lo, hi = 0, _COMMENT_BODY_MAX_CHARS
         best: str | None = None
@@ -2951,6 +2960,8 @@ def jira_list_comments(
     means an agent marked it internal-only, not visible to the
     customer. Neither should be assumed public just because the other
     is null.
+    The result's issue_key identifies the issue that owns these comments,
+    including when the response contains a partial or empty page.
     start_at: offset into the full comment list -- pass the previous
     response's next_start_at to fetch the next page (0 to start over).
     tail: with start_at=0, discover Jira's current total and fetch the last
@@ -3080,6 +3091,7 @@ def jira_list_comments(
             total,
             has_more_raw,
             get_tool_max_output_length(),
+            issue_key=issue_key,
             raw_fields=raw_fields,
         )
         if response is None:

@@ -630,6 +630,9 @@ async def create_model(
             api_key=bedrock_api_key,
             default_temperature=model.temperature,
             context_window=model.context_window,
+            openrouter_provider_only=model.openrouter_provider_only,
+            openrouter_zdr=model.openrouter_zdr,
+            openrouter_data_collection=model.openrouter_data_collection,
             timeout=180.0,
             abilities=model.abilities,
             description=model.description,
@@ -767,6 +770,9 @@ async def create_model(
         "sample_rate": db_model.sample_rate,
         "temperature": db_model.temperature,
         "context_window": db_model.context_window,
+        "openrouter_provider_only": db_model.openrouter_provider_only,
+        "openrouter_zdr": bool(db_model.openrouter_zdr),
+        "openrouter_data_collection": db_model.openrouter_data_collection,
         "dimension": db_model.dimension,
         "abilities": db_model.abilities,
         "description": db_model.description,
@@ -955,6 +961,9 @@ async def test_model_connection(
                 "base_url": base_url,
                 "bedrock_region": request.bedrock_region,
                 "bedrock_auth_mode": request.bedrock_auth_mode,
+                "openrouter_provider_only": request.openrouter_provider_only,
+                "openrouter_zdr": request.openrouter_zdr,
+                "openrouter_data_collection": request.openrouter_data_collection,
             }
 
             if provider == "bedrock":
@@ -2097,6 +2106,20 @@ async def update_model(
         )
     effective_provider = update_data.get("model_provider", db_model.model_provider)
     provider_changed = effective_provider != db_model.model_provider
+    if effective_provider != "openrouter":
+        if (
+            update_data.get("openrouter_provider_only") is not None
+            or update_data.get("openrouter_zdr") is True
+            or update_data.get("openrouter_data_collection") is not None
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail="OpenRouter routing policy requires the openrouter provider",
+            )
+        if provider_changed:
+            update_data["openrouter_provider_only"] = None
+            update_data["openrouter_zdr"] = False
+            update_data["openrouter_data_collection"] = None
     if effective_provider != "bedrock":
         update_data.pop("bedrock_region", None)
         update_data.pop("bedrock_auth_mode", None)
@@ -2157,6 +2180,14 @@ async def update_model(
                 update_data["api_key"] = ""
     effective_category = update_data.get("category", db_model.category)
     identity_fields = ["model_provider", "model_name", "base_url"]
+    if effective_provider == "openrouter":
+        identity_fields.extend(
+            (
+                "openrouter_provider_only",
+                "openrouter_zdr",
+                "openrouter_data_collection",
+            )
+        )
     if effective_provider == "bedrock":
         identity_fields.extend(("bedrock_region", "bedrock_auth_mode"))
     identity_changed = any(

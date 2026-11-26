@@ -30,10 +30,10 @@ _PROVIDER = "deepseek"
 DEEPSEEK_PROVIDER_STATE_NAMESPACE = "deepseek"
 DEEPSEEK_REASONING_CONTENT_STATE_KEY = "reasoning_content"
 _SERIALIZED_TOOL_CALL_RE = re.compile(
-    r"<[^>\n]*dsml[^>\n]*tool_calls",
+    r"<[^>\n]*dsml[^>\n]*(?:tool_)?calls",
     re.IGNORECASE,
 )
-_PARTIAL_MARKER_TARGET = "dsmltool_calls"
+_PARTIAL_MARKER_TARGETS = ("dsmltool_calls", "dsmlcalls")
 _PARTIAL_MARKER_SCAN_LIMIT = 64
 _MARKER_SEPARATOR_RE = re.compile(r"[\s|｜]")
 _ARGUMENTS_PREVIEW_LIMIT = 4096
@@ -637,7 +637,9 @@ def _safe_streaming_text_length(content: str) -> int:
         if "\n" in tail or ">" in tail:
             continue
         normalized_tail = _MARKER_SEPARATOR_RE.sub("", tail).casefold()
-        if _PARTIAL_MARKER_TARGET.startswith(normalized_tail):
+        if any(
+            target.startswith(normalized_tail) for target in _PARTIAL_MARKER_TARGETS
+        ):
             return match.start()
     return len(content)
 

@@ -269,26 +269,25 @@ async def test_two_web_two_worker_delivery_and_single_execution(
             pipe.send("claim")
         results = await asyncio.gather(*(recv(pipe) for pipe in workers))
         assert sum(item["executed"] for item in results) == 1
+        # The run announces itself before any of its output, on every host.
         first = (
             [
                 json.loads(
                     await asyncio.wait_for(sockets[0].recv(), DB_PROGRESS_TIMEOUT)
                 )
-                for _ in range(2)
+                for _ in range(3)
             ]
             if not ingress_exits
             else []
         )
         second = [
             json.loads(await asyncio.wait_for(sockets[1].recv(), DB_PROGRESS_TIMEOUT))
-            for _ in range(2)
+            for _ in range(3)
         ]
-        if not ingress_exits:
-            assert [item["text"] for item in first if item["type"] == "delta"] == [
-                "hello ",
-                "world",
-            ]
-        assert [item["text"] for item in second] == ["hello ", "world"]
+        for frames in (first, second) if not ingress_exits else (second,):
+            assert frames[0]["type"] == "task_started"
+            assert frames[0]["run_id"] == accepted.run_id
+            assert [item["text"] for item in frames[1:]] == ["hello ", "world"]
         # Reconnect to an empty local socket registry and recover persisted
         # output; the bridge does not replay old token events.
         await sockets[1].close()

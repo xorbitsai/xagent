@@ -1,15 +1,26 @@
 """Builder history reuses owner-scoped tasks and their persisted transcript."""
 
 import asyncio
+from threading import Event
+from unittest.mock import MagicMock
 
 import pytest
+from fastapi import Depends, FastAPI
+from httpx import ASGITransport, AsyncClient
+from sqlalchemy import event
 from sqlalchemy.orm import Session
 
-from tests.shared.postgres_disposable import disposable_database_factory
+from tests.shared.postgres_disposable import (
+    disposable_database_factory,
+    disposable_session_factory,
+)
+from xagent.web.api import agents
 from xagent.web.api.agents import get_agent_preview_task
+from xagent.web.api.auth import create_access_token
+from xagent.web.auth_sessions import user_session_claims
 from xagent.web.models.agent import Agent
 from xagent.web.models.chat_message import TaskChatMessage
-from xagent.web.models.database import Base
+from xagent.web.models.database import Base, get_engine
 from xagent.web.models.task import Task, TaskStatus
 from xagent.web.models.user import User
 from xagent.web.services import agent_team_scope
@@ -345,7 +356,7 @@ def test_postgresql_preview_query_ignores_malformed_metadata():
                 )
             )
             db.commit()
-            result = asyncio.run(get_agent_preview_task(agent.id, user, db))
+            result = get_agent_preview_task(agent.id, user, db)
             assert result is not None
             assert result.task_id == task.id
             assert result.message == "Sample"
@@ -356,10 +367,9 @@ def test_postgresql_preview_query_ignores_malformed_metadata():
                 "preview_history_agent_id": agent.id,
             }
             db.commit()
-            assert (
-                asyncio.run(get_agent_preview_task(agent.id, user, db)).task_id
-                == task.id
-            )
+            bound = get_agent_preview_task(agent.id, user, db)
+            assert bound is not None
+            assert bound.task_id == task.id
 
 
 def test_legacy_preview_without_snapshot_is_not_current_config():
@@ -388,3 +398,119 @@ def test_deleted_preview_is_not_returned():
         client.get(f"/api/agents/{agent['id']}/preview-task", headers=headers).json()
         is None
     )
+
+
+def test_slow_preview_query_does_not_block_other_requests(monkeypatch):
+    query_started = Event()
+    release_query = Event()
+    db = MagicMock(spec=Session)
+
+    def slow_query():
+        query_started.set()
+        assert release_query.wait(timeout=5), "query outlasted the probe"
+        return None
+
+    db.query.return_value.filter.return_value.order_by.return_value.first.side_effect = slow_query
+    monkeypatch.setattr(agents.AgentStore, "get_owned_agent", lambda *_: object())
+    app = FastAPI()
+    app.include_router(agents.router)
+    app.dependency_overrides[agents.get_current_user] = lambda: User(id=1)
+    app.dependency_overrides[agents.get_db] = lambda: db
+
+    @app.get("/probe")
+    async def probe():
+        return {"ok": True}
+
+    async def check():
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as browser:
+            preview = asyncio.create_task(browser.get("/api/agents/1/preview-task"))
+            try:
+                assert await asyncio.to_thread(query_started.wait, 3)
+                assert (await browser.get("/probe")).json() == {"ok": True}
+                assert not preview.done(), "the probe must finish during the query"
+            finally:
+                release_query.set()
+                response = await preview
+            assert response.status_code == 200
+            assert response.json() is None
+
+    asyncio.run(check())
+
+
+@pytest.mark.postgresql
+def test_postgresql_slow_preview_route_releases_session(monkeypatch):
+    with (
+        monkeypatch.context() as patch,
+        disposable_session_factory("preview_route", patch) as sessions,
+    ):
+        engine = get_engine()
+        with sessions.begin() as db:
+            user = User(username="preview-route-test", password_hash="unused")
+            db.add(user)
+            db.flush()
+            agent = Agent(user_id=user.id, name="Preview route")
+            db.add(agent)
+            db.flush()
+            task = Task(
+                user_id=user.id,
+                title="Preview",
+                is_visible=False,
+                agent_config={"is_preview": True, "preview_agent_id": agent.id},
+            )
+            db.add(task)
+            db.flush()
+            db.add(
+                TaskChatMessage(
+                    task_id=task.id,
+                    user_id=user.id,
+                    role="user",
+                    content="Sample",
+                    message_type="message",
+                )
+            )
+            user_id, task_id = user.id, task.id
+            url = f"/api/agents/{agent.id}/preview-task"
+            token = create_access_token(user_session_claims(user))
+
+        preview_query_started = Event()
+
+        @event.listens_for(engine, "before_cursor_execute")
+        def bound_preview_lock_wait(conn, cursor, statement, parameters, context, many):
+            if "FROM tasks" in statement and "FROM task_chat_messages" in statement:
+                cursor.execute("SET LOCAL lock_timeout = '5s'")
+                preview_query_started.set()
+
+        app = FastAPI()
+        app.include_router(agents.router)
+
+        @app.get("/probe")
+        def probe(user: User = Depends(agents.get_current_user)):
+            return {"user_id": user.id}
+
+        async def check():
+            async with AsyncClient(
+                transport=ASGITransport(app=app), base_url="http://test"
+            ) as browser:
+                assert (await browser.get(url)).status_code == 401
+                headers = {"Authorization": f"Bearer {token}"}
+                with engine.connect() as blocker:
+                    blocker.exec_driver_sql("LOCK TABLE tasks IN ACCESS EXCLUSIVE MODE")
+                    preview = asyncio.create_task(browser.get(url, headers=headers))
+                    try:
+                        assert await asyncio.to_thread(preview_query_started.wait, 3)
+                        probe_response = await asyncio.wait_for(
+                            browser.get("/probe", headers=headers), timeout=3
+                        )
+                        assert probe_response.json() == {"user_id": user_id}
+                        assert not preview.done()
+                    finally:
+                        blocker.rollback()
+                        response = await preview
+                assert response.status_code == 200
+                assert response.json()["task_id"] == task_id
+                assert response.json()["message"] == "Sample"
+                assert engine.pool.checkedout() == 0
+
+        asyncio.run(check())

@@ -1058,12 +1058,14 @@ class AgentPreviewTaskBinding(BaseModel):
 
 
 @router.get("/{agent_id}/preview-task", response_model=AgentPreviewTaskResponse | None)
-async def get_agent_preview_task(
+def get_agent_preview_task(
     agent_id: int,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> AgentPreviewTaskResponse | None:
     """Find this editor's latest preview, without exposing teammates' transcripts."""
+    # FastAPI runs this sync endpoint in its worker pool so DB I/O cannot
+    # block the web event loop.
     user_id = int(current_user.id)
     if AgentStore(db).get_owned_agent(user_id, agent_id) is None:
         raise HTTPException(status_code=404, detail="Agent not found")

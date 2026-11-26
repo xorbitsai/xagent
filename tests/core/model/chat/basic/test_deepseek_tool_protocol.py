@@ -99,6 +99,42 @@ def test_deepseek_codec_rejects_same_line_serialized_tool_call_content() -> None
     assert error["code"] == "serialized_tool_call_content"
 
 
+def test_deepseek_codec_rejects_nested_calls_marker_in_question() -> None:
+    response = {
+        "type": "tool_call",
+        "tool_calls": [
+            {
+                "id": "call_question",
+                "type": "function",
+                "function": {
+                    "name": "ask_user_question",
+                    "arguments": json.dumps(
+                        {
+                            "message": (
+                                "Should I create the tickets?\n\n"
+                                '<｜DSML｜ calls><｜DSML｜ invoke name="interactions" '
+                                'string="false">[{"type":"confirm","field":"approve"}]'
+                            )
+                        },
+                        ensure_ascii=False,
+                    ),
+                },
+            }
+        ],
+    }
+
+    normalized = normalize_deepseek_response(
+        response,
+        tools=[_tool_schema("ask_user_question", {"message": {"type": "string"}})],
+    )
+
+    error = get_tool_protocol_error(normalized)
+    assert error is not None
+    assert error["code"] == "nested_serialized_tool_call"
+    assert normalized["tool_calls"] == []
+    assert normalized["content"] == ""
+
+
 def test_deepseek_codec_rejects_nested_work_call_in_final_answer() -> None:
     response = {
         "type": "tool_call",
@@ -659,6 +695,58 @@ async def test_deepseek_stream_suppresses_same_line_split_marker() -> None:
     streamed_text = "".join(chunk.delta for chunk in chunks if chunk.is_token())
     assert streamed_text == "Sure: "
     assert len([chunk for chunk in chunks if chunk.is_protocol_error()]) == 1
+
+
+@pytest.mark.asyncio
+async def test_deepseek_stream_suppresses_split_calls_marker() -> None:
+    async def source() -> AsyncIterator[StreamChunk]:
+        yield StreamChunk(type=ChunkType.TOKEN, delta="Question? <｜DS")
+        yield StreamChunk(type=ChunkType.TOKEN, delta="ML｜ calls>[")
+        yield StreamChunk(type=ChunkType.END, finish_reason="stop")
+
+    chunks = [
+        chunk
+        async for chunk in adapt_deepseek_stream(source(), tools=[FINAL_ANSWER_TOOL])
+    ]
+
+    assert "".join(chunk.delta for chunk in chunks if chunk.is_token()) == "Question? "
+    assert [
+        chunk.protocol_error["code"] for chunk in chunks if chunk.is_protocol_error()
+    ] == ["serialized_tool_call_content"]
+
+
+@pytest.mark.asyncio
+async def test_deepseek_stream_rejects_calls_marker_inside_question_arguments() -> None:
+    arguments = json.dumps(
+        {"message": 'Proceed? <｜DSML｜ calls><｜DSML｜ invoke name="interactions">[]'},
+        ensure_ascii=False,
+    )
+
+    async def source() -> AsyncIterator[StreamChunk]:
+        yield StreamChunk(
+            type=ChunkType.TOOL_CALL,
+            tool_calls=[
+                {
+                    "id": "call_question",
+                    "type": "function",
+                    "function": {"name": "ask_user_question", "arguments": arguments},
+                }
+            ],
+        )
+        yield StreamChunk(type=ChunkType.END, finish_reason="tool_calls")
+
+    chunks = [
+        chunk
+        async for chunk in adapt_deepseek_stream(
+            source(),
+            tools=[_tool_schema("ask_user_question", {"message": {"type": "string"}})],
+        )
+    ]
+
+    assert not any(chunk.is_tool_call() for chunk in chunks)
+    assert [
+        chunk.protocol_error["code"] for chunk in chunks if chunk.is_protocol_error()
+    ] == ["nested_serialized_tool_call"]
 
 
 @pytest.mark.asyncio

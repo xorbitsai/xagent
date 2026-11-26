@@ -3378,6 +3378,7 @@ def test_list_comments_reports_truncated(monkeypatch):
     result = json.loads(jira.jira_list_comments("ENG-1"))
 
     assert result["status"] == "success"
+    assert result["issue_key"] == "ENG-1"
     assert result["truncated"] is True
     assert result["next_start_at"] == 1
 
@@ -3400,6 +3401,7 @@ def test_list_comments_paginates_with_start_at(monkeypatch):
 
     assert result["truncated"] is False
     assert result["next_start_at"] is None
+    assert result["issue_key"] == "ENG-1"
     comment_call = mock_request.call_args_list[1]
     assert comment_call.kwargs["params"]["startAt"] == 1
 
@@ -3419,6 +3421,7 @@ def test_list_comments_tail_discovers_total_then_reads_bounded_tail(monkeypatch)
     )
 
     assert result["total"] == 50
+    assert result["issue_key"] == "ENG-1"
     assert result["returned_count"] == 5
     assert result["truncated"] is False
     assert result["next_start_at"] is None
@@ -3567,6 +3570,7 @@ def test_list_comments_tail_preserves_page_size_adaptation(monkeypatch):
     )
 
     assert result["status"] == "success"
+    assert result["issue_key"] == "ENG-1"
     assert 0 < result["returned_count"] < 20
     assert result["truncated"] is True
     assert result["next_start_at"] == 30 + result["returned_count"]
@@ -3957,7 +3961,7 @@ def test_list_comments_falls_back_to_an_empty_page_when_single_comment_unfittabl
         ]
     )
     monkeypatch.setattr(jira.requests, "request", mock_request)
-    empty_page_size = len(jira._build_comments_response([], 1, 1))
+    empty_page_size = len(jira._build_comments_response([], 1, 1, "ENG-1"))
     monkeypatch.setattr(jira, "get_tool_max_output_length", lambda: empty_page_size + 5)
 
     result = json.loads(jira.jira_list_comments("ENG-1"))

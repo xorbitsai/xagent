@@ -14,7 +14,6 @@ matters).
 
 import asyncio
 import json
-import uuid
 from datetime import UTC, datetime
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -5474,25 +5473,20 @@ async def test_planning_step_ids_count_per_connection_and_collide_with_steps():
     assert live_step["started_at"] == step_two["started_at"]
 
 
-async def test_known_divergence_message_step_id_differs_between_the_two_paths():
-    """Accepted divergence, not a bug: an ``ai_message``'s ``PublicStep``
-    id is the persisted trace ``event_id`` via ``steps()`` (the row's own
-    primary identifier) but a fresh uuid4 minted per broadcast frame via
-    the live stream (``create_stream_event`` mints a new one on every
-    send) -- the two paths can't share this id, so a client must not try
-    to correlate a message step across ``steps()`` and the live stream by
-    id. Content itself still matches -- ``data`` is the only field
-    compared below; ``started_at``/``completed_at`` aren't, since this
-    fixture doesn't mirror a timestamp into the live frame either.
+async def test_message_step_id_matches_between_the_two_paths():
+    """An ``ai_message``'s ``PublicStep`` id is the same on both paths:
+    ``steps()`` reads the persisted trace ``event_id`` and the live
+    stream converts a frame that carries that same id, so a client can
+    correlate a message step across ``steps()`` and the live stream by
+    id. ``data`` matches too; ``started_at``/``completed_at`` aren't
+    compared, since this fixture doesn't mirror a timestamp into the live
+    frame.
 
     Both legs fork from one ``CoreTraceEvent`` through the real
     producers -- ``_persist_core_event`` for the persisted row,
     ``_broadcast_frame_for`` for the live frame -- so neither id is
-    written down here. If production ever forwarded the canonical event
-    id to the live frame, the inequality below fails; if uuid minting
-    changed shape, the uuid assertion fails. This test takes no position
-    on what the public id contract *should* be -- that is tracked
-    elsewhere."""
+    written down here, and converting the same event twice yields the
+    same live id."""
     agent_id, full_key = _create_agent_with_key()
     task_id = _create_task(full_key, agent_id)
     base = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
@@ -5514,15 +5508,15 @@ async def test_known_divergence_message_step_id_differs_between_the_two_paths():
 
     sink = _make_sink(task_id=task_id)
     await sink.send_text(_broadcast_frame_for(event, task_id=task_id))
-    frame_text, _ = sink.queue.get_nowait()
-    step_via_live = json.loads(frame_text.split("data: ", 1)[1])["step"]
-    # The live leg's id is minted per broadcast by ``create_stream_event``,
-    # so it is a fresh uuid that is neither the event's id nor stable
-    # across two conversions of the same event.
-    live_id = step_via_live["id"].removeprefix("message:")
-    assert uuid.UUID(live_id).version == 4
-    assert live_id != str(event.id)
-    assert step_via_live["id"] != polled["id"]
+    await sink.send_text(_broadcast_frame_for(event, task_id=task_id))
+    first_text, _ = sink.queue.get_nowait()
+    second_text, _ = sink.queue.get_nowait()
+    step_via_live = json.loads(first_text.split("data: ", 1)[1])["step"]
+    second_step = json.loads(second_text.split("data: ", 1)[1])["step"]
+    # The live leg reuses the persisted row's event id, so the step id is
+    # the polled one and stays stable across conversions of the event.
+    assert step_via_live["id"] == polled["id"]
+    assert second_step["id"] == polled["id"]
     assert step_via_live["data"] == polled["data"]
 
 
@@ -5542,13 +5536,14 @@ async def test_live_projection_matches_steps_for_a_streamed_final_answer():
     asserted again here since
     ``test_final_answer_delta_projects_message_delta_frame`` and its
     ``_completed`` counterpart already pin that half independently.
-    ``id`` is excluded below for the same reason the plain-``ai_message``
-    divergence test above excludes it (a fresh uuid4 per live frame);
+    ``id`` is excluded below: this fixture inserts the persisted row
+    directly with its own ``event_id`` instead of deriving both legs from
+    one event;
     ``started_at``/``completed_at`` are compared, with the live frame's
     timestamp mirroring the persisted event's -- both derive from the
     same event timestamp field regardless of path (see
     ``_step_mapping.py``'s ``_ts``), so a client can rely on those two
-    fields matching even though ``id`` never will."""
+    fields matching."""
     agent_id, full_key = _create_agent_with_key()
     task_id = _create_task(full_key, agent_id)
     base = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)

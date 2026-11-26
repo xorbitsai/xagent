@@ -1143,14 +1143,17 @@ async def build_oauth_refresh_request(
     refresh_token: str | None,
     instance_url: str | None,
     user_id: Any,
+    redirect_uri: str | None = None,
 ) -> OAuthRefreshRequest:
     """Build the token request a refresh of this provider sends.
 
     Raises _OAuthRefreshPermanentlyInvalid when the grant lacks what the
     request needs (a refresh token, its account or its Deputy instance).
-    ``user_id`` is only used in log messages.
+    ``redirect_uri`` is the grant's recorded authorization callback; when it
+    is NULL (a pre-column grant), Deputy falls back to the configured
+    pre-switch callback. ``user_id`` is only used in log messages.
     """
-    from ..api.auth import _resolve_oauth_redirect_uri
+    from ..api.auth import _registered_oauth_redirect_uri
     from ..oauth_provider_quirks import requires_json_accept_header
 
     normalized_provider = provider_name.lower()
@@ -1237,18 +1240,11 @@ async def build_oauth_refresh_request(
         # hardcoded literal, so an admin who edits this provider row's
         # scopes doesn't leave refresh silently still sending the old
         # value.
-        # Resolved from the CURRENT provider row/env var, not whatever
-        # redirect_uri was actually used for this grant's original
-        # authorization -- UserOAuth has no per-grant redirect_uri
-        # column to read instead (no provider in this codebase needs
-        # one; Deputy is the only one requiring redirect_uri on
-        # refresh at all). If an admin changes the Deputy provider's
-        # redirect_uri (or DEPUTY_REDIRECT_URI) after users have
-        # already connected, Deputy may reject those users' next
-        # refresh with a redirect_uri mismatch until they reconnect --
-        # a known limitation, not something this function can resolve
-        # without a schema change.
-        data["redirect_uri"] = _resolve_oauth_redirect_uri(
+        # Use the URI this grant actually authorized with. New grants record
+        # it on UserOAuth.redirect_uri; a pre-column grant has none, so it
+        # keeps the configured (pre-switch) callback rather than the newly
+        # advertised one. Only Deputy requires redirect_uri on refresh.
+        data["redirect_uri"] = redirect_uri or _registered_oauth_redirect_uri(
             provider_name, provider_config
         )
         data["scope"] = (
@@ -1517,6 +1513,7 @@ async def refresh_oauth_token_if_needed(
             access_token=oauth_account.access_token,
             refresh_token=oauth_account.refresh_token,
             instance_url=getattr(oauth_account, "instance_url", None),
+            redirect_uri=getattr(oauth_account, "redirect_uri", None),
             user_id=oauth_account.user_id,
         )
         async with _oauth_refresh_http_client() as client:

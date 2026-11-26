@@ -138,14 +138,23 @@ def _deputy_provider() -> SimpleNamespace:
     )
 
 
-def _callback_request(db, user, provider: str = "deputy") -> SimpleNamespace:
+def _callback_request(
+    db,
+    user,
+    provider: str = "deputy",
+    *,
+    connector_callback_uri: str | None = None,
+) -> SimpleNamespace:
+    claims = {
+        "type": "oauth_state",
+        "user_id": user.id,
+        "provider": provider,
+        "app_id": provider,
+    }
+    if connector_callback_uri is not None:
+        claims["connector_callback_uri"] = connector_callback_uri
     state = create_access_token(
-        data={
-            "type": "oauth_state",
-            "user_id": user.id,
-            "provider": provider,
-            "app_id": provider,
-        },
+        data=claims,
         expires_delta=timedelta(minutes=10),
     )
     return SimpleNamespace(query_params={"code": "deputy-code", "state": state})
@@ -184,6 +193,9 @@ def test_callback_persists_normalized_endpoint_scope_and_identity(
 
     assert response.status_code == 200
     assert mock_post.call_args.kwargs["data"]["scope"] == "longlife_refresh_token"
+    assert mock_post.call_args.kwargs["data"]["redirect_uri"] == (
+        "https://app.example.com/api/auth/deputy/callback"
+    )
 
     oauth_account = (
         db.query(UserOAuth)
@@ -195,12 +207,89 @@ def test_callback_persists_normalized_endpoint_scope_and_identity(
     assert oauth_account.instance_url == "https://acme.au.deputy.com"
     assert oauth_account.provider_user_id == "42"
     assert oauth_account.email == "alice@acme.example"
+    assert oauth_account.redirect_uri == (
+        "https://app.example.com/api/auth/deputy/callback"
+    )
 
     mock_get.assert_called_once()
     assert mock_get.call_args.args[0] == "https://acme.au.deputy.com/api/v1/me"
     assert (
         mock_get.call_args.kwargs["headers"]["Authorization"] == "Bearer deputy-token"
     )
+
+
+def test_callback_exchanges_with_the_flow_snapshot_not_current_config(
+    db_session, monkeypatch
+):
+    """A flow started after the switch stores and exchanges the new URI."""
+    db, user = db_session
+    provider = _deputy_provider()
+    pinned = "https://cloud.tobybot.ai/api/auth/deputy/callback"
+    monkeypatch.setenv(
+        "XAGENT_CONNECTOR_OAUTH_CALLBACK_BASE_URL", "https://cloud.tobybot.ai"
+    )
+    mock_post = Mock(
+        return_value=MockResponse(
+            {
+                "access_token": "deputy-token",
+                "refresh_token": "deputy-refresh",
+                "token_type": "Bearer",
+                "endpoint": "acme.au.deputy.com",
+            }
+        )
+    )
+    monkeypatch.setattr(auth_api.requests, "post", mock_post)
+    monkeypatch.setattr(
+        auth_api.requests, "get", Mock(return_value=MockResponse({"Id": 42}))
+    )
+
+    response = generic_oauth_callback(
+        "deputy",
+        _callback_request(db, user, connector_callback_uri=pinned),
+        db,
+        provider,
+    )
+
+    assert response.status_code == 200, response.body
+    assert mock_post.call_args.kwargs["data"]["redirect_uri"] == pinned
+    account = db.query(UserOAuth).filter(UserOAuth.provider == "deputy").one()
+    assert account.redirect_uri == pinned
+
+
+def test_callback_started_before_the_switch_exchanges_with_the_old_uri(
+    db_session, monkeypatch
+):
+    """An in-flight, snapshot-less flow keeps the URI the provider saw."""
+    db, user = db_session
+    provider = _deputy_provider()
+    monkeypatch.setenv(
+        "XAGENT_CONNECTOR_OAUTH_CALLBACK_BASE_URL", "https://cloud.tobybot.ai"
+    )
+    mock_post = Mock(
+        return_value=MockResponse(
+            {
+                "access_token": "deputy-token",
+                "refresh_token": "deputy-refresh",
+                "token_type": "Bearer",
+                "endpoint": "acme.au.deputy.com",
+            }
+        )
+    )
+    monkeypatch.setattr(auth_api.requests, "post", mock_post)
+    monkeypatch.setattr(
+        auth_api.requests, "get", Mock(return_value=MockResponse({"Id": 42}))
+    )
+
+    response = generic_oauth_callback(
+        "deputy", _callback_request(db, user), db, provider
+    )
+
+    assert response.status_code == 200, response.body
+    assert mock_post.call_args.kwargs["data"]["redirect_uri"] == (
+        "https://app.example.com/api/auth/deputy/callback"
+    )
+    account = db.query(UserOAuth).filter(UserOAuth.provider == "deputy").one()
+    assert account.redirect_uri == ("https://app.example.com/api/auth/deputy/callback")
 
 
 def test_callback_scope_filters_empty_entries_in_default_scopes(

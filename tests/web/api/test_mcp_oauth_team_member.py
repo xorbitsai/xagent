@@ -1148,6 +1148,53 @@ async def test_team_member_accepts_either_spelling_of_the_deployment_callback(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("stored", "advertised"),
+    [
+        ("site", "https://cloud.tobybot.ai/api/mcp/oauth/callback"),
+        ("branded", "https://CLOUD.TOBYBOT.AI:443/api/mcp/oauth/callback"),
+    ],
+    ids=["stored_site_callback", "stored_explicit_branded_callback"],
+)
+async def test_team_member_callback_matches_the_configured_destination_spelling(
+    env, monkeypatch, stored, advertised
+):
+    # The destination spells its DNS name and default port explicitly. A
+    # stored callback on this deployment's own site resolves to the canonical
+    # destination and must not be refused; an explicitly spelled branded
+    # callback is advertised and stored exactly as configured.
+    monkeypatch.setenv("XAGENT_APP_BASE_URL", "https://site.tobybot.ai")
+    monkeypatch.delenv("XAGENT_PUBLIC_API_BASE_URL", raising=False)
+    monkeypatch.setenv(
+        "XAGENT_CONNECTOR_OAUTH_CALLBACK_BASE_URL", "https://CLOUD.TOBYBOT.AI:443"
+    )
+    configured = (
+        mcp_api._mcp_oauth_callback_site_redirect_uri()
+        if stored == "site"
+        else mcp_api._default_mcp_oauth_redirect_uri()
+    )
+    env.edit_auth(redirect_uri=configured)
+    assert (
+        env.db.query(UserMCPServer)
+        .filter(UserMCPServer.user_id == env.member.id)
+        .count()
+        == 0
+    )
+
+    response = await env.connect()
+
+    assert response.status_code == 303
+    assert response.headers["location"].startswith(f"{ISSUER}/authorize")
+    query = parse_qs(urlparse(response.headers["location"]).query)
+    assert query["redirect_uri"] == [advertised]
+    env.db.expire_all()
+    flow = env.db.query(MCPOAuthFlowState).one()
+    assert flow.redirect_uri == advertised
+    client = env.db.get(MCPOAuthClient, flow.mcp_oauth_client_id)
+    assert client.redirect_uri == advertised
+
+
+@pytest.mark.asyncio
 async def test_team_member_regional_request_without_public_entries_is_not_rejected(
     env, monkeypatch
 ):

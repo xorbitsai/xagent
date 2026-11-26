@@ -204,9 +204,16 @@ def check_callback_origin(
             False,
             f"launch start refused: HTTP {status_code}{_detail_suffix(payload)}",
         )
-    actual = normalize_origin(payload.get("callback_origin"))
-    if actual is None:
+    # The frontend uses callback_origin for the popup completion message. It
+    # must remain a usable origin even when a newer field names the provider
+    # callback separately.
+    if start_callback_origin(payload) is None:
         return CheckResult(name, False, "launch start returned no callback origin")
+    actual = start_provider_callback_origin(payload)
+    if actual is None:
+        return CheckResult(
+            name, False, "launch start returned no provider callback origin"
+        )
     if actual != normalize_origin(expected_origin):
         return CheckResult(
             name, False, f"callback origin is {actual}, expected {expected_origin}"
@@ -214,10 +221,55 @@ def check_callback_origin(
     return CheckResult(name, True)
 
 
+def check_completion_origin(
+    provider: str,
+    *,
+    status_code: int,
+    payload: object,
+    expected_origin: str,
+    composio: bool = False,
+) -> CheckResult:
+    """The popup's final page must post from the origin the opener trusts.
+
+    ``callback_origin`` is the completion origin the API hands the frontend
+    after historical alias mapping; it can differ from the provider-facing
+    callback when an ingress forwards the return to the entry that started
+    the flow.
+    """
+    name = f"oauth:{provider}:{'composio:' if composio else ''}completion"
+    if status_code != 200 or not isinstance(payload, Mapping):
+        return CheckResult(
+            name,
+            False,
+            f"launch start refused: HTTP {status_code}{_detail_suffix(payload)}",
+        )
+    actual = start_callback_origin(payload)
+    if actual is None:
+        return CheckResult(name, False, "launch start returned no completion origin")
+    if actual != normalize_origin(expected_origin):
+        return CheckResult(
+            name, False, f"completion origin is {actual}, expected {expected_origin}"
+        )
+    return CheckResult(name, True)
+
+
 def start_callback_origin(payload: object) -> str | None:
-    """The callback origin a launch start reports, if it reports one."""
+    """The completion origin a launch start reports for the frontend."""
     if not isinstance(payload, Mapping):
         return None
+    return normalize_origin(payload.get("callback_origin"))
+
+
+def start_provider_callback_origin(payload: object) -> str | None:
+    """The origin the provider actually sees, or the legacy single report.
+
+    A present ``provider_callback_origin`` is authoritative: an unusable value
+    does not fall back to the completion origin.
+    """
+    if not isinstance(payload, Mapping):
+        return None
+    if "provider_callback_origin" in payload:
+        return normalize_origin(payload.get("provider_callback_origin"))
     return normalize_origin(payload.get("callback_origin"))
 
 

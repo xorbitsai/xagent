@@ -376,6 +376,7 @@ MCP_OAUTH_ALLOW_PRIVATE_HOSTS = "XAGENT_MCP_OAUTH_ALLOW_PRIVATE_HOSTS"
 MCP_OAUTH_PROXY_URL = "XAGENT_MCP_OAUTH_PROXY_URL"
 MCP_OAUTH_CLIENT_NAME = "XAGENT_MCP_OAUTH_CLIENT_NAME"
 MCP_OAUTH_CALLBACK_BASE_URL = "XAGENT_MCP_OAUTH_CALLBACK_BASE_URL"
+CONNECTOR_OAUTH_CALLBACK_BASE_URL = "XAGENT_CONNECTOR_OAUTH_CALLBACK_BASE_URL"
 DEFAULT_MCP_OAUTH_CLIENT_NAME = "Xagent"
 HUBSPOT_MCP_CLIENT_ID = "XAGENT_HUBSPOT_MCP_CLIENT_ID"
 HUBSPOT_MCP_CLIENT_SECRET = "XAGENT_HUBSPOT_MCP_CLIENT_SECRET"
@@ -1341,6 +1342,150 @@ def get_mcp_oauth_proxy_url() -> str | None:
     return value
 
 
+def _oauth_callback_base_origin(env_name: str) -> str | None:
+    """Read one trusted callback origin, defaulting to off.
+
+    The value must be an https origin, or an http loopback origin for local
+    development. A path cannot work because callers preserve each callback's
+    own path and the browser's state cookie is scoped to that path.
+    """
+    value = _reject_url_userinfo(
+        env_name,
+        _normalized_http_env_url(env_name),
+    )
+    if value is None:
+        return None
+    parts = urlsplit(value)
+    loopback = (parts.hostname or "").lower() in {"localhost", "127.0.0.1", "::1"}
+    if (
+        parts.path
+        or "?" in value
+        or "#" in value
+        or not (parts.scheme == "https" or (parts.scheme == "http" and loopback))
+    ):
+        raise ValueError(
+            f"Invalid {env_name} value: {value!r}. "
+            "Expected an https origin (or an http loopback origin) without a path."
+        )
+    return value
+
+
+def get_connector_oauth_callback_base_url() -> str | None:
+    """Return the trusted public origin for this app's connector callbacks.
+
+    Priority:
+        1. XAGENT_CONNECTOR_OAUTH_CALLBACK_BASE_URL environment variable
+        2. None: every callback keeps the origin it is configured with
+
+    This is the default-off production switch for the first-party callback
+    paths this app serves: the builtin ``/api/auth/{provider}/callback``
+    routes, the shared Composio return, and remote MCP OAuth's
+    ``/api/mcp/oauth/callback``. It changes only the origin of a standard
+    callback. A callback on another path, or one carrying credentials, query
+    or fragment, is a custom external return and is left untouched.
+
+    Raises ``ValueError`` for a value that is not an https origin (or an http
+    loopback origin for local development): a path, query, fragment or
+    credentials are rejected.
+    """
+    return _oauth_callback_base_origin(CONNECTOR_OAUTH_CALLBACK_BASE_URL)
+
+
+def _oauth_callback_destination_origin(base: str) -> str:
+    """Canonical destination origin, keeping an accepted bracketed IPv6 base.
+
+    ``normalize_public_origin`` accepts only DNS and IPv4 hosts, while
+    ``_oauth_callback_base_origin`` also accepts a bracketed IPv6 literal. Keep
+    that configured spelling, which is what dynamic registration advertises;
+    ``urlsplit`` validates the literal and reading ``port`` enforces its range.
+    """
+    parts = urlsplit(base)
+    if ":" in (parts.hostname or "") and re.fullmatch(
+        r"\[[^\]]+\](?::[0-9]+)?", parts.netloc
+    ):
+        parts.port  # An out-of-range port is a ValueError.
+        return base
+    return normalize_public_origin(base)
+
+
+def _connector_oauth_callback_owned_origins() -> set[str]:
+    """Exact origins this deployment configures for its own callbacks.
+
+    Public entries count only when explicitly configured. The unconfigured
+    fallback can be the default development localhost, which must not make a
+    local callback eligible to move to a production origin. The public API and
+    app origins are already empty unless explicitly set.
+
+    A configured base that strict public-origin matching cannot represent is
+    skipped, not fatal: an internal frontend such as ``http://xagent_web:3000``
+    or a bracketed IPv6 frontend is no source of its own, but it must not stop
+    an eligible public API origin from being recognized.
+    """
+    origins: set[str] = set()
+    if public_entries_configured():
+        origins.update(entry.origin for entry in get_public_entries())
+    for value in (get_public_api_base_url(), get_app_base_url()):
+        if not value:
+            continue
+        parts = urlsplit(value)
+        try:
+            origin = normalize_public_origin(f"{parts.scheme}://{parts.netloc}")
+        except ValueError:
+            continue
+        origins.add(origin)
+    return origins
+
+
+def get_connector_oauth_callback_uri(current_uri: str, *, callback_path: str) -> str:
+    """Move one of this app's standard callbacks onto the configured origin.
+
+    ``current_uri`` is the URI already configured in the database or resolved
+    from the environment. When ``XAGENT_CONNECTOR_OAUTH_CALLBACK_BASE_URL``
+    is unset, it is returned unchanged. When it is set, only a standard
+    callback -- exactly ``callback_path``, without credentials, query or
+    fragment, on an origin this deployment configures (a trusted public entry,
+    the public API, or the explicitly configured app origin) -- moves to that
+    origin. Any other URI belongs to a custom or external return and is
+    returned byte-for-byte unchanged, so its existing registration keeps
+    working.
+
+    ``XAGENT_MCP_OAUTH_CALLBACK_BASE_URL`` remains the separate
+    dynamic-registration setting and does not select a source or destination
+    here.
+
+    Callers that exchange an authorization code must use the URI returned at
+    that flow's start, not re-resolve it from mutable configuration.
+    """
+    base = get_connector_oauth_callback_base_url()
+    if base is None:
+        return current_uri
+    try:
+        current = urlsplit(current_uri)
+    except ValueError:
+        return current_uri
+    if (
+        current.scheme not in {"http", "https"}
+        or not current.netloc
+        or current.path != callback_path
+        or current.query
+        or current.fragment
+        or "?" in current_uri
+        or "#" in current_uri
+        or "@" in current.netloc
+    ):
+        return current_uri
+    try:
+        source_origin = normalize_public_origin(f"{current.scheme}://{current.netloc}")
+        destination_origin = _oauth_callback_destination_origin(base)
+    except ValueError:
+        return current_uri
+    if source_origin not in _connector_oauth_callback_owned_origins():
+        return current_uri
+    if source_origin == destination_origin:
+        return current_uri
+    return f"{destination_origin}{callback_path}"
+
+
 def get_mcp_oauth_callback_base_url() -> str | None:
     """Return the origin advertised in MCP OAuth Dynamic Client Registration.
 
@@ -1359,30 +1504,16 @@ def get_mcp_oauth_callback_base_url() -> str | None:
     it changes, servers register again on their next connect, and existing
     grants keep refreshing with their own client rows.
 
+    ``XAGENT_CONNECTOR_OAUTH_CALLBACK_BASE_URL`` takes precedence for both
+    pre-registered and dynamic MCP clients when it is set. This older setting
+    keeps its dynamic-registration-only behavior when that variable is unset.
+
     Raises ``ValueError`` for a value that is not an https origin (or an http
     loopback origin, which dynamic registration also allows): a path, query,
     fragment or credentials are rejected. A path cannot work, because the state
     cookie is scoped to ``/api/mcp``.
     """
-    value = _reject_url_userinfo(
-        MCP_OAUTH_CALLBACK_BASE_URL,
-        _normalized_http_env_url(MCP_OAUTH_CALLBACK_BASE_URL),
-    )
-    if value is None:
-        return None
-    parts = urlsplit(value)
-    loopback = (parts.hostname or "").lower() in {"localhost", "127.0.0.1", "::1"}
-    if (
-        parts.path
-        or "?" in value
-        or "#" in value
-        or not (parts.scheme == "https" or (parts.scheme == "http" and loopback))
-    ):
-        raise ValueError(
-            f"Invalid {MCP_OAUTH_CALLBACK_BASE_URL} value: {value!r}. "
-            "Expected an https origin (or an http loopback origin) without a path."
-        )
-    return value
+    return _oauth_callback_base_origin(MCP_OAUTH_CALLBACK_BASE_URL)
 
 
 def get_mcp_oauth_client_name() -> str:

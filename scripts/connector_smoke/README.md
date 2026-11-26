@@ -37,12 +37,21 @@ below and adds no `oauth:<provider>:composio` line.
 The check launches each provider once per app backend it serves, through one of
 its visible catalog apps (a registry app when there is one):
 
-1. `POST /api/auth/{provider}/login` starts the launch. The returned callback
-   origin must equal the environment's origin. An unset `<PROVIDER>_REDIRECT_URI`
-   falls back to `http://localhost:8000`, so it fails here.
+1. `POST /api/auth/{provider}/login` starts the launch. Its
+   `provider_callback_origin` (or `callback_origin` on an older deployment)
+   must equal the environment's provider-facing origin. An unset
+   `<PROVIDER>_REDIRECT_URI` falls back to `http://localhost:8000`, so it fails
+   here.
 2. `GET` on the returned launch path redeems it, without following the
    redirect. The provider `Location` must carry a non-empty `client_id` and a
    `redirect_uri` of `<origin>/api/auth/{provider}/callback`.
+
+With `--completion-origin`, each launch additionally gets an
+`oauth:<provider>:completion` check (and `oauth:<provider>:composio:completion`
+for a Composio target): the start's `callback_origin`, which the frontend
+compares with the popup's final `postMessage` origin, must equal that value.
+This can differ from the provider-facing origin when the new callback host
+forwards the return to the entry that started the flow.
 
 A provider with any native app keeps these two checks through a native app, so
 turning one app over to Composio never drops them (`oauth:<provider>:callback`
@@ -50,9 +59,12 @@ and `oauth:<provider>:authorize`). An operator-created app under a provider
 counts as a native target too. A provider with any app whose catalog entry says
 `auth_backend: "composio"` additionally gets one `oauth:<provider>:composio`
 check: its launch redeem must redirect to the shared Composio callback path
-with a `state`, on the callback origin its own launch start reports, which may
-be another host than the deployment's. A Composio-only provider (every app's web
-connect on Composio, with the Composio settings present) gets only that check.
+with a `state`, on the provider-facing callback origin its own launch start
+reports, which may be another host than the deployment's. When
+`--callback-origin`/`XAGENT_CONNECTOR_SMOKE_CALLBACK_ORIGIN` is explicit, the
+redeem and begin must use that origin instead, so two stale self-reports cannot
+both pass. A Composio-only provider (every app's web connect on Composio, with
+the Composio settings present) gets only that check.
 Every start is redeemed before the next one, so a launch ticket never expires
 mid-run.
 
@@ -143,7 +155,8 @@ PYTHONPATH=src:scripts python -m connector_smoke l1 \
 | --- | --- | --- |
 | `--base-url` | `XAGENT_CONNECTOR_SMOKE_BASE_URL` | Deployment base URL. Required. |
 | (none) | `XAGENT_CONNECTOR_SMOKE_LOGIN`, `XAGENT_CONNECTOR_SMOKE_PASSWORD` | Monitor account. Accepted only from the environment. |
-| `--callback-origin` | `XAGENT_CONNECTOR_SMOKE_CALLBACK_ORIGIN` | Origin every OAuth callback must use. Defaults to the base URL's origin. |
+| `--callback-origin` | `XAGENT_CONNECTOR_SMOKE_CALLBACK_ORIGIN` | Origin every provider-facing OAuth callback must use. Defaults to the base URL's origin. |
+| `--completion-origin` | `XAGENT_CONNECTOR_SMOKE_COMPLETION_ORIGIN` | Optional origin the OAuth popup must finish on, for checking the frontend completion message. Unset skips the completion check. |
 | `--exclude` | `XAGENT_CONNECTOR_SMOKE_EXCLUDE` | Registry apps this deployment hides. Each one must be shown by the registry by default. |
 | `--include` | `XAGENT_CONNECTOR_SMOKE_INCLUDE` | Apps this deployment shows beyond the registry default. |
 | `--cookie NAME=VALUE` | `XAGENT_CONNECTOR_SMOKE_COOKIES` (`;`-separated) | Cookies sent on every request. |

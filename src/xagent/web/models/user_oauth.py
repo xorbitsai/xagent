@@ -135,6 +135,12 @@ class UserOAuth(Base):  # type: ignore[no-any-unimported]
         String, nullable=True
     )  # The user's ID in the provider system
     email = Column(String, nullable=True)
+    # The exact callback URI sent with the authorization that minted this
+    # grant. A provider that requires redirect_uri again on refresh (Deputy)
+    # must receive this value, not whatever the provider row advertises now.
+    # NULL means the grant predates the column or came from an older release;
+    # the refresh resolves the configured (pre-switch) callback for it.
+    redirect_uri = Column(String(1000), nullable=True)
     # A per-connection value some providers need beyond a fixed API domain,
     # reused for different shapes by whichever provider populates it:
     # Salesforce's per-org API host (a real URL), Deputy's per-install API

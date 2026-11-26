@@ -82,7 +82,9 @@ def db(tmp_path, monkeypatch):
     engine.dispose()
 
 
-def _captured_refresh(db, monkeypatch, provider: str) -> httpx.Request:
+def _captured_refresh(
+    db, monkeypatch, provider: str, *, redirect_uri: str | None = None
+) -> httpx.Request:
     captured: list[httpx.Request] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -98,6 +100,7 @@ def _captured_refresh(db, monkeypatch, provider: str) -> httpx.Request:
     grant = UserOAuth(
         user_id=user.id,
         provider=provider,
+        redirect_uri=redirect_uri,
         access_token=ACCESS_TOKEN,
         refresh_token=REFRESH_TOKEN,
         instance_url=INSTANCE_URLS.get(provider),
@@ -392,6 +395,30 @@ def test_refresh_sends_the_pinned_request(db, monkeypatch, provider):
     assert (
         _shape(_captured_refresh(db, monkeypatch, provider))
         == EXPECTED_SHAPES[provider]
+    )
+
+
+def test_deputy_refresh_repeats_the_uri_recorded_on_the_grant(db, monkeypatch):
+    monkeypatch.setenv(
+        "XAGENT_CONNECTOR_OAUTH_CALLBACK_BASE_URL", "https://cloud.tobybot.ai"
+    )
+    pinned = "https://cloud.tobybot.ai/api/auth/deputy/callback"
+
+    shape = _shape(_captured_refresh(db, monkeypatch, "deputy", redirect_uri=pinned))
+
+    assert shape["body"]["redirect_uri"] == pinned
+
+
+def test_legacy_deputy_grant_refreshes_with_the_registered_uri(db, monkeypatch):
+    """A NULL snapshot must not silently adopt the newly advertised origin."""
+    monkeypatch.setenv(
+        "XAGENT_CONNECTOR_OAUTH_CALLBACK_BASE_URL", "https://cloud.tobybot.ai"
+    )
+
+    shape = _shape(_captured_refresh(db, monkeypatch, "deputy"))
+
+    assert shape["body"]["redirect_uri"] == (
+        "https://app.example.com/api/auth/deputy/callback"
     )
 
 

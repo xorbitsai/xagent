@@ -2754,7 +2754,9 @@ def _summarize_comment(
 
 
 def _build_comments_response(
-    comments: list[dict[str, Any]], total: int, next_start_at: int | None,
+    comments: list[dict[str, Any]],
+    total: int,
+    next_start_at: int | None,
     issue_key: str = "",
 ) -> str:
     return _success(
@@ -2852,7 +2854,9 @@ def _fit_comments_page(
 
     def response_for(count: int) -> str:
         comments = [comment for _, comment in kept[:count]]
-        return _build_comments_response(comments, total, next_start_at_for(count), issue_key)
+        return _build_comments_response(
+            comments, total, next_start_at_for(count), issue_key
+        )
 
     # Try every kept comment first, then halve the count until the
     # response fits -- the same halving strategy utils.py's
@@ -2906,7 +2910,9 @@ def _fit_comments_page(
             comment = dict(template)
             comment["body"] = flattened_body
             comment["body_truncated"] = _cap_text_field(comment, "body", body_max_chars)
-            return _build_comments_response([comment], total, next_start_at_for(1), issue_key)
+            return _build_comments_response(
+                [comment], total, next_start_at_for(1), issue_key
+            )
 
         lo, hi = 0, _COMMENT_BODY_MAX_CHARS
         best: str | None = None

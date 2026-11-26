@@ -50,6 +50,7 @@ from ...config import (
     get_auth_recovery_email_limit,
     get_auth_recovery_ip_limit,
     get_auth_recovery_pair_limit,
+    get_connector_oauth_callback_uri,
     get_email_change_target_limit,
     get_email_confirmation_expire_minutes,
     get_google_restricted_scopes,
@@ -585,13 +586,53 @@ def _resolve_oauth_client_per_field(provider: str, db_provider: Any) -> tuple[st
     )
 
 
-def _resolve_oauth_redirect_uri(provider: str, db_provider: Any) -> str:
+def _registered_oauth_redirect_uri(provider: str, db_provider: Any) -> str:
     if getattr(db_provider, "redirect_uri", None):
         return str(db_provider.redirect_uri)
     return os.environ.get(
         _oauth_env_name(provider, "REDIRECT_URI"),
         f"http://localhost:8000/api/auth/{provider}/callback",
     )
+
+
+def _resolve_oauth_redirect_uri(provider: str, db_provider: Any) -> str:
+    """The provider-facing callback for a new authorization.
+
+    The configured URI (database row, else environment) is the registration's
+    own source of truth; the default-off connector callback origin replaces
+    only its origin, and only for this provider's standard callback path.
+    """
+    return get_connector_oauth_callback_uri(
+        _registered_oauth_redirect_uri(provider, db_provider),
+        callback_path=f"/api/auth/{provider}/callback",
+    )
+
+
+def _oauth_completion_origin(provider_callback_origin: str) -> str:
+    """The browser page origin the opener must trust after the callback.
+
+    A provider returns to the advertised callback origin; the ingress may
+    forward that request to the entry that started the flow. The completion
+    page is then served from that entry, which posts ``oauth-success`` to the
+    opener. ``XAGENT_OAUTH_CALLBACK_ORIGIN_MAP`` names those historical
+    callback-to-completion aliases explicitly; an unmapped origin completes
+    on itself.
+
+    Keep the previous behavior when no map is configured: a deployment may use
+    a local service name (``http://xagent_web:3000``) that the strict public
+    origin validator deliberately rejects. Only a configured map opts into
+    normalization of the source origin.
+    """
+    from ...config import get_oauth_callback_origin_map, normalize_public_origin
+
+    callback_map = get_oauth_callback_origin_map()
+    if not callback_map:
+        return provider_callback_origin
+    try:
+        normalized = normalize_public_origin(provider_callback_origin)
+    except ValueError:
+        return provider_callback_origin
+    return callback_map.get(normalized, provider_callback_origin)
 
 
 def _oauth_provider_config_error(
@@ -3718,25 +3759,12 @@ def start_builtin_oauth_for_resource_owner(
     )
     if not isinstance(response, RedirectResponse):
         return response
+    # The Composio begin route already carries the signed state for this flow.
     if via_composio:
-        # Same state, flow row and proof cookie; the browser comes back to the
-        # shared Composio callback path first, which sends it on to Composio
-        # (composio_auth). The proof cookie is scoped to that path.
-        from urllib.parse import parse_qs, urlsplit
-
-        state = parse_qs(urlsplit(response.headers["location"]).query)["state"][0]
-        callback_url = composio_auth.shared_callback_url(
-            db,
-            db_provider
-            if provider.lower() == composio_auth.DEFAULT_CALLBACK_PROVIDER
-            else None,
-        )
-        response = RedirectResponse(composio_auth.begin_location(callback_url, state))
-        cookie_secure, cookie_path = _oauth_cookie_scope_for(callback_url)
+        callback_url = response.headers["location"]
     else:
-        cookie_secure, cookie_path = _oauth_cookie_scope_for(
-            _resolve_oauth_redirect_uri(provider, db_provider)
-        )
+        callback_url = _resolve_oauth_redirect_uri(provider, db_provider)
+    cookie_secure, cookie_path = _oauth_cookie_scope_for(callback_url)
     db.add(ActorOAuthFlowState(nonce=nonce_digest, expires_at=expires_at))
     response.set_cookie(
         _actor_oauth_cookie_name(nonce_digest),
@@ -4531,13 +4559,23 @@ def _generic_oauth_login(
                 provider, [_oauth_env_name(provider, "CLIENT_ID")]
             )
         auth_url = db_provider.auth_url
-        redirect_uri = _resolve_oauth_redirect_uri(provider, db_provider)
+        registered_callback = _registered_oauth_redirect_uri(provider, db_provider)
+        redirect_uri = get_connector_oauth_callback_uri(
+            registered_callback, callback_path=f"/api/auth/{provider}/callback"
+        )
         default_scopes = db_provider.default_scopes
     else:
-        # A Composio start keeps only the state; the URL built here is discarded.
         client_id = ""
         auth_url = ""
-        redirect_uri = ""
+        registered_callback = composio_auth.registered_callback_url(
+            db,
+            (
+                db_provider
+                if provider == composio_auth.DEFAULT_CALLBACK_PROVIDER
+                else None
+            ),
+        )
+        redirect_uri = composio_auth.advertised_callback_url(registered_callback)
         default_scopes = None
 
     user_id = trusted_user_id
@@ -4618,6 +4656,10 @@ def _generic_oauth_login(
         "redirect": redirect,
         "session_epoch": session_epoch,
     }
+    # Only the opt-in first-party replacement needs a snapshot. Older states
+    # and unchanged custom registrations keep their original configured URI.
+    if redirect_uri != registered_callback:
+        state_payload["connector_callback_uri"] = redirect_uri
     if browser_state_nonce is not None:
         browser_nonce_hash = hashlib.sha256(
             browser_state_nonce.encode("ascii")
@@ -4889,16 +4931,17 @@ def _generic_oauth_login(
 
     cookie_secure: bool
     cookie_path: str = "/"
+    if not native_start:
+        response = RedirectResponse(composio_auth.begin_location(redirect_uri, state))
+        cookie_secure, cookie_path = _oauth_cookie_scope_for(redirect_uri)
+    else:
+        separator = "&" if "?" in auth_url else "?"
+        full_auth_url = f"{auth_url}{separator}{urlencode(params)}"
+        response = RedirectResponse(full_auth_url)
+        cookie_secure = urlsplit(redirect_uri).scheme.lower() == "https"
+
     if composio_ordinary:
         assert browser_nonce_hash is not None
-        callback_url = composio_auth.shared_callback_url(
-            db,
-            db_provider
-            if provider.lower() == composio_auth.DEFAULT_CALLBACK_PROVIDER
-            else None,
-        )
-        response = RedirectResponse(composio_auth.begin_location(callback_url, state))
-        cookie_secure, cookie_path = _oauth_cookie_scope_for(callback_url)
         # Committed before the redirect returns: the browser follows it at
         # once. Begin only checks this row; the verify or denied trip spends it.
         db.add(
@@ -4908,15 +4951,6 @@ def _generic_oauth_login(
             )
         )
         db.commit()
-    else:
-        separator = "&" if "?" in auth_url else "?"
-        full_auth_url = f"{auth_url}{separator}{urlencode(params)}"
-        response = RedirectResponse(full_auth_url)
-        cookie_secure = urlsplit(redirect_uri).scheme.lower() == "https"
-        # Match the callback URL's transport, rather than an environment
-        # label. Development can run behind HTTPS and production can be
-        # reached over HTTP during local health checks; the cookie must
-        # follow the browser-visible OAuth origin.
     if browser_state_nonce is not None:
         assert browser_nonce_hash is not None
         response.set_cookie(
@@ -5781,7 +5815,16 @@ def _generic_oauth_callback(
                     status_code=409,
                 )
 
-    redirect_uri = _resolve_oauth_redirect_uri(provider, db_provider)
+    # Exchange the code with the URI this authorization actually sent. A state
+    # minted after the switch carries that URI; older states and unchanged
+    # registrations fall back to the configured URI, not to a re-resolved
+    # advertised one, so a flow started before the switch still matches.
+    callback_snapshot = payload.get("connector_callback_uri")
+    redirect_uri = (
+        callback_snapshot
+        if isinstance(callback_snapshot, str) and callback_snapshot
+        else _registered_oauth_redirect_uri(provider, db_provider)
+    )
 
     try:
         data = {
@@ -6810,6 +6853,10 @@ def _generic_oauth_callback(
                 )
             setattr(oauth_account, "scope", token_scope)
             setattr(oauth_account, "email", email)
+            # The grant remembers the exact callback its authorization sent.
+            # Deputy's refresh repeats this value, so a later configuration
+            # change must not make an existing connection unrefreshable.
+            setattr(oauth_account, "redirect_uri", redirect_uri)
             if not google_shared_state:
                 setattr(oauth_account, "refresh_token", None)
             if "refresh_token" in token_data:
@@ -7383,7 +7430,12 @@ def start_oauth_authorization(
         raise HTTPException(
             400, "Invalid OAuth callback configuration", headers=private_headers
         )
-    callback_origin = f"{callback.scheme}://{callback.netloc}"
+    provider_callback_origin = f"{callback.scheme}://{callback.netloc}"
+    # The frontend validates the popup's completion message against the page
+    # that actually finishes the flow, which an ingress alias may serve on the
+    # entry that started it. Keep the provider-facing origin separately for
+    # smoke checks and diagnostics.
+    completion_origin = _oauth_completion_origin(provider_callback_origin)
     from ..oauth_handoff import (
         issue_handoff,
         regional_launch_requested,
@@ -7391,7 +7443,6 @@ def start_oauth_authorization(
     )
 
     if regional_launch_requested(request):
-        from ...config import get_oauth_callback_origin_map, normalize_public_origin
         from ..public_entries import request_public_entry
 
         validate_builtin_resource(db, provider, payload.app_id)
@@ -7405,10 +7456,8 @@ def start_oauth_authorization(
                 "options": payload.model_dump(),
             },
         )
-        # Map keys are normalized origins; normalize before the alias lookup.
-        result["callback_origin"] = get_oauth_callback_origin_map().get(
-            normalize_public_origin(callback_origin), callback_origin
-        )
+        result["callback_origin"] = completion_origin
+        result["provider_callback_origin"] = provider_callback_origin
         return JSONResponse(result, headers=private_headers)
 
     from urllib.parse import quote, urlencode
@@ -7428,7 +7477,11 @@ def start_oauth_authorization(
     # trust arbitrary forwarded Host headers to choose a credential destination.
     path = f"/api/auth/{quote(provider, safe='')}/login?{urlencode({'ticket': ticket})}"
     return JSONResponse(
-        {"authorization_url": path, "callback_origin": callback_origin},
+        {
+            "authorization_url": path,
+            "callback_origin": completion_origin,
+            "provider_callback_origin": provider_callback_origin,
+        },
         headers=private_headers,
     )
 

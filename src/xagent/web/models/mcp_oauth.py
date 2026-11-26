@@ -270,6 +270,8 @@ class MCPOAuthFlowState(Base):  # type: ignore
     resource = Column(String(1000), nullable=False)
     scope = Column(Text, nullable=False, default="")
     code_verifier = Column(Text, nullable=False)
+    # The URI included in the authorization request that issued this code.
+    redirect_uri = Column(String(1000), nullable=True)
     redirect_after = Column(String(1000), nullable=True)
     expires_at = Column(DateTime(timezone=True), nullable=False, index=True)
     consumed_at = Column(DateTime(timezone=True), nullable=True)

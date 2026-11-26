@@ -117,7 +117,7 @@ from fastapi.responses import HTMLResponse, RedirectResponse, Response
 from sqlalchemy import event, text
 
 from ..config import COMPOSIO_CALLBACK_URL as COMPOSIO_CALLBACK_URL_ENV
-from ..config import get_composio_callback_url
+from ..config import get_composio_callback_url, get_connector_oauth_callback_uri
 from ..core.utils import public_requests as requests
 from .auth_sessions import lock_current_session_epoch
 from .composio_apps import _CALLBACK_PATHS as _CALLBACK_PATHS
@@ -400,7 +400,7 @@ def _log_invalid_callback_url(
     )
 
 
-def shared_callback_url(db: Session, meta_row: Any = None) -> str:
+def registered_callback_url(db: Session, meta_row: Any = None) -> str:
     """The callback URL every Composio trip returns to.
 
     ``XAGENT_COMPOSIO_CALLBACK_URL`` when set (``_CallbackUrlInvalid`` when
@@ -408,7 +408,7 @@ def shared_callback_url(db: Session, meta_row: Any = None) -> str:
     otherwise the Meta callback URL, read from ``meta_row`` when the caller
     already holds the Meta provider row and from the database otherwise.
     """
-    from .api.auth import _resolve_oauth_redirect_uri
+    from .api.auth import _registered_oauth_redirect_uri
 
     configured = _configured_callback_url()
     if configured is not None:
@@ -421,7 +421,25 @@ def shared_callback_url(db: Session, meta_row: Any = None) -> str:
             .filter(OAuthProvider.provider_name == DEFAULT_CALLBACK_PROVIDER)
             .first()
         )
-    return _resolve_oauth_redirect_uri(DEFAULT_CALLBACK_PROVIDER, meta_row)
+    return _registered_oauth_redirect_uri(DEFAULT_CALLBACK_PROVIDER, meta_row)
+
+
+def advertised_callback_url(registered: str) -> str:
+    """The callback presented to Composio for a new trip.
+
+    Only this app's own shared-return paths move to
+    ``XAGENT_CONNECTOR_OAUTH_CALLBACK_BASE_URL``; a custom external return
+    configured through ``XAGENT_COMPOSIO_CALLBACK_URL`` keeps its origin.
+    """
+    path = urlsplit(registered).path
+    if path not in (COMPOSIO_CALLBACK_PATH, "/api/auth/meta/callback"):
+        return registered
+    return get_connector_oauth_callback_uri(registered, callback_path=path)
+
+
+def shared_callback_url(db: Session, meta_row: Any = None) -> str:
+    """Provider-facing callback; historical trips keep the registered URL."""
+    return advertised_callback_url(registered_callback_url(db, meta_row))
 
 
 def begin_location(redirect_uri: str, state: str) -> str:
@@ -1227,6 +1245,7 @@ class _Flow:
     user_id: int
     owner_key: str | None
     redirect: str | None
+    connector_callback_uri: str | None
     expires_at: float
     app_id: str
     shape: Shape
@@ -1374,6 +1393,7 @@ def _verified_flow(state: str, request: Any, db: Session) -> _Flow:
         user_id=user_id,
         owner_key=owner_key,
         redirect=redirect if isinstance(redirect, str) else None,
+        connector_callback_uri=payload.get("connector_callback_uri"),
         expires_at=float(expires_at),
         app_id=app_id,
         shape=shape,
@@ -1501,7 +1521,7 @@ def handle_callback(
     """Handle one Composio trip; ``meta_row`` is the Meta provider row when the
     trip arrived on the Meta callback."""
     try:
-        callback = shared_callback_url(db, meta_row)
+        callback = registered_callback_url(db, meta_row)
     except _CallbackUrlInvalid as problem:
         _log_invalid_callback_url(problem)
         _log_rejection("callback_url_invalid")
@@ -1546,6 +1566,9 @@ def _handle_begin(request: Any, db: Session, callback: str) -> Response:
         _log_rejection(rejected.reason, actor_flow=rejected.actor_flow)
         return rejected.response
     db.rollback()
+
+    # The callback presented to Composio stays fixed across a configuration change.
+    callback = flow.connector_callback_uri or callback
 
     # Only one actor's flows stay open in a browser, so a verification can be
     # completed with the one Composio user id they share. Another actor's

@@ -23,6 +23,7 @@ ENV_BASE_URL = "XAGENT_CONNECTOR_SMOKE_BASE_URL"
 ENV_LOGIN = "XAGENT_CONNECTOR_SMOKE_LOGIN"
 ENV_PASSWORD = "XAGENT_CONNECTOR_SMOKE_PASSWORD"
 ENV_CALLBACK_ORIGIN = "XAGENT_CONNECTOR_SMOKE_CALLBACK_ORIGIN"
+ENV_COMPLETION_ORIGIN = "XAGENT_CONNECTOR_SMOKE_COMPLETION_ORIGIN"
 ENV_EXCLUDE = "XAGENT_CONNECTOR_SMOKE_EXCLUDE"
 ENV_INCLUDE = "XAGENT_CONNECTOR_SMOKE_INCLUDE"
 ENV_COOKIES = "XAGENT_CONNECTOR_SMOKE_COOKIES"
@@ -48,7 +49,9 @@ def run_l1(
     login_start: bool,
     expected: set[str],
     expected_origin: str,
+    expected_origin_explicit: bool,
     oauth_accounts: Mapping[str, str],
+    expected_completion_origin: str | None = None,
 ) -> list[l1.CheckResult]:
     try:
         client.login(login, password, login_field=login_field, login_start=login_start)
@@ -63,10 +66,25 @@ def run_l1(
     results = l1.check_catalog(apps, expected)
     for target in l1.select_oauth_targets(apps, preferred=expected):
         if target.auth_backend == l1.COMPOSIO_BACKEND:
-            results.extend(_check_composio_target(client, target, oauth_accounts))
+            results.extend(
+                _check_composio_target(
+                    client,
+                    target,
+                    oauth_accounts,
+                    expected_completion_origin,
+                    expected_origin,
+                    expected_origin_explicit,
+                )
+            )
         else:
             results.extend(
-                _check_oauth_target(client, target, expected_origin, oauth_accounts)
+                _check_oauth_target(
+                    client,
+                    target,
+                    expected_origin,
+                    oauth_accounts,
+                    expected_completion_origin,
+                )
             )
     return results
 
@@ -75,6 +93,9 @@ def _check_composio_target(
     client: SmokeClient,
     target: l1.OAuthTarget,
     oauth_accounts: Mapping[str, str],
+    expected_completion_origin: str | None,
+    expected_origin: str,
+    expected_origin_explicit: bool,
 ) -> list[l1.CheckResult]:
     provider = target.provider
     name = f"oauth:{provider}:composio"
@@ -100,26 +121,60 @@ def _check_composio_target(
                 + l1.start_refused_detail(start.status_code, start.payload),
             )
         ]
-    origin = l1.start_callback_origin(start.payload)
-    if origin is None:
-        return [
+    results: list[l1.CheckResult] = []
+    if expected_completion_origin is not None:
+        results.append(
+            l1.check_completion_origin(
+                provider,
+                status_code=start.status_code,
+                payload=start.payload,
+                expected_origin=expected_completion_origin,
+                composio=True,
+            )
+        )
+    origin = l1.start_provider_callback_origin(start.payload)
+    if expected_origin_explicit:
+        # The Composio project's own shared callback can be an independent
+        # host, so only an explicit expected origin can pin this check. The
+        # same helper also refuses a missing or unusable completion origin.
+        results.append(
+            l1.check_callback_origin(
+                provider,
+                status_code=start.status_code,
+                payload=start.payload,
+                expected_origin=expected_origin,
+            )
+        )
+        if origin is None:
+            return results
+    elif origin is None:
+        results.append(
             l1.CheckResult(
                 name, False, "launch start returned no usable callback origin"
             )
-        ]
+        )
+        return results
+    elif l1.start_callback_origin(start.payload) is None:
+        # The frontend needs this field even when the provider-facing origin
+        # is separately reported.
+        results.append(
+            l1.CheckResult(name, False, "launch start returned no completion origin")
+        )
     try:
         redeem = client.redeem_launch(provider, start.payload.get("authorization_url"))
     except SmokeError as exc:
-        return [l1.CheckResult(name, False, str(exc))]
-    return [
+        results.append(l1.CheckResult(name, False, str(exc)))
+        return results
+    results.append(
         l1.check_composio_callback(
             provider,
             status_code=redeem.status_code,
             location=redeem.location,
             body=redeem.body,
-            expected_origin=origin,
+            expected_origin=expected_origin if expected_origin_explicit else origin,
         )
-    ]
+    )
+    return results
 
 
 def _check_oauth_target(
@@ -127,6 +182,7 @@ def _check_oauth_target(
     target: l1.OAuthTarget,
     expected_origin: str,
     oauth_accounts: Mapping[str, str],
+    expected_completion_origin: str | None,
 ) -> list[l1.CheckResult]:
     provider = target.provider
     account = oauth_accounts.get(provider)
@@ -150,6 +206,15 @@ def _check_oauth_target(
             expected_origin=expected_origin,
         )
     ]
+    if expected_completion_origin is not None:
+        results.append(
+            l1.check_completion_origin(
+                provider,
+                status_code=start.status_code,
+                payload=start.payload,
+                expected_origin=expected_completion_origin,
+            )
+        )
     authorize = f"oauth:{provider}:authorize"
     if start.status_code != 200 or not isinstance(start.payload, dict):
         results.append(l1.CheckResult(authorize, False, "launch start refused"))
@@ -348,6 +413,11 @@ def main(
     expected_origin = l1.normalize_origin(args.callback_origin or base_origin)
     if expected_origin is None:
         parser.error("--callback-origin must be an http(s) origin")
+    expected_completion_origin = None
+    if args.completion_origin:
+        expected_completion_origin = l1.normalize_origin(args.completion_origin)
+        if expected_completion_origin is None:
+            parser.error("--completion-origin must be an http(s) origin")
     try:
         cookies = _parse_pairs(
             _arg_or_env(args.cookie, env, ENV_COOKIES), separator=";"
@@ -386,7 +456,9 @@ def main(
             login_start=args.login_start,
             expected=expected,
             expected_origin=expected_origin,
+            expected_origin_explicit=bool(args.callback_origin),
             oauth_accounts=oauth_accounts,
+            expected_completion_origin=expected_completion_origin,
         )
 
     return _report(results, out)
@@ -529,8 +601,14 @@ def _build_parser(env: Mapping[str, str]) -> argparse.ArgumentParser:
     p.add_argument(
         "--callback-origin",
         default=env.get(ENV_CALLBACK_ORIGIN),
-        help="origin every OAuth callback must use; defaults to the base URL's "
-        f"(env {ENV_CALLBACK_ORIGIN})",
+        help="origin every provider-facing OAuth callback must use; defaults to "
+        f"the base URL's (env {ENV_CALLBACK_ORIGIN})",
+    )
+    p.add_argument(
+        "--completion-origin",
+        default=env.get(ENV_COMPLETION_ORIGIN),
+        help="optional origin the OAuth popup finishes on, for checking the "
+        f"frontend completion message (env {ENV_COMPLETION_ORIGIN})",
     )
     p.add_argument(
         "--exclude",

@@ -65,6 +65,7 @@ class FakeDeployment:
         }
         self.callback_origin = BASE
         self.shared_callback_origin = "https://global.example.net"
+        self.provider_callback_origin: str | None = None
         self.composio_apps: set[str] = set()
         self.requests: list[httpx.Request] = []
         self.launch_bodies: dict[str, dict[str, Any]] = {}
@@ -107,14 +108,14 @@ class FakeDeployment:
             if body.get("app_id") in self.composio_apps
             else self.callback_origin
         )
-        return httpx.Response(
-            200,
-            json={
-                "authorization_url": f"/api/auth/{provider}/login?"
-                + urlencode({"ticket": ticket}),
-                "callback_origin": origin,
-            },
-        )
+        payload = {
+            "authorization_url": f"/api/auth/{provider}/login?"
+            + urlencode({"ticket": ticket}),
+            "callback_origin": origin,
+        }
+        if self.provider_callback_origin is not None:
+            payload["provider_callback_origin"] = self.provider_callback_origin
+        return httpx.Response(200, json=payload)
 
     def _redeem(self, provider: str, request: httpx.Request) -> httpx.Response:
         assert parse_qs(request.url.query.decode())["ticket"] == [
@@ -142,7 +143,10 @@ class FakeDeployment:
             {
                 "response_type": "code",
                 "client_id": client_id,
-                "redirect_uri": f"{self.callback_origin}/api/auth/{provider}/callback",
+                "redirect_uri": (
+                    f"{self.provider_callback_origin or self.callback_origin}"
+                    f"/api/auth/{provider}/callback"
+                ),
                 "state": STATE,
             }
         )
@@ -197,6 +201,48 @@ def test_healthy_deployment_passes_every_check() -> None:
     assert "PASS oauth:slack:authorize" in lines
     assert "PASS oauth:google:authorize" in lines
     assert lines[-1] == "7 checks, 0 failed"
+
+
+def test_callback_and_completion_origins_are_checked_separately() -> None:
+    fake = FakeDeployment()
+    provider = "https://cloud.tobybot.ai"
+    completion = "https://au.cloud.example.com"
+    fake.provider_callback_origin = provider
+    fake.callback_origin = completion
+
+    code, lines = _run(
+        fake,
+        "--callback-origin",
+        provider,
+        "--completion-origin",
+        completion,
+    )
+
+    assert code == 0, lines
+    assert "PASS oauth:slack:callback" in lines
+    assert "PASS oauth:slack:completion" in lines
+    assert "PASS oauth:google:completion" in lines
+
+
+def test_a_completion_origin_mismatch_fails_that_check() -> None:
+    fake = FakeDeployment()
+    provider = "https://cloud.tobybot.ai"
+    fake.provider_callback_origin = provider
+    fake.callback_origin = "https://au.cloud.example.com"
+
+    code, lines = _run(
+        fake,
+        "--callback-origin",
+        provider,
+        "--completion-origin",
+        "https://wrong.example.com",
+    )
+
+    assert code == 1
+    assert _failed_checks(lines) == {
+        "oauth:slack:completion",
+        "oauth:google:completion",
+    }
 
 
 def test_unset_client_id_fails_only_that_provider() -> None:
@@ -355,6 +401,27 @@ def test_a_composio_redeem_on_another_origin_than_its_start_fails() -> None:
         "FAIL oauth:salesforce:composio: callback origin is "
         "https://elsewhere.example.net, expected https://global.example.net"
     ]
+
+
+def test_an_explicit_new_origin_rejects_stale_composio_report_and_begin() -> None:
+    fake = _composio_deployment()
+    old = "https://old.example.net"
+    fake.callback_origin = old
+    fake.provider_callback_origin = old
+    fake.shared_callback_origin = old
+
+    code, lines = _run(
+        fake,
+        "--callback-origin",
+        "https://cloud.tobybot.ai",
+        registry_rows=COMPOSIO_REGISTRY_ROWS,
+    )
+
+    assert code == 1
+    assert (
+        "FAIL oauth:salesforce:composio: callback origin is "
+        "https://old.example.net, expected https://cloud.tobybot.ai"
+    ) in lines
 
 
 @pytest.mark.parametrize("origin", [None, "", "/relative", "ftp://host"])

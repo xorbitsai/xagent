@@ -391,7 +391,9 @@ def redeem_handoff(
         params = {
             "response_type": "code",
             "client_id": str(client.client_id),
-            "redirect_uri": str(client.redirect_uri),
+            # Snapshot first: the client row can be updated by another connect
+            # between this flow's creation and its redemption.
+            "redirect_uri": str(flow.redirect_uri or client.redirect_uri),
             "state": str(flow.state),
             "code_challenge": mcp._pkce_code_challenge(
                 mcp.decrypt_value(str(flow.code_verifier))

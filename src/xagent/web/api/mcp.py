@@ -48,6 +48,8 @@ from sqlalchemy.orm.exc import StaleDataError
 
 from ...config import (
     get_app_base_url,
+    get_connector_oauth_callback_base_url,
+    get_connector_oauth_callback_uri,
     get_mcp_oauth_callback_base_url,
     get_mcp_oauth_client_name,
     get_mcp_tool_init_timeout_seconds,
@@ -147,6 +149,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 MCP_OAUTH_STATE_COOKIE = "xagent_mcp_oauth_state"
+MCP_OAUTH_CALLBACK_PATH = "/api/mcp/oauth/callback"
 MCP_OAUTH_STATE_TTL = timedelta(minutes=10)
 MCP_OAUTH_STATE_COOKIE_MAX_AGE_SECONDS = int(MCP_OAUTH_STATE_TTL.total_seconds())
 # How long an expired mcp_oauth_flow_states row is kept before the sweep in
@@ -691,18 +694,23 @@ def _mcp_oauth_callback_site_redirect_uri() -> str:
     base_url = (
         get_public_api_base_url() or get_app_base_url() or "http://localhost:8000"
     )
-    return f"{base_url.rstrip('/')}/api/mcp/oauth/callback"
+    return f"{base_url.rstrip('/')}{MCP_OAUTH_CALLBACK_PATH}"
 
 
 def _default_mcp_oauth_redirect_uri() -> str:
     """The callback a dynamically registered client advertises.
 
-    ``XAGENT_MCP_OAUTH_CALLBACK_BASE_URL`` can move it to another host whose
-    ingress redirects the callback to this deployment's own site.
+    ``XAGENT_CONNECTOR_OAUTH_CALLBACK_BASE_URL`` moves every standard MCP
+    callback (pre-registered and dynamic). When it is unset,
+    ``XAGENT_MCP_OAUTH_CALLBACK_BASE_URL`` keeps its older
+    dynamic-registration-only behavior. Either origin's ingress must forward
+    the callback to this deployment's own site, where the state cookie is.
     """
-    advertised_base_url = get_mcp_oauth_callback_base_url()
+    advertised_base_url = (
+        get_connector_oauth_callback_base_url() or get_mcp_oauth_callback_base_url()
+    )
     if advertised_base_url:
-        return f"{advertised_base_url}/api/mcp/oauth/callback"
+        return f"{advertised_base_url}{MCP_OAUTH_CALLBACK_PATH}"
     return _mcp_oauth_callback_site_redirect_uri()
 
 
@@ -1147,7 +1155,9 @@ def _team_member_mcp_oauth_definition_refusal(
     # A blank value means unset here, as it does when the flow starts. A set
     # value must be the advertised callback or this deployment's own one.
     configured_redirect_uri = _configured_mcp_oauth_value(None, auth, "redirect_uri")
-    if configured_redirect_uri and configured_redirect_uri not in {
+    if configured_redirect_uri and get_connector_oauth_callback_uri(
+        configured_redirect_uri, callback_path=MCP_OAUTH_CALLBACK_PATH
+    ) not in {
         _default_mcp_oauth_redirect_uri(),
         _mcp_oauth_callback_site_redirect_uri(),
     }:
@@ -1280,6 +1290,18 @@ def _upsert_mcp_oauth_client(
         else:
             encrypted_client_secret = (
                 encrypt_value(client_secret) if client_secret else None
+            )
+        if existing is not None and existing.redirect_uri != redirect_uri:
+            # Older workers can start a flow without a snapshot during a
+            # rolling upgrade. Pin its original URI before updating this client.
+            db.query(MCPOAuthFlowState).filter(
+                MCPOAuthFlowState.mcp_oauth_client_id == existing.id,
+                MCPOAuthFlowState.redirect_uri.is_(None),
+                MCPOAuthFlowState.consumed_at.is_(None),
+                MCPOAuthFlowState.expires_at > _utc_now(),
+            ).update(
+                {MCPOAuthFlowState.redirect_uri: existing.redirect_uri},
+                synchronize_session=False,
             )
         client = existing or MCPOAuthClient(
             mcp_server_id=server_id,
@@ -1708,6 +1730,7 @@ def _persist_mcp_oauth_connect_flow(
                 issuer=selected_issuer,
                 resource=selected_resource,
                 scope=selected_scope,
+                redirect_uri=redirect_uri,
                 code_verifier=encrypt_value(code_verifier),
                 redirect_after=_safe_mcp_oauth_redirect_after(redirect_after),
                 expires_at=_utc_now() + MCP_OAUTH_STATE_TTL,
@@ -1820,6 +1843,7 @@ def _persist_team_member_mcp_oauth_connect_flow(
                 issuer=prepared.discovered.selected_issuer,
                 resource=prepared.selected_resource,
                 scope=prepared.selected_scope,
+                redirect_uri=prepared.discovered.redirect_uri,
                 code_verifier=encrypt_value(code_verifier),
                 redirect_after=_safe_mcp_oauth_redirect_after(redirect_after),
                 expires_at=_utc_now() + MCP_OAUTH_STATE_TTL,
@@ -1980,12 +2004,13 @@ async def _exchange_mcp_oauth_code(
     code: str,
     code_verifier: str,
     resource: str,
+    redirect_uri: str | None = None,
 ) -> dict[str, Any]:
     data = {
         "grant_type": "authorization_code",
         "code": code,
         "client_id": client.client_id,
-        "redirect_uri": client.redirect_uri,
+        "redirect_uri": redirect_uri or client.redirect_uri,
         "code_verifier": code_verifier,
         "resource": resource,
     }
@@ -7288,6 +7313,10 @@ async def mcp_oauth_callback(
         )
     code_verifier = decrypt_value(str(flow_state.code_verifier))
     resource = str(flow_state.resource)
+    # A later authorization can update a shared static client's redirect URI.
+    # Exchange this code with the URI the provider saw for this flow. Rows
+    # from a release before this snapshot fall back to their client row.
+    pinned_redirect_uri = flow_state.redirect_uri
     # The claim commit expires ORM instances. Keep the provider-facing client
     # snapshot detached so a concurrent server deletion cannot make token
     # exchange or compensation reload stale ORM state.
@@ -7334,6 +7363,7 @@ async def mcp_oauth_callback(
             code=code,
             code_verifier=code_verifier,
             resource=resource,
+            redirect_uri=pinned_redirect_uri,
         )
         failure_stage = "snapshot_issued_token"
         issued_token = _mcp_oauth_issued_token_snapshot(
@@ -7548,14 +7578,21 @@ async def _discover_mcp_oauth_connect(server: MCPServer) -> _MCPOAuthConnectDisc
 
     redirect_uri = _configured_mcp_oauth_value(None, auth_config, "redirect_uri")
     if not redirect_uri:
-        # A pre-registered client was registered with this deployment's own
-        # callback; only a dynamic registration advertises the configured one.
+        # The older MCP-only setting applies to dynamic registrations. Static
+        # registrations start from the address configured for this deployment.
         redirect_uri = (
             _mcp_oauth_callback_site_redirect_uri()
             if _configured_mcp_oauth_value(None, auth_config, "client_id")
             else _default_mcp_oauth_redirect_uri()
         )
-    redirect_uri = _bounded_mcp_oauth_value(redirect_uri, field_name="redirect_uri")
+    # The connector-wide switch also moves a pre-registered client's own
+    # standard callback; a custom external return path is left unchanged.
+    redirect_uri = _bounded_mcp_oauth_value(
+        get_connector_oauth_callback_uri(
+            redirect_uri, callback_path=MCP_OAUTH_CALLBACK_PATH
+        ),
+        field_name="redirect_uri",
+    )
     selected_issuer = _bounded_mcp_oauth_value(
         str(discovery.authorization_server.issuer), field_name="issuer"
     )

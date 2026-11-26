@@ -2018,6 +2018,87 @@ async def test_preregistered_client_keeps_the_deployment_callback(
 
 
 @pytest.mark.asyncio
+async def test_connector_callback_base_moves_a_preregistered_client(
+    db_session, monkeypatch
+):
+    db, user, _ = db_session
+    monkeypatch.setenv("XAGENT_PUBLIC_API_BASE_URL", "https://api.xagent.test")
+    monkeypatch.setenv(
+        "XAGENT_CONNECTOR_OAUTH_CALLBACK_BASE_URL", "https://cloud.tobybot.ai"
+    )
+    server = _add_mcp_oauth_server(db, user, redirect_uri=None)
+
+    async def fake_discover(*args, **kwargs):
+        return _discovery()
+
+    async def fail_dcr(*args, **kwargs):
+        raise AssertionError("a pre-registered client must not register")
+
+    monkeypatch.setattr(mcp_api, "discover_mcp_oauth_metadata", fake_discover)
+    monkeypatch.setattr(mcp_api, "register_mcp_oauth_public_client", fail_dcr)
+
+    response = await connect_mcp_oauth(
+        server.id,
+        MCPOAuthConnectRequest(redirect_after="/settings/mcp"),
+        user,
+        db,
+    )
+
+    advertised = "https://cloud.tobybot.ai/api/mcp/oauth/callback"
+    query = parse_qs(urlparse(response.headers["location"]).query)
+    assert query["client_id"] == ["client-123"]
+    assert query["redirect_uri"] == [advertised]
+    assert db.query(MCPOAuthClient).one().redirect_uri == advertised
+    flow_state = db.query(MCPOAuthFlowState).one()
+    assert flow_state.redirect_uri == advertised
+
+
+@pytest.mark.asyncio
+async def test_connector_callback_base_wins_for_dynamic_registration(
+    db_session, monkeypatch
+):
+    db, user, _ = db_session
+    monkeypatch.setenv("XAGENT_PUBLIC_API_BASE_URL", "https://api.xagent.test")
+    monkeypatch.setenv("XAGENT_MCP_OAUTH_CALLBACK_BASE_URL", "https://legacy-mcp.test")
+    monkeypatch.setenv(
+        "XAGENT_CONNECTOR_OAUTH_CALLBACK_BASE_URL", "https://cloud.tobybot.ai"
+    )
+    server = _add_mcp_oauth_server(
+        db,
+        user,
+        client_id="",
+        client_secret=None,
+        redirect_uri=None,
+        token_endpoint_auth_method="none",
+    )
+    registration_calls: list[str] = []
+
+    async def fake_discover(*args, **kwargs):
+        return _discovery()
+
+    async def fake_register(_server, *, redirect_uri, client_name):
+        registration_calls.append(redirect_uri)
+        return SimpleNamespace(
+            client_id="new-client", token_endpoint_auth_method="none"
+        )
+
+    monkeypatch.setattr(mcp_api, "discover_mcp_oauth_metadata", fake_discover)
+    monkeypatch.setattr(mcp_api, "register_mcp_oauth_public_client", fake_register)
+
+    response = await connect_mcp_oauth(
+        server.id,
+        MCPOAuthConnectRequest(redirect_after="/settings/mcp"),
+        user,
+        db,
+    )
+
+    advertised = "https://cloud.tobybot.ai/api/mcp/oauth/callback"
+    assert registration_calls == [advertised]
+    query = parse_qs(urlparse(response.headers["location"]).query)
+    assert query["redirect_uri"] == [advertised]
+
+
+@pytest.mark.asyncio
 async def test_connect_without_client_id_or_registration_endpoint_requires_preregistration(
     db_session, monkeypatch
 ):
@@ -3569,8 +3650,8 @@ async def test_callback_exchanges_code_and_stores_encrypted_grant(
     db_session, monkeypatch
 ):
     monkeypatch.setenv("XAGENT_APP_BASE_URL", "https://app.example.com/")
-    # The token request must repeat the client row's redirect URI, not
-    # whatever this deployment would advertise now.
+    # The token request must repeat the flow's own snapshot, not the shared
+    # client row or whatever this deployment would advertise now.
     monkeypatch.setenv("XAGENT_MCP_OAUTH_CALLBACK_BASE_URL", "https://brand.test")
     db, user, _ = db_session
     server = _add_mcp_oauth_server(db, user)
@@ -3598,6 +3679,7 @@ async def test_callback_exchanges_code_and_stores_encrypted_grant(
         issuer="https://auth.example.com",
         resource="https://mcp.example.com/mcp",
         scope="records.read",
+        redirect_uri="https://pinned.example/api/mcp/oauth/callback",
         code_verifier=mcp_api.encrypt_value("verifier-123"),
         redirect_after="/mcp",
         expires_at=mcp_api._utc_now() + timedelta(minutes=10),
@@ -3615,7 +3697,7 @@ async def test_callback_exchanges_code_and_stores_encrypted_grant(
         assert form["resource"] == "https%3A%2F%2Fmcp.example.com%2Fmcp"
         assert form["client_secret"] == "client-secret"
         assert form["redirect_uri"] == (
-            "https%3A%2F%2Fxagent.example.com%2Fapi%2Fmcp%2Foauth%2Fcallback"
+            "https%3A%2F%2Fpinned.example%2Fapi%2Fmcp%2Foauth%2Fcallback"
         )
         return httpx.Response(
             200,

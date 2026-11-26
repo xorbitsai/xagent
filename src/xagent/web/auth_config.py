@@ -3,6 +3,7 @@ from dataclasses import dataclass
 
 from ..config import (
     INSECURE_SECRET_PLACEHOLDER,
+    get_connector_oauth_callback_base_url,
     get_session_secret,
     requires_secure_secrets,
     validate_encryption_config,
@@ -46,6 +47,10 @@ def validate_auth_config() -> None:
             "session signing value"
         )
     validate_encryption_config()
+    # A configured connector callback origin is advertised verbatim to OAuth
+    # providers. An unusable value must stop the deployment instead of
+    # surfacing only when the first user tries to connect.
+    get_connector_oauth_callback_base_url()
     # An enabled idle policy with an unusable value must stop the deployment
     # rather than fall back to a weaker default.
     get_browser_idle_policy()

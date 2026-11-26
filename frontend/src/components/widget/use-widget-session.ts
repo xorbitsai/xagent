@@ -7,12 +7,15 @@ import { WidgetSessionUploadError } from "@/lib/widget-session-upload"
 
 const TOKEN_REFRESH_THRESHOLD_MS = 60_000
 const EXPIRY_WARNING_LEAD_MS = 10 * 60_000
-// The longest a reconnect after a 1001 (going away) close waits before it asks
-// the parent. A reverse proxy reloading its configuration, or a server shutting
-// down, closes every socket it holds with 1001 at the same instant; a random
-// wait in [0, this] spreads the resulting reconnect requests out instead of
-// sending them all to the session server in the same second.
-export const GOING_AWAY_RECONNECT_MAX_DELAY_MS = 30_000
+// A dropped socket waits a random time in [0, this) before asking the parent
+// to reconnect, so that sockets dropped together (a release switch, a proxy
+// reload) do not all POST /sessions/reconnect at the same moment. The bound
+// stays well inside every limit that can lose a session: the 30 s session
+// token grace and the parent's 30 s give-up on a long Retry-After, the 60 s
+// staleness threshold above, and the 10 min reconnect token replay window.
+// It is also far below RESEND_RECONNECT_DEADLINE_MS (90 s), so a message that
+// waits through it still has the rest of its deadline for the reconnect.
+export const WS_CLOSE_RECONNECT_JITTER_MAX_MS = 15_000
 // Keep this predicate aligned with the two retry signals that a parent sends
 // (frontend/public/widget.js and the link host page, link-session-host.ts);
 // every other parent code fails closed.
@@ -208,15 +211,14 @@ export function useWidgetSession() {
   const activeSessionGenerationRef = useRef<number | null>(null)
   const activeDeliveryIdRef = useRef<string | null>(null)
   const warningTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
-  // A reconnect request that is waiting out its random delay (see
-  // GOING_AWAY_RECONNECT_MAX_DELAY_MS) before it is sent to the parent.
-  const delayedReconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   // The session the current generation was built from; null while there is no
   // usable session (waiting, refreshing, degraded, terminal).
   const sessionRef = useRef<WidgetSession | null>(null)
   const degradedRef = useRef(false)
   // The generation whose socket has opened, if any.
   const openGenerationRef = useRef<number | null>(null)
+  // Timer of a reconnect request that is waiting out its jitter.
+  const reconnectDelayTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const sessionWaitRef = useRef<{ promise: Promise<WidgetSession>, waiters: Waiter<WidgetSession>[] } | null>(null)
   const openWaitersRef = useRef<Waiter<void>[]>([])
 
@@ -250,17 +252,17 @@ export function useWidgetSession() {
     }
   }, [])
 
-  const clearDelayedReconnect = useCallback(() => {
-    if (delayedReconnectTimerRef.current) {
-      clearTimeout(delayedReconnectTimerRef.current)
-      delayedReconnectTimerRef.current = null
+  const clearReconnectDelayTimer = useCallback(() => {
+    if (reconnectDelayTimerRef.current) {
+      clearTimeout(reconnectDelayTimerRef.current)
+      reconnectDelayTimerRef.current = null
     }
   }, [])
 
   const transitionTerminal = useCallback((code: string) => {
     if (terminalRef.current) return
     terminalRef.current = true
-    clearDelayedReconnect()
+    clearReconnectDelayTimer()
     // Tells the parent that this page ended the session, so a parent that owns
     // navigation can act on it. widget.js has no handler for this type; the link
     // host page (link-session-host.ts) maps the code to its end page.
@@ -285,7 +287,7 @@ export function useWidgetSession() {
       terminalCode: code,
       isAbsoluteExpiryWarningVisible: false,
     })
-  }, [clearDelayedReconnect, clearWarningTimer, failPendingWaits])
+  }, [clearReconnectDelayTimer, clearWarningTimer, failPendingWaits])
 
   const transitionDegraded = useCallback(() => {
     if (terminalRef.current) return
@@ -305,11 +307,13 @@ export function useWidgetSession() {
     }))
   }, [clearWarningTimer, failPendingWaits])
 
-  // Enters "refreshing" at once and asks the parent for a new session, after
-  // `delayMs` when it is positive. The recovery counts as in flight from the
-  // start, so any other reconnect during the delay joins it instead of
-  // sending a request of its own.
-  const issueReconnectRequest = useCallback((reason: WidgetSessionReconnectReason, delayMs: number) => {
+  const postReconnectRequest = useCallback((reason: WidgetSessionReconnectReason) => {
+    const targetOrigin = targetOriginRef.current
+    if (!mountedRef.current || !targetOrigin || terminalRef.current) return
+    window.parent.postMessage({ xagent: true, v: 1, type: "reconnect_request", reason }, targetOrigin)
+  }, [])
+
+  const issueReconnectRequest = useCallback((reason: WidgetSessionReconnectReason) => {
     const targetOrigin = targetOriginRef.current
     if (!mountedRef.current || !targetOrigin || terminalRef.current) return
 
@@ -325,29 +329,45 @@ export function useWidgetSession() {
       terminalCode: null,
       isAbsoluteExpiryWarningVisible: false,
     }))
-    const send = () => {
-      window.parent.postMessage({ xagent: true, v: 1, type: "reconnect_request", reason }, targetOrigin)
-    }
-    if (delayMs <= 0) {
-      send()
+    if (reason === "ws_closed") {
+      // Shows "refreshing" now and asks the parent later: a reconnect that
+      // nobody waits for can be spread out. See WS_CLOSE_RECONNECT_JITTER_MAX_MS.
+      const delayMs = Math.floor(Math.random() * WS_CLOSE_RECONNECT_JITTER_MAX_MS)
+      reconnectDelayTimerRef.current = setTimeout(() => {
+        reconnectDelayTimerRef.current = null
+        postReconnectRequest(reason)
+      }, delayMs)
       return
     }
-    delayedReconnectTimerRef.current = setTimeout(() => {
-      delayedReconnectTimerRef.current = null
-      if (!mountedRef.current || terminalRef.current) return
-      send()
-    }, delayMs)
-  }, [clearWarningTimer])
-
-  const startReconnect = useCallback((reason: WidgetSessionReconnectReason, delayMs: number) => {
-    if (!mountedRef.current || terminalRef.current || recoveryInFlightRef.current) return
-    activeSessionGenerationRef.current = null
-    issueReconnectRequest(reason, delayMs)
-  }, [issueReconnectRequest])
+    postReconnectRequest(reason)
+  }, [clearWarningTimer, postReconnectRequest])
 
   const requestReconnect = useCallback((reason: WidgetSessionReconnectReason) => {
-    startReconnect(reason, 0)
-  }, [startReconnect])
+    if (!mountedRef.current || terminalRef.current || recoveryInFlightRef.current) return
+    // The parent must stop counting this delivery as stable before the
+    // reconnect jitter starts; otherwise its 60-second timer can reset the
+    // rapid-recovery budget while the socket is already closed.
+    const deliveryId = activeDeliveryIdRef.current
+    const targetOrigin = targetOriginRef.current
+    if (reason === "ws_closed" && activeSessionGenerationRef.current !== null && deliveryId && targetOrigin) {
+      window.parent.postMessage({
+        xagent: true,
+        v: 1,
+        type: "session_connection_closed",
+        session_delivery_id: deliveryId,
+      }, targetOrigin)
+    }
+    activeSessionGenerationRef.current = null
+    issueReconnectRequest(reason)
+  }, [issueReconnectRequest])
+
+  // A caller that needs a session now (a message being sent, an upload) must
+  // not wait out the jitter: sends the delayed request at once.
+  const sendDelayedReconnectNow = useCallback(() => {
+    if (!reconnectDelayTimerRef.current) return
+    clearReconnectDelayTimer()
+    postReconnectRequest("token_expired")
+  }, [clearReconnectDelayTimer, postReconnectRequest])
 
   const isActiveConnection = useCallback((connectionIdentity?: string) => {
     const activeGeneration = activeSessionGenerationRef.current
@@ -397,24 +417,8 @@ export function useWidgetSession() {
     if (!isActiveConnection(connectionIdentity)) return "handled"
     // 1001 (going away) is not a verdict on the session: some reverse proxies
     // send it to every socket they proxy when their configuration is reloaded,
-    // and servers send it when they shut down. It reconnects like any other
-    // dropped connection, but after a random delay, because every other widget
-    // behind the same proxy or server got the same close at the same moment.
-    if (event.code === 1001) {
-      const deliveryId = activeDeliveryIdRef.current
-      const targetOrigin = targetOriginRef.current
-      if (activeSessionGenerationRef.current !== null && deliveryId && targetOrigin && mountedRef.current) {
-        window.parent.postMessage({
-          xagent: true,
-          v: 1,
-          type: "session_connection_closed",
-          session_delivery_id: deliveryId,
-        }, targetOrigin)
-      }
-      startReconnect("ws_closed", Math.round(Math.random() * GOING_AWAY_RECONNECT_MAX_DELAY_MS))
-      return "handled"
-    }
-
+    // so it falls through to the reconnect below like any other dropped
+    // connection.
     if (event.code === 1000) {
       transitionTerminal("unexpected_error")
       return "handled"
@@ -432,7 +436,7 @@ export function useWidgetSession() {
 
     requestReconnect("ws_closed")
     return "handled"
-  }, [isActiveConnection, requestReconnect, startReconnect, transitionTerminal])
+  }, [isActiveConnection, requestReconnect, transitionTerminal])
 
   const handleConnectionFailure = useCallback((
     failure: WebSocketConnectionFailure,
@@ -473,6 +477,7 @@ export function useWidgetSession() {
   // caller started it, so a caller that joins later waits only for the time
   // left. A wait never issues a second reconnect request.
   const waitForNextSession = useCallback((): Promise<WidgetSession> => {
+    sendDelayedReconnectNow()
     if (sessionWaitRef.current) return sessionWaitRef.current.promise
     const waiters: Waiter<WidgetSession>[] = []
     const promise = new Promise<WidgetSession>((resolve, reject) => {
@@ -483,7 +488,7 @@ export function useWidgetSession() {
     })
     sessionWaitRef.current = { promise, waiters }
     return promise
-  }, [newWaiter])
+  }, [newWaiter, sendDelayedReconnectNow])
 
   const unavailableError = useCallback((): WidgetSessionUploadError | null =>
     terminalRef.current || degradedRef.current || !mountedRef.current
@@ -526,6 +531,7 @@ export function useWidgetSession() {
   // Resolves once the socket of the current generation is open; waits through
   // a refresh for the next generation's socket.
   const waitForOpenConnection = useCallback((): Promise<void> => {
+    sendDelayedReconnectNow()
     const unavailable = unavailableError()
     if (unavailable) {
       return Promise.reject(new WidgetSessionUploadError("connection_not_ready", "session unavailable"))
@@ -540,7 +546,7 @@ export function useWidgetSession() {
       }, "connection_not_ready")
       openWaitersRef.current.push(waiter)
     })
-  }, [newWaiter, unavailableError])
+  }, [newWaiter, sendDelayedReconnectNow, unavailableError])
 
   const scheduleExpiryWarning = useCallback((absoluteExpiresAt: number) => {
     clearWarningTimer()
@@ -621,10 +627,8 @@ export function useWidgetSession() {
         return
       }
 
-      // A session that arrives while a delayed reconnect request is still
-      // waiting makes that request unnecessary.
-      clearDelayedReconnect()
       recoveryInFlightRef.current = false
+      clearReconnectDelayTimer()
       generationRef.current += 1
       const capabilities = parseCapabilities(event.data.capabilities)
       const session: WidgetSession = {
@@ -668,7 +672,7 @@ export function useWidgetSession() {
       failPendingWaits()
       window.removeEventListener("message", onMessage)
       recoveryInFlightRef.current = false
-      clearDelayedReconnect()
+      clearReconnectDelayTimer()
       clearWarningTimer()
     }
     // The bridge owns its parent message subscription for the mounted lifetime.

@@ -1641,6 +1641,7 @@ class ConnectionManager:
         reply_deadline_seconds: float = 5.0,
         close_timeout_seconds: float = RESTART_CLOSE_TIMEOUT_SECONDS,
         close_window_seconds: float | None = None,
+        drain: bool = True,
     ) -> int:
         """Close registered WebSockets with ``1012 Service Restart``.
 
@@ -1668,8 +1669,15 @@ class ConnectionManager:
         closed at once. If the call is cancelled, the not-yet-closed sockets
         of that spread are closed at once before it unwinds.
 
-        The manager then keeps draining: a socket registered afterwards is
-        closed with 1012 at once, until ``end_restart_drain``. A socket that
+        ``drain=False`` closes only the sockets registered when the call
+        starts and never starts a drain: a socket registered meanwhile or
+        afterwards is kept. It is for a serving process whose clients must
+        move to another proxy worker (an nginx reload), not to another
+        process; the spread and the reply wait are the same.
+
+        With ``drain=True`` (default) the manager then keeps draining: a
+        socket registered afterwards is closed with 1012 at once, until
+        ``end_restart_drain``. A socket that
         was already registered and is only moved to another task is not
         closed early. Only sockets registered with this manager are covered;
         ``/ws/build/chat``, ``/ws/progress/{task_id}``, ``/asr/stream`` and a
@@ -1686,7 +1694,8 @@ class ConnectionManager:
         """
         loop = asyncio.get_running_loop()
         deadline = loop.time() + max(0.0, reply_deadline_seconds)
-        self._restart_draining = True
+        if drain:
+            self._restart_draining = True
         generation = self._restart_drain_generation
         completed = False
         try:
@@ -1726,7 +1735,7 @@ class ConnectionManager:
                 )
             return len(sockets)
         finally:
-            if not completed and self._restart_drain_generation == generation:
+            if drain and not completed and self._restart_drain_generation == generation:
                 self.end_restart_drain()
 
     async def _close_when_replied(

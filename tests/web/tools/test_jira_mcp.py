@@ -3230,6 +3230,38 @@ def test_list_transitions_returns_id_and_name(monkeypatch):
     ]
 
 
+def test_status_history_reads_latest_page_and_pages_backward(monkeypatch):
+    history = [
+        {"created": f"2026-10-{day:02d}T10:00:00.000+0000", "items": items}
+        for day, items in [
+            (1, [{"field": "status", "fromString": "Open", "toString": "In Progress"}]),
+            (2, [{"field": "labels", "fromString": None, "toString": "urgent"}]),
+            (3, [{"field": "status", "fromString": "In Progress", "toString": "Blocked"}]),
+            (4, [{"field": "summary", "fromString": "old", "toString": "new"}]),
+        ]
+    ]
+    def request(method, cloud_id, path, *, params):
+        assert method == "GET"
+        assert path == "/rest/api/2/issue/ENG-1/changelog"
+        offset = params["startAt"]
+        return {"total": len(history), "values": history[offset:offset + params["maxResults"]]}
+
+    monkeypatch.setattr(jira, "_request", request)
+    latest = json.loads(jira.jira_list_status_changes("ENG-1", limit=2))
+    older = json.loads(jira.jira_list_status_changes(
+        "ENG-1", limit=2, start_at=latest["previous_start_at"]
+    ))
+
+    assert latest["status_changes"] == [
+        {"at": "2026-10-03T10:00:00.000+0000", "from": "In Progress", "to": "Blocked"}
+    ]
+    assert latest["previous_start_at"] == 0
+    assert older["status_changes"] == [
+        {"at": "2026-10-01T10:00:00.000+0000", "from": "Open", "to": "In Progress"}
+    ]
+    assert older["previous_start_at"] is None
+
+
 def test_transition_issue_matches_name_case_insensitively(monkeypatch):
     mock_request = Mock(
         side_effect=[

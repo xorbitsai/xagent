@@ -2599,6 +2599,67 @@ def jira_update_issue(
 
 
 @mcp.tool()
+def jira_list_status_changes(
+    issue_key: str,
+    cloud_id: str = "",
+    limit: int = 50,
+    start_at: int | None = None,
+) -> str:
+    """Read dated status transitions from an issue's Jira changelog.
+
+    By default fetch the latest page. Each result gives previous_start_at;
+    pass it as start_at to inspect older history until the requested time
+    window is covered. A page may have no status changes even when older
+    pages do. This is historical data, unlike jira_list_transitions, which
+    lists transitions currently available to perform.
+    """
+    try:
+        page_size = clamp_limit(limit, max_limit=MAX_LIMIT)
+        if start_at is not None and (not isinstance(start_at, int) or start_at < 0):
+            return _error("start_at must be a non-negative integer")
+        path = _issue_path(issue_key, "/changelog")
+        if start_at is None:
+            first = _request(
+                "GET", cloud_id, path, params={"startAt": 0, "maxResults": 1}
+            )
+            if not isinstance(first, dict) or not isinstance(first.get("total"), int):
+                return _error("Unexpected response format from Jira changelog API")
+            offset = max(0, first["total"] - page_size)
+        else:
+            offset = start_at
+
+        result = _request(
+            "GET", cloud_id, path,
+            params={"startAt": offset, "maxResults": page_size},
+        )
+        if not isinstance(result, dict) or not isinstance(result.get("values"), list):
+            return _error("Unexpected response format from Jira changelog API")
+        changes = [
+            {
+                "at": history.get("created"),
+                "from": item.get("fromString"),
+                "to": item.get("toString"),
+            }
+            for history in result["values"]
+            if isinstance(history, dict)
+            for item in history.get("items", [])
+            if isinstance(item, dict) and item.get("field") == "status"
+        ]
+        return _success(
+            issue_key=issue_key,
+            status_changes=changes,
+            start_at=offset,
+            returned_history_count=len(result["values"]),
+            total_history_count=result.get("total"),
+            previous_start_at=max(0, offset - page_size) if offset else None,
+        )
+    except Exception as e:
+        safe_message = _safe_text(e)
+        logger.error(f"Error listing Jira status history for {issue_key}: {safe_message}")
+        return _error(safe_message)
+
+
+@mcp.tool()
 def jira_list_transitions(issue_key: str, cloud_id: str = "") -> str:
     """
     List an issue's available workflow transitions (e.g. "Start Progress",

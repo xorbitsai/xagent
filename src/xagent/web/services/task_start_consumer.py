@@ -571,6 +571,7 @@ async def _execute_task_start(command: ClaimedTaskCommand) -> SettledTaskCommand
                     context=None,
                     before_message_id=start.before_message_id,
                     channel_command=command,
+                    claimed_state_version=handoff.claimed.state_version,
                 )
             except BaseException as exc:
                 await _settle_failed_schedule(
@@ -596,6 +597,7 @@ async def _execute_task_start(command: ClaimedTaskCommand) -> SettledTaskCommand
                     ),
                     force_fresh=False,
                     context=start.existing_context.model_dump(exclude_none=True),
+                    claimed_state_version=handoff.claimed.state_version,
                 )
             except BaseException as exc:
                 await _settle_failed_schedule(

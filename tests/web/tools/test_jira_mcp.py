@@ -3316,6 +3316,22 @@ def test_status_history_exposes_forward_cursor_when_tail_keeps_moving(monkeypatc
             {"total": 5, "values": [{}, {}]},
             {"total": 6, "values": [{}, {}]},
             {"total": 7, "values": [{}, {}]},
+            {"total": 9, "values": [{}, {}]},
+            {
+                "total": 9,
+                "values": [
+                    {
+                        "created": "2026-10-22T10:00:00.000+0000",
+                        "items": [
+                            {
+                                "field": "status",
+                                "fromString": "Open",
+                                "toString": "Blocked",
+                            }
+                        ],
+                    }
+                ],
+            },
         ]
     )
     monkeypatch.setattr(jira, "_request", request)
@@ -3325,6 +3341,52 @@ def test_status_history_exposes_forward_cursor_when_tail_keeps_moving(monkeypatc
     assert request.call_count == 4
     assert result["latest_page_complete"] is False
     assert result["next_start_at"] == 6
+
+    catch_up = json.loads(
+        jira.jira_list_status_changes(
+            "ENG-1", limit=2, start_at=result["next_start_at"]
+        )
+    )
+    assert catch_up["latest_page_complete"] is False
+    assert catch_up["next_start_at"] == 8
+
+    final_page = json.loads(
+        jira.jira_list_status_changes(
+            "ENG-1", limit=2, start_at=catch_up["next_start_at"]
+        )
+    )
+    assert final_page["latest_page_complete"] is True
+    assert final_page["next_start_at"] is None
+    assert final_page["status_changes"][0]["to"] == "Blocked"
+
+
+def test_status_history_returns_bounded_json_when_page_exceeds_output_cap(monkeypatch):
+    history = [
+        {
+            "created": "2026-10-22T10:00:00.000+0000",
+            "items": [
+                {"field": "status", "fromString": "A" * 100, "toString": "B" * 100}
+            ],
+        }
+        for _ in range(50)
+    ]
+
+    def request(method, cloud_id, path, *, params):
+        offset = params["startAt"]
+        return {
+            "total": len(history),
+            "values": history[offset : offset + params["maxResults"]],
+        }
+
+    monkeypatch.setattr(jira, "_request", request)
+    monkeypatch.setattr(jira, "get_tool_max_output_length", lambda: 4096)
+
+    response = jira.jira_list_status_changes("ENG-1")
+
+    assert len(response) <= 4096
+    result = json.loads(response)
+    assert result["status"] == "error"
+    assert "smaller limit" in result["message"]
 
 
 def test_transition_issue_matches_name_case_insensitively(monkeypatch):

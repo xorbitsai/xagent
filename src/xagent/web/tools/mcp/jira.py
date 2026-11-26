@@ -2610,10 +2610,10 @@ def jira_list_status_changes(
     By default fetch the latest page. Each result gives previous_start_at;
     pass it as start_at to inspect older history until the requested time
     window is covered. A page may have no status changes even when older
-    pages do. If latest_page_complete is false, fetch next_start_at before
-    paging backward: the history changed during this read. This is historical
-    data, unlike jira_list_transitions, which
-    lists transitions currently available to perform.
+    pages do. If latest_page_complete is false, follow next_start_at on each
+    page until it is true, then page backward. This is historical data,
+    unlike jira_list_transitions, which lists transitions currently available
+    to perform.
     """
     try:
         page_size = clamp_limit(limit, max_limit=MAX_LIMIT)
@@ -2649,11 +2649,9 @@ def jira_list_status_changes(
                 break
             offset = desired_offset
 
-        latest_page_complete = (
-            offset + len(result["values"]) >= result["total"]
-            if latest_requested
-            else None
-        )
+        latest_page_complete = offset + len(result["values"]) >= result["total"]
+        if not latest_page_complete and not result["values"]:
+            return _error("Jira returned an empty changelog page before the end")
         changes = [
             {
                 "at": history.get("created"),
@@ -2665,7 +2663,7 @@ def jira_list_status_changes(
             for item in history.get("items", [])
             if isinstance(item, dict) and item.get("field") == "status"
         ]
-        return _success(
+        response = _success(
             issue_key=issue_key,
             status_changes=changes,
             start_at=offset,
@@ -2674,9 +2672,15 @@ def jira_list_status_changes(
             previous_start_at=max(0, offset - page_size) if offset else None,
             latest_page_complete=latest_page_complete,
             next_start_at=(offset + len(result["values"]))
-            if latest_requested and not latest_page_complete
+            if not latest_page_complete
             else None,
         )
+        if len(response) > get_tool_max_output_length():
+            return _bounded_search_error(
+                "Status history page exceeds output limit; retry with a smaller limit",
+                get_tool_max_output_length(),
+            )
+        return response
     except Exception as e:
         safe_message = _safe_text(e)
         logger.error(

@@ -18,9 +18,11 @@ its own adapter):
   - response shapes / error envelopes
     (``{"detail": ...}`` for ``/api/*`` vs ``{"error": {"code", "message"}}``
     for ``/v1/*``)
-  - live broadcast events (``task_completed`` and the like stay with each
-    transport; the only exception is ``task_started``, which ``_schedule_bg``
-    publishes for every lease-backed run before its first trace event)
+
+Live broadcast events go through ``task_events.publish_task_event`` to
+whatever sink the host registered. This module itself publishes
+``task_started`` (from ``_schedule_bg``, when the caller passes both the lease
+and the claimed state version) and ``task_paused``.
 
 Background context — why we replaced the older ``task_execution.py``
 helper with this orchestrator:

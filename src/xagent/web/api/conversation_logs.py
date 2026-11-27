@@ -1073,7 +1073,7 @@ def _load_tasks_by_id(db: Session, user: User, task_ids: list[int]) -> dict[int,
 
 
 @router.get("")
-async def list_conversation_logs(
+def list_conversation_logs(
     source: str = Query("all"),
     agent_id: int | None = Query(None),
     search: str | None = Query(None),
@@ -1092,6 +1092,8 @@ async def list_conversation_logs(
     options to conversations whose last activity is in ``[active_from,
     active_to)``.
     """
+    # FastAPI runs this sync endpoint in its worker pool so DB I/O cannot
+    # block the web event loop.
     normalized_source = _validated_source_filter(source)
     window_start, window_end = _activity_window(active_from, active_to)
     search_value = search.strip() if search else None
@@ -1543,7 +1545,7 @@ def export_conversation_logs(
 
 
 @router.get("/{task_id}")
-async def get_conversation_log_detail(
+def get_conversation_log_detail(
     task_id: int,
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
@@ -1555,6 +1557,8 @@ async def get_conversation_log_detail(
     expired answers ``410 task_expired`` to exactly those callers and 404 to
     everyone else; the list never includes it.
     """
+    # FastAPI runs this sync endpoint in its worker pool so DB I/O cannot
+    # block the web event loop.
     query = _base_task_query(db, user).filter(Task.id == task_id)
     task = query.first()
     if task is None:

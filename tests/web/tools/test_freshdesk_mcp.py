@@ -932,6 +932,72 @@ def test_list_ticket_conversations_pages_the_ticket_subpath(
     assert recorder.call["params"]["per_page"] == 10
 
 
+def test_list_ticket_fields_returns_status_names_and_custom_fields(
+    monkeypatch: pytest.MonkeyPatch, configured_env: None
+):
+    fields = [
+        {
+            "name": "priority",
+            "label": "Priority",
+            "type": "default_priority",
+            "default": True,
+        },
+        {
+            "name": "status",
+            "label": "Status",
+            "type": "default_status",
+            "default": True,
+            "choices": {
+                "5": ["Closed", "Closed"],
+                "29": ["Internal review", "Under review"],
+                "3": ["Pending", "Awaiting your Reply"],
+                "2": ["Open", "Being Processed"],
+            },
+        },
+        {
+            "name": "cf_product",
+            "label": "Product",
+            "type": "custom_dropdown",
+            "default": False,
+            "choices": ["A", "B"],
+        },
+        {
+            "name": "cf_jira_key",
+            "label": "Jira key",
+            "type": "custom_text",
+            "default": False,
+        },
+    ]
+    recorder = _install(monkeypatch, _json_response(fields))
+
+    result = _payload(freshdesk.freshdesk_list_ticket_fields())
+
+    assert recorder.call["method"] == "GET"
+    assert recorder.call["url"].endswith("/api/v2/ticket_fields")
+    assert result["status"] == "success"
+    ticket_fields = result["ticket_fields"]
+    assert ticket_fields["statuses"] == [
+        {"id": 2, "name": "Open"},
+        {"id": 3, "name": "Pending"},
+        {"id": 5, "name": "Closed"},
+        {"id": 29, "name": "Internal review"},
+    ]
+    assert all(isinstance(status["id"], int) for status in ticket_fields["statuses"])
+    assert ticket_fields["custom_fields"] == [
+        {"name": "cf_product", "label": "Product", "type": "custom_dropdown"},
+        {"name": "cf_jira_key", "label": "Jira key", "type": "custom_text"},
+    ]
+
+
+def test_list_ticket_fields_reports_a_vendor_error(
+    monkeypatch: pytest.MonkeyPatch, configured_env: None
+):
+    _install(monkeypatch, _json_response({"description": "Forbidden"}, status_code=403))
+    result = _payload(freshdesk.freshdesk_list_ticket_fields())
+    assert result["status"] == "error"
+    assert "Forbidden" in result["message"]
+
+
 def test_reply_posts_to_the_reply_subpath(
     monkeypatch: pytest.MonkeyPatch, configured_env: None
 ):
@@ -1544,11 +1610,12 @@ def test_status_questions_are_sent_to_get_ticket():
         in ticket
     )
     assert (
-        "report it as a custom status with its number rather than guessing a name"
+        "look the name up with freshdesk_list_ticket_fields rather than guessing it"
         in ticket
     )
     assert (
-        "to report one ticket's current status, read it with freshdesk_get_ticket"
-        in search
+        "To report one ticket's current status, read it with freshdesk_get_ticket "
+        "rather than quoting a search result" in search
     )
+    assert "search index" not in search
     assert "The newest entries are on the last page" in conversations

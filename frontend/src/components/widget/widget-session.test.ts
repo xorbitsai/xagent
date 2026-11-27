@@ -2593,6 +2593,138 @@ describe("widget session mode", () => {
     expect(fetchMock).toHaveBeenCalledTimes(2)
   })
 
+  describe("a server's Retry-After as a floor", () => {
+    // The first exchange is refused with `status`/`code` and `Retry-After`;
+    // later requests succeed.
+    function refuseFirstExchange(status: number, code: string, retryAfter: string) {
+      vi.useFakeTimers()
+      fetchMock
+        .mockResolvedValueOnce(jsonResponse(status, { error: { code } }, { "Retry-After": retryAfter }))
+        .mockResolvedValue(jsonResponse(200, exchangeBody()))
+      runWidget({ "data-encrypted-context": GRANT })
+    }
+
+    // Advances to one millisecond before `at` ms after the refusal (0 ms),
+    // checks nothing was sent, then to `at` and checks the retry went out.
+    async function expectRetryAt(at: number, elapsed = 0) {
+      if (at > elapsed) {
+        await vi.advanceTimersByTimeAsync(at - elapsed - 1)
+        expect(fetchMock).toHaveBeenCalledTimes(1)
+        await vi.advanceTimersByTimeAsync(1)
+      } else {
+        await vi.advanceTimersByTimeAsync(0)
+      }
+      expect(fetchMock).toHaveBeenCalledTimes(2)
+    }
+
+    async function wakeAt(ms: number) {
+      await vi.advanceTimersByTimeAsync(ms)
+      expect(fetchMock).toHaveBeenCalledTimes(1)
+      window.dispatchEvent(new Event("online"))
+    }
+
+    it("does not let a wake send before a 503 Retry-After no longer than the back-off", async () => {
+      vi.mocked(Math.random).mockReturnValue(0.5) // back-off 1000 ms
+      refuseFirstExchange(503, "service_unavailable", "1")
+      await wakeAt(500)
+      await expectRetryAt(1_000, 500)
+    })
+
+    it("does not let a wake send before a 503 Retry-After longer than the back-off", async () => {
+      vi.mocked(Math.random).mockReturnValue(0.5) // 2000 ms plus a 500 ms spread
+      refuseFirstExchange(503, "service_unavailable", "2")
+      await wakeAt(500)
+      // The spread beyond the server's 2 s is the client's own and a wake ends it.
+      await expectRetryAt(2_000, 500)
+    })
+
+    it("lets a wake end the back-off beyond a shorter 503 Retry-After", async () => {
+      vi.mocked(Math.random).mockReturnValue(1) // back-off 1200 ms
+      refuseFirstExchange(503, "service_unavailable", "1")
+      await wakeAt(1_050)
+      await expectRetryAt(1_050, 1_050)
+    })
+
+    it.each([" ", "-3", "abc", "2.5", "Wed, 01 Jan 2031 00:00:00 GMT"])(
+      "ignores a 503 Retry-After of %j and keeps the back-off",
+      async (retryAfter) => {
+        vi.mocked(Math.random).mockReturnValue(0) // back-off 800 ms
+        refuseFirstExchange(503, "service_unavailable", retryAfter)
+        await expectRetryAt(800)
+      },
+    )
+
+    describe("across a bfcache restore", () => {
+      // The restore replaces the waiting exchange, which has no session yet.
+      async function restoreAt(ms: number, clockShiftMs = 0) {
+        await vi.advanceTimersByTimeAsync(ms)
+        expect(fetchMock).toHaveBeenCalledTimes(1)
+        firePageHide(true)
+        if (clockShiftMs) vi.setSystemTime(Date.now() + clockShiftMs)
+        firePageShow(true)
+        // Neither the restore nor a wake ends what is left of the server's wait.
+        window.dispatchEvent(new Event("online"))
+      }
+
+      it("keeps the rest of a 503 Retry-After", async () => {
+        vi.mocked(Math.random).mockReturnValue(0.5)
+        refuseFirstExchange(503, "service_unavailable", "2")
+        await restoreAt(500)
+        await expectRetryAt(2_000, 500)
+      })
+
+      it("keeps the rest of a 503 Retry-After for a reconnect whose session went stale", async () => {
+        vi.mocked(Math.random).mockReturnValue(0.5)
+        // Stale (under 60 s left) once 500 ms have passed.
+        fetchMock.mockResolvedValueOnce(jsonResponse(200, exchangeBody({
+          session_token_expires_at: new Date(Date.now() + 60_300).toISOString(),
+        })))
+        vi.useFakeTimers()
+        runWidget({ "data-encrypted-context": GRANT })
+        await vi.advanceTimersByTimeAsync(0)
+        fetchMock
+          .mockResolvedValueOnce(jsonResponse(503, { error: { code: "service_unavailable" } }, { "Retry-After": "2" }))
+          .mockResolvedValue(jsonResponse(200, exchangeBody({
+            session_token: "st_second",
+            reconnect_token: "rt_second",
+          })))
+        fromIframe("reconnect_request", { reason: "ws_closed" })
+        await vi.advanceTimersByTimeAsync(0)
+        expect(fetchMock).toHaveBeenCalledTimes(2)
+
+        await vi.advanceTimersByTimeAsync(500)
+        firePageRestore()
+        window.dispatchEvent(new Event("online"))
+        await vi.advanceTimersByTimeAsync(1_499)
+        expect(fetchMock).toHaveBeenCalledTimes(2)
+        await vi.advanceTimersByTimeAsync(1)
+        expect(fetchMock).toHaveBeenCalledTimes(3)
+        expect(fetchMock.mock.calls[2][0]).toBe(RECONNECT_URL)
+      })
+
+      it("keeps the rest of a rate_limited Retry-After", async () => {
+        vi.mocked(Math.random).mockReturnValue(0.5)
+        refuseFirstExchange(429, "rate_limited", "2")
+        await restoreAt(500)
+        await expectRetryAt(2_000, 500)
+      })
+
+      it("sends at once when the deadline has passed", async () => {
+        vi.mocked(Math.random).mockReturnValue(1) // back-off 1200 ms against 1 s
+        refuseFirstExchange(503, "service_unavailable", "1")
+        await restoreAt(1_100)
+        await expectRetryAt(1_100, 1_100)
+      })
+
+      it("holds no longer than the server asked when the clock went back", async () => {
+        vi.mocked(Math.random).mockReturnValue(0.5)
+        refuseFirstExchange(503, "service_unavailable", "2")
+        await restoreAt(500, -3_600_000)
+        await expectRetryAt(2_500, 500)
+      })
+    })
+  })
+
   it("stops listening for wake events once the widget is removed", async () => {
     vi.useFakeTimers()
     fetchMock.mockImplementation(() => Promise.resolve(

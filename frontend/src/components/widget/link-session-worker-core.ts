@@ -116,11 +116,13 @@ function classify(
   }
   const { status, data } = outcome
   const code = errorCode(data)
-  // A coded rate_limited follows widget.js's rate-limit rule (widget.js:257-266):
+  // A coded rate_limited follows widget.js's rate-limit rule (widget.js:318-334):
   // the code decides, whatever the status; the request is retried after
   // Retry-After while fewer than MAX_RATE_LIMIT_RETRIES such retries were used
   // and the wait is under MAX_RATE_LIMIT_WAIT_MS, and is final otherwise. A 429
-  // without that code is always final.
+  // without that code is always final. widget.js also keeps that wait's
+  // deadline across a bfcache restore; this page ends the session on a restore
+  // instead, so it has nothing to keep.
   if (code === "rate_limited") {
     const waitMs = retryAfterMs(outcome.retryAfter, now)
     return rateLimitedSoFar >= MAX_RATE_LIMIT_RETRIES || waitMs >= MAX_RATE_LIMIT_WAIT_MS

@@ -659,11 +659,12 @@ def freshdesk_get_ticket(ticket_id: int, include: str | None = None) -> str:
     """
     Fetch one ticket by its numeric id, including its description.
 
-    Read the ticket here to report its current status. `status` is a
-    number: 2 Open, 3 Pending, 4 Resolved and 5 Closed are the four every
-    helpdesk has; any other number is a status this helpdesk defined
-    itself, and the ticket does not carry its name, so look the name up with
-    freshdesk_list_ticket_fields rather than guessing it.
+    Read the ticket here to report its current status. `status` is a number: 2
+    Open, 3 Pending, 4 Resolved and 5 Closed are the four every helpdesk has;
+    any other number is a status this helpdesk defined itself, and the ticket
+    does not carry its name, so look the name up with
+    freshdesk_list_ticket_fields rather than guessing it. If that lookup
+    fails, give the number and say it is a custom status.
 
     ticket_id: the ticket's numeric id (the number in its Freshdesk URL).
     include: comma-separated side-loads, e.g. "conversations,requester,stats".
@@ -693,7 +694,8 @@ def freshdesk_search_tickets(query: str, page: int = 1) -> str:
     Search tickets with Freshdesk's filter query language.
 
     To report one ticket's current status, read it with freshdesk_get_ticket
-    rather than quoting a search result.
+    rather than quoting a search result. To filter on a status someone names,
+    look its number up with freshdesk_list_ticket_fields.
 
     query: the filter expression WITHOUT the enclosing double quotes this
     tool adds, e.g. status:2 AND priority:4, or
@@ -998,11 +1000,15 @@ def freshdesk_list_ticket_fields() -> str:
     statuses: every status number the helpdesk has, built-in and
     helpdesk-defined, as {id, name}. Use it to report a ticket's numeric
     `status` (from freshdesk_get_ticket, freshdesk_list_tickets or
-    freshdesk_search_tickets) by the name agents see.
+    freshdesk_search_tickets) by the name agents see, and to turn a status
+    someone names, such as "In progress", into the number to search for
+    (status:<id> in a freshdesk_search_tickets query).
 
-    custom_fields: every custom ticket field as {name, label, type}. `name`
-    is the cf_ key a ticket's custom_fields uses and a freshdesk_search_tickets
-    query takes; `label` is the name agents see in Freshdesk.
+    custom_fields: each top-level custom ticket field as {name, label,
+    type}; the lower levels of a dependent (nested) field are not listed.
+    `name` is the key a ticket's custom_fields uses and a
+    freshdesk_search_tickets query takes, usually starting with cf_;
+    `label` is the name agents see in Freshdesk.
     """
     try:
         fields = _validated_list(_request("GET", "/ticket_fields"), "/ticket_fields")

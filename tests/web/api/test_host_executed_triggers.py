@@ -42,8 +42,13 @@ def _isolated_registry() -> Iterator[None]:
     with trigger_executors._lock:
         saved = dict(trigger_executors._executors)
         trigger_executors._executors.clear()
-    with patch("xagent.web.services.task_orchestrator._schedule_bg", new=MagicMock()):
+    triggers.accept_host_trigger_runs()
+    with (
+        patch("xagent.web.services.task_orchestrator._schedule_bg", new=MagicMock()),
+        patch.object(triggers, "_HOST_SETTLE_RETRY_DELAYS", (0.0, 0.0, 0.0)),
+    ):
         yield
+    triggers.accept_host_trigger_runs()
     with trigger_executors._lock:
         trigger_executors._executors.clear()
         trigger_executors._executors.update(saved)
@@ -477,3 +482,145 @@ def test_shutdown_cancels_host_executions_and_settles_their_runs() -> None:
     row = _run_row(out["run_id"])
     assert row.status == TriggerRunStatus.FAILED.value
     assert "Cancelled" in str(row.error_message)
+
+
+def _unsettled_total() -> int:
+    from xagent.web.services.release_hold import release_hold
+
+    return release_hold.unsettled_total
+
+
+def _fire_waiting(trigger_id: int, source_event_id: str):
+    return _fire(
+        trigger_id,
+        event_payload={"a": 1},
+        source_event_id=source_event_id,
+        wait_for_completion=True,
+    )
+
+
+def test_terminal_write_is_retried_after_a_transient_database_error() -> None:
+    from sqlalchemy.exc import OperationalError
+
+    recorder = Recorder()
+    register_trigger_executor("hostx", recorder)
+    trigger_id = _make_trigger(executor="hostx")
+    real = triggers._finish_host_trigger_run
+    attempts: list[int] = []
+
+    def flaky(run_id: int, error_message: str | None) -> None:
+        attempts.append(run_id)
+        if len(attempts) == 1:
+            raise OperationalError("UPDATE", {}, Exception("connection lost"))
+        real(run_id, error_message)
+
+    before = _unsettled_total()
+    with patch.object(triggers, "_finish_host_trigger_run", flaky):
+        run, _ = _fire_waiting(trigger_id, "evt-retry")
+
+    assert len(attempts) == 2
+    assert _run_row(int(run.id)).status == TriggerRunStatus.COMPLETED.value
+    assert _unsettled_total() == before
+
+
+def test_unconfirmed_terminal_write_is_recorded_as_unsettled() -> None:
+    from sqlalchemy.exc import OperationalError
+
+    from xagent.web.services.release_hold import release_hold
+
+    recorder = Recorder()
+    register_trigger_executor("hostx", recorder)
+    trigger_id = _make_trigger(executor="hostx")
+
+    def broken(run_id: int, error_message: str | None) -> None:
+        raise OperationalError("UPDATE", {}, Exception("connection lost"))
+
+    before = _unsettled_total()
+    with patch.object(triggers, "_finish_host_trigger_run", broken):
+        run, _ = _fire_waiting(trigger_id, "evt-unsettled")
+
+    # The task ended without raising, the run is still RUNNING, and the
+    # process says it cannot vouch for it instead of reading it as settled.
+    assert _run_row(int(run.id)).status == TriggerRunStatus.RUNNING.value
+    assert _unsettled_total() == before + 1
+    entry = release_hold.snapshot()["unsettled"][-1]
+    assert entry["kind"] == "host_trigger_run"
+    assert entry["identity"] == f"run:{int(run.id)}"
+
+
+def test_shutdown_joins_an_in_flight_claim_and_drains_its_execution() -> None:
+    started = threading.Event()
+    cancelled: list[bool] = []
+
+    async def executor(_run: HostTriggerRun) -> None:
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancelled.append(True)
+            raise
+
+    register_trigger_executor("hostx", executor)
+    trigger_id = _make_trigger(executor="hostx")
+    unregister_trigger_executor("hostx")
+    run, _ = _fire(trigger_id, event_payload={"a": 1}, source_event_id="evt-join")
+    register_trigger_executor("hostx", executor)
+
+    gate = threading.Event()
+    in_thread = threading.Event()
+    real_claim = triggers._claim_host_trigger_run
+
+    def slow_claim(run_id: int, kind: str):
+        in_thread.set()
+        gate.wait(10)
+        return real_claim(run_id, kind)
+
+    out: dict[str, object] = {}
+
+    async def run_it() -> None:
+        starter = asyncio.ensure_future(
+            _start_host_trigger_run_id(int(run.id), "hostx")
+        )
+        while not in_thread.is_set():
+            await asyncio.sleep(0.01)
+        starter.cancel()
+        await asyncio.gather(starter, return_exceptions=True)
+        stopper = asyncio.ensure_future(triggers.shutdown_host_trigger_runs())
+        await asyncio.sleep(0.2)
+        out["returned_before_claim_finished"] = stopper.done()
+        gate.set()
+        await stopper
+        out["tasks"] = len(triggers._host_run_tasks)
+        out["claims"] = len(triggers._host_claims)
+
+    with patch.object(triggers, "_claim_host_trigger_run", slow_claim):
+        asyncio.run(run_it())
+
+    assert out["returned_before_claim_finished"] is False
+    assert started.is_set() and cancelled == [True]
+    assert out["tasks"] == 0 and out["claims"] == 0
+    row = _run_row(int(run.id))
+    assert row.status == TriggerRunStatus.FAILED.value
+    assert "Cancelled" in str(row.error_message)
+
+
+def test_no_host_run_is_claimed_after_shutdown_started() -> None:
+    recorder = Recorder()
+    register_trigger_executor("hostx", recorder)
+    trigger_id = _make_trigger(executor="hostx")
+    unregister_trigger_executor("hostx")
+    run, _ = _fire(trigger_id, event_payload={"a": 1}, source_event_id="evt-fence")
+    register_trigger_executor("hostx", recorder)
+
+    async def run_it() -> bool:
+        await triggers.shutdown_host_trigger_runs()
+        return await _start_host_trigger_run_id(int(run.id), "hostx")
+
+    assert asyncio.run(run_it()) is False
+    assert recorder.calls == []
+    assert _run_row(int(run.id)).status == TriggerRunStatus.PENDING.value
+    triggers.accept_host_trigger_runs()
+    assert asyncio.run(
+        _start_host_trigger_run_id(int(run.id), "hostx", wait_for_completion=True)
+    )
+    assert len(recorder.calls) == 1

@@ -2044,6 +2044,20 @@ async def _start_prepared_trigger_run_id(
 
 
 _host_run_tasks: dict[int, asyncio.Task[None]] = {}
+# Claims whose worker thread may still commit RUNNING, by run id, until their
+# handoff callback has launched the executor (or found nothing to launch).
+_host_claims: dict[int, asyncio.Future[HostTriggerRun | None]] = {}
+# Set once shutdown starts: no new host run is claimed by this process. Runs
+# stay PENDING for the successor, like the release hold's deferral.
+_host_runs_closed = False
+# Delays before each attempt to write a host run's terminal state.
+_HOST_SETTLE_RETRY_DELAYS: tuple[float, ...] = (0.0, 0.5, 2.0)
+
+
+def accept_host_trigger_runs() -> None:
+    """Lift the shutdown fence: this process may claim host runs again."""
+    global _host_runs_closed
+    _host_runs_closed = False
 
 
 def _claim_host_trigger_run(run_id: int, executor_kind: str) -> HostTriggerRun | None:
@@ -2152,6 +2166,44 @@ def _finish_host_trigger_run(run_id: int, error_message: str | None) -> None:
         db.close()
 
 
+async def _settle_host_trigger_run(run_id: int, error_message: str | None) -> None:
+    """Persist a host run's terminal state; never raise, never lose ownership.
+
+    The write is retried on database errors and shielded from cancellation (its
+    worker thread may still commit). When it cannot be confirmed the run is
+    recorded as unsettled in the release ledger: a run left RUNNING with no
+    in-process owner is exactly what a host must not read as settled.
+    """
+    from .release_hold import release_hold
+
+    last: Exception | None = None
+    for delay in _HOST_SETTLE_RETRY_DELAYS:
+        try:
+            if delay:
+                await asyncio.sleep(delay)
+            await asyncio.shield(
+                run_tracked(_finish_host_trigger_run, run_id, error_message)
+            )
+            return
+        except asyncio.CancelledError:
+            release_hold.record_unsettled(
+                "host_trigger_run",
+                f"run:{run_id}",
+                "settlement cancelled before the terminal write was confirmed",
+            )
+            raise
+        except Exception as exc:
+            last = exc
+            logger.warning(
+                "Terminal write for host trigger run %s failed", run_id, exc_info=True
+            )
+    release_hold.record_unsettled(
+        "host_trigger_run",
+        f"run:{run_id}",
+        f"terminal write failed: {type(last).__name__}",
+    )
+
+
 async def _execute_host_trigger_run(host_run: HostTriggerRun) -> None:
     executor = get_trigger_executor(host_run.executor)
     error_message: str | None = None
@@ -2162,16 +2214,12 @@ async def _execute_host_trigger_run(host_run: HostTriggerRun) -> None:
             )
         await executor(host_run)
     except asyncio.CancelledError:
-        await asyncio.shield(
-            run_tracked(
-                _finish_host_trigger_run, host_run.run_id, "Cancelled: executor stopped"
-            )
-        )
+        await _settle_host_trigger_run(host_run.run_id, "Cancelled: executor stopped")
         raise
     except Exception as exc:
         error_message = f"{type(exc).__name__}: {exc}"
         logger.exception("Host executor failed for trigger run %s", host_run.run_id)
-    await run_tracked(_finish_host_trigger_run, host_run.run_id, error_message)
+    await _settle_host_trigger_run(host_run.run_id, error_message)
 
 
 def _launch_host_trigger_run(host_run: HostTriggerRun) -> asyncio.Task[None]:
@@ -2209,7 +2257,7 @@ async def _start_host_trigger_run_id(
     done by a callback on the claim future, not by this coroutine: a claim that
     commits always reaches the executor.
     """
-    if get_trigger_executor(executor_kind) is None:
+    if _host_runs_closed or get_trigger_executor(executor_kind) is None:
         return False
     from .release_hold import release_hold
 
@@ -2240,8 +2288,11 @@ async def _start_host_trigger_run_id(
         finally:
             # The execution task now carries the responsibility (adopt ran
             # first), or there is nothing left to carry.
+            if _host_claims.get(run_id) is done:
+                del _host_claims[run_id]
             claim_token.release()
 
+    _host_claims[run_id] = claim
     claim.add_done_callback(_handoff)
     host_run = await asyncio.shield(claim)
     if host_run is None:
@@ -2252,21 +2303,29 @@ async def _start_host_trigger_run_id(
 
 
 async def shutdown_host_trigger_runs() -> None:
-    """Cancel and drain engine-owned host executions, settling their runs.
+    """Fence, join in-flight claims, then cancel and drain host executions.
 
-    A cancelled execution records its run FAILED ("Cancelled"), including one
-    cancelled before it first ran. Mirrors how owned agent executions are
-    cancelled and drained at shutdown.
+    No new host run is claimed from here on (they stay PENDING for the
+    successor). A claim whose worker thread is still running is joined first:
+    its handoff callback launches the executor, which is then cancelled and
+    drained with the rest. A cancelled execution records its run FAILED
+    ("Cancelled"), including one cancelled before it first ran. Mirrors how
+    owned agent executions are cancelled and drained at shutdown.
     """
+    global _host_runs_closed
+    _host_runs_closed = True
+    claims = list(_host_claims.values())
+    if claims:
+        await asyncio.gather(
+            *(asyncio.shield(c) for c in claims), return_exceptions=True
+        )
     tasks = dict(_host_run_tasks)
     for task in tasks.values():
         task.cancel()
     await asyncio.gather(*tasks.values(), return_exceptions=True)
     for run_id, task in tasks.items():
         if task.cancelled():
-            await run_tracked(
-                _finish_host_trigger_run, run_id, "Cancelled: executor stopped"
-            )
+            await _settle_host_trigger_run(run_id, "Cancelled: executor stopped")
 
 
 async def start_prepared_trigger_run(

@@ -2289,7 +2289,9 @@ async def _start_local_runtime_loops(app_instance: FastAPI) -> None:
     # Reopen process-local task admission before any trigger, command, or
     # channel ingress can create background execution work for this lifespan.
     from .services.task_execution import background_task_manager
+    from .services.triggers import accept_host_trigger_runs
 
+    accept_host_trigger_runs()
     if not get_shared_task_execution_enabled():
         background_task_manager.start_accepting()
 

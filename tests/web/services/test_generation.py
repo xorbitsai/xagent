@@ -3,12 +3,24 @@
 from __future__ import annotations
 
 import asyncio
+import threading
+import time
+from datetime import datetime, timedelta, timezone
 
 import pytest
+import sqlalchemy as sa
+from sqlalchemy.orm import sessionmaker
 
 from tests.shared.db_teardown import drop_all_tables
+from tests.shared.postgres_disposable import disposable_database_factory
+from xagent.web.models import database
 from xagent.web.models.database import get_db, get_engine, init_db
+from xagent.web.models.serving_generation import ServingGeneration
+from xagent.web.models.task import Task
+from xagent.web.models.task_command import TaskExecutionCommand
+from xagent.web.models.user import User
 from xagent.web.services import generation
+from xagent.web.services import task_command_transport as transport
 from xagent.web.services.generation import (
     current_generation,
     is_serving,
@@ -237,6 +249,163 @@ def test_cached_serving_rechecks_after_max_age(monkeypatch) -> None:
     clock["now"] = 12.0
     assert not generation.is_serving_cached()
     assert record["reads"] == 2
+
+
+def test_cached_serving_releases_lock_while_reading(monkeypatch) -> None:
+    monkeypatch.setenv(generation.GENERATION_ENV, "green")
+    monkeypatch.setattr(generation, "_cached_at", float("-inf"))
+    entered = threading.Event()
+    release = threading.Event()
+
+    def read() -> str:
+        entered.set()
+        assert release.wait(2)
+        return "green"
+
+    monkeypatch.setattr(generation, "serving_generation", read)
+    worker = threading.Thread(target=generation.is_serving_cached)
+    worker.start()
+    try:
+        assert entered.wait(2)
+        assert generation._cache_lock.acquire(timeout=0.5)
+        generation._cache_lock.release()
+    finally:
+        release.set()
+        worker.join(timeout=2)
+    assert not worker.is_alive()
+
+
+@pytest.mark.asyncio
+async def test_slow_refresh_cannot_overwrite_a_newer_cache_read(monkeypatch) -> None:
+    monkeypatch.setenv(generation.GENERATION_ENV, "green")
+    monkeypatch.setattr(generation, "_cached_at", float("-inf"))
+    entered = threading.Event()
+    release = threading.Event()
+    record = {"value": "blue"}
+
+    def read() -> str:
+        if threading.current_thread() is not threading.main_thread():
+            old = record["value"]
+            entered.set()
+            assert release.wait(2)
+            return old
+        return record["value"]
+
+    monkeypatch.setattr(generation, "serving_generation", read)
+    refresh = asyncio.create_task(generation.refresh_serving())
+    try:
+        assert await asyncio.to_thread(entered.wait, 2)
+        record["value"] = "green"
+        assert generation.is_serving_cached(max_age=0)
+    finally:
+        release.set()
+    assert await asyncio.wait_for(refresh, timeout=2)
+    assert generation.is_serving_cached()
+
+
+@pytest.mark.parametrize("shared", [True, False], ids=["shared", "non-shared"])
+def test_command_claim_uses_one_postgres_connection_with_cold_cache(
+    monkeypatch, shared
+) -> None:
+    with disposable_database_factory("generation_claim") as make_database:
+        setup_engine = make_database("single")
+        database.Base.metadata.create_all(setup_engine)
+        # Use the disposable database's connector with the production-supported
+        # one-slot QueuePool configuration.
+        engine = sa.create_engine(
+            "postgresql://",
+            creator=setup_engine.pool._creator,
+            pool_size=1,
+            max_overflow=0,
+            pool_timeout=2.2,
+        )
+        setup_engine.dispose()
+        sessions = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+        monkeypatch.setattr(database, "_engine", engine)
+        monkeypatch.setattr(database, "_SessionLocal", sessions)
+        monkeypatch.setenv(generation.GENERATION_ENV, "green")
+        monkeypatch.setattr(generation, "_cached_at", float("-inf"))
+        monkeypatch.setattr(transport, "consumes_task_commands", lambda: True)
+        monkeypatch.setattr(transport, "get_runner_id", lambda: "green-worker")
+        monkeypatch.setattr(
+            transport, "get_shared_task_execution_enabled", lambda: shared
+        )
+        try:
+            with sessions() as db, db.begin():
+                db.add(ServingGeneration(id=1, generation="green"))
+                user = User(username="single-pool-user", password_hash="unused")
+                db.add(user)
+                db.flush()
+                task = Task(user_id=user.id, title="Unowned pending command")
+                db.add(task)
+                db.flush()
+                task_id = task.id
+                command = TaskExecutionCommand(
+                    task_id=task_id,
+                    command_id="single-pool-command",
+                    kind="pause",
+                    payload={},
+                )
+                db.add(command)
+                db.flush()
+                command_id = command.id
+
+            for attempt in range(2):
+                if attempt and not shared:
+                    with sessions() as db, db.begin():
+                        db.execute(
+                            sa.update(TaskExecutionCommand)
+                            .where(TaskExecutionCommand.id == command_id)
+                            .values(
+                                status="pending",
+                                claimed_by=None,
+                                claim_expires_at=None,
+                            )
+                        )
+                monkeypatch.setattr(generation, "_cached_at", float("-inf"))
+                started = time.monotonic()
+                if shared:
+                    candidate = transport._find_command_candidate(None)
+                    found_id = candidate.id if candidate is not None else None
+                else:
+                    with sessions() as db:
+                        claimed = transport.claim_task_command(db)
+                        found_id = claimed.id if claimed is not None else None
+                        db.rollback()
+                assert found_id == command_id
+                assert time.monotonic() - started < 1.5
+
+            # A missing generation table is a real PostgreSQL statement error.
+            # The fail-closed decision must still leave the caller's transaction
+            # usable for commands whose live lease this worker owns.
+            with sessions() as db, db.begin():
+                db.execute(
+                    sa.update(Task)
+                    .where(Task.id == task_id)
+                    .values(
+                        runner_id="green-worker",
+                        lease_expires_at=datetime.now(timezone.utc)
+                        + timedelta(minutes=5),
+                    )
+                )
+                db.execute(
+                    sa.update(TaskExecutionCommand)
+                    .where(TaskExecutionCommand.id == command_id)
+                    .values(status="pending", claimed_by=None, claim_expires_at=None)
+                )
+            with engine.begin() as connection:
+                connection.exec_driver_sql("DROP TABLE serving_generation")
+            monkeypatch.setattr(generation, "_cached_at", float("-inf"))
+            if shared:
+                candidate = transport._find_command_candidate(None)
+                found_id = candidate.id if candidate is not None else None
+            else:
+                with sessions() as db:
+                    claimed = transport.claim_task_command(db)
+                    found_id = claimed.id if claimed is not None else None
+            assert found_id == command_id
+        finally:
+            engine.dispose()
 
 
 @pytest.mark.asyncio

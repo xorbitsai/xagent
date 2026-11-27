@@ -27,8 +27,9 @@ import time
 from datetime import datetime, timezone
 from typing import Any, cast
 
-from sqlalchemy import CursorResult, update
+from sqlalchemy import CursorResult, select, update
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import Session
 from sqlalchemy.sql import func
 
 logger = logging.getLogger(__name__)
@@ -40,6 +41,8 @@ _cache_lock = threading.Lock()
 _cached_generation: str | None = None
 _cached_serving = False
 _cached_at = float("-inf")
+_cache_read_started = 0
+_cache_read_published = 0
 _serving_changed: asyncio.Event | None = None
 
 
@@ -49,7 +52,7 @@ def current_generation() -> str | None:
     return value or None
 
 
-def serving_generation() -> str | None:
+def serving_generation(db: Session | None = None) -> str | None:
     """The generation the record names, or ``None`` when the row is missing.
 
     Raises on a database error; callers decide the fail direction.
@@ -57,9 +60,21 @@ def serving_generation() -> str | None:
     from ..models.database import get_session_local
     from ..models.serving_generation import ServingGeneration
 
-    with get_session_local()() as db:
-        row = db.get(ServingGeneration, _RECORD_ID)
-        return str(row.generation) if row is not None else None
+    statement = select(ServingGeneration.generation).where(
+        ServingGeneration.id == _RECORD_ID
+    )
+    if db is not None:
+        # Read through the caller's connection without relying on its identity
+        # map, which may contain an older version of the serving row. A
+        # statement error on PostgreSQL aborts its transaction, so isolate this
+        # fail-closed probe in a savepoint. Use the connection's savepoint to
+        # avoid Session.begin_nested() flushing unrelated caller state.
+        with db.connection().begin_nested():
+            value = db.execute(statement).scalar_one_or_none()
+    else:
+        with get_session_local()() as own_db:
+            value = own_db.execute(statement).scalar_one_or_none()
+    return str(value) if value is not None else None
 
 
 def set_serving_generation(new: str, expected: str | None) -> bool:
@@ -116,9 +131,9 @@ def is_serving() -> bool:
     return serving is None or serving == mine
 
 
-def _read_serving(mine: str) -> bool:
+def _read_serving(mine: str, db: Session | None = None) -> bool:
     try:
-        serving = serving_generation()
+        serving = serving_generation(db) if db is not None else serving_generation()
     except Exception:  # noqa: BLE001
         logger.warning(
             "could not read serving generation; refusing new work", exc_info=True
@@ -127,19 +142,31 @@ def _read_serving(mine: str) -> bool:
     return serving is None or serving == mine
 
 
-def is_serving_cached(max_age: float = 2.0) -> bool:
+def is_serving_cached(max_age: float = 2.0, *, db: Session | None = None) -> bool:
     """Bound command-claim reads; errors expire a previous positive result."""
     mine = current_generation()
     if mine is None:
         return True
     global _cached_generation, _cached_serving, _cached_at
+    global _cache_read_started, _cache_read_published
     with _cache_lock:
         now = time.monotonic()
-        if _cached_generation != mine or now - _cached_at >= max_age:
-            _cached_serving = _read_serving(mine)
+        if _cached_generation == mine and now - _cached_at < max_age:
+            return _cached_serving
+        _cache_read_started += 1
+        read_id = _cache_read_started
+    # A caller may already hold the only database connection. Never wait for
+    # a connection while holding the cache lock: another caller can hold that
+    # connection and be waiting for this lock.
+    serving = _read_serving(mine, db)
+    with _cache_lock:
+        if read_id >= _cache_read_published:
+            _cached_serving = serving
             _cached_generation = mine
             _cached_at = now
-        return _cached_serving
+            _cache_read_published = read_id
+            return serving
+        return _cached_serving if _cached_generation == mine else serving
 
 
 async def refresh_serving() -> bool:
@@ -147,12 +174,20 @@ async def refresh_serving() -> bool:
     mine = current_generation()
     if mine is None:
         return True
-    serving = await asyncio.to_thread(_read_serving, mine)
     global _cached_generation, _cached_serving, _cached_at, _serving_changed
+    global _cache_read_started, _cache_read_published
     with _cache_lock:
-        _cached_generation = mine
-        _cached_serving = serving
-        _cached_at = time.monotonic()
+        _cache_read_started += 1
+        read_id = _cache_read_started
+    serving = await asyncio.to_thread(_read_serving, mine)
+    with _cache_lock:
+        if read_id >= _cache_read_published:
+            _cached_generation = mine
+            _cached_serving = serving
+            _cached_at = time.monotonic()
+            _cache_read_published = read_id
+        elif _cached_generation == mine:
+            serving = _cached_serving
     if serving:
         event = _serving_changed
         _serving_changed = asyncio.Event()

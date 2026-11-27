@@ -21,6 +21,7 @@ from ..services.assistant_history_safety import client_safe_assistant_history_co
 from ..services.gmail_provisioning import reconcile_gmail_trigger_provisioning
 from ..services.trigger_providers import (
     CallbackRequestContext,
+    maybe_get_trigger_provider,
     process_trigger_callback,
     record_trigger_audit,
     record_trigger_audit_best_effort,
@@ -62,7 +63,7 @@ router = APIRouter(tags=["triggers"])
 
 
 class TriggerCreateRequest(BaseModel):
-    type: Literal["webhook", "scheduled", "gmail"]
+    type: Literal["webhook", "scheduled", "gmail", "github"]
     name: str | None = Field(default=None, max_length=200)
     enabled: bool = True
     config: dict[str, Any] = Field(default_factory=dict)
@@ -988,6 +989,25 @@ class TriggerCallbackResponse(BaseModel):
     duplicates: int = 0
 
 
+async def _read_callback_body(request: Request, provider: str) -> bytes:
+    """Read the raw callback body, bounded by the provider's declared cap."""
+    registered = maybe_get_trigger_provider(provider)
+    limit = getattr(registered, "max_body_bytes", None)
+    if not isinstance(limit, int):
+        return await request.body()
+    declared = request.headers.get("content-length", "")
+    if declared.isdecimal() and int(declared) > limit:
+        raise HTTPException(status_code=413, detail="Callback body too large")
+    chunks: list[bytes] = []
+    total = 0
+    async for chunk in request.stream():
+        total += len(chunk)
+        if total > limit:
+            raise HTTPException(status_code=413, detail="Callback body too large")
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
 @router.post(
     "/api/triggers/callback/{provider}/{callback_id}",
     response_model=TriggerCallbackResponse,
@@ -1030,7 +1050,7 @@ async def receive_trigger_callback(
                 detail="Callback credentials must be sent via headers",
             )
 
-    raw_body = await request.body()
+    raw_body = await _read_callback_body(request, provider)
     context = CallbackRequestContext(
         provider=provider,
         callback_id=callback_id,

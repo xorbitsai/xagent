@@ -88,9 +88,9 @@ _FAILURE_MESSAGES = {
         "The media service failed to answer. The same request may work later."
     ),
     PROVIDER_QUOTA: (
-        "The account that pays for this model has run out of credit. Retrying "
-        "or changing the request will not help until an administrator adds "
-        "credit."
+        "The account that pays for this model has run out of credit or reached "
+        "its spending limit. Retrying or changing the request will not help "
+        "until an administrator adds credit or raises the limit."
     ),
     UNKNOWN: "The request failed, and the reason is not available.",
 }
@@ -197,8 +197,10 @@ _QUOTA_CODES = frozenset(
 )
 
 # HTTP 402 Payment Required: the provider refused because the account cannot
-# pay. Xinference's prepaid video API answers it with
-# ``credit_insufficient_balance``; the status alone is enough to say so.
+# pay. Xinference's prepaid API answers it with ``credit_insufficient_balance``
+# when the balance is short and ``spending_limit_reached`` when a spending cap
+# is hit with credit left, so the sentence covers both; the status alone is
+# enough to say so.
 _PAYMENT_REQUIRED_STATUS = 402
 
 # HTTP statuses that mean the caller has to change the request.

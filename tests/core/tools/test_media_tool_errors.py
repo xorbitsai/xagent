@@ -50,6 +50,7 @@ from xagent.core.tools.core.image_tool import ImageGenerationToolCore
 from xagent.core.tools.core.media_errors import (
     INVALID_REQUEST,
     MODEL_NOT_ENABLED,
+    PROVIDER_QUOTA,
     PROVIDER_UNAVAILABLE,
     UNKNOWN,
     MediaParameterError,
@@ -447,16 +448,24 @@ async def test_a_failed_transcription_keeps_the_provider_text_out(
 
 
 class TestClassification:
-    """The category is what an alert fires on, so pin the four it can say."""
+    """The category is what an alert fires on, so pin the ones it can say."""
 
     def test_a_missing_credential_is_not_reported_as_a_retryable_outage(self) -> None:
-        """401/402/403 need a human; calling them "unavailable" would promise
-        a retry that cannot work."""
+        """401/403 need a human; calling them "unavailable" would promise a
+        retry that cannot work."""
         error = ProviderStatusError(
             status_code=401, code="AuthenticationError", message="invalid api key"
         )
 
         assert classify_media_failure(error) == UNKNOWN
+
+    def test_payment_required_is_an_exhausted_account(self) -> None:
+        """A bare 402 names no code, and still says the account cannot pay."""
+        error = ProviderStatusError(
+            status_code=402, code="payment_required", message="payment required"
+        )
+
+        assert classify_media_failure(error) == PROVIDER_QUOTA
 
     def test_a_timeout_is_an_outage(self) -> None:
         assert classify_media_failure(TimeoutError("read timed out")) == (
@@ -1172,8 +1181,9 @@ class TestStructuredQuotaStatus:
         result = await tool.generate_image("A product shot")
 
         assert result["success"] is False
-        assert result["error_category"] == UNKNOWN
+        assert result["error_category"] == PROVIDER_QUOTA
         assert "may work later" not in result["error"]
+        assert "run out of credit" in result["error"]
 
     @pytest.mark.asyncio
     async def test_an_ordinary_429_remains_an_outage(self, workspace: Mock) -> None:

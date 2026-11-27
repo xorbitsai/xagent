@@ -5173,3 +5173,141 @@ def test_complete_scan_fails_closed_when_time_budget_runs_out(monkeypatch):
     assert result["status"] == "error"
     assert "incomplete" in result["message"]
     assert len(calls) == 1
+
+
+def _commit(sha, committed_at, message="change"):
+    return {
+        "sha": sha,
+        "html_url": f"https://github.com/octocat/Hello-World/commit/{sha}",
+        "commit": {
+            "message": message,
+            "author": {"name": "Ada", "date": committed_at},
+            "committer": {"name": "GitHub", "date": committed_at},
+        },
+    }
+
+
+def test_count_commits_uses_local_day_bounds_across_dst_change(monkeypatch):
+    """Sydney moves from +10:00 to +11:00 at 02:00 on 2026-10-04, inside the
+    1-10 October window: the window starts at local midnight +10:00 and ends
+    at local midnight +11:00, and each commit is shown with its own offset."""
+    page_one = [
+        _commit("end-excluded", "2026-10-10T13:00:00Z"),
+        _commit("end-included", "2026-10-10T12:59:59Z"),
+        _commit("after-dst", "2026-10-04T16:30:00Z"),
+    ]
+    page_two = [
+        _commit("before-dst", "2026-10-03T15:30:00Z"),
+        _commit("start-included", "2026-09-30T14:00:00Z"),
+    ]
+    fake, calls = _paged([page_one, page_two])
+    monkeypatch.setattr(github.requests, "request", fake)
+
+    result = json.loads(
+        github.github_count_commits(
+            "octocat/Hello-World",
+            since_date="2026-10-01",
+            until_date="2026-10-10",
+            timezone="Australia/Sydney",
+            branch="main",
+        )
+    )
+
+    assert result["status"] == "success"
+    assert result["complete"] is True
+    assert result["timezone"] == "Australia/Sydney"
+    assert result["date_basis"] == "committer_date"
+    assert result["window_start"] == "2026-10-01T00:00:00+10:00"
+    assert result["window_end"] == "2026-10-11T00:00:00+11:00"
+    assert result["commit_count"] == 4
+    assert [c["sha"] for c in result["commits"]] == [
+        "end-included",
+        "after-dst",
+        "before-dst",
+        "start-included",
+    ]
+    local_times = {c["sha"]: c["committed_at"] for c in result["commits"]}
+    assert local_times["after-dst"] == "2026-10-05T03:30:00+11:00"
+    assert local_times["before-dst"] == "2026-10-04T01:30:00+10:00"
+    assert local_times["start-included"] == "2026-10-01T00:00:00+10:00"
+    params = calls[0]["params"]
+    assert params["sha"] == "main"
+    assert params["since"] == "2026-09-30T14:00:00Z"
+    assert params["until"] == "2026-10-10T13:00:00Z"
+    assert [c["params"]["page"] for c in calls] == [1, 2]
+
+
+def test_count_commits_omits_sha_for_default_branch(monkeypatch):
+    fake, calls = _paged([[]])
+    monkeypatch.setattr(github.requests, "request", fake)
+
+    result = json.loads(
+        github.github_count_commits(
+            "octocat/Hello-World", "2026-10-01", "2026-10-01", "UTC"
+        )
+    )
+
+    assert result["commit_count"] == 0
+    assert result["complete"] is True
+    assert result["branch"] is None
+    assert "sha" not in calls[0]["params"]
+
+
+@pytest.mark.parametrize(
+    ("since_date", "until_date", "tz", "expected"),
+    [
+        ("2026-10-01", "2026-10-10", "Mars/Olympus", "IANA"),
+        ("2026-10-10", "2026-10-01", "UTC", "until_date"),
+        ("1 Oct", "2026-10-10", "UTC", "YYYY-MM-DD"),
+        ("2026-10-01", "2026-10-10", "", "timezone"),
+    ],
+)
+def test_count_commits_rejects_bad_window(
+    monkeypatch, since_date, until_date, tz, expected
+):
+    mock_request = Mock()
+    monkeypatch.setattr(github.requests, "request", mock_request)
+
+    result = json.loads(
+        github.github_count_commits("octocat/Hello-World", since_date, until_date, tz)
+    )
+
+    assert result["status"] == "error"
+    assert expected in result["message"]
+    mock_request.assert_not_called()
+
+
+def test_count_commits_fails_closed_at_page_limit(monkeypatch):
+    pages = [
+        [_commit(f"c{p}-{i}", "2026-10-02T00:00:00Z") for i in range(100)]
+        for p in range(50)
+    ]
+    fake, calls = _paged(pages)
+    monkeypatch.setattr(github.requests, "request", fake)
+
+    result = json.loads(
+        github.github_count_commits(
+            "octocat/Hello-World", "2026-10-01", "2026-10-10", "UTC"
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "incomplete" in result["message"]
+    assert "commit_count" not in result
+    assert len(calls) == github.MAX_COMPLETE_SCAN_PAGES
+
+
+def test_count_commits_caps_listed_commits_but_not_the_count(monkeypatch):
+    commits = [_commit(f"c{i}", "2026-10-02T00:00:00Z") for i in range(150)]
+    fake, _ = _paged([commits[:100], commits[100:]])
+    monkeypatch.setattr(github.requests, "request", fake)
+
+    result = json.loads(
+        github.github_count_commits(
+            "octocat/Hello-World", "2026-10-01", "2026-10-10", "UTC"
+        )
+    )
+
+    assert result["commit_count"] == 150
+    assert len(result["commits"]) == github.MAX_LISTED_COMMITS
+    assert result["commits_listed_truncated"] is True

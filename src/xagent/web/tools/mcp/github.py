@@ -4,12 +4,15 @@ import logging
 import os
 import re
 import time
+from datetime import UTC, date, datetime
 from typing import Any
 from urllib.parse import quote
 
 from mcp.server.fastmcp import FastMCP
 
 from ....core.utils import public_requests as requests
+from .utils import calendar_day_bounds as _calendar_day_bounds
+from .utils import resolve_zoneinfo as _resolve_zoneinfo
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("github-mcp")
@@ -1613,6 +1616,7 @@ def github_list_commits(
 ) -> str:
     """
     List recent commits in a repository.
+    To count commits within a date range, use github_count_commits instead.
     repo: "owner/repo".
     path: optional file or directory path to restrict history to.
     limit: max commits to return (default 30, capped at 100).
@@ -1663,7 +1667,8 @@ def github_list_commits(
         return _error(str(e))
 
 
-# Complete scans behind the statistics tools (github_list_branches). The paged list tools return one page with
+# Complete scans behind the statistics tools (github_list_branches,
+# github_count_commits). The paged list tools return one page with
 # truncated=true and leave paging to the model, which has undercounted in
 # production (it stopped early, or never had a tool to page with). These
 # tools answer "how many"/"which" questions, so they read every page
@@ -1674,6 +1679,11 @@ MAX_COMPLETE_SCAN_PAGES = 10
 # Aggregate wall-clock budget for one scan, as MAX_ISSUE_LIST_SECONDS is for
 # github_list_issues: MAX_COMPLETE_SCAN_PAGES bounds request count, not time.
 MAX_COMPLETE_SCAN_SECONDS = 60
+# github_count_commits always counts every commit in the window but lists at
+# most this many, so a busy window cannot flood the model's context.
+MAX_LISTED_COMMITS = 100
+
+_ISO_DATE_RE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}")
 
 
 class _IncompleteScanError(RuntimeError):
@@ -1765,6 +1775,126 @@ def github_list_branches(repo: str, prefix: str = "") -> str:
         )
     except Exception as e:
         logger.error(f"Error listing GitHub branches for {repo}: {e}", exc_info=True)
+        return _error(str(e))
+
+
+def _parse_iso_date(value: str, *, field: str) -> date:
+    text = (value or "").strip()
+    if _ISO_DATE_RE.fullmatch(text):
+        try:
+            return date.fromisoformat(text)
+        except ValueError:
+            pass
+    raise ValueError(
+        f"{field} must be a calendar date in YYYY-MM-DD format, got {value!r}"
+    )
+
+
+def _utc_timestamp(moment: datetime) -> str:
+    return moment.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+@mcp.tool()
+def github_count_commits(
+    repo: str,
+    since_date: str,
+    until_date: str,
+    timezone: str,
+    branch: str = "",
+) -> str:
+    """
+    Count the commits on a branch dated on the calendar days since_date
+    through until_date (both inclusive) in a named time zone.
+    repo: "owner/repo".
+    since_date, until_date: local dates in `timezone`, YYYY-MM-DD.
+    timezone: IANA zone name such as "Australia/Sydney", "America/New_York"
+    or "UTC". Ask the user which zone they mean instead of assuming one.
+    branch: branch name (default: the repository's default branch).
+
+    Use this, not github_list_commits, for "how many commits between X and
+    Y". It converts the local days to exact instants itself, including any
+    daylight-saving change inside the window -- do not convert times
+    yourself. Dates are committer dates (when the commit was made on the
+    branch, which is what GitHub filters by); author dates can differ for
+    rebased or cherry-picked commits.
+
+    Returns commit_count, the exact window_start/window_end, and up to 100
+    commits (newest first) with committed_at shown in `timezone`;
+    commits_listed_truncated is true when more were counted than listed.
+    A successful result is always complete -- if the window holds more
+    commits than this tool can read, it returns an error instead of a
+    partial count. Always state the time zone when reporting the result.
+    """
+    try:
+        owner, name = _parse_repo(repo)
+        start_day = _parse_iso_date(since_date, field="since_date")
+        end_day = _parse_iso_date(until_date, field="until_date")
+        if end_day < start_day:
+            raise ValueError(
+                f"until_date ({end_day}) must be on or after since_date ({start_day})"
+            )
+        zone_name = (timezone or "").strip()
+        if not zone_name:
+            raise ValueError(
+                "timezone is required: an IANA zone name such as "
+                "'Australia/Sydney' or 'UTC'"
+            )
+        zone = _resolve_zoneinfo(zone_name)
+        window_start, window_end = _calendar_day_bounds(
+            start_day.isoformat(), zone_name, days=(end_day - start_day).days + 1
+        )
+        start = datetime.fromisoformat(window_start)
+        end = datetime.fromisoformat(window_end)
+        params: dict[str, Any] = {
+            "since": _utc_timestamp(start),
+            "until": _utc_timestamp(end),
+        }
+        branch_name = None
+        if branch:
+            branch_name = _validate_branch_name(branch, field="branch")
+            params["sha"] = branch_name
+        raw = _collect_all_pages(
+            f"/repos/{owner}/{name}/commits",
+            params,
+            what=f"the commits of {repo} in this date window",
+        )
+        counted: list[dict[str, Any]] = []
+        for commit in raw:
+            details = commit.get("commit") or {}
+            committed = (details.get("committer") or {}).get("date")
+            if not isinstance(committed, str):
+                raise ValueError(
+                    f"GitHub returned commit {commit.get('sha')} without a "
+                    "committer date"
+                )
+            when = datetime.fromisoformat(committed.replace("Z", "+00:00"))
+            # GitHub's `until` is inclusive; the window's end is the next
+            # local midnight, which belongs to the following day.
+            if not start <= when < end:
+                continue
+            counted.append(
+                {
+                    "sha": commit.get("sha"),
+                    "title": str(details.get("message") or "").split("\n", 1)[0],
+                    "author": (details.get("author") or {}).get("name"),
+                    "committed_at": when.astimezone(zone).isoformat(),
+                    "html_url": commit.get("html_url"),
+                }
+            )
+        return _success(
+            repo=repo,
+            branch=branch_name,
+            timezone=zone_name,
+            date_basis="committer_date",
+            window_start=window_start,
+            window_end=window_end,
+            commit_count=len(counted),
+            complete=True,
+            commits=counted[:MAX_LISTED_COMMITS],
+            commits_listed_truncated=len(counted) > MAX_LISTED_COMMITS,
+        )
+    except Exception as e:
+        logger.error(f"Error counting GitHub commits for {repo}: {e}", exc_info=True)
         return _error(str(e))
 
 

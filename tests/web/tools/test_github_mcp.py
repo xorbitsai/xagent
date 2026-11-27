@@ -5088,3 +5088,88 @@ def test_get_pull_request_names_missing_change_stats_instead_of_zero(monkeypatch
     assert result["change_stats"]["deletions"] is None
     assert result["change_stats"]["additions"] == 5
     assert result["missing_stats"] == ["changed_files", "deletions", "commits"]
+
+
+def _paged(pages, *, path_check=None):
+    """Mock requests.request serving `pages` in order; every page except the
+    last carries a Link rel="next"."""
+    calls = []
+
+    def fake_request(**kwargs):
+        calls.append(kwargs)
+        index = len(calls) - 1
+        if path_check is not None:
+            path_check(kwargs)
+        headers = (
+            {"Link": '<https://api.github.com/x?page=2>; rel="next"'}
+            if index < len(pages) - 1
+            else {}
+        )
+        return MockResponse(json_data=pages[index], headers=headers)
+
+    return fake_request, calls
+
+
+def test_list_branches_reads_every_page_and_matches_prefix(monkeypatch):
+    first = [{"name": f"feature-{i:03d}"} for i in range(99)] + [{"name": "xero/a"}]
+    second = [
+        {"name": "xero/b"},
+        {"name": "main"},
+        {"name": "xeroish"},
+        {"name": "feature/xero/c"},
+    ]
+    fake, calls = _paged([first, second])
+    monkeypatch.setattr(github.requests, "request", fake)
+
+    result = json.loads(
+        github.github_list_branches("octocat/Hello-World", prefix="xero/")
+    )
+
+    assert result["status"] == "success"
+    assert result["complete"] is True
+    assert result["total_count"] == 104
+    assert result["matching_count"] == 2
+    assert result["branches"] == ["xero/a", "xero/b"]
+    assert [c["params"]["page"] for c in calls] == [1, 2]
+    assert all(c["params"]["per_page"] == 100 for c in calls)
+    assert calls[0]["url"] == (
+        f"{github.GITHUB_BASE_URL}/repos/octocat/Hello-World/branches"
+    )
+
+
+def test_list_branches_without_prefix_returns_all_names(monkeypatch):
+    fake, _ = _paged([[{"name": "main"}, {"name": "dev"}]])
+    monkeypatch.setattr(github.requests, "request", fake)
+
+    result = json.loads(github.github_list_branches("octocat/Hello-World"))
+
+    assert result["total_count"] == 2
+    assert result["branches"] == ["dev", "main"]
+
+
+def test_list_branches_fails_closed_at_page_limit(monkeypatch):
+    pages = [[{"name": f"b{p}-{i}"} for i in range(100)] for p in range(50)]
+    fake, calls = _paged(pages)
+    monkeypatch.setattr(github.requests, "request", fake)
+
+    result = json.loads(
+        github.github_list_branches("octocat/Hello-World", prefix="xero/")
+    )
+
+    assert result["status"] == "error"
+    assert "incomplete" in result["message"]
+    assert "total_count" not in result
+    assert len(calls) == github.MAX_COMPLETE_SCAN_PAGES
+
+
+def test_complete_scan_fails_closed_when_time_budget_runs_out(monkeypatch):
+    clock = itertools.count(0, github.MAX_COMPLETE_SCAN_SECONDS)
+    monkeypatch.setattr(github, "_monotonic", lambda: next(clock))
+    fake, calls = _paged([[{"name": "a"}], [{"name": "b"}], [{"name": "c"}]])
+    monkeypatch.setattr(github.requests, "request", fake)
+
+    result = json.loads(github.github_list_branches("octocat/Hello-World"))
+
+    assert result["status"] == "error"
+    assert "incomplete" in result["message"]
+    assert len(calls) == 1

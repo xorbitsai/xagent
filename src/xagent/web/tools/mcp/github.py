@@ -1663,6 +1663,111 @@ def github_list_commits(
         return _error(str(e))
 
 
+# Complete scans behind the statistics tools (github_list_branches). The paged list tools return one page with
+# truncated=true and leave paging to the model, which has undercounted in
+# production (it stopped early, or never had a tool to page with). These
+# tools answer "how many"/"which" questions, so they read every page
+# themselves and fail closed -- an error, never a partial count presented as
+# the total -- when the scan cannot finish, the same contract as xero.py's
+# list_paid_invoices.
+MAX_COMPLETE_SCAN_PAGES = 10
+# Aggregate wall-clock budget for one scan, as MAX_ISSUE_LIST_SECONDS is for
+# github_list_issues: MAX_COMPLETE_SCAN_PAGES bounds request count, not time.
+MAX_COMPLETE_SCAN_SECONDS = 60
+
+
+class _IncompleteScanError(RuntimeError):
+    """A complete scan stopped before GitHub's last page."""
+
+
+def _collect_all_pages(
+    path: str, params: dict[str, Any], *, what: str
+) -> list[dict[str, Any]]:
+    """GET every page of a GitHub list endpoint, following the Link header.
+
+    Raises _IncompleteScanError when MAX_COMPLETE_SCAN_PAGES or
+    MAX_COMPLETE_SCAN_SECONDS is reached with pages still left, so callers
+    never report a partial list as complete. Rate-limit retries are off for
+    the same reason github_list_issues turns them off: the retry's sleep is
+    invisible to this scan's own deadline.
+    """
+    items: list[dict[str, Any]] = []
+    deadline = _monotonic() + MAX_COMPLETE_SCAN_SECONDS
+    for page in range(1, MAX_COMPLETE_SCAN_PAGES + 1):
+        remaining = deadline - _monotonic()
+        if page > 1 and remaining <= 0:
+            raise _IncompleteScanError(
+                f"Result incomplete: reading {what} hit the "
+                f"{MAX_COMPLETE_SCAN_SECONDS}s time limit after {page - 1} "
+                "page(s), so no count is returned. Tell the user the result "
+                "is unavailable rather than estimating it."
+            )
+        response = _request_raw(
+            "GET",
+            path,
+            params={**params, "per_page": MAX_PER_PAGE, "page": page},
+            timeout=max(1.0, min(DEFAULT_TIMEOUT_SECONDS, remaining)),
+            allow_retry=False,
+        )
+        body = response.json() if response.content else []
+        if not isinstance(body, list):
+            raise ValueError(
+                f"GitHub returned a non-list page ({type(body).__name__}) for {what}"
+            )
+        _require_object_items(body, context=what)
+        items.extend(body)
+        if "next" not in _link_header_rels(response.headers.get("Link")):
+            return items
+    raise _IncompleteScanError(
+        f"Result incomplete: {what} span more than {MAX_COMPLETE_SCAN_PAGES} "
+        f"pages ({MAX_COMPLETE_SCAN_PAGES * MAX_PER_PAGE} items), so no count "
+        "is returned. Tell the user the result is unavailable rather than "
+        "estimating it."
+    )
+
+
+@mcp.tool()
+def github_list_branches(repo: str, prefix: str = "") -> str:
+    """
+    Count a repository's branches and list every branch name, or every name
+    starting with `prefix`.
+    repo: "owner/repo".
+    prefix: optional case-sensitive name prefix, e.g. "xero/" (default: all).
+
+    Use this for "how many branches are there" or "which branches start with
+    X". It reads every page itself: total_count counts all branches in the
+    repository; branches (sorted) and matching_count cover the names that
+    start with prefix. A successful result is always complete. If the
+    repository has more branches than this tool can read, it returns an
+    error instead of a partial list -- report the count as unavailable.
+    """
+    try:
+        owner, name = _parse_repo(repo)
+        raw = _collect_all_pages(
+            f"/repos/{owner}/{name}/branches", {}, what=f"the branches of {repo}"
+        )
+        names: list[str] = []
+        for branch in raw:
+            branch_name = branch.get("name")
+            if not isinstance(branch_name, str):
+                raise ValueError(f"GitHub returned a branch without a name for {repo}")
+            names.append(branch_name)
+        matching = sorted(
+            branch_name for branch_name in names if branch_name.startswith(prefix)
+        )
+        return _success(
+            repo=repo,
+            prefix=prefix or None,
+            total_count=len(names),
+            matching_count=len(matching),
+            branches=matching,
+            complete=True,
+        )
+    except Exception as e:
+        logger.error(f"Error listing GitHub branches for {repo}: {e}", exc_info=True)
+        return _error(str(e))
+
+
 @mcp.tool()
 def github_search_code(
     query: str, limit: int = SEARCH_DEFAULT_LIMIT, page: int = 1

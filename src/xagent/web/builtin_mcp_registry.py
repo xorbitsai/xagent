@@ -1439,7 +1439,7 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
         {
             "app_id": "mixpanel",
             "name": "Mixpanel",
-            "description": "Connect to Mixpanel with a Service Account to query events, segmentation, retention, funnels, and user profiles, and export raw event data. Supports US, EU, and India data residency.",
+            "description": "Connect to Mixpanel with a Service Account to query events, segmentation, retention, funnels, and user profiles, and export raw event data. User profile queries need the Analyst, Admin, or Owner project role. Supports US, EU, and India data residency.",
             "icon": "https://www.google.com/s2/favicons?domain=mixpanel.com&sz=128",
             "transport": "stdio",
             "provider_name": None,

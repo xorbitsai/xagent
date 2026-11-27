@@ -1018,6 +1018,11 @@ def test_query_engage_identifies_profile_permission_without_blocking_events(
     assert result["status"] == "error"
     assert result["error_code"] == "mixpanel_profile_permission_missing"
     assert result["required_permission"] == "download_users_csv"
+    assert result["required_role"] == "Analyst, Admin, or Owner"
+    assert "lacks the download_users_csv permission" in result["message"]
+    assert "Analyst, Admin, or Owner role" in result["message"]
+    assert "Export Users as CSV" in result["message"]
+    assert "download_users_csv permission" in result["mixpanel_error"]
     assert result["event_query_available"] is True
     assert result["recommended_tool"] == "mixpanel_query_user_activity"
 
@@ -1058,6 +1063,10 @@ def test_query_engage_does_not_infer_specific_permission_without_token(
         True if expects_event_hint else None
     )
     assert "event_query_available" not in result
+    assert "required_role" not in result
+    assert ("Analyst, Admin, or Owner" in result.get("possible_fix", "")) is (
+        expects_event_hint
+    )
 
 
 def test_list_annotations_requires_valid_dates(monkeypatch):

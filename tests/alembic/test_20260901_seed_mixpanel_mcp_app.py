@@ -118,14 +118,32 @@ def test_upgrade_warns_and_still_inserts_when_column_missing(tmp_path):
 
 def test_seed_row_matches_registry():
     """The migration snapshot and the runtime registry must define the same
-    mixpanel row (the migration is a frozen copy; this catches drift)."""
+    mixpanel row (the migration is a frozen copy; this catches drift).
+
+    The description later moved on: 20261127_update_mixpanel_description
+    rewrites the seeded text and owns the current registry match."""
     from xagent.web.builtin_mcp_registry import get_builtin_public_mcp_app_rows
 
     migration = _load_migration_module()
     registry_row = next(
         r for r in get_builtin_public_mcp_app_rows() if r["app_id"] == "mixpanel"
     )
-    assert migration.ROW == registry_row
+    update_file = (
+        Path(__file__).parent.parent.parent
+        / "src/xagent/migrations/versions/20261127_update_mixpanel_description.py"
+    )
+    spec = importlib.util.spec_from_file_location(
+        "update_mixpanel_description_migration", update_file
+    )
+    update = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(update)
+
+    assert migration.ROW["description"] == update.PREVIOUS_DESCRIPTION
+    assert registry_row["description"] == update.CURRENT_DESCRIPTION
+    assert {k: v for k, v in migration.ROW.items() if k != "description"} == {
+        k: v for k, v in registry_row.items() if k != "description"
+    }
 
 
 def test_downgrade_removes_mixpanel(tmp_path):

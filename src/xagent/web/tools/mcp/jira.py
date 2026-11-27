@@ -1340,6 +1340,13 @@ def jira_search_issues(
     jira_get_issue for a description or dependencies
     (issue_links/subtasks); pass extra_fields for any other field not in
     that list.
+
+    Results come from Jira's search index, which Atlassian does not keep
+    read-after-write consistent: a change made seconds or minutes ago may
+    not show yet, and a result you already have shows the issue only as it
+    was when that search ran. To report one issue's current status, read it
+    with jira_get_issue instead of quoting a search result.
+
     jql: a JQL query, e.g. 'project = ENG AND status = "In Progress"
     ORDER BY updated DESC' or 'text ~ "login bug"'. To search by a custom
     field, write it the way jira_list_fields' clause_names spells it --

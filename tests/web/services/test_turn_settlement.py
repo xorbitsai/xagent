@@ -61,6 +61,7 @@ from xagent.web.services.turn_settlement import (
     TurnModelUsage,
     TurnSettlement,
     TurnUsage,
+    bind_settlement_turn,
     build_error_code,
     build_turn_settlement,
     drain_turn_settlement_hooks,
@@ -68,6 +69,7 @@ from xagent.web.services.turn_settlement import (
     report_turn_settled,
     set_turn_settled_hook,
     settled_outcome,
+    settlement_turn_for_run,
 )
 
 HOOK_METRIC = "xagent.turn_settlement.hook"
@@ -1167,6 +1169,7 @@ async def _drive_resume(
     extra_patches: tuple[Any, ...] = (),
     preacquired_prior_status: TaskStatus | None = None,
     finalize_side_effect: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
+    during_resume: Callable[[], None] | None = None,
 ) -> type[BaseException] | None:
     from xagent.web.services.task_execution import execute_resume_background
 
@@ -1182,6 +1185,14 @@ async def _drive_resume(
         side_effect=outcome if isinstance(outcome, BaseException) else None,
         return_value=outcome if isinstance(outcome, dict) else None,
     )
+    if during_resume is not None:
+        resume_outcome = service.resume_execution_by_id
+
+        async def resume_then_observe(*args: Any, **kwargs: Any) -> Any:
+            during_resume()
+            return await resume_outcome(*args, **kwargs)
+
+        service.resume_execution_by_id = resume_then_observe
     monkeypatch.setattr(agent_service_manager, "get_agent_manager", lambda: Mock())
     finalized = {
         "task_title": "t",
@@ -2164,3 +2175,115 @@ async def test_committed_run_whose_settlement_is_deferred_is_reported(
         assert db.get(Task, tid).status == TaskStatus.COMPLETED
     settle.assert_not_called()
     assert [(s.status, s.turn_id) for s in received] == [("completed", payload.turn_id)]
+
+
+# ---------------------------------------------------------------------------
+# The turn id a run's settlement will report, recorded while the run executes.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("delivery_turn_id", "expected"), [("A", "A"), (None, None)], ids=["answer", "none"]
+)
+async def test_resume_binds_its_settlement_turn_while_it_runs(
+    monkeypatch, delivery_turn_id, expected
+) -> None:
+    seen: list[str | None] = []
+
+    await _drive_resume(
+        monkeypatch,
+        RESUME_OK,
+        delivery_turn_id=delivery_turn_id,
+        during_resume=lambda: seen.append(settlement_turn_for_run(42, "run-a")),
+    )
+
+    assert seen == [expected]
+    assert settlement_turn_for_run(42, "run-a") is None
+
+
+def test_bind_settlement_turn_cleans_only_its_own_entry() -> None:
+    with bind_settlement_turn(42, "run-a", "O"):
+        assert settlement_turn_for_run(42, "run-a") == "O"
+        assert settlement_turn_for_run(42, "run-b") is None
+        assert settlement_turn_for_run(43, "run-a") is None
+    assert settlement_turn_for_run(42, "run-a") is None
+
+    # Two blocks of the same run that overlap, leaving in either order.
+    first = bind_settlement_turn(42, "run-a", "O")
+    second = bind_settlement_turn(42, "run-a", "A")
+    first.__enter__()
+    second.__enter__()
+    assert settlement_turn_for_run(42, "run-a") == "A"
+    first.__exit__(None, None, None)
+    assert settlement_turn_for_run(42, "run-a") == "A"
+    second.__exit__(None, None, None)
+    assert settlement_turn_for_run(42, "run-a") is None
+
+    # Without a run id nothing is recorded.
+    before = dict(turn_settlement._settlement_turns)
+    with bind_settlement_turn(42, None, "O"):
+        assert settlement_turn_for_run(42, None) is None
+        assert turn_settlement._settlement_turns == before
+    assert turn_settlement._settlement_turns == before
+
+    # Leaving the block through an exception also removes the entry.
+    with pytest.raises(RuntimeError):
+        with bind_settlement_turn(42, "run-a", "O"):
+            raise RuntimeError("run failed")
+    assert settlement_turn_for_run(42, "run-a") is None
+
+
+@pytest.mark.usefixtures("_clear_bg_manager")
+async def test_scheduled_run_binds_its_payload_turn(canonical) -> None:
+    factory, tid = canonical
+    seen: list[str | None] = []
+    manager = _result_manager({"success": True, "output": "4"})
+
+    async def execute_task(**_kwargs: Any) -> dict[str, Any]:
+        with factory() as db:
+            run_id = db.get(Task, tid).run_id
+        seen.append(settlement_turn_for_run(tid, run_id))
+        return {"success": True, "output": "4"}
+
+    manager.execute_task = execute_task
+
+    lease, payload, raised = await _schedule_turn(canonical, manager)
+
+    assert raised is None
+    assert seen == [payload.turn_id]
+    assert settlement_turn_for_run(tid, lease.run_id) is None
+
+
+def test_settlement_turn_is_bound_where_runs_execute() -> None:
+    import ast
+    from pathlib import Path
+
+    services = Path(turn_settlement.__file__).parent
+    found: set[tuple[str, str]] = set()
+
+    def visit(node: ast.AST, functions: list[str], path: Path) -> None:
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                visit(child, [*functions, child.name], path)
+                continue
+            if isinstance(child, ast.Call):
+                callee = child.func
+                name = (
+                    callee.id
+                    if isinstance(callee, ast.Name)
+                    else callee.attr
+                    if isinstance(callee, ast.Attribute)
+                    else None
+                )
+                if name == "bind_settlement_turn":
+                    # Only the innermost function that holds the call counts.
+                    found.add((path.relative_to(services).as_posix(), functions[-1]))
+            visit(child, functions, path)
+
+    for path in services.rglob("*.py"):
+        visit(ast.parse(path.read_text()), ["<module>"], path)
+
+    assert found == {
+        ("task_orchestrator.py", "execute_owned_run"),
+        ("task_execution.py", "execute_resume_background"),
+    }

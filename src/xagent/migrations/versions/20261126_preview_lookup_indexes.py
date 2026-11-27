@@ -11,7 +11,7 @@ from xagent.db.preview_lookup_ddl import (
 )
 
 revision = "20261126_preview_lookup_indexes"
-down_revision = "20261119_shopify_store_locks"
+down_revision = "20261126_connector_oauth_redirect_uri"
 branch_labels = None
 depends_on = None
 

@@ -1,6 +1,7 @@
 """The public connector launch transports credentials only in HTTP headers."""
 
 import hashlib
+import json
 import secrets
 from datetime import timedelta
 from unittest.mock import Mock
@@ -329,6 +330,53 @@ def test_launch_reports_the_configured_callback_origin_not_frontend_origin(launc
     response = _post(client, token, redirect="https://frontend.example")
     assert response.status_code == 200
     assert response.json()["callback_origin"] == "https://callback.example:8443"
+
+
+def test_launch_reports_the_completion_origin_after_alias_mapping(launch, monkeypatch):
+    client, db, _, provider, token = launch
+    old = "https://au.cloud.example.com"
+    new = "https://cloud.tobybot.ai"
+    provider.redirect_uri = f"{old}/api/auth/custom/callback"
+    db.commit()
+    monkeypatch.setenv("XAGENT_APP_BASE_URL", old)
+    monkeypatch.setenv("XAGENT_PUBLIC_API_BASE_URL", old)
+    monkeypatch.setenv(
+        "XAGENT_PUBLIC_ENTRIES_JSON",
+        json.dumps(
+            [
+                {
+                    "origin": origin,
+                    "region_cookie_domain": None,
+                    "google_oidc_redirect_uri": origin
+                    + "/api/auth/oidc/google/callback",
+                }
+                for origin in (old, new)
+            ]
+        ),
+    )
+    monkeypatch.setenv("XAGENT_OAUTH_CALLBACK_ORIGIN_MAP", json.dumps({new: old}))
+    monkeypatch.setenv("XAGENT_CONNECTOR_OAUTH_CALLBACK_BASE_URL", new)
+
+    response = _post(client, token, redirect=old)
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["callback_origin"] == old
+    assert body["provider_callback_origin"] == new
+    launch_response = client.get(body["authorization_url"], follow_redirects=False)
+    request_url = urlsplit(launch_response.headers["location"])
+    query = parse_qs(request_url.query)
+    assert query["redirect_uri"] == [f"{new}/api/auth/custom/callback"]
+    state = auth.verify_token(query["state"][0])
+    assert state["connector_callback_uri"] == (f"{new}/api/auth/custom/callback")
+
+
+def test_completion_origin_keeps_an_unmapped_local_service_name(monkeypatch):
+    monkeypatch.delenv("XAGENT_OAUTH_CALLBACK_ORIGIN_MAP", raising=False)
+
+    assert auth._oauth_completion_origin("http://xagent_web:3000") == (
+        "http://xagent_web:3000"
+    )
 
 
 def test_conflicting_or_oversized_manifest_options_are_rejected(launch):

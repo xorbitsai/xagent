@@ -57,6 +57,10 @@ interface TaskConversationPanelProps {
   // each answer. Off for the embedded widget, where a visitor should see the
   // answer and a status line, not the run; share links keep it on.
   showProcessView?: boolean
+  // Starts the execution trace's steps folded, so the visitor opens one only on
+  // request. Only the initial state of a step changes; with `showProcessView`
+  // off there is no trace to fold.
+  collapseProcessSteps?: boolean
   hideFileUpload?: boolean
   hideConfig?: boolean
   compactInput?: boolean
@@ -300,6 +304,7 @@ export function TaskConversationPanel({
   showDagPreview = mode === "page",
   showTaskFiles = mode === "page",
   showProcessView = true,
+  collapseProcessSteps = false,
   hideFileUpload = false,
   hideConfig = mode === "embedded-preview",
   compactInput = false,
@@ -1107,6 +1112,7 @@ export function TaskConversationPanel({
                         rawContent={item.rawContent}
                         traceEvents={item.traceEvents as any || []}
                         showProcessView={showProcessView}
+                        collapseProcessSteps={collapseProcessSteps}
                         showInterruptedStatus={item.showInterruptedStatus}
                         processStatus={item.status === "interrupted" ? "interrupted" : item.processStatus}
                         taskStatus={
@@ -1147,6 +1153,7 @@ export function TaskConversationPanel({
                       content={state.currentTask?.status === "waiting_for_user" ? waitingPrompt : null}
                       traceEvents={currentTurnTraceEvents as any || []}
                       showProcessView={showProcessView}
+                      collapseProcessSteps={collapseProcessSteps}
                       isVirtual
                       processStatus={isLatestTurnVisitorStopped ? "interrupted" : state.currentTask?.status}
                       taskStatus={state.currentTask?.status}

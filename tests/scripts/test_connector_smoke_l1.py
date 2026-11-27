@@ -309,6 +309,69 @@ def test_callback_origin_falling_back_to_localhost_fails() -> None:
     assert "http://localhost:8000" in result.reason
 
 
+def test_callback_origin_prefers_the_provider_field() -> None:
+    result = l1.check_callback_origin(
+        "slack",
+        status_code=200,
+        payload={
+            "callback_origin": "https://au.cloud.example.com",
+            "provider_callback_origin": "https://cloud.tobybot.ai",
+        },
+        expected_origin="https://cloud.tobybot.ai",
+    )
+
+    assert result.ok
+    assert (
+        l1.start_provider_callback_origin(
+            {
+                "callback_origin": "https://au.cloud.example.com",
+                "provider_callback_origin": "https://cloud.tobybot.ai",
+            }
+        )
+        == "https://cloud.tobybot.ai"
+    )
+
+
+def test_completion_origin_uses_the_frontend_reported_origin() -> None:
+    result = l1.check_completion_origin(
+        "slack",
+        status_code=200,
+        payload={
+            "callback_origin": "https://au.cloud.example.com",
+            "provider_callback_origin": "https://cloud.tobybot.ai",
+        },
+        expected_origin="https://au.cloud.example.com",
+    )
+
+    assert result.ok
+    assert result.name == "oauth:slack:completion"
+
+
+def test_completion_origin_mismatch_fails() -> None:
+    result = l1.check_completion_origin(
+        "slack",
+        status_code=200,
+        payload={"callback_origin": "https://cloud.tobybot.ai"},
+        expected_origin="https://au.cloud.example.com",
+    )
+
+    assert not result.ok
+    assert "completion origin" in result.reason
+
+
+def test_composio_completion_check_has_its_own_name() -> None:
+    result = l1.check_completion_origin(
+        "salesforce",
+        status_code=200,
+        payload={"callback_origin": "https://au.cloud.example.com"},
+        expected_origin="https://au.cloud.example.com",
+        composio=True,
+    )
+
+    assert result.ok
+    assert result.name == "oauth:salesforce:composio:completion"
+
+
 def test_callback_check_fails_when_the_launch_start_is_refused() -> None:
     result = l1.check_callback_origin(
         "slack",

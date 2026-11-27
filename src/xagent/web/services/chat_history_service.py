@@ -407,6 +407,29 @@ def withdraw_pending_user_message_delivery_sync(task_id: int, turn_id: str) -> b
         return removed == 1
 
 
+def withdraw_pending_user_message_delivery_no_commit(
+    db: Session, task_id: int, turn_id: str
+) -> bool:
+    """The conditional DELETE of ``withdraw_pending_user_message_delivery_sync``
+    in the caller's transaction; returns whether the row was removed.
+
+    The caller commits, so it can remove rows of its own in the same
+    transaction.
+    """
+
+    removed = (
+        db.query(TaskChatMessage)
+        .filter(
+            TaskChatMessage.task_id == task_id,
+            TaskChatMessage.role == "user",
+            TaskChatMessage.turn_id == turn_id,
+            TaskChatMessage.delivery_status == DELIVERY_PENDING,
+        )
+        .delete(synchronize_session=False)
+    )
+    return removed == 1
+
+
 def supersede_legacy_question_rows(db: Session, *, task_id: int) -> int:
     """Mark every assistant question row on a task as superseded, whether
     still pending or already answered.

@@ -337,7 +337,7 @@ describe("useWidgetSession", () => {
     },
   )
 
-  it.each([4401, 1006, 1001, 4500])(
+  it.each([4401, 1006, 4500])(
     "owns abnormal WebSocket close %s and requests one parent reconnect",
     (code) => {
       vi.useFakeTimers()
@@ -866,6 +866,36 @@ describe("useWidgetSession capabilities", () => {
 
     expect(result.current.status).toBe("active")
     expect(result.current.session?.capabilities).toBeUndefined()
+  })
+
+  const processViewCapabilitiesFor = (capabilities: unknown) => {
+    const { result } = renderHook(() => useWidgetSession())
+    dispatchFromParent(updateMessage({ capabilities }))
+    expect(result.current.status).toBe("active")
+    return result.current.session?.capabilities
+  }
+
+  it.each([
+    ["collapsed", { process_view: "collapsed" }, { processView: "collapsed" }],
+    ["hidden", { process_view: "hidden" }, { processView: "hidden" }],
+    ["hidden next to voice", { process_view: "hidden", voice: true }, { voice: true, processView: "hidden" }],
+    ["an unknown value next to voice", { process_view: "bogus", voice: true }, { voice: true }],
+  ])("parses process_view %s", (_label, capabilities, expected) => {
+    expect(processViewCapabilitiesFor(capabilities)).toStrictEqual(expected)
+  })
+
+  it.each([
+    ["show", { process_view: "show" }],
+    ["upper case", { process_view: "HIDDEN" }],
+    ["an empty string", { process_view: "" }],
+    ["a number", { process_view: 1 }],
+    ["a boolean", { process_view: true }],
+    ["null", { process_view: null }],
+    ["an object", { process_view: {} }],
+    ["an array", { process_view: ["hidden"] }],
+    ["a missing key", {}],
+  ])("reads process_view as %s as no capabilities", (_label, capabilities) => {
+    expect(processViewCapabilitiesFor(capabilities)).toBeUndefined()
   })
 })
 
@@ -1505,6 +1535,23 @@ describe("useWidgetSession reconnect jitter", () => {
 
   it("keeps the jitter bound under the thresholds that lose a session", () => {
     expect(WS_CLOSE_RECONNECT_JITTER_MAX_MS).toBeLessThanOrEqual(30_000)
+  })
+
+  it.each([1001, 1006])("reports a correlated %i close before delaying reconnect", (code) => {
+    vi.spyOn(Math, "random").mockReturnValue(0.5)
+    const { result, postMessage } = mountActive()
+
+    act(() => result.current.handleConnectionClose(new CloseEvent("close", { code })))
+
+    expect(postMessage).toHaveBeenCalledWith({
+      xagent: true,
+      v: 1,
+      type: "session_connection_closed",
+      session_delivery_id: "delivery-a",
+    }, PARENT_ORIGIN)
+    expect(reconnectRequests(postMessage)).toHaveLength(0)
+    act(() => vi.advanceTimersByTime(WS_CLOSE_RECONNECT_JITTER_MAX_MS / 2))
+    expect(reconnectRequests(postMessage)).toHaveLength(1)
   })
 
   it("sends the delayed request at once when a caller needs a session", () => {

@@ -95,6 +95,9 @@ class SQLAlchemyModelHub:
                     "temperature": model.default_temperature,
                     "max_tokens": model.default_max_tokens,
                     "context_window": model.context_window,
+                    "openrouter_provider_only": model.openrouter_provider_only,
+                    "openrouter_zdr": model.openrouter_zdr,
+                    "openrouter_data_collection": model.openrouter_data_collection,
                     "category": "llm",
                 }
             )
@@ -230,6 +233,9 @@ class SQLAlchemyModelHub:
                 default_temperature=db_model.temperature,
                 default_max_tokens=db_model.max_tokens,
                 context_window=db_model.context_window,
+                openrouter_provider_only=db_model.openrouter_provider_only,
+                openrouter_zdr=bool(db_model.openrouter_zdr),
+                openrouter_data_collection=db_model.openrouter_data_collection,
                 bedrock_region=db_model.bedrock_region,
                 bedrock_auth_mode=db_model.bedrock_auth_mode or "auto",
             )
@@ -306,6 +312,9 @@ class SQLAlchemyModelHub:
                     default_temperature=db_model.temperature,
                     default_max_tokens=db_model.max_tokens,
                     context_window=db_model.context_window,
+                    openrouter_provider_only=db_model.openrouter_provider_only,
+                    openrouter_zdr=bool(db_model.openrouter_zdr),
+                    openrouter_data_collection=db_model.openrouter_data_collection,
                     bedrock_region=db_model.bedrock_region,
                     bedrock_auth_mode=db_model.bedrock_auth_mode or "auto",
                 )

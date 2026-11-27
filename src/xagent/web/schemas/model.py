@@ -128,6 +128,9 @@ class ModelCreate(BaseModel):
     bedrock_auth_mode: Literal["api_key", "credentials_chain"] = "api_key"
     temperature: Optional[float] = None
     context_window: Optional[int] = None  # LLM total context window in tokens
+    openrouter_provider_only: Optional[List[str]] = None
+    openrouter_zdr: bool = False
+    openrouter_data_collection: Optional[Literal["deny"]] = None
     dimension: Optional[int] = None
     abilities: Optional[List[str]] = None
     description: Optional[str] = None
@@ -160,6 +163,34 @@ class ModelCreate(BaseModel):
         category = values.data.get("category", "llm")
         return _validate_abilities_for_category(v, category)
 
+    @field_validator("openrouter_provider_only")
+    @classmethod
+    def validate_openrouter_provider_only(
+        cls, v: Optional[List[str]]
+    ) -> Optional[List[str]]:
+        if v is None:
+            return None
+        normalized = [provider.strip() for provider in v]
+        if not normalized or any(not provider for provider in normalized):
+            raise ValueError("openrouter_provider_only must contain non-empty slugs")
+        if len(normalized) != len(set(normalized)):
+            raise ValueError("openrouter_provider_only must not contain duplicates")
+        return normalized
+
+    @model_validator(mode="after")
+    def validate_openrouter_provider(self) -> "ModelCreate":
+        has_openrouter_policy = (
+            self.openrouter_provider_only is not None
+            or self.openrouter_zdr
+            or self.openrouter_data_collection is not None
+        )
+        if has_openrouter_policy and (
+            self.category != "llm"
+            or self.model_provider.strip().lower() != "openrouter"
+        ):
+            raise ValueError("OpenRouter routing policy requires an OpenRouter LLM")
+        return self
+
 
 class ModelUpdate(BaseModel):
     """Model update request schema"""
@@ -173,6 +204,9 @@ class ModelUpdate(BaseModel):
     bedrock_auth_mode: Optional[Literal["api_key", "credentials_chain"]] = None
     temperature: Optional[float] = None
     context_window: Optional[int] = None  # LLM total context window in tokens
+    openrouter_provider_only: Optional[List[str]] = None
+    openrouter_zdr: Optional[bool] = None
+    openrouter_data_collection: Optional[Literal["deny"]] = None
     dimension: Optional[int] = None
     description: Optional[str] = None
     abilities: Optional[List[str]] = None
@@ -206,6 +240,13 @@ class ModelUpdate(BaseModel):
 
         return v
 
+    @field_validator("openrouter_provider_only")
+    @classmethod
+    def validate_openrouter_provider_only(
+        cls, v: Optional[List[str]]
+    ) -> Optional[List[str]]:
+        return ModelCreate.validate_openrouter_provider_only(v)
+
 
 class ModelResponse(BaseModel):
     """Model response schema"""
@@ -224,6 +265,9 @@ class ModelResponse(BaseModel):
     sample_rate: Optional[int] = None
     temperature: Optional[float]
     context_window: Optional[int] = None
+    openrouter_provider_only: Optional[List[str]] = None
+    openrouter_zdr: bool = False
+    openrouter_data_collection: Optional[Literal["deny"]] = None
     dimension: Optional[int]
     is_default: bool
     is_small_fast: bool
@@ -275,6 +319,9 @@ class ModelConnectionTestRequest(BaseModel):
     bedrock_auth_mode: Literal["api_key", "credentials_chain"] = "api_key"
     category: str = "llm"
     temperature: Optional[float] = None
+    openrouter_provider_only: Optional[List[str]] = None
+    openrouter_zdr: bool = False
+    openrouter_data_collection: Optional[Literal["deny"]] = None
     dimension: Optional[int] = None
     abilities: Optional[List[str]] = None
     top_n: Optional[int] = None
@@ -286,6 +333,27 @@ class ModelConnectionTestRequest(BaseModel):
     @classmethod
     def strip_string_fields(cls, v: Any) -> Any:
         return _strip_whitespace(v)
+
+    @field_validator("openrouter_provider_only")
+    @classmethod
+    def validate_openrouter_provider_only(
+        cls, v: Optional[List[str]]
+    ) -> Optional[List[str]]:
+        return ModelCreate.validate_openrouter_provider_only(v)
+
+    @model_validator(mode="after")
+    def validate_openrouter_provider(self) -> "ModelConnectionTestRequest":
+        has_openrouter_policy = (
+            self.openrouter_provider_only is not None
+            or self.openrouter_zdr
+            or self.openrouter_data_collection is not None
+        )
+        if has_openrouter_policy and (
+            self.category != "llm"
+            or self.model_provider.strip().lower() != "openrouter"
+        ):
+            raise ValueError("OpenRouter routing policy requires an OpenRouter LLM")
+        return self
 
 
 class UserDefaultModelCreate(BaseModel):
@@ -386,6 +454,9 @@ class ModelWithAccessInfo(BaseModel):
     sample_rate: Optional[int] = None
     temperature: Optional[float]
     context_window: Optional[int] = None
+    openrouter_provider_only: Optional[List[str]] = None
+    openrouter_zdr: bool = False
+    openrouter_data_collection: Optional[Literal["deny"]] = None
     dimension: Optional[int]
     abilities: Optional[List[str]]
     description: Optional[str]

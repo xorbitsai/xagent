@@ -50,6 +50,10 @@ export interface WidgetSessionCapabilities {
   // Present when the server offers voice calls to this session (the
   // advertised value is exactly `true`).
   voice?: true
+  // How the chat window shows the agent's processing steps. Absent means
+  // "show" (the default); the server only advertises a value that differs
+  // from it.
+  processView?: "collapsed" | "hidden"
 }
 
 export interface WidgetSession {
@@ -142,18 +146,23 @@ const parseFileUploads = (value: unknown): WidgetSessionFileUploads | undefined 
 
 // The parent forwards the server's capabilities untouched, so everything here
 // is untrusted. Each capability is read on its own: one that does not match
-// its documented shape is dropped without affecting the other, and a session
+// its documented shape is dropped without affecting the others, and a session
 // with none left counts as "no capabilities" (undefined) instead of failing.
 export const parseCapabilities = (value: unknown): WidgetSessionCapabilities | undefined => {
   if (!isRecord(value)) return undefined
   const fileUploads = parseFileUploads(value.file_uploads)
   const conversationHistory = isRecord(value.conversation_history)
   const voice = value.voice === true
-  if (!fileUploads && !conversationHistory && !voice) return undefined
+  const processView =
+    value.process_view === "collapsed" || value.process_view === "hidden"
+      ? value.process_view
+      : undefined
+  if (!fileUploads && !conversationHistory && !voice && !processView) return undefined
   return {
     ...(fileUploads ? { fileUploads } : {}),
     ...(conversationHistory ? { conversationHistory: true as const } : {}),
     ...(voice ? { voice: true as const } : {}),
+    ...(processView ? { processView } : {}),
   }
 }
 
@@ -344,6 +353,19 @@ export function useWidgetSession() {
 
   const requestReconnect = useCallback((reason: WidgetSessionReconnectReason) => {
     if (!mountedRef.current || terminalRef.current || recoveryInFlightRef.current) return
+    // The parent must stop counting this delivery as stable before the
+    // reconnect jitter starts; otherwise its 60-second timer can reset the
+    // rapid-recovery budget while the socket is already closed.
+    const deliveryId = activeDeliveryIdRef.current
+    const targetOrigin = targetOriginRef.current
+    if (reason === "ws_closed" && activeSessionGenerationRef.current !== null && deliveryId && targetOrigin) {
+      window.parent.postMessage({
+        xagent: true,
+        v: 1,
+        type: "session_connection_closed",
+        session_delivery_id: deliveryId,
+      }, targetOrigin)
+    }
     activeSessionGenerationRef.current = null
     issueReconnectRequest(reason)
   }, [issueReconnectRequest])

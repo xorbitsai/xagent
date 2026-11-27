@@ -393,7 +393,15 @@ class OpenRouterLLM(OpenAILLM):
         timeout: float = 180.0,
         abilities: Optional[List[str]] = None,
         timeout_config: Optional[TimeoutConfig] = None,
+        provider_only: Optional[List[str]] = None,
+        require_zdr: bool = False,
+        data_collection: Optional[str] = None,
     ):
+        self._provider_only = (
+            tuple(provider_only) if provider_only is not None else None
+        )
+        self._require_zdr = require_zdr
+        self._data_collection = data_collection
         super().__init__(
             model_name=model_name,
             base_url=base_url or OPENROUTER_BASE_URL,
@@ -1099,25 +1107,53 @@ class OpenRouterLLM(OpenAILLM):
             yield chunk
 
     def _prepare_extra_body(self, extra_body: Dict[str, Any]) -> Dict[str, Any]:
+        configured_provider = extra_body.get("provider")
+        has_caller_provider = "provider" in extra_body
+        has_saved_policy = (
+            self._provider_only is not None
+            or self._require_zdr
+            or self._data_collection is not None
+        )
         if (
-            not get_openrouter_official_providers_only()
-            or not self._is_official_openrouter_client()
-            or "provider" in extra_body
+            has_caller_provider
+            and not isinstance(configured_provider, dict)
+            and not has_saved_policy
         ):
             return extra_body
+        provider = (
+            dict(configured_provider) if isinstance(configured_provider, dict) else {}
+        )
 
-        author = _openrouter_model_author(self._model_name)
-        official_providers = _OPENROUTER_OFFICIAL_PROVIDERS_BY_AUTHOR.get(author)
-        if not official_providers:
-            return extra_body
+        if self._provider_only is not None:
+            provider.update(
+                {
+                    "only": list(self._provider_only),
+                    "allow_fallbacks": False,
+                }
+            )
+        elif (
+            get_openrouter_official_providers_only()
+            and self._is_official_openrouter_client()
+            and not has_caller_provider
+        ):
+            author = _openrouter_model_author(self._model_name)
+            official_providers = _OPENROUTER_OFFICIAL_PROVIDERS_BY_AUTHOR.get(author)
+            if official_providers:
+                provider.update(
+                    {
+                        "only": list(official_providers),
+                        "allow_fallbacks": False,
+                    }
+                )
 
-        return {
-            **extra_body,
-            "provider": {
-                "only": list(official_providers),
-                "allow_fallbacks": False,
-            },
-        }
+        if self._require_zdr:
+            provider["zdr"] = True
+        if self._data_collection is not None:
+            provider["data_collection"] = self._data_collection
+
+        if provider or has_caller_provider:
+            return {**extra_body, "provider": provider}
+        return extra_body
 
     def _provider_reasoning_intent(
         self,

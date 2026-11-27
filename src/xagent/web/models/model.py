@@ -27,6 +27,9 @@ if TYPE_CHECKING:
         # as Text in create_model_table().
         api_key = Column(Text, nullable=False)
         base_url = Column(String(500), nullable=True)
+        openrouter_provider_only = Column(JSON, nullable=True)
+        openrouter_zdr = Column(Boolean, nullable=True)
+        openrouter_data_collection = Column(String(16), nullable=True)
         bedrock_region = Column(String(64), nullable=True)
         bedrock_auth_mode = Column(String(32), nullable=True)
         language = Column(String(64), nullable=True)

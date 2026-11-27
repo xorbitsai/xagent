@@ -11,6 +11,8 @@ the host's stdout.
 
 import json
 import os
+import threading
+import time
 import shutil
 import signal
 import subprocess
@@ -71,12 +73,21 @@ def _timeout_result(timeout_seconds: float) -> Dict[str, Any]:
     }
 
 
+def _cancelled_result() -> Dict[str, Any]:
+    return {
+        "success": False,
+        "output": "",
+        "error": "Execution was cancelled.",
+    }
+
+
 def run_python_code_in_subprocess(
     code: str,
     *,
     capture_output: bool = True,
     working_directory: Optional[str] = None,
     timeout_seconds: float,
+    cancel_event: Optional[threading.Event] = None,
 ) -> Dict[str, Any]:
     """
     Execute Python code in a child process and return the executor result.
@@ -128,11 +139,23 @@ def run_python_code_in_subprocess(
                 stderr=stderr_file,
                 start_new_session=os.name == "posix",
             )
-            try:
-                process.wait(timeout=timeout_seconds)
-            except subprocess.TimeoutExpired:
-                _kill_process_group(process)
-                return _timeout_result(timeout_seconds)
+            # Poll instead of blocking wait so a cancellation signal
+            # (cancel_event) can kill the process group promptly.
+            deadline = time.monotonic() + timeout_seconds
+            while True:
+                if process.poll() is not None:
+                    break
+                if cancel_event is not None and cancel_event.is_set():
+                    _kill_process_group(process)
+                    return _cancelled_result()
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    _kill_process_group(process)
+                    return _timeout_result(timeout_seconds)
+                try:
+                    process.wait(timeout=min(remaining, 0.2))
+                except subprocess.TimeoutExpired:
+                    pass
 
         try:
             with open(result_path, encoding="utf-8") as f:

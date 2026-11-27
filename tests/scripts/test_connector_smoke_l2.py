@@ -86,7 +86,9 @@ def test_unconnected_expected_app_reports_why() -> None:
     )
 
 
-def _unavailable(*phases: str, reason: str | None = None) -> dict[str, Any]:
+def _unavailable(
+    *phases: str, reason: str | None = None, outcome: str | None = None
+) -> dict[str, Any]:
     detail: dict[str, Any] = {
         "code": "mcp_tools_unavailable",
         "message": "MCP server tools could not be loaded.",
@@ -96,6 +98,8 @@ def _unavailable(*phases: str, reason: str | None = None) -> dict[str, Any]:
     }
     if reason is not None:
         detail["reason"] = reason
+    if outcome is not None:
+        detail["outcome"] = outcome
     return {"detail": detail}
 
 
@@ -143,6 +147,24 @@ def _unavailable(*phases: str, reason: str | None = None) -> dict[str, Any]:
         (502, _unavailable("auth_rejected"), False, "not connected (auth_rejected)"),
         (502, _unavailable("session_start"), False, "failed to start (session_start)"),
         (502, _unavailable("initialize"), False, "failed to start (initialize)"),
+        (
+            502,
+            _unavailable("initialize", outcome="timed_out"),
+            False,
+            "timed out on the server",
+        ),
+        (
+            502,
+            _unavailable(outcome="timed_out"),
+            False,
+            "timed out on the server",
+        ),
+        (
+            502,
+            _unavailable("initialize", outcome="no_tools"),
+            False,
+            "failed to start (initialize)",
+        ),
         (
             502,
             _unavailable(reason="sandbox_unavailable"),

@@ -151,6 +151,14 @@ def check_request_error(app_id: str, reason: str) -> CheckResult:
 
 
 def _unavailable_reason(detail: Mapping[str, Any]) -> str:
+    # The route's 502 body carries the connector session's outcome
+    # (timed_out, no_tools, failed_to_start, not_connected), which
+    # distinguishes a connector that hung from one that exited during
+    # the handshake.  Use it when present so L2 can report "timed out"
+    # without guessing from the phase.
+    outcome = detail.get("outcome")
+    if outcome == "timed_out":
+        return "timed out on the server"
     # A failure before any load (sandbox lease, config scan) carries a reason;
     # a load failure carries the phase of each server that failed.
     if detail.get("reason") is not None:

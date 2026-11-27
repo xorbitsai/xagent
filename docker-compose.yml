@@ -36,20 +36,36 @@ services:
     restart: unless-stopped
     # Don't expose ports, only accessible through nginx
     environment:
+      - XAGENT_ENVIRONMENT=${XAGENT_ENVIRONMENT:-production}
       - DATABASE_URL=postgresql://xagent:${POSTGRES_PASSWORD:-xagent_password}@postgres:5432/xagent
       - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-xagent_password}
       - BACKEND_PORT=8000
       - XAGENT_UPLOADS_DIR=/root/.xagent/uploads
+      # The published image runs this service as root for its existing volume
+      # layout. Keep the compatibility opt-in explicit here; non-root
+      # deployments should set this to false and use Chromium's sandbox.
+      - XAGENT_BROWSER_ALLOW_UNSANDBOXED=${XAGENT_BROWSER_ALLOW_UNSANDBOXED:-true}
       - XAGENT_MAX_UPLOAD_SIZE=${XAGENT_MAX_UPLOAD_SIZE:-100M}
+      - XAGENT_ARTIFACT_VALIDATION_MAX_BYTES=${XAGENT_ARTIFACT_VALIDATION_MAX_BYTES:-32M}
+      - XAGENT_ARTIFACT_VALIDATION_TIMEOUT_SECONDS=${XAGENT_ARTIFACT_VALIDATION_TIMEOUT_SECONDS:-8}
       - XAGENT_REDIS_URL=redis://redis:6379/0
       - XAGENT_HOT_PATH_CACHE_ENABLED=${XAGENT_HOT_PATH_CACHE_ENABLED:-true}
       - XAGENT_CELERY_ENABLED=${XAGENT_CELERY_ENABLED:-true}
       - XAGENT_CELERY_BROKER_URL=redis://redis:6379/1
       - XAGENT_BACKGROUND_JOB_VISIBILITY_TIMEOUT_SECONDS=${XAGENT_BACKGROUND_JOB_VISIBILITY_TIMEOUT_SECONDS:-3600}
+      # This backend sits behind the single nginx hop above, which sets
+      # X-Forwarded-For in append mode. Trust exactly that one hop so every
+      # per-IP rate limit (share/widget auth, task-create, run sub-quota,
+      # trigger callbacks) keys on the real client IP instead of nginx's
+      # container IP — otherwise all client traffic collapses onto one IP and
+      # per-IP caps become a single global cap. Raise only if you add more
+      # trusted proxies (CDN/LB) in front of nginx.
+      - XAGENT_TRUSTED_PROXY_HOPS=${XAGENT_TRUSTED_PROXY_HOPS:-1}
     env_file:
       - .env
     volumes:
       - xagent_data:/root/.xagent
+      - xagent_secrets:/run/xagent-secrets
     depends_on:
       postgres:
         condition: service_healthy
@@ -80,10 +96,14 @@ services:
         "--loglevel=INFO",
       ]
     environment:
+      - XAGENT_ENVIRONMENT=${XAGENT_ENVIRONMENT:-production}
       - DATABASE_URL=postgresql://xagent:${POSTGRES_PASSWORD:-xagent_password}@postgres:5432/xagent
       - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-xagent_password}
       - XAGENT_UPLOADS_DIR=/root/.xagent/uploads
+      - XAGENT_BROWSER_ALLOW_UNSANDBOXED=${XAGENT_BROWSER_ALLOW_UNSANDBOXED:-true}
       - XAGENT_MAX_UPLOAD_SIZE=${XAGENT_MAX_UPLOAD_SIZE:-100M}
+      - XAGENT_ARTIFACT_VALIDATION_MAX_BYTES=${XAGENT_ARTIFACT_VALIDATION_MAX_BYTES:-32M}
+      - XAGENT_ARTIFACT_VALIDATION_TIMEOUT_SECONDS=${XAGENT_ARTIFACT_VALIDATION_TIMEOUT_SECONDS:-8}
       - XAGENT_REDIS_URL=redis://redis:6379/0
       - XAGENT_HOT_PATH_CACHE_ENABLED=${XAGENT_HOT_PATH_CACHE_ENABLED:-true}
       - XAGENT_CELERY_ENABLED=${XAGENT_CELERY_ENABLED:-true}
@@ -93,6 +113,7 @@ services:
       - .env
     volumes:
       - xagent_data:/root/.xagent
+      - xagent_secrets:/run/xagent-secrets
     depends_on:
       postgres:
         condition: service_healthy
@@ -115,6 +136,7 @@ services:
         "--loglevel=INFO",
       ]
     environment:
+      - XAGENT_ENVIRONMENT=${XAGENT_ENVIRONMENT:-production}
       - DATABASE_URL=postgresql://xagent:${POSTGRES_PASSWORD:-xagent_password}@postgres:5432/xagent
       - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-xagent_password}
       - XAGENT_REDIS_URL=redis://redis:6379/0
@@ -125,6 +147,7 @@ services:
       - .env
     volumes:
       - xagent_data:/root/.xagent
+      - xagent_secrets:/run/xagent-secrets
     depends_on:
       postgres:
         condition: service_healthy
@@ -135,7 +158,7 @@ services:
 
   # PostgreSQL Database
   postgres:
-    image: postgres:16-bookworm
+    image: postgres:${POSTGRES_IMAGE_TAG:-17-bookworm}
     container_name: xagent_postgres
     restart: unless-stopped
     environment:
@@ -173,6 +196,8 @@ volumes:
   postgres_data:
     driver: local
   xagent_data:
+    driver: local
+  xagent_secrets:
     driver: local
   redis_data:
     driver: local

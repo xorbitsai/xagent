@@ -1686,12 +1686,15 @@ MAX_LISTED_COMMITS = 100
 _ISO_DATE_RE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}")
 
 
+_NO_ESTIMATE_HINT = "Tell the user the result is unavailable rather than estimating it."
+
+
 class _IncompleteScanError(RuntimeError):
     """A complete scan stopped before GitHub's last page."""
 
 
 def _collect_all_pages(
-    path: str, params: dict[str, Any], *, what: str
+    path: str, params: dict[str, Any], *, what: str, narrow_hint: str = ""
 ) -> list[dict[str, Any]]:
     """GET every page of a GitHub list endpoint, following the Link header.
 
@@ -1709,8 +1712,8 @@ def _collect_all_pages(
             raise _IncompleteScanError(
                 f"Result incomplete: reading {what} hit the "
                 f"{MAX_COMPLETE_SCAN_SECONDS}s time limit after {page - 1} "
-                "page(s), so no count is returned. Tell the user the result "
-                "is unavailable rather than estimating it."
+                "page(s), so no count is returned. "
+                + (narrow_hint or _NO_ESTIMATE_HINT)
             )
         response = _request_raw(
             "GET",
@@ -1731,8 +1734,7 @@ def _collect_all_pages(
     raise _IncompleteScanError(
         f"Result incomplete: {what} span more than {MAX_COMPLETE_SCAN_PAGES} "
         f"pages ({MAX_COMPLETE_SCAN_PAGES * MAX_PER_PAGE} items), so no count "
-        "is returned. Tell the user the result is unavailable rather than "
-        "estimating it."
+        "is returned. " + (narrow_hint or _NO_ESTIMATE_HINT)
     )
 
 
@@ -1742,7 +1744,8 @@ def github_list_branches(repo: str, prefix: str = "") -> str:
     Count a repository's branches and list every branch name, or every name
     starting with `prefix`.
     repo: "owner/repo".
-    prefix: optional case-sensitive name prefix, e.g. "xero/" (default: all).
+    prefix: optional literal, case-sensitive name prefix, e.g. "xero/"
+    (default: all). Wildcards such as "xero/*" are not supported.
 
     Use this for "how many branches are there" or "which branches start with
     X". It reads every page itself: total_count counts all branches in the
@@ -1753,6 +1756,14 @@ def github_list_branches(repo: str, prefix: str = "") -> str:
     """
     try:
         owner, name = _parse_repo(repo)
+        if _FORBIDDEN_BRANCH_CHARS.search(prefix):
+            # No branch name can contain these, so a "0 matches, complete"
+            # answer would state a false fact about the repository.
+            raise ValueError(
+                f"prefix contains characters no branch name can contain: "
+                f"{prefix!r} (pass a literal prefix such as 'xero/', no "
+                "wildcards or spaces)"
+            )
         raw = _collect_all_pages(
             f"/repos/{owner}/{name}/branches", {}, what=f"the branches of {repo}"
         )
@@ -1773,6 +1784,9 @@ def github_list_branches(repo: str, prefix: str = "") -> str:
             branches=matching,
             complete=True,
         )
+    except _IncompleteScanError as e:
+        logger.warning(f"Incomplete GitHub branch scan for {repo}: {e}")
+        return _error(str(e))
     except Exception as e:
         logger.error(f"Error listing GitHub branches for {repo}: {e}", exc_info=True)
         return _error(str(e))
@@ -1808,22 +1822,25 @@ def github_count_commits(
     repo: "owner/repo".
     since_date, until_date: local dates in `timezone`, YYYY-MM-DD.
     timezone: IANA zone name such as "Australia/Sydney", "America/New_York"
-    or "UTC". Ask the user which zone they mean instead of assuming one.
+    or "UTC" -- the user's zone when known; if it is not, ask rather than
+    assume one.
     branch: branch name (default: the repository's default branch).
 
     Use this, not github_list_commits, for "how many commits between X and
     Y". It converts the local days to exact instants itself, including any
     daylight-saving change inside the window -- do not convert times
-    yourself. Dates are committer dates (when the commit was made on the
-    branch, which is what GitHub filters by); author dates can differ for
-    rebased or cherry-picked commits.
+    yourself. Dates are committer dates, which is what GitHub filters by. A
+    commit's committer date is set when it is created (or rebased, squashed
+    or cherry-picked); a commit brought in by a plain merge keeps its own
+    date rather than the merge time, and author dates can differ.
 
     Returns commit_count, the exact window_start/window_end, and up to 100
-    commits (newest first) with committed_at shown in `timezone`;
+    commits in GitHub's order with committed_at shown in `timezone`;
     commits_listed_truncated is true when more were counted than listed.
     A successful result is always complete -- if the window holds more
     commits than this tool can read, it returns an error instead of a
-    partial count. Always state the time zone when reporting the result.
+    partial count; count shorter date ranges and add them up instead.
+    Always state the time zone when reporting the result.
     """
     try:
         owner, name = _parse_repo(repo)
@@ -1857,6 +1874,10 @@ def github_count_commits(
             f"/repos/{owner}/{name}/commits",
             params,
             what=f"the commits of {repo} in this date window",
+            narrow_hint=(
+                "Split the window into shorter date ranges, count each, and "
+                "add the counts; do not estimate."
+            ),
         )
         counted: list[dict[str, Any]] = []
         for commit in raw:
@@ -1893,6 +1914,9 @@ def github_count_commits(
             commits=counted[:MAX_LISTED_COMMITS],
             commits_listed_truncated=len(counted) > MAX_LISTED_COMMITS,
         )
+    except _IncompleteScanError as e:
+        logger.warning(f"Incomplete GitHub commit scan for {repo}: {e}")
+        return _error(str(e))
     except Exception as e:
         logger.error(f"Error counting GitHub commits for {repo}: {e}", exc_info=True)
         return _error(str(e))

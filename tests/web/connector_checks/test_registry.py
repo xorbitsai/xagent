@@ -2655,6 +2655,12 @@ _GITHUB_READS_BEYOND_THE_FIVE_TOOLS = frozenset(
     }
 )
 
+# Reads added after the 80% cut was measured (xorbitsai/xagent-saas#3584,
+# #3585): no call volume ranks them yet, so they take the plain read reason.
+_GITHUB_READS_ADDED_AFTER_THE_CUT = frozenset(
+    {"github_count_commits", "github_list_branches"}
+)
+
 # The writes that create an object GitHub's own tools cannot remove: the server
 # has no delete tool at all, so a write check would have nothing to clean up
 # with. A release edit is the one write that creates no object.
@@ -2774,8 +2780,22 @@ def test_a_github_read_outside_the_five_is_exempt_for_the_cut() -> None:
     for tool in _GITHUB_READS_BEYOND_THE_FIVE_TOOLS:
         assert exemptions[tool] == _GITHUB_READS_BEYOND_THE_FIVE, tool
     assert set(exemptions) == _GITHUB_READS_BEYOND_THE_FIVE_TOOLS | (
-        _GITHUB_WRITES_WITHOUT_CLEANUP | {"github_update_release"}
+        _GITHUB_READS_ADDED_AFTER_THE_CUT
+        | _GITHUB_WRITES_WITHOUT_CLEANUP
+        | {"github_update_release"}
     )
+
+
+def test_a_github_read_added_after_the_cut_waits_on_tier_1() -> None:
+    exemptions = {
+        exemption.tool: exemption.reason
+        for exemption in CONNECTOR_CHECKS["github"].exemptions
+    }
+
+    for tool in _GITHUB_READS_ADDED_AFTER_THE_CUT:
+        assert exemptions[tool] == (
+            "read; whether it gets a read check is decided in #3568"
+        ), tool
 
 
 def test_a_github_write_has_no_cleanup_tool() -> None:

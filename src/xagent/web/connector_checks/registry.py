@@ -1079,6 +1079,7 @@ CONNECTOR_CHECKS: Mapping[str, ConnectorChecks] = {
             ),
             *_exemptions(
                 issue=_GITHUB_TIER_1,
+                reads=("github_count_commits", "github_list_branches"),
                 in_place_edits=("github_update_release",),
                 writes_without_cleanup=(
                     "github_comment_on_issue",

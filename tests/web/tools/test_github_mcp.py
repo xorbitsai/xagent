@@ -5172,6 +5172,7 @@ def test_complete_scan_fails_closed_when_time_budget_runs_out(monkeypatch):
 
     assert result["status"] == "error"
     assert "incomplete" in result["message"]
+    assert "rather than estimating" in result["message"]
     assert len(calls) == 1
 
 
@@ -5311,3 +5312,119 @@ def test_count_commits_caps_listed_commits_but_not_the_count(monkeypatch):
     assert result["commit_count"] == 150
     assert len(result["commits"]) == github.MAX_LISTED_COMMITS
     assert result["commits_listed_truncated"] is True
+
+
+def test_get_pull_request_does_not_take_a_boolean_for_a_statistic(monkeypatch):
+    monkeypatch.setattr(
+        github.requests,
+        "request",
+        Mock(
+            return_value=MockResponse(
+                json_data={
+                    "changed_files": True,
+                    "additions": 1,
+                    "deletions": 1,
+                    "commits": 1,
+                }
+            )
+        ),
+    )
+
+    result = json.loads(github.github_get_pull_request("octocat/Hello-World", 1))
+
+    assert result["change_stats"]["changed_files"] is None
+    assert result["missing_stats"] == ["changed_files"]
+
+
+@pytest.mark.parametrize("prefix", ["xero/*", " xero/", "xero/[ab]"])
+def test_list_branches_rejects_a_prefix_no_branch_can_match(monkeypatch, prefix):
+    """A wildcard or a space would otherwise come back as a confident
+    "0 matches, complete" -- a false statement about the repository."""
+    mock_request = Mock()
+    monkeypatch.setattr(github.requests, "request", mock_request)
+
+    result = json.loads(github.github_list_branches("octocat/Hello-World", prefix))
+
+    assert result["status"] == "error"
+    assert "literal prefix" in result["message"]
+    mock_request.assert_not_called()
+
+
+def test_complete_scan_fails_closed_on_mid_scan_rate_limit(monkeypatch):
+    """A rate limit on page 2 must not sleep inside the scan (its deadline
+    cannot see that sleep) and must not hand back page 1 as the total."""
+    mock_request = Mock(
+        side_effect=[
+            MockResponse(
+                json_data=[{"name": "a"}],
+                headers={"Link": '<https://api.github.com/x?page=2>; rel="next"'},
+            ),
+            MockResponse(
+                json_data={"message": "rate limited"},
+                status_code=429,
+                headers={"Retry-After": "1"},
+            ),
+        ]
+    )
+    monkeypatch.setattr(github.requests, "request", mock_request)
+    sleep_mock = Mock()
+    monkeypatch.setattr(github, "_sleep", sleep_mock)
+
+    result = json.loads(github.github_list_branches("octocat/Hello-World"))
+
+    assert result["status"] == "error"
+    assert "rate limited" in result["message"]
+    assert "total_count" not in result
+    assert mock_request.call_count == 2
+    sleep_mock.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("page", "expected"),
+    [
+        ({"message": "not a list"}, "non-list page"),
+        ([{"name": "main"}, {"protected": False}], "without a name"),
+    ],
+)
+def test_list_branches_rejects_malformed_pages(monkeypatch, page, expected):
+    monkeypatch.setattr(
+        github.requests, "request", Mock(return_value=MockResponse(json_data=page))
+    )
+
+    result = json.loads(github.github_list_branches("octocat/Hello-World"))
+
+    assert result["status"] == "error"
+    assert expected in result["message"]
+
+
+def test_count_commits_rejects_a_commit_without_committer_date(monkeypatch):
+    broken = _commit("broken", "2026-10-02T00:00:00Z")
+    del broken["commit"]["committer"]
+    fake, _ = _paged([[broken]])
+    monkeypatch.setattr(github.requests, "request", fake)
+
+    result = json.loads(
+        github.github_count_commits(
+            "octocat/Hello-World", "2026-10-01", "2026-10-10", "UTC"
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "without a committer date" in result["message"]
+
+
+def test_count_commits_limit_error_says_to_split_the_window(monkeypatch):
+    pages = [
+        [_commit(f"c{p}-{i}", "2026-10-02T00:00:00Z") for i in range(100)]
+        for p in range(50)
+    ]
+    fake, _ = _paged(pages)
+    monkeypatch.setattr(github.requests, "request", fake)
+
+    result = json.loads(
+        github.github_count_commits(
+            "octocat/Hello-World", "2026-10-01", "2026-10-10", "UTC"
+        )
+    )
+
+    assert "shorter date ranges" in result["message"]

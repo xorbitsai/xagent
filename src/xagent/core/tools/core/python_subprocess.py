@@ -28,6 +28,19 @@ module = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(module)
 with open(sys.argv[2], encoding="utf-8") as f:
     request = json.load(f)
+
+# Install a fallback deadline in the child itself (issue #3256).
+# The parent's process.wait(timeout=...) is the primary deadline, but if
+# the backend crashes or is restarted the detached child has no limit left.
+# signal.alarm gives the child its own bound so it cannot run forever.
+# User code that calls signal.alarm or replaces the SIGALRM handler will
+# override this fallback -- that is an accepted edge case.
+_alarm_seconds = request.get("alarm_seconds")
+if _alarm_seconds and _alarm_seconds > 0 and hasattr(__import__("signal"), "alarm"):
+    import signal as _signal
+    _signal.signal(_signal.SIGALRM, lambda *_: os._exit(1))
+    _signal.alarm(int(_alarm_seconds))
+
 result = module.PythonExecutorCore(request["working_directory"]).execute_code(
     request["code"], request["capture_output"]
 )
@@ -45,6 +58,9 @@ os._exit(0)
 
 _EXECUTOR_PATH = Path(__file__).with_name("python_executor.py")
 _STDERR_TAIL_BYTES = 2000
+
+# Grace seconds added to the parent timeout for the child alarm (issue #3256).
+_ALARM_GRACE_SECONDS = 5
 
 
 def _kill_process_group(process: "subprocess.Popen[bytes]") -> None:
@@ -96,11 +112,17 @@ def run_python_code_in_subprocess(
         result_path = os.path.join(temp_dir, "result.json")
         stderr_path = os.path.join(temp_dir, "stderr.txt")
         with open(request_path, "w", encoding="utf-8") as f:
+            # alarm_seconds gives the child its own fallback deadline (issue #3256).
+            # A grace period beyond the parent timeout lets the parent report
+            # the timeout under normal conditions; the alarm only fires if the
+            # parent has died and can no longer kill the process group.
+            alarm_seconds = int(timeout_seconds) + _ALARM_GRACE_SECONDS
             json.dump(
                 {
                     "code": code,
                     "capture_output": capture_output,
                     "working_directory": working_directory,
+                    "alarm_seconds": alarm_seconds,
                 },
                 f,
             )

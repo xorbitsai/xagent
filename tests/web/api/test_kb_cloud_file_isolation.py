@@ -10,6 +10,7 @@ from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import pytest
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
 from sqlalchemy.exc import OperationalError
@@ -223,8 +224,9 @@ def test_a_file_raising_outside_its_try_does_not_end_the_request(
     metadata_store.save_collection_config.assert_awaited_once()
 
 
+@pytest.mark.parametrize("gated", [True, False], ids=["gated", "ungated"])
 def test_each_cloud_file_bills_the_requesting_member(
-    test_env, temp_uploads, monkeypatch
+    test_env, temp_uploads, monkeypatch, gated
 ) -> None:
     from xagent.core.model.chat.token_context import MediaCallType, add_media_usage
     from xagent.core.tools.core.RAG_tools.utils import model_resolution_pin
@@ -232,10 +234,11 @@ def test_each_cloud_file_bills_the_requesting_member(
 
     app, headers, user, _ = test_env
     _connect_drive(test_env, monkeypatch)
-    pins: list = []
+    resolver_pins: list = []
+    ingestion_pins: list = []
 
     def _resolve(*_args, **_kwargs):
-        pins.append(model_resolution_pin._active_pin.get())
+        resolver_pins.append(model_resolution_pin._active_pin.get())
         return ("team-embedding",)
 
     gate_calls: list = []
@@ -244,7 +247,7 @@ def test_each_cloud_file_bills_the_requesting_member(
         gate_calls.append((user_id, source, model_ids))
 
     def _ingest(**_kwargs):
-        pins.append(model_resolution_pin._active_pin.get())
+        ingestion_pins.append(model_resolution_pin._active_pin.get())
         add_media_usage(call_type=MediaCallType.EMBEDDING, quantity=2, model_id="e")
         return IngestionResult(
             status="success",
@@ -277,7 +280,7 @@ def test_each_cloud_file_bills_the_requesting_member(
     quota_hooks.set_standalone_usage_hook(
         lambda user_id, details, source: calls.append((user_id, details, source))
     )
-    quota_hooks.set_standalone_gate_hook(_gate)
+    quota_hooks.set_standalone_gate_hook(_gate if gated else None)
     try:
         with ExitStack() as stack:
             for p in (
@@ -315,11 +318,18 @@ def test_each_cloud_file_bills_the_requesting_member(
         quota_hooks.set_standalone_gate_hook(None)
 
     assert [e["status"] for e in response.json()] == ["success", "success"]
-    # Resolved once; every file is ingested under that resolution.
-    assert len(pins) == 3 and pins[0] is not None
-    assert pins[1] is pins[0] and pins[2] is pins[0]
-    # Checked up front and again as each file starts, on that resolution.
-    assert gate_calls == [(int(user.id), "kb_ingest_cloud", ("team-embedding",))] * 3
+    if gated:
+        [resolved_under] = resolver_pins
+        assert resolved_under is not None
+        first_file_pin, second_file_pin = ingestion_pins
+        assert first_file_pin is resolved_under and second_file_pin is resolved_under
+        assert (
+            gate_calls == [(int(user.id), "kb_ingest_cloud", ("team-embedding",))] * 3
+        )
+    else:
+        assert resolver_pins == []
+        assert ingestion_pins == [None, None]
+        assert gate_calls == []
     # One delivery per file, each from the thread that ran its ingestion.
     assert sorted((u, s, len(d), d[0]["quantity"]) for u, d, s in calls) == [
         (int(user.id), "kb_ingest_cloud", 1, 2.0),

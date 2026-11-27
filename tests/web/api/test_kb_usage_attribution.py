@@ -291,15 +291,18 @@ def test_kb_work_runs_under_the_resolution_it_was_gated_on(
     client, model_gate, tmp_path, path, data, files, resolver, work, source, gates
 ):
     pins: list = []
+    threads: list[int] = []
     model_ids = ("platform/text-embedding-v4",)
 
     def resolve(*_args: Any, **kwargs: Any) -> tuple[str, ...]:
         # The tenant's view of the collection, as the pipeline resolves it.
         assert kwargs["user_id"] == STORAGE_ID
+        threads.append(threading.get_ident())
         pins.append(_active_pin())
         return model_ids
 
     def run(*_args: Any, **_kwargs: Any) -> Any:
+        threads.append(threading.get_ident())
         pins.append(_active_pin())
         raise RuntimeError("stop")
 
@@ -327,6 +330,9 @@ def test_kb_work_runs_under_the_resolution_it_was_gated_on(
     assert model_gate == [(ACTOR_ID, source, model_ids)] * gates
     [resolved_under, ran_under] = pins
     assert resolved_under is not None and ran_under is resolved_under
+    if source == "kb_search":
+        resolver_thread, handler_thread = threads
+        assert resolver_thread != handler_thread
 
 
 @pytest.mark.parametrize(
@@ -374,55 +380,74 @@ def test_a_job_is_gated_on_the_resolved_model_when_queued(
 
 
 @pytest.mark.parametrize(
-    "path,data,files,resolver",
+    "path,data,files,resolver,work",
     [
         (
             "/api/kb/search",
             {"collection": "team-kb", "query_text": "q"},
             None,
             "resolve_search_model_ids",
+            "run_document_search",
+        ),
+        (
+            "/api/kb/ingest",
+            {"collection": "team-kb"},
+            {"file": ("notes.txt", b"abc", "text/plain")},
+            "resolve_ingestion_model_ids",
+            "run_document_ingestion_with_outcome",
+        ),
+        (
+            "/api/kb/ingest-web",
+            {"collection": "team-kb", "start_url": "https://example.com"},
+            None,
+            "resolve_ingestion_model_ids",
+            "run_web_ingestion_with_outcome",
         ),
         (
             "/api/kb/ingest/jobs",
             {"collection": "team-kb"},
             {"file": ("notes.txt", b"abc", "text/plain")},
             "resolve_ingestion_model_ids",
+            "create_background_job",
         ),
         (
             "/api/kb/ingest-web/jobs",
             {"collection": "team-kb", "start_url": "https://example.com"},
             None,
             "resolve_ingestion_model_ids",
+            "create_background_job",
         ),
     ],
-    ids=["search", "ingest-job", "ingest-web-job"],
+    ids=["search", "ingest", "ingest-web", "ingest-job", "ingest-web-job"],
 )
 def test_without_a_gate_nothing_is_resolved_for_it(
-    client, tmp_path, path, data, files, resolver
+    client, tmp_path, path, data, files, resolver, work
 ):
     pins: list = []
 
-    def search(**_kwargs: Any) -> Any:
+    def run(*_args: Any, **_kwargs: Any) -> Any:
         pins.append(_active_pin())
         raise RuntimeError("stop")
 
     with (
         patch.object(kb_module, resolver) as resolve,
-        patch.object(kb_module, "run_document_search", side_effect=search),
+        patch.object(kb_module, work, side_effect=run),
         patch.object(
-            kb_module, "get_upload_path", return_value=str(tmp_path / "f.txt")
+            kb_module,
+            "get_non_terminal_background_job_by_idempotency_key",
+            return_value=None,
         ),
+        patch.object(kb_module, "get_upload_path", return_value=tmp_path / "f.txt"),
         patch.object(
             kb_module, "_ensure_background_job_queue_available_async", new=AsyncMock()
         ),
         patch.object(
             kb_module,
-            "_enqueue_background_job_or_503_async",
-            side_effect=RuntimeError("stop"),
+            "_upsert_uploaded_file_record",
+            return_value=MagicMock(file_id="file-1"),
         ),
     ):
         client.post(path, data=data, files=files)
 
     resolve.assert_not_called()
-    # And nothing is pinned: the work resolves as it did before gating.
-    assert pins == ([None] if path == "/api/kb/search" else [])
+    assert pins == [None]

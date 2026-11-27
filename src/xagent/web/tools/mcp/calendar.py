@@ -6,6 +6,7 @@ from typing import Any
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build  # type: ignore
 from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp.exceptions import ToolError
 
 from .utils import setup_proxy_env
 
@@ -76,7 +77,7 @@ def google_calendar_search_events(
 
     except Exception as e:
         logger.error(f"Error listing events: {e}")
-        return json.dumps({"status": "error", "message": str(e)})
+        raise ToolError(str(e)) from e
 
 
 @mcp.tool()
@@ -116,7 +117,7 @@ def google_calendar_create_events(
 
     except Exception as e:
         logger.error(f"Error creating event: {e}")
-        return json.dumps({"status": "error", "message": str(e)})
+        raise ToolError(str(e)) from e
 
 
 @mcp.tool()
@@ -130,7 +131,7 @@ def google_calendar_get_event(event_id: str) -> str:
         return json.dumps({"status": "success", "event": event})
     except Exception as e:
         logger.error(f"Error getting event: {e}")
-        return json.dumps({"status": "error", "message": str(e)})
+        raise ToolError(str(e)) from e
 
 
 @mcp.tool()
@@ -172,7 +173,7 @@ def google_calendar_update_events(
 
     except Exception as e:
         logger.error(f"Error updating event: {e}")
-        return json.dumps({"status": "error", "message": str(e)})
+        raise ToolError(str(e)) from e
 
 
 @mcp.tool()
@@ -188,7 +189,7 @@ def google_calendar_delete_events(event_id: str) -> str:
         )
     except Exception as e:
         logger.error(f"Error deleting event: {e}")
-        return json.dumps({"status": "error", "message": str(e)})
+        raise ToolError(str(e)) from e
 
 
 if __name__ == "__main__":

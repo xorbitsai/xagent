@@ -6,6 +6,7 @@ from urllib.parse import quote
 
 import requests
 from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp.exceptions import ToolError
 
 from .utils import setup_proxy_env
 
@@ -107,7 +108,7 @@ def auth_status() -> str:
         )
     except Exception as e:
         logger.error("Error checking Teams auth status: %s", e)
-        return _error(str(e))
+        raise ToolError(str(e)) from e
 
 
 @mcp.tool()
@@ -127,7 +128,7 @@ def get_current_user() -> str:
         return _success(user=me)
     except Exception as e:
         logger.error("Error getting current Teams user: %s", e)
-        return _error(str(e))
+        raise ToolError(str(e)) from e
 
 
 @mcp.tool()
@@ -142,7 +143,7 @@ def list_teams(top: int = 25) -> str:
         return _success(teams=result.get("value", []))
     except Exception as e:
         logger.error("Error listing Teams: %s", e)
-        return _error(str(e))
+        raise ToolError(str(e)) from e
 
 
 @mcp.tool()
@@ -157,7 +158,7 @@ def list_channels(team_id: str, top: int = 50) -> str:
         return _success(channels=result.get("value", []))
     except Exception as e:
         logger.error("Error listing channels for team %s: %s", team_id, e)
-        return _error(str(e))
+        raise ToolError(str(e)) from e
 
 
 @mcp.tool()
@@ -172,7 +173,7 @@ def list_team_members(team_id: str, top: int = 50) -> str:
         return _success(members=result.get("value", []))
     except Exception as e:
         logger.error("Error listing team members for %s: %s", team_id, e)
-        return _error(str(e))
+        raise ToolError(str(e)) from e
 
 
 @mcp.tool()
@@ -198,7 +199,7 @@ def get_channel_messages(team_id: str, channel_id: str, top: int = 20) -> str:
             channel_id,
             e,
         )
-        return _error(str(e))
+        raise ToolError(str(e)) from e
 
 
 @mcp.tool()
@@ -226,7 +227,7 @@ def send_channel_message(
             channel_id,
             e,
         )
-        return _error(str(e))
+        raise ToolError(str(e)) from e
 
 
 @mcp.tool()
@@ -241,7 +242,7 @@ def list_chats(top: int = 20) -> str:
         return _success(chats=result.get("value", []))
     except Exception as e:
         logger.error("Error listing chats: %s", e)
-        return _error(str(e))
+        raise ToolError(str(e)) from e
 
 
 @mcp.tool()
@@ -259,7 +260,7 @@ def get_chat_messages(chat_id: str, top: int = 20) -> str:
         )
     except Exception as e:
         logger.error("Error getting chat messages for %s: %s", chat_id, e)
-        return _error(str(e))
+        raise ToolError(str(e)) from e
 
 
 @mcp.tool()
@@ -278,7 +279,7 @@ def send_chat_message(
         return _success(message=result)
     except Exception as e:
         logger.error("Error sending chat message for %s: %s", chat_id, e)
-        return _error(str(e))
+        raise ToolError(str(e)) from e
 
 
 if __name__ == "__main__":

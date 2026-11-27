@@ -195,7 +195,34 @@ class ExecutionRegistry:
             return None
         if handle.status == ExecutionLifecycleStatus.CANCELLED:
             return None
-        result = await handle.runner.resume(execution_id, **kwargs)
+        # Wrap the resumed execution in an asyncio task so that the handle
+        # tracks it as running.  Without this, handle.is_running returns
+        # False during the resumed execution and callers cannot pause or
+        # cancel it through the registry.  (Refs #3946)
+        run_task = asyncio.create_task(handle.runner.resume(execution_id, **kwargs))
+        handle.task = run_task
+        handle.status = ExecutionLifecycleStatus.RUNNING
+        handle.updated_at = _utcnow()
+        self._emit_event("execution.started", handle)
+        try:
+            result = await run_task
+        except asyncio.CancelledError:
+            handle.task = None
+            handle.status = ExecutionLifecycleStatus.CANCELLED
+            handle.last_error = "Execution task was cancelled."
+            handle.updated_at = _utcnow()
+            self._emit_event("execution.cancelled", handle)
+            self.unregister(execution_id)
+            raise
+        except Exception:  # noqa: BLE001
+            handle.task = None
+            handle.status = ExecutionLifecycleStatus.FAILED
+            handle.last_error = "Execution task failed without a normalized result."
+            handle.updated_at = _utcnow()
+            self._emit_event("execution.failed", handle)
+            self.unregister(execution_id)
+            raise
+        handle.task = None
         self._apply_result(handle, result)
         if not handle.is_resumable:
             self.unregister(execution_id)

@@ -459,3 +459,166 @@ async def test_registry_status_queries_return_none_or_empty_for_missing_handles(
 
     assert registry.get_status("missing") is None
     assert registry.list_statuses() == []
+
+
+@pytest.mark.asyncio
+async def test_registry_resume_tracks_running_task(tmp_path: Path) -> None:
+    """During resume, the handle should report ``is_running`` as True.
+
+    Before the fix, ``registry.resume`` awaited ``runner.resume`` directly
+    without creating an asyncio task, so ``handle.task`` stayed ``None``
+    and ``handle.is_running`` returned ``False`` throughout the resumed
+    execution.  (Refs #3946)
+    """
+
+    class ResumableBlockingPattern:
+        def __init__(self) -> None:
+            self.started = asyncio.Event()
+
+        async def run(self, **_: Any) -> dict[str, Any]:
+            self.started.set()
+            await asyncio.Future()  # block until cancelled
+            return {"success": True, "output": "unreachable"}
+
+    tracer = TracerCheckpointStore()
+    registry = ExecutionRegistry()
+    blocking = ResumableBlockingPattern()
+    agent = Agent(name="writer", patterns=[blocking])
+    runner = AgentRunner(
+        agent=agent,
+        tracer=tracer,
+        workspace_manager=FakeWorkspaceManager(tmp_path),
+    )
+
+    # Manually register an interrupted handle (simulates a paused execution)
+    handle = registry.register(
+        "exec-resume-running",
+        runner,
+        metadata={"execution_type": "agent_react"},
+    )
+    handle.status = ExecutionLifecycleStatus.INTERRUPTED
+    assert handle.is_resumable
+
+    # Start resume in the background
+    resume_task = asyncio.create_task(registry.resume("exec-resume-running"))
+
+    # Wait for the resumed execution to start
+    await blocking.started.wait()
+
+    # The handle should now report as running
+    live = registry.get("exec-resume-running")
+    assert live is not None
+    assert live.is_running is True
+    assert live.status == ExecutionLifecycleStatus.RUNNING
+
+    # Clean up
+    registry.cancel("exec-resume-running", reason="test cleanup")
+    with pytest.raises(asyncio.CancelledError):
+        await resume_task
+
+
+@pytest.mark.asyncio
+async def test_registry_cancel_during_resume(tmp_path: Path) -> None:
+    """Cancelling a resumed execution should cancel the tracked task."""
+
+    class ResumableBlockingPattern:
+        def __init__(self) -> None:
+            self.started = asyncio.Event()
+
+        async def run(self, **_: Any) -> dict[str, Any]:
+            self.started.set()
+            await asyncio.Future()
+            return {"success": True, "output": "unreachable"}
+
+    tracer = TracerCheckpointStore()
+    registry = ExecutionRegistry()
+    blocking = ResumableBlockingPattern()
+    runner = AgentRunner(
+        agent=Agent(name="writer", patterns=[blocking]),
+        tracer=tracer,
+        workspace_manager=FakeWorkspaceManager(tmp_path),
+    )
+
+    handle = registry.register(
+        "exec-cancel-resume-running",
+        runner,
+        metadata={"execution_type": "agent_react"},
+    )
+    handle.status = ExecutionLifecycleStatus.INTERRUPTED
+
+    resume_task = asyncio.create_task(registry.resume("exec-cancel-resume-running"))
+    await blocking.started.wait()
+
+    # Cancel while the resumed execution is running
+    assert registry.cancel("exec-cancel-resume-running", reason="user cancel") is True
+
+    with pytest.raises(asyncio.CancelledError):
+        await resume_task
+
+    # Handle should be cleaned up
+    assert registry.get("exec-cancel-resume-running") is None
+
+
+@pytest.mark.asyncio
+async def test_registry_pause_during_resume(tmp_path: Path) -> None:
+    """Pausing during a resumed execution should succeed."""
+
+    class PauseAwarePattern:
+        def __init__(self) -> None:
+            self.started = asyncio.Event()
+            self.paused = asyncio.Event()
+
+        async def run(
+            self, *, context: ExecutionContext, runtime: PatternRuntime, **_: Any
+        ) -> dict[str, Any]:
+            self.started.set()
+            # Wait until paused
+            await self.paused.wait()
+            if await runtime.should_interrupt():
+                await runtime.checkpoint(
+                    "interrupted",
+                    context=context,
+                    pattern=self,
+                    status="interrupted",
+                    metadata={"safe_point": "during_pattern"},
+                )
+                return {
+                    "success": False,
+                    "status": "interrupted",
+                    "error": "Paused during resume.",
+                }
+            return {"success": True, "output": "done"}
+
+    tracer = TracerCheckpointStore()
+    execution_id = "exec-pause-resume"
+    registry = ExecutionRegistry()
+    pattern = PauseAwarePattern()
+    runner = AgentRunner(
+        agent=Agent(name="writer", patterns=[pattern]),
+        tracer=tracer,
+        workspace_manager=FakeWorkspaceManager(tmp_path),
+    )
+
+    # Register an interrupted handle
+    handle = registry.register(
+        execution_id,
+        runner,
+        metadata={"execution_type": "agent_react"},
+    )
+    handle.status = ExecutionLifecycleStatus.INTERRUPTED
+
+    resume_task = asyncio.create_task(registry.resume(execution_id))
+    await pattern.started.wait()
+
+    # The handle should report as running
+    live = registry.get(execution_id)
+    assert live is not None
+    assert live.is_running is True
+
+    # Pause should succeed
+    assert registry.pause(execution_id, reason="user pause") is True
+    pattern.paused.set()
+
+    result = await resume_task
+    assert result is not None
+    assert result["status"] == "interrupted"

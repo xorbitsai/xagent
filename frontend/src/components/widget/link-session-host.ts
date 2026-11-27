@@ -449,6 +449,9 @@ export function createLinkSessionHost(deps: LinkSessionHostDeps): LinkSessionHos
       case "widget_chrome_ready":
         state.chromeReady = true
         sendToIframe({ type: "widget_expand_state", expanded: false })
+        // widget_close ends the session here, so the header's button must read
+        // as close, not as the embedded widget's minimize.
+        sendToIframe({ type: "widget_close_ends_chat" })
         notify()
         return
       case "widget_chrome_not_ready":

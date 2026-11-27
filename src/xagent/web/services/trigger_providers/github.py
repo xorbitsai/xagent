@@ -88,6 +88,15 @@ def hook_events_for(config: Mapping[str, Any]) -> list[str]:
     return [event for event in GITHUB_HOOK_EVENTS if event in wanted]
 
 
+def _obj(value: object) -> dict[str, Any]:
+    return value if isinstance(value, dict) else {}
+
+
+def _stored_config(trigger: AgentTrigger) -> dict[str, Any]:
+    config = trigger.config
+    return dict(config) if isinstance(config, dict) else {}
+
+
 def _text(value: object) -> str | None:
     if value is None:
         return None
@@ -103,8 +112,8 @@ def _user(value: object) -> dict[str, Any] | None:
 def _pull_request(value: object) -> dict[str, Any] | None:
     if not isinstance(value, dict):
         return None
-    base = value.get("base") if isinstance(value.get("base"), dict) else {}
-    head = value.get("head") if isinstance(value.get("head"), dict) else {}
+    base = _obj(value.get("base"))
+    head = _obj(value.get("head"))
     return {
         "number": value.get("number"),
         "title": _text(value.get("title")),
@@ -122,7 +131,8 @@ def _pull_request(value: object) -> dict[str, Any] | None:
 def _issue(value: object) -> dict[str, Any] | None:
     if not isinstance(value, dict):
         return None
-    labels = value.get("labels") if isinstance(value.get("labels"), list) else []
+    raw_labels = value.get("labels")
+    labels: list[Any] = raw_labels if isinstance(raw_labels, list) else []
     return {
         "number": value.get("number"),
         "title": _text(value.get("title")),
@@ -324,7 +334,7 @@ class GithubProvider:
     async def register(
         self, db: Session, trigger: AgentTrigger, config: Any
     ) -> RegistrationResult:
-        trigger_config = self.validate_config(trigger.config or {})
+        trigger_config = self.validate_config(_stored_config(trigger))
         repository = str(trigger_config.repository)
         _, hook_id = split_binding(
             str(trigger.resource_id) if trigger.resource_id else None
@@ -343,7 +353,7 @@ class GithubProvider:
             token = await ensure_fresh_token(db, account)
             callback_url = github_callback_url(base_url, str(trigger.callback_id))
             secret = decrypt_value(str(trigger.secret_encrypted))
-            events = hook_events_for(trigger.config or {})
+            events = hook_events_for(_stored_config(trigger))
             hook = None
             if hook_id is not None:
                 hook = await asyncio.to_thread(

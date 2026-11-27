@@ -2251,6 +2251,43 @@ async def _host_stage(run_id: int, fn: Callable[..., Any], *args: Any) -> Any:
         raise _HostStageFailed from exc
 
 
+async def _claim_host_run(run_id: int) -> bool:
+    """Claim a PENDING run; True only when this process proved it won it.
+
+    A ``RUNNING`` row does not say which process owns it, so cleanup is
+    ownership-aware: after joining a claim thread that cancellation interrupted,
+    the run is settled only when the thread confirmed this process won the
+    conditional update. A lost claim touches nothing (another process's
+    executor may be running it), and an outcome that cannot be established is
+    recorded as unsettled evidence instead of being settled by guess.
+    """
+    from .release_hold import release_hold
+
+    fut = asyncio.ensure_future(run_tracked(_claim_pending_host_run, run_id))
+    try:
+        return bool(await asyncio.shield(fut))
+    except asyncio.CancelledError:
+        await asyncio.wait({fut})
+        if fut.cancelled():
+            raise  # the thread never started: nothing was claimed
+        if fut.exception() is not None:
+            release_hold.record_unsettled(
+                "host_trigger_run",
+                f"run:{run_id}",
+                "claim outcome unknown after cancellation",
+            )
+        elif fut.result() is True:
+            await _settle_host_trigger_run(run_id, "Cancelled: executor stopped")
+        raise
+    except Exception as exc:
+        release_hold.record_unsettled(
+            "host_trigger_run",
+            f"run:{run_id}",
+            f"claim outcome unknown: {type(exc).__name__}",
+        )
+        raise _HostStageFailed from exc
+
+
 async def _host_run_lifecycle(
     run_id: int, executor_kind: str, started: asyncio.Future[bool]
 ) -> None:
@@ -2267,7 +2304,7 @@ async def _host_run_lifecycle(
 
     try:
         try:
-            claimed = await _host_stage(run_id, _claim_pending_host_run, run_id)
+            claimed = await _claim_host_run(run_id)
             if not claimed:
                 return
             signal(True)

@@ -699,3 +699,80 @@ def test_start_cancelled_before_the_lifecycle_runs_returns_false() -> None:
     assert asyncio.run(run_it()) is False
     assert recorder.calls == []
     assert _run_row(int(run.id)).status == TriggerRunStatus.PENDING.value
+
+
+def _mark_running_elsewhere(run_id: int) -> None:
+    """Another backend process won the claim: the row is RUNNING and not ours."""
+    db = _direct_db_session()
+    try:
+        row = db.query(TriggerRun).filter(TriggerRun.id == run_id).one()
+        row.status = TriggerRunStatus.RUNNING.value
+        db.commit()
+    finally:
+        db.close()
+
+
+def test_cancelling_a_losing_claim_leaves_the_other_owners_run_alone() -> None:
+    recorder = Recorder()
+    register_trigger_executor("hostx", recorder)
+    trigger_id = _make_trigger(executor="hostx")
+    unregister_trigger_executor("hostx")
+    run, _ = _fire(trigger_id, event_payload={"a": 1}, source_event_id="evt-lost")
+    register_trigger_executor("hostx", recorder)
+
+    gate = threading.Event()
+    in_thread = threading.Event()
+    real_claim = triggers._claim_pending_host_run
+
+    def losing_claim(run_id: int) -> bool:
+        in_thread.set()
+        gate.wait(10)
+        # By now the other process has won.
+        _mark_running_elsewhere(run_id)
+        return real_claim(run_id)
+
+    async def run_it() -> None:
+        starter = asyncio.ensure_future(
+            _start_host_trigger_run_id(int(run.id), "hostx")
+        )
+        while not in_thread.is_set():
+            await asyncio.sleep(0.01)
+        stopper = asyncio.ensure_future(triggers.shutdown_host_trigger_runs())
+        await asyncio.sleep(0.1)
+        gate.set()
+        await stopper
+        await asyncio.gather(starter, return_exceptions=True)
+
+    before = _unsettled_total()
+    with patch.object(triggers, "_claim_pending_host_run", losing_claim):
+        asyncio.run(run_it())
+
+    row = _run_row(int(run.id))
+    assert row.status == TriggerRunStatus.RUNNING.value  # not settled FAILED
+    assert row.error_message is None and row.finished_at is None
+    assert recorder.calls == []
+    assert _unsettled_total() == before
+
+
+def test_ambiguous_claim_failure_is_unsettled_evidence_not_a_guess() -> None:
+    from sqlalchemy.exc import OperationalError
+
+    recorder = Recorder()
+    register_trigger_executor("hostx", recorder)
+    trigger_id = _make_trigger(executor="hostx")
+    unregister_trigger_executor("hostx")
+    run, _ = _fire(trigger_id, event_payload={"a": 1}, source_event_id="evt-ambiguous")
+    register_trigger_executor("hostx", recorder)
+    _mark_running_elsewhere(int(run.id))
+
+    def broken(_run_id: int) -> bool:
+        raise OperationalError("UPDATE", {}, Exception("connection lost"))
+
+    before = _unsettled_total()
+    with patch.object(triggers, "_claim_pending_host_run", broken):
+        started = asyncio.run(_start_host_trigger_run_id(int(run.id), "hostx"))
+
+    assert started is False
+    assert _run_row(int(run.id)).status == TriggerRunStatus.RUNNING.value
+    assert _unsettled_total() == before + 1
+    assert recorder.calls == []

@@ -4,6 +4,7 @@ whose ``executor`` field names its kind; everything else behaves as before."""
 from __future__ import annotations
 
 import asyncio
+import threading
 from datetime import datetime, timedelta, timezone
 from typing import Iterator
 from unittest.mock import MagicMock, patch
@@ -13,7 +14,7 @@ import pytest
 from xagent.web.models.task import Task
 from xagent.web.models.trigger import AgentTrigger, TriggerRun, TriggerRunStatus
 from xagent.web.models.user import User
-from xagent.web.services import trigger_executors
+from xagent.web.services import trigger_executors, triggers
 from xagent.web.services.trigger_executors import (
     HostTriggerRun,
     TriggerExecutorAlreadyRegisteredError,
@@ -348,3 +349,131 @@ def test_registry_rejects_conflicts_and_blank_kinds() -> None:
     with pytest.raises(ValueError):
         register_trigger_executor("  ", first)
     assert trigger_executors.get_trigger_executor(None) is None
+
+
+def _hold_kinds() -> list[str]:
+    from xagent.web.services.release_hold import release_hold
+
+    return [item.kind for item in release_hold._responsibilities.values()]
+
+
+def test_running_host_execution_keeps_release_status_busy_until_settled() -> None:
+    from xagent.web.services.release_hold import execution_status
+
+    started = threading.Event()
+    seen: dict[str, object] = {}
+
+    async def run() -> None:
+        release = asyncio.Event()
+
+        async def executor(_run: HostTriggerRun) -> None:
+            started.set()
+            await release.wait()
+
+        register_trigger_executor("hostx", executor)
+        trigger_id = _make_trigger(executor="hostx")
+        db = _direct_db_session()
+        try:
+            trigger = db.query(AgentTrigger).filter(AgentTrigger.id == trigger_id).one()
+            # Default wait_for_completion=False: the launcher returns at once.
+            fired, _ = await fire_trigger(
+                db, trigger=trigger, event_payload={"a": 1}, source_event_id="evt-busy"
+            )
+        finally:
+            db.close()
+        while not started.is_set():
+            await asyncio.sleep(0.01)
+        seen["busy_while_running"] = execution_status()["busy"]
+        seen["kinds_while_running"] = _hold_kinds()
+        release.set()
+        for _ in range(500):
+            if not _hold_kinds():
+                break
+            await asyncio.sleep(0.01)
+        seen["busy_after"] = execution_status()["busy"]
+        seen["run_id"] = int(fired.id)
+
+    asyncio.run(run())
+    assert seen["busy_while_running"] is True
+    assert "host_trigger_run" in seen["kinds_while_running"]  # type: ignore[operator]
+    assert seen["busy_after"] is False
+    # Released only after the outcome was durably settled.
+    assert _run_row(int(seen["run_id"])).status == TriggerRunStatus.COMPLETED.value  # type: ignore[arg-type]
+
+
+def test_cancelled_claim_after_commit_still_reaches_the_executor() -> None:
+    recorder = Recorder()
+    register_trigger_executor("hostx", recorder)
+    trigger_id = _make_trigger(executor="hostx")
+    unregister_trigger_executor("hostx")
+    run, _ = _fire(trigger_id, event_payload={"a": 1}, source_event_id="evt-cancel")
+    register_trigger_executor("hostx", recorder)
+
+    gate = threading.Event()
+    in_thread = threading.Event()
+    real_claim = triggers._claim_host_trigger_run
+
+    def slow_claim(run_id: int, kind: str):
+        in_thread.set()
+        gate.wait(10)
+        return real_claim(run_id, kind)
+
+    async def run_it() -> None:
+        starter = asyncio.ensure_future(
+            _start_host_trigger_run_id(int(run.id), "hostx")
+        )
+        while not in_thread.is_set():
+            await asyncio.sleep(0.01)
+        starter.cancel()
+        await asyncio.gather(starter, return_exceptions=True)
+        gate.set()
+        for _ in range(500):
+            if recorder.calls and not _hold_kinds():
+                break
+            await asyncio.sleep(0.01)
+
+    with patch.object(triggers, "_claim_host_trigger_run", slow_claim):
+        asyncio.run(run_it())
+
+    assert len(recorder.calls) == 1
+    assert _run_row(int(run.id)).status == TriggerRunStatus.COMPLETED.value
+
+
+def test_shutdown_cancels_host_executions_and_settles_their_runs() -> None:
+    started = threading.Event()
+    cancelled: list[bool] = []
+
+    async def executor(_run: HostTriggerRun) -> None:
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancelled.append(True)
+            raise
+
+    register_trigger_executor("hostx", executor)
+    trigger_id = _make_trigger(executor="hostx")
+    out: dict[str, int] = {}
+
+    async def run() -> None:
+        db = _direct_db_session()
+        try:
+            trigger = db.query(AgentTrigger).filter(AgentTrigger.id == trigger_id).one()
+            fired, _ = await fire_trigger(
+                db, trigger=trigger, event_payload={"a": 1}, source_event_id="evt-stop"
+            )
+        finally:
+            db.close()
+        while not started.is_set():
+            await asyncio.sleep(0.01)
+        await triggers.shutdown_host_trigger_runs()
+        out["run_id"] = int(fired.id)
+        out["tasks"] = len(triggers._host_run_tasks)
+        out["ledger"] = len(_hold_kinds())
+
+    asyncio.run(run())
+    assert cancelled == [True]
+    assert out["tasks"] == 0 and out["ledger"] == 0
+    row = _run_row(out["run_id"])
+    assert row.status == TriggerRunStatus.FAILED.value
+    assert "Cancelled" in str(row.error_message)

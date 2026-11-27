@@ -1680,6 +1680,9 @@ def github_list_commits(
 MAX_COMPLETE_SCAN_PAGES = 30
 # Aggregate wall-clock budget for one scan, as MAX_ISSUE_LIST_SECONDS is for
 # github_list_issues: MAX_COMPLETE_SCAN_PAGES bounds request count, not time.
+# At ~1.4 s a page the budget, not the page cap, is what binds near 30 pages,
+# so a repository that size may fail closed when GitHub is slow -- an error,
+# never a wrong count.
 MAX_COMPLETE_SCAN_SECONDS = 60
 # github_count_commits always counts every commit in the window but lists at
 # most this many, so a busy window cannot flood the model's context.
@@ -1750,7 +1753,8 @@ def github_list_branches(repo: str, prefix: str = "") -> str:
     starting with `prefix`.
     repo: "owner/repo".
     prefix: optional literal, case-sensitive name prefix, e.g. "xero/"
-    (default: all). Wildcards such as "xero/*" are not supported.
+    (default: all). Pass the bare branch-name prefix -- not "refs/heads/..."
+    -- and no wildcards such as "xero/*".
 
     Use this for "how many branches are there" or "which branches start with
     X". It reads every page itself: total_count counts all branches in the

@@ -5037,3 +5037,54 @@ def test_update_submodule_write_error_mapping(monkeypatch, route, status, needle
     result = _bump()
     assert result["status"] == "error"
     assert needle in result["message"]
+
+
+# --- Change statistics, branch listing and date-window commit counts --------
+# (xagent-saas#3583, #3584, #3585: Toby answered GitHub statistics questions
+# from data the connector dropped or never fetched completely.)
+
+
+def test_get_pull_request_reports_change_stats(monkeypatch):
+    """The single-PR endpoint carries changed_files/additions/deletions; the
+    tool must pass them through instead of dropping them in the summary."""
+    monkeypatch.setattr(
+        github.requests,
+        "request",
+        Mock(
+            return_value=MockResponse(
+                json_data={
+                    "number": 12,
+                    "changed_files": 7,
+                    "additions": 240,
+                    "deletions": 0,
+                    "commits": 3,
+                }
+            )
+        ),
+    )
+
+    result = json.loads(github.github_get_pull_request("octocat/Hello-World", 12))
+
+    assert result["status"] == "success"
+    assert result["change_stats"] == {
+        "changed_files": 7,
+        "additions": 240,
+        "deletions": 0,
+        "commits": 3,
+    }
+    assert result["missing_stats"] == []
+
+
+def test_get_pull_request_names_missing_change_stats_instead_of_zero(monkeypatch):
+    monkeypatch.setattr(
+        github.requests,
+        "request",
+        Mock(return_value=MockResponse(json_data={"number": 12, "additions": 5})),
+    )
+
+    result = json.loads(github.github_get_pull_request("octocat/Hello-World", 12))
+
+    assert result["change_stats"]["changed_files"] is None
+    assert result["change_stats"]["deletions"] is None
+    assert result["change_stats"]["additions"] == 5
+    assert result["missing_stats"] == ["changed_files", "deletions", "commits"]

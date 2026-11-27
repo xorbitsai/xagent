@@ -468,3 +468,23 @@ for i in range(100):
         # Check that original streams are restored
         assert sys.stdout is original_stdout
         assert sys.stderr is original_stderr
+
+
+class TestPythonExecutorDescription:
+    """Tests for the execute_python_code tool description (issue #3250)."""
+
+    def test_description_mentions_working_directory(self, python_executor):
+        """The description must tell the model which directory its code runs in."""
+        assert "working directory" in python_executor.description.lower()
+
+    def test_description_mentions_workspace_env_vars(self, python_executor):
+        """The description must list the workspace environment variables."""
+        desc = python_executor.description
+        assert "WORKSPACE_OUTPUT_DIR" in desc
+        assert "WORKSPACE_INPUT_DIR" in desc
+        assert "WORKSPACE_TEMP_DIR" in desc
+        assert "WORKSPACE_DIR" in desc
+
+    def test_description_mentions_spill_path(self, python_executor):
+        """The description must guide the model to spilled tool-result files."""
+        assert "tool-results" in python_executor.description

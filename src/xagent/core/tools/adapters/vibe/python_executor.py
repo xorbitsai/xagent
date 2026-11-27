@@ -60,7 +60,20 @@ class PythonExecutorTool(AbstractBaseTool):
     def description(self) -> str:
         return """Execute Python code safely and return the output.
         Supports most Python operations including calculations, data processing, and visualization.
-        Captures stdout and stderr from the execution."""
+        Captures stdout and stderr from the execution.
+
+        The code runs with the task output directory as its working directory.
+        The following environment variables are available inside the executed code:
+        - WORKSPACE_OUTPUT_DIR: absolute path to the task output directory (also the working directory)
+        - WORKSPACE_INPUT_DIR: absolute path to the task input directory
+        - WORKSPACE_TEMP_DIR: absolute path to the task temp directory
+        - WORKSPACE_DIR: absolute path to the task workspace root
+
+        Files written to the working directory are automatically registered as task artifacts.
+        When a previous tool result is too large for the model context it may be spilled to
+        tool-results/<name>.json relative to the working directory; open it with a relative
+        path (e.g. open('tool-results/result.json')) or via WORKSPACE_OUTPUT_DIR, not an
+        absolute path that doubles the working directory."""
 
     @property
     def tags(self) -> list[str]:

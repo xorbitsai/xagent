@@ -40,6 +40,7 @@ RUN mkdir -p "$NPM_CONFIG_CACHE" && chmod 0755 "$NPM_CONFIG_CACHE"
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates \
+        git \
         netbase \
         tzdata \
         openssh-client \
@@ -148,6 +149,9 @@ RUN groupadd --gid 1010 sandbox \
 
 USER sandbox
 WORKDIR /home/sandbox
+
+# Verify Git is available to the unprivileged sandbox runtime user.
+RUN git --version
 
 # Prove the warmed package is usable by the sandbox runtime uid without network
 # access. This also catches root-owned cache metadata before the image ships.

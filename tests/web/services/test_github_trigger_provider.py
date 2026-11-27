@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import patch
@@ -46,6 +48,8 @@ class FakeGithub:
     def __init__(self) -> None:
         self.calls: list[tuple[str, str, dict[str, Any]]] = []
         self.fail_status: int | None = None
+        self.delete_status = 204
+        self.patch_gate: Any = None  # called with the body before PATCH applies
         self.hooks: dict[int, dict[str, Any]] = {}
         self._next_id = 1000
         self.RequestException = Exception
@@ -67,11 +71,15 @@ class FakeGithub:
         hook_id = int(url.rsplit("/", 1)[1])
         if hook_id not in self.hooks:
             return self._response(404)
+        if self.patch_gate is not None:
+            self.patch_gate(json)
         self.hooks[hook_id] = json
         return self._response(200, {"id": hook_id})
 
     def delete(self, url, headers=None, timeout=None):
         self.calls.append(("DELETE", url, {}))
+        if self.delete_status >= 400:
+            return self._response(self.delete_status)
         self.hooks.pop(int(url.rsplit("/", 1)[1]), None)
         return self._response(204)
 
@@ -529,3 +537,145 @@ def test_body_cap_matches_githubs_25mb_limit(github):
     with pytest.raises(HTTPException) as streamed:
         _run(_read_callback_body(_FakeRequest([b"x" * MAX_BODY_BYTES, b"x"]), "github"))
     assert streamed.value.status_code == 413
+
+
+def _expire(db, account) -> None:
+    account.expires_at = datetime.now(timezone.utc) - timedelta(hours=1)
+    db.commit()
+
+
+@pytest.mark.parametrize(
+    ("exception_name", "message"),
+    [
+        ("_OAuthRefreshPermanentlyInvalid", "reconnect the GitHub account"),
+        ("_OAuthRefreshClientRejected", "OAuth client"),
+    ],
+)
+def test_classified_refresh_failures_become_provisioning_errors(
+    db_session, owner, github, exception_name, message
+):
+    from xagent.web.tools import config as tools_config
+
+    user, agent = owner
+    account = _connect_github(db_session, user)
+    _expire(db_session, account)
+    exc = getattr(tools_config, exception_name)
+
+    async def _boom(*args, **kwargs):
+        raise exc("dead") if exception_name.endswith("Rejected") else exc()
+
+    with patch.object(tools_config, "refresh_oauth_token_if_needed", _boom):
+        trigger = _create(db_session, user, agent)
+
+    assert trigger.provisioning_status == TriggerProvisioningStatus.FAILED.value
+    assert message in str(trigger.provisioning_error)
+    assert github.calls == []
+
+
+@pytest.mark.parametrize("delete_status", [204, 500])
+def test_teardown_keeps_the_rotated_oauth_pair(
+    db_session, owner, github, delete_status
+):
+    from xagent.web.tools import config as tools_config
+
+    user, agent = owner
+    account = _connect_github(db_session, user)
+    trigger = _create(db_session, user, agent)
+    _expire(db_session, account)
+    github.delete_status = delete_status
+
+    async def _rotate(db, oauth_account, provider, **kwargs):
+        oauth_account.access_token = "gho_rotated"
+        db.flush()  # the real helper only flushes
+        return True
+
+    with patch.object(tools_config, "refresh_oauth_token_if_needed", _rotate):
+        delete_agent_trigger(
+            db_session, user_id=user.id, agent_id=agent.id, trigger_id=trigger.id
+        )
+
+    db_session.expire_all()
+    fresh = next(get_db())
+    try:
+        stored = fresh.query(UserOAuth).filter(UserOAuth.id == account.id).one()
+        assert stored.access_token == "gho_rotated"
+    finally:
+        fresh.close()
+
+
+def test_stale_reassertion_cannot_overwrite_a_newer_secret(db_session, owner, github):
+    """The earlier request's PATCH would land last; the lock must prevent it."""
+    user, agent = owner
+    _connect_github(db_session, user)
+    trigger = _create(db_session, user, agent)
+    trigger_id, agent_id, user_id = trigger.id, agent.id, user.id
+
+    entered = threading.Event()
+    release = threading.Event()
+    first = {"seen": False}
+
+    def _gate(body):
+        if not first["seen"]:
+            first["seen"] = True
+            entered.set()
+            assert release.wait(20)
+
+    github.patch_gate = _gate
+
+    def _name_only():
+        db = next(get_db())
+        try:
+            update_agent_trigger(
+                db,
+                user_id=user_id,
+                agent_id=agent_id,
+                trigger_id=trigger_id,
+                updates={"name": "renamed"},
+            )
+        finally:
+            db.close()
+
+    def _rotate():
+        db = next(get_db())
+        try:
+            update_agent_trigger(
+                db,
+                user_id=user_id,
+                agent_id=agent_id,
+                trigger_id=trigger_id,
+                updates={"rotate_secret": True},
+            )
+        finally:
+            db.close()
+
+    older = threading.Thread(target=_name_only)
+    older.start()
+    assert entered.wait(20)
+    newer = threading.Thread(target=_rotate)
+    newer.start()
+    # Let the rotation commit its secret and reach the (blocked) hook write.
+    newer.join(timeout=2)
+    release.set()
+    older.join(20)
+    newer.join(20)
+    assert not older.is_alive() and not newer.is_alive()
+
+    db_session.expire_all()
+    stored = db_session.get(AgentTrigger, trigger_id)
+    assert github.hooks[1001]["config"]["secret"] == _secret(stored)
+
+
+def test_register_skips_remote_write_for_a_trigger_disabled_meanwhile(
+    db_session, owner, github
+):
+    user, agent = owner
+    _connect_github(db_session, user)
+    trigger = _create(db_session, user, agent)
+    trigger.enabled = False
+    db_session.commit()
+    calls_before = len(github.calls)
+
+    result = _run(GithubProvider().register(db_session, trigger, trigger.config))
+
+    assert result.status == TriggerProvisioningStatus.PENDING
+    assert len(github.calls) == calls_before

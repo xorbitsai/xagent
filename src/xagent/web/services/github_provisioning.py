@@ -100,12 +100,33 @@ async def ensure_fresh_token(db: Session, account: UserOAuth) -> str:
             else expires_at
         )
         if aware <= datetime.now(timezone.utc):
-            from ..tools.config import refresh_oauth_token_if_needed
+            from ..tools.config import (
+                _OAuthRefreshClientRejected,
+                _OAuthRefreshPermanentlyInvalid,
+                refresh_oauth_token_if_needed,
+            )
 
-            if not await refresh_oauth_token_if_needed(
-                db, account, GITHUB_OAUTH_PROVIDER
-            ):
+            try:
+                refreshed = await refresh_oauth_token_if_needed(
+                    db, account, GITHUB_OAUTH_PROVIDER
+                )
+            except _OAuthRefreshPermanentlyInvalid as exc:
+                db.rollback()
+                raise GithubProvisioningError(
+                    "The GitHub authorization was revoked or expired; "
+                    "reconnect the GitHub account"
+                ) from exc
+            except _OAuthRefreshClientRejected as exc:
+                db.rollback()
+                raise GithubProvisioningError(
+                    "GitHub rejected this deployment's OAuth client while "
+                    "refreshing the token; contact the administrator"
+                ) from exc
+            if not refreshed:
                 raise GithubProvisioningError(GITHUB_RECONNECT_REQUIRED_ERROR)
+            # GitHub invalidates the consumed refresh token, so the rotated
+            # pair must be durable before any later step can roll back.
+            db.commit()
     token = str(account.access_token or "")
     if not token:
         raise GithubProvisioningError(GITHUB_RECONNECT_REQUIRED_ERROR)

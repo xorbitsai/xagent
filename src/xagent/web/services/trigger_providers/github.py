@@ -14,13 +14,19 @@ name for push, create and delete.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
 import hmac
 import json
 import logging
+import threading
+import weakref
+from collections.abc import AsyncIterator
 from typing import Any, Mapping
 
 from pydantic import ValidationError
+from sqlalchemy import text
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
 
 from ....config import get_trigger_callback_base_url
@@ -95,6 +101,58 @@ def _obj(value: object) -> dict[str, Any]:
 def _stored_config(trigger: AgentTrigger) -> dict[str, Any]:
     config = trigger.config
     return dict(config) if isinstance(config, dict) else {}
+
+
+_PROVISIONING_LOCK_TIMEOUT_SECONDS = 30
+_PG_ROW_LOCK_TIMEOUT = "5s"
+_provisioning_locks: "weakref.WeakValueDictionary[int, threading.Lock]" = (
+    weakref.WeakValueDictionary()
+)
+_provisioning_locks_guard = threading.Lock()
+
+
+@contextlib.asynccontextmanager
+async def _trigger_provisioning_lock(trigger_id: int) -> AsyncIterator[None]:
+    """In-process per-trigger lock (the only serialization on SQLite)."""
+    with _provisioning_locks_guard:
+        lock = _provisioning_locks.get(trigger_id)
+        if lock is None:
+            lock = threading.Lock()
+            _provisioning_locks[trigger_id] = lock
+    acquired = await asyncio.to_thread(
+        lock.acquire, True, _PROVISIONING_LOCK_TIMEOUT_SECONDS
+    )
+    if not acquired:
+        raise GithubProvisioningError(
+            "Another update of this trigger is in progress; retry shortly"
+        )
+    try:
+        yield
+    finally:
+        lock.release()
+
+
+def _lock_trigger_row(db: Session, trigger_id: int) -> AgentTrigger | None:
+    """Reload the trigger under a row lock (PostgreSQL; a no-op on SQLite).
+
+    The lock is held until the caller commits, so concurrent processes also
+    serialize their hook writes. The wait is bounded by ``lock_timeout``.
+    """
+    try:
+        if db.get_bind().dialect.name == "postgresql":
+            db.execute(text(f"SET LOCAL lock_timeout = '{_PG_ROW_LOCK_TIMEOUT}'"))
+        return (
+            db.query(AgentTrigger)
+            .filter(AgentTrigger.id == trigger_id)
+            .populate_existing()
+            .with_for_update()
+            .first()
+        )
+    except OperationalError as exc:
+        db.rollback()
+        raise GithubProvisioningError(
+            "Another update of this trigger is in progress; retry shortly"
+        ) from exc
 
 
 def _text(value: object) -> str | None:
@@ -334,50 +392,74 @@ class GithubProvider:
     async def register(
         self, db: Session, trigger: AgentTrigger, config: Any
     ) -> RegistrationResult:
+        trigger_id = int(trigger.id)
         trigger_config = self.validate_config(_stored_config(trigger))
-        repository = str(trigger_config.repository)
-        _, hook_id = split_binding(
-            str(trigger.resource_id) if trigger.resource_id else None
-        )
         try:
             base_url = get_trigger_callback_base_url()
             if not base_url:
                 raise GithubProvisioningError(CALLBACK_BASE_URL_MISSING_ERROR)
-            if not trigger.callback_id or not trigger.secret_encrypted:
-                raise GithubProvisioningError("GitHub trigger has no callback secret")
+            # Token refresh commits, so it runs before the row lock is taken.
             account = resolve_github_account(
                 db,
                 user_id=int(trigger.user_id),
                 oauth_account_id=trigger_config.oauth_account_id,
             )
             token = await ensure_fresh_token(db, account)
-            callback_url = github_callback_url(base_url, str(trigger.callback_id))
-            secret = decrypt_value(str(trigger.secret_encrypted))
-            events = hook_events_for(_stored_config(trigger))
-            hook = None
-            if hook_id is not None:
-                hook = await asyncio.to_thread(
-                    update_hook,
-                    token,
-                    repository,
-                    hook_id,
-                    callback_url=callback_url,
-                    secret=secret,
-                    events=events,
+            # Serialize read secret -> hook write -> persist per trigger, so a
+            # stale request cannot reinstall an older secret after a newer
+            # one was committed and installed.
+            async with _trigger_provisioning_lock(trigger_id):
+                fresh = _lock_trigger_row(db, trigger_id)
+                if fresh is None or not bool(fresh.enabled):
+                    return RegistrationResult(status=TriggerProvisioningStatus.PENDING)
+                if not fresh.callback_id or not fresh.secret_encrypted:
+                    raise GithubProvisioningError(
+                        "GitHub trigger has no callback secret"
+                    )
+                current = self.validate_config(_stored_config(fresh))
+                repository = str(current.repository)
+                _, hook_id = split_binding(
+                    str(fresh.resource_id) if fresh.resource_id else None
                 )
-            if hook is None:
-                hook = await asyncio.to_thread(
-                    create_hook,
-                    token,
-                    repository,
-                    callback_url=callback_url,
-                    secret=secret,
-                    events=events,
+                callback_url = github_callback_url(base_url, str(fresh.callback_id))
+                secret = decrypt_value(str(fresh.secret_encrypted))
+                events = hook_events_for(_stored_config(fresh))
+                hook = None
+                if hook_id is not None:
+                    hook = await asyncio.to_thread(
+                        update_hook,
+                        token,
+                        repository,
+                        hook_id,
+                        callback_url=callback_url,
+                        secret=secret,
+                        events=events,
+                    )
+                if hook is None:
+                    hook = await asyncio.to_thread(
+                        create_hook,
+                        token,
+                        repository,
+                        callback_url=callback_url,
+                        secret=secret,
+                        events=events,
+                    )
+                binding = join_binding(repository.lower(), hook.hook_id)
+                setattr(fresh, "resource_id", binding)
+                setattr(
+                    fresh, "provisioning_status", TriggerProvisioningStatus.ACTIVE.value
+                )
+                setattr(fresh, "provisioning_error", None)
+                db.add(fresh)
+                db.commit()
+                return RegistrationResult(
+                    status=TriggerProvisioningStatus.ACTIVE, resource_id=binding
                 )
         except GithubProvisioningError as exc:
             logger.warning(
-                "GitHub hook provisioning failed for trigger %s: %s", trigger.id, exc
+                "GitHub hook provisioning failed for trigger %s: %s", trigger_id, exc
             )
+            db.rollback()
             setattr(
                 trigger, "provisioning_status", TriggerProvisioningStatus.FAILED.value
             )
@@ -387,16 +469,6 @@ class GithubProvider:
             return RegistrationResult(
                 status=TriggerProvisioningStatus.FAILED, error=str(exc)
             )
-
-        binding = join_binding(repository.lower(), hook.hook_id)
-        setattr(trigger, "resource_id", binding)
-        setattr(trigger, "provisioning_status", TriggerProvisioningStatus.ACTIVE.value)
-        setattr(trigger, "provisioning_error", None)
-        db.add(trigger)
-        db.commit()
-        return RegistrationResult(
-            status=TriggerProvisioningStatus.ACTIVE, resource_id=binding
-        )
 
     async def unregister(
         self,
@@ -409,13 +481,15 @@ class GithubProvider:
         repository, hook_id = split_binding(resource_id)
         if repository is None or hook_id is None:
             return  # never provisioned; nothing exists on GitHub
+        # Read before any commit: the trigger row may already be deleted.
+        user_id = int(trigger.user_id)
         raw_account_id = (
             config.get("oauth_account_id") if isinstance(config, dict) else None
         )
         try:
             account = resolve_github_account(
                 db,
-                user_id=int(trigger.user_id),
+                user_id=user_id,
                 oauth_account_id=raw_account_id
                 if isinstance(raw_account_id, int)
                 else None,

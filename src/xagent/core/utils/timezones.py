@@ -10,10 +10,27 @@ report which zone was actually used.
 from __future__ import annotations
 
 from collections import defaultdict
+from datetime import date
 from functools import lru_cache
 from types import MappingProxyType
 from typing import Mapping, Optional
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError, available_timezones
+
+_WEEKDAYS = (
+    "Monday",
+    "Tuesday",
+    "Wednesday",
+    "Thursday",
+    "Friday",
+    "Saturday",
+    "Sunday",
+)
+
+
+def weekday_name(day: date) -> str:
+    """Return the English weekday regardless of the process locale."""
+    return _WEEKDAYS[day.weekday()]
+
 
 # ActiveSupport::TimeZone::MAPPING from Ruby on Rails v8.1.4
 # (activesupport/lib/active_support/values/time_zone.rb), copied verbatim:

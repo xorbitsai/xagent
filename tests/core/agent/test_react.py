@@ -12602,10 +12602,10 @@ async def test_blank_streaming_arguments_flow_from_adapter_into_react(mocker) ->
     assert tool.calls == [{}]
 
 
-def _react_clock_messages(timezone_name: str | None) -> tuple[str, str]:
-    context = ExecutionContext(
-        created_at=datetime(2026, 8, 24, 22, 3, 37, tzinfo=timezone.utc)
-    )
+def _react_clock_messages(
+    timezone_name: str | None, created_at: datetime = _FROZEN_TURN_START
+) -> tuple[str, str]:
+    context = ExecutionContext(created_at=created_at)
     if timezone_name is not None:
         context.metadata[CLOCK_TIMEZONE_METADATA_KEY] = timezone_name
     context.add_user_message("how many shifts do we have on tomorrow?")
@@ -12629,14 +12629,18 @@ def test_tool_call_date_line_keeps_utc_wording_without_a_timezone() -> None:
     system, turn = _react_clock_messages(None)
 
     assert DATE_RULE in system
-    assert "Turn-start date (UTC): 2026-08-24." in turn
+    assert (
+        "Turn-start date (UTC): 2026-08-24 (Monday). Next 7 days: "
+        "Tue 2026-08-25, Wed 2026-08-26, Thu 2026-08-27, Fri 2026-08-28, "
+        "Sat 2026-08-29, Sun 2026-08-30, Mon 2026-08-31."
+    ) in turn.splitlines()
     assert "Turn-start date (" not in system
 
 
 def test_tool_call_date_line_uses_the_caller_timezone() -> None:
     system, turn = _react_clock_messages("Australia/Melbourne")
 
-    assert "Turn-start date (Australia/Melbourne): 2026-08-25." in turn
+    assert "Turn-start date (Australia/Melbourne): 2026-08-25 (Tuesday)." in turn
     # The UTC date is what produced the wrong "tomorrow" in production.
     assert "Turn-start date (UTC)" not in turn
     assert "Turn-start date (" not in system
@@ -12645,7 +12649,66 @@ def test_tool_call_date_line_uses_the_caller_timezone() -> None:
 def test_tool_call_date_line_degrades_to_utc_for_an_unusable_timezone() -> None:
     _system, turn = _react_clock_messages("Not/AZone")
 
-    assert "Turn-start date (UTC): 2026-08-24." in turn
+    assert "Turn-start date (UTC): 2026-08-24 (Monday)." in turn
+
+
+def test_tool_call_date_line_starts_the_week_from_the_local_date() -> None:
+    _, turn = _react_clock_messages(
+        "Australia/Sydney", datetime(2026, 3, 3, 13, 30, tzinfo=timezone.utc)
+    )
+
+    assert (
+        "Turn-start date (Australia/Sydney): 2026-03-04 (Wednesday). Next 7 days: "
+        "Thu 2026-03-05, Fri 2026-03-06, Sat 2026-03-07, Sun 2026-03-08, "
+        "Mon 2026-03-09, Tue 2026-03-10, Wed 2026-03-11."
+    ) in turn.splitlines()
+    assert "2026-03-03 (" not in turn
+
+
+@pytest.mark.parametrize(
+    ("created_at", "expected"),
+    [
+        (
+            datetime(2026, 4, 28, tzinfo=timezone.utc),
+            "Turn-start date (UTC): 2026-04-28 (Tuesday). Next 7 days: "
+            "Wed 2026-04-29, Thu 2026-04-30, Fri 2026-05-01, Sat 2026-05-02, "
+            "Sun 2026-05-03, Mon 2026-05-04, Tue 2026-05-05.",
+        ),
+        (
+            datetime(2026, 12, 28, tzinfo=timezone.utc),
+            "Turn-start date (UTC): 2026-12-28 (Monday). Next 7 days: "
+            "Tue 2026-12-29, Wed 2026-12-30, Thu 2026-12-31, Fri 2027-01-01, "
+            "Sat 2027-01-02, Sun 2027-01-03, Mon 2027-01-04.",
+        ),
+    ],
+)
+def test_tool_call_date_line_crosses_calendar_boundaries(
+    created_at: datetime, expected: str
+) -> None:
+    _, turn = _react_clock_messages(None, created_at)
+
+    assert expected in turn.splitlines()
+
+
+def test_weekday_deadline_and_count_rules_stay_in_the_system_message() -> None:
+    system, utc_turn = _react_clock_messages(None)
+    local_system, local_turn = _react_clock_messages("Australia/Sydney")
+    deadline_rule = (
+        "For a weekday or a relative deadline ('by Friday', 'next Monday', "
+        "'this week'), take its date from the turn-start date and the Next 7 "
+        "days list in the turn context and state that date in your answer; "
+        "a 'by' or 'until' deadline includes items due on that date."
+    )
+    count_rule = (
+        "When you say how many items you are listing, that number must equal "
+        "the items listed."
+    )
+
+    assert system == local_system
+    assert f"{DATE_RULE} {deadline_rule} {count_rule}" in system
+    for turn in (utc_turn, local_turn):
+        assert deadline_rule not in turn
+        assert count_rule not in turn
 
 
 # ---------------------------------------------------------------------------

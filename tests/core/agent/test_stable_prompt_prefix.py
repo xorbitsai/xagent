@@ -102,7 +102,7 @@ def test_turn_values_follow_the_request_text_in_the_same_message() -> None:
     assert messages[1]["content"].startswith(f"{request}\n\n{TURN_CONTEXT_HEADER}")
     turn = messages[1]["content"][len(request) :]
     assert "Run ID for this execution: run-bbbb" in turn
-    assert "Turn started at: 2026-11-11 09:58:41 UTC" in turn
+    assert "Turn started at: 2026-11-11 (Wednesday) 09:58:41 UTC" in turn
     assert '"independent_user_request": "帮我把这个翻成英文"' in turn
     assert "Ann works on the billing team." in turn
     # The stored request message is unchanged.

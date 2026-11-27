@@ -49,7 +49,7 @@ from ...tools.tool_result_spill import (
     spill_dir_for_workspace,
     spill_record_shape_is_valid,
 )
-from ...utils.timezones import resolve_zone
+from ...utils.timezones import resolve_zone, weekday_name
 from ..grounding import VALUE_KINDS, step_intent_not_fact_rule
 from ..language import (
     effective_output_language,
@@ -1364,21 +1364,19 @@ class ExecutionContext:
         return resolve_zone(self.metadata.get(CLOCK_TIMEZONE_METADATA_KEY))
 
     def _current_clock_text(self) -> str:
-        utc_stamp = self.created_at.astimezone(timezone.utc).strftime(
-            "%Y-%m-%d %H:%M:%S UTC"
-        )
         zone = self.clock_zone()
+        local = self.created_at.astimezone(zone or timezone.utc)
+        local_stamp = f"{local.date()} ({weekday_name(local)}) {local:%H:%M:%S}"
         if zone is None:
-            return utc_stamp
-        local = self.created_at.astimezone(zone)
+            return f"{local_stamp} UTC"
+        utc = self.created_at.astimezone(timezone.utc)
         offset = local.utcoffset() or timedelta(0)
         sign = "-" if offset < timedelta(0) else "+"
         hours, remainder = divmod(abs(offset), timedelta(hours=1))
         minutes = remainder // timedelta(minutes=1)
         return (
-            f"{local.strftime('%Y-%m-%d %H:%M:%S')} "
-            f"({zone.key}, UTC{sign}{hours:02d}:{minutes:02d}), "
-            f"which is {utc_stamp}"
+            f"{local_stamp} ({zone.key}, UTC{sign}{hours:02d}:{minutes:02d}), "
+            f"which is {utc:%Y-%m-%d %H:%M:%S} UTC"
         )
 
     def _current_time_context(self) -> str:

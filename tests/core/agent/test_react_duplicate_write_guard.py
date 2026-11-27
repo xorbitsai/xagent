@@ -19,9 +19,13 @@ with a turn_id, and only against records from the same turn.
 from __future__ import annotations
 
 import json
+import socket
+from contextlib import asynccontextmanager
 from typing import Any
 
 import pytest
+import requests
+from mcp.shared.memory import create_connected_server_and_client_session
 from pydantic import BaseModel
 
 from xagent.core.agent import ExecutionContext, PatternRuntime, ReActPattern
@@ -30,7 +34,9 @@ from xagent.core.agent.pattern.react.duplicate_write_guard import (
     build_suppression_envelope,
     tool_requires_duplicate_write_guard,
 )
+from xagent.core.tools.adapters.vibe import mcp_adapter
 from xagent.core.tools.tool_result_spill import SPILL_RESERVED_RESULT_KEY
+from xagent.web.tools.mcp import freshdesk
 
 TURN_1 = {"turn_id": "turn-1"}
 TURN_2 = {"turn_id": "turn-2"}
@@ -214,6 +220,136 @@ async def test_duplicate_write_is_suppressed() -> None:
     assert envelope["success"] is True
     assert envelope["suppressed_duplicate_of"] == "call_1"
     assert envelope["result"] == {"success": True, "record_id": "rec-1"}
+
+
+@pytest.mark.parametrize(
+    ("tool_name", "args", "path"),
+    [
+        (
+            "freshdesk_create_ticket",
+            {
+                "subject": "Printer",
+                "description": "Broken",
+                "email": "user@example.com",
+            },
+            "/tickets",
+        ),
+        (
+            "freshdesk_reply_to_ticket",
+            {"ticket_id": 8, "body": "Reply"},
+            "/tickets/8/reply",
+        ),
+        (
+            "freshdesk_add_note_to_ticket",
+            {"ticket_id": 8, "body": "Note"},
+            "/tickets/8/notes",
+        ),
+    ],
+)
+@pytest.mark.parametrize(
+    ("failure", "can_retry"),
+    [
+        ("connect timeout", True),
+        ("DNS failure", True),
+        ("HTTP 400", True),
+        ("HTTP 429", True),
+        ("read timeout", False),
+        ("connection reset", False),
+        ("proxy reset", False),
+        ("HTTP 502", False),
+        ("malformed 2xx", False),
+    ],
+)
+@pytest.mark.asyncio
+async def test_freshdesk_write_failure_reaches_adapter_and_guard(
+    monkeypatch: pytest.MonkeyPatch,
+    tool_name: str,
+    args: dict[str, Any],
+    path: str,
+    failure: str,
+    can_retry: bool,
+) -> None:
+    monkeypatch.setenv("FRESHDESK_SUBDOMAIN", "acme")
+    monkeypatch.setenv("FRESHDESK_API_KEY", "fake-key")
+    monkeypatch.setattr(freshdesk, "get_trusted_proxy_url", lambda: None)
+    outbound = []
+
+    def request(**kwargs: Any) -> requests.Response:
+        outbound.append(kwargs)
+        response = requests.Response()
+        response.status_code = 201
+        response._content = b'{"id": 42}'
+        if len(outbound) == 1:
+            if failure == "connect timeout":
+                raise requests.ConnectTimeout("connect timed out")
+            if failure == "DNS failure":
+                raise requests.ConnectionError(
+                    "host could not resolve"
+                ) from socket.gaierror("DNS lookup failed")
+            if failure == "read timeout":
+                raise requests.ReadTimeout("response timed out")
+            if failure == "connection reset":
+                raise requests.ConnectionError(
+                    "connection reset"
+                ) from ConnectionResetError()
+            if failure == "proxy reset":
+                raise requests.exceptions.ProxyError("proxy connection reset")
+            if failure == "malformed 2xx":
+                response._content = b"not JSON"
+            else:
+                response.status_code = int(failure.removeprefix("HTTP "))
+                response._content = b'{"description": "vendor error"}'
+        return response
+
+    @asynccontextmanager
+    async def session(_connection):
+        async with create_connected_server_and_client_session(
+            freshdesk.mcp._mcp_server
+        ) as client:
+            yield client
+
+    monkeypatch.setattr(freshdesk._session, "request", request)
+    monkeypatch.setattr(mcp_adapter, "create_session", session)
+    connection = {
+        "transport": "stdio",
+        "command": "python",
+        "args": ["-m", freshdesk.__name__],
+    }
+    async with session(connection) as client:
+        tools = (await client.list_tools()).tools
+    tool = next(entry for entry in tools if entry.name == tool_name)
+    assert tool.annotations is not None
+    adapter = mcp_adapter.MCPToolAdapter(
+        mcp_tool=tool,
+        connection=connection,
+        name_prefix="mcp_freshdesk_",
+        source_server="freshdesk",
+        raw_annotations=tool.annotations.model_dump(exclude_none=True),
+    )
+    assert tool_requires_duplicate_write_guard(adapter)
+    context = _turn_context()
+    llm = _run_twice_llm(adapter.metadata.name, args, args)
+
+    await _pattern().run(context=context, tools=[adapter], llm=llm)
+
+    first, second = _tool_results(context)
+    assert first["is_error"] is can_retry
+    assert len(outbound) == (2 if can_retry else 1)
+    assert all(
+        call["method"] == "POST" and call["url"].endswith(path) for call in outbound
+    )
+    if can_retry:
+        assert DUPLICATE_WRITE_SUPPRESSED_KEY not in second
+        assert second["is_error"] is False
+        assert json.loads(second["content"][0]["text"])["status"] == "success"
+    else:
+        initial_payload = json.loads(first["content"][0]["text"])
+        assert "may already have been applied" in initial_payload["message"]
+        assert "check whether it succeeded" in initial_payload["message"]
+        assert second[DUPLICATE_WRITE_SUPPRESSED_KEY] is True
+        assert second["suppressed_duplicate_of"] == "call_1"
+        assert second["result"] == first
+        assert "already succeeded" not in second["message"]
 
 
 @pytest.mark.asyncio
@@ -797,4 +933,4 @@ def test_suppression_envelope_shape() -> None:
     assert envelope["tool_name"] == "create_record"
     assert envelope["suppressed_duplicate_of"] == "call_1"
     assert envelope["result"] == {"success": True, "record_id": "rec-1"}
-    assert "already succeeded earlier in this turn" in envelope["message"]
+    assert "already produced a result earlier in this turn" in envelope["message"]

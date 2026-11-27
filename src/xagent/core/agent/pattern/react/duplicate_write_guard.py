@@ -1,7 +1,7 @@
 """Same-turn duplicate-write guard for the ReAct tool-execution path.
 
 Defends against a model re-issuing a write-category tool call with
-byte-identical arguments after that call already succeeded in the same turn
+byte-identical arguments after that call completed in the same turn
 (xorbitsai/xagent#2217): the repeat is not executed; the model receives a
 structured envelope carrying the prior result instead.
 
@@ -84,13 +84,14 @@ def build_suppression_envelope(
 ) -> dict[str, Any]:
     """Build the model-facing envelope for a suppressed duplicate write.
 
-    A successful prior call produces a successful envelope: the requested
-    effect exists — it was produced by the earlier call — so the loop's
-    success accounting should treat this observation like the write it stands
-    in for. A denied or dispatch-unknown settlement stays unsuccessful while
-    still preventing the write from being executed again.
+    A completed prior call produces a successful envelope for the loop's
+    accounting. The attached result describes the actual effect, which can
+    be unknown for a completed MCP call. A denied or dispatch-unknown
+    settlement stays unsuccessful while still preventing another write.
     """
-    outcome = "already succeeded" if prior_succeeded else "was denied or is uncertain"
+    outcome = (
+        "already produced a result" if prior_succeeded else "was denied or is uncertain"
+    )
     return {
         "success": prior_succeeded,
         DUPLICATE_WRITE_SUPPRESSED_KEY: True,

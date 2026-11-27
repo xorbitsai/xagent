@@ -23,7 +23,11 @@ import re
 import socket
 from typing import Any
 
+from urllib3.exceptions import ConnectTimeoutError, MaxRetryError, NewConnectionError
+from urllib3.exceptions import ProxyError as Urllib3ProxyError
+
 from mcp.server.fastmcp import FastMCP
+from mcp.types import ToolAnnotations
 
 from ....config import get_tool_max_output_length
 from ....core.tools.core.web_content import get_trusted_proxy_url
@@ -235,6 +239,53 @@ def _extract_error_detail(response: requests.Response) -> str | None:
     return ": ".join(parts) if parts else None
 
 
+class _OutcomeUnknownError(RuntimeError):
+    """A failure where the write may already have been applied to Freshdesk.
+
+    Covers transport failures after the request was sent (read timeout,
+    connection reset, TLS failure) and HTTP 5xx responses. The caller
+    should NOT retry the same call without first checking whether the
+    write already happened.
+    """
+
+
+# NameResolutionError subclasses NewConnectionError in urllib3 2.x.
+_CONNECT_STAGE_ERRORS = (NewConnectionError, ConnectTimeoutError)
+
+
+def _certainly_not_sent(exc: requests.RequestException) -> bool:
+    """True if the request provably never reached Freshdesk.
+
+    A generic connection or proxy error can wrap a reset after the POST.
+    Only treat an identified DNS or connect-stage failure as safe to retry.
+    """
+    if isinstance(exc, (requests.ConnectTimeout, requests.exceptions.InvalidURL)):
+        return True
+    if not isinstance(exc, requests.ConnectionError):
+        return False
+    if isinstance(exc.__cause__, socket.gaierror):
+        return True
+    reason = exc.args[0] if exc.args else None
+    if isinstance(reason, MaxRetryError):
+        reason = reason.reason
+    if isinstance(reason, Urllib3ProxyError):
+        reason = reason.original_error
+    return isinstance(reason, _CONNECT_STAGE_ERRORS)
+
+
+_OUTCOME_UNKNOWN_ADVICE = (
+    "The write may already have been applied to Freshdesk; do not call this "
+    "tool again for the same request, and tell the user to check whether it "
+    "succeeded before trying again"
+)
+
+
+def _unknown_write_result(exc: _OutcomeUnknownError) -> str:
+    message = f"{_OUTCOME_UNKNOWN_ADVICE}. Detail: {exc}"
+    logger.error("%s", message)
+    return _error(message)
+
+
 def _send(
     method: str,
     path: str,
@@ -283,9 +334,13 @@ def _send(
         # A connection/timeout/proxy failure's message can itself embed
         # sensitive data -- e.g. a ProxyError echoing the ambient HTTPS_PROXY
         # URL, which may carry embedded user:pass@ credentials.
-        raise RuntimeError(
-            f"Freshdesk request failed: {truncate_error_text(_sanitize_exception_text(exc))}"
-        ) from exc
+        message = f"Freshdesk request failed: {truncate_error_text(_sanitize_exception_text(exc))}"
+        if _certainly_not_sent(exc):
+            raise RuntimeError(message) from None
+        # A transport failure after the request was sent (read timeout,
+        # connection reset, TLS failure) means Freshdesk may already have
+        # applied the write.
+        raise _OutcomeUnknownError(message) from None
 
     if 300 <= response.status_code < 400:
         raise RuntimeError(
@@ -333,7 +388,11 @@ def _send(
                 "agent has permission for this operation"
             )
             detail = f"{detail} -- {credential_hint}" if detail else credential_hint
-        raise RuntimeError(
+        # A 5xx can come from Freshdesk after it applied the write.
+        error_type = (
+            _OutcomeUnknownError if response.status_code >= 500 else RuntimeError
+        )
+        raise error_type(
             f"Freshdesk API error (status {response.status_code}){suffix}"
             + (f": {detail}" if detail else "")
         )
@@ -418,6 +477,17 @@ def _validated_dict(result: Any, endpoint: str) -> dict[str, Any]:
     if not isinstance(result, dict):
         raise RuntimeError(f"Freshdesk returned an unexpected response for {endpoint}")
     return result
+
+
+def _post_write(path: str, payload: dict[str, Any]) -> dict[str, Any]:
+    response = _send("POST", path, json_data=payload)
+    try:
+        return _validated_dict(_body(response), path)
+    except RuntimeError:
+        # A response parsing failure after 2xx must not make the POST retryable.
+        raise _OutcomeUnknownError(
+            f"Freshdesk returned HTTP {response.status_code} with an unreadable response"
+        ) from None
 
 
 def _validated_list(result: Any, endpoint: str) -> list[Any]:
@@ -794,7 +864,10 @@ def freshdesk_search_tickets(query: str, page: int = 1) -> str:
         return _error(str(exc))
 
 
-@mcp.tool()
+WRITE_TOOL = ToolAnnotations(destructiveHint=False, idempotentHint=False)
+
+
+@mcp.tool(annotations=WRITE_TOOL)
 def freshdesk_create_ticket(
     subject: str,
     description: str,
@@ -886,13 +959,10 @@ def freshdesk_create_ticket(
             "cc_emails": cc_emails,
         }
         payload.update({k: v for k, v in optional.items() if v not in (None, "", [])})
-        ticket = _validated_dict(
-            _request("POST", "/tickets", json_data=payload), "/tickets"
-        )
+        ticket = _post_write("/tickets", payload)
         return success_with_capped_dict("ticket", ticket)
-    except Exception as exc:
-        logger.error("Error in freshdesk_create_ticket: %s", exc)
-        return _error(str(exc))
+    except _OutcomeUnknownError as exc:
+        return _unknown_write_result(exc)
 
 
 @mcp.tool()
@@ -1034,7 +1104,7 @@ def freshdesk_list_ticket_fields() -> str:
         return _error(str(exc))
 
 
-@mcp.tool()
+@mcp.tool(annotations=WRITE_TOOL)
 def freshdesk_reply_to_ticket(
     ticket_id: int,
     body: str,
@@ -1059,21 +1129,15 @@ def freshdesk_reply_to_ticket(
             payload["cc_emails"] = cc_emails
         if bcc_emails:
             payload["bcc_emails"] = bcc_emails
-        reply = _validated_dict(
-            _request(
-                "POST",
-                f"/tickets/{_positive_id(ticket_id, 'ticket_id')}/reply",
-                json_data=payload,
-            ),
-            f"/tickets/{ticket_id}/reply",
+        reply = _post_write(
+            f"/tickets/{_positive_id(ticket_id, 'ticket_id')}/reply", payload
         )
         return success_with_capped_dict("reply", reply)
-    except Exception as exc:
-        logger.error("Error in freshdesk_reply_to_ticket: %s", exc)
-        return _error(str(exc))
+    except _OutcomeUnknownError as exc:
+        return _unknown_write_result(exc)
 
 
-@mcp.tool()
+@mcp.tool(annotations=WRITE_TOOL)
 def freshdesk_add_note_to_ticket(
     ticket_id: int,
     body: str,
@@ -1097,18 +1161,12 @@ def freshdesk_add_note_to_ticket(
         payload: dict[str, Any] = {"body": body, "private": bool(private)}
         if notify_emails:
             payload["notify_emails"] = notify_emails
-        note = _validated_dict(
-            _request(
-                "POST",
-                f"/tickets/{_positive_id(ticket_id, 'ticket_id')}/notes",
-                json_data=payload,
-            ),
-            f"/tickets/{ticket_id}/notes",
+        note = _post_write(
+            f"/tickets/{_positive_id(ticket_id, 'ticket_id')}/notes", payload
         )
         return success_with_capped_dict("note", note)
-    except Exception as exc:
-        logger.error("Error in freshdesk_add_note_to_ticket: %s", exc)
-        return _error(str(exc))
+    except _OutcomeUnknownError as exc:
+        return _unknown_write_result(exc)
 
 
 # ---------------------------------------------------------------------------

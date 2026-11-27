@@ -18,6 +18,10 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# Keys that ``tool_result_succeeded`` reads to classify a result as a failure.
+# Listed in the order they are checked by the classifier.
+_FAILURE_CLASSIFICATION_KEYS = ("success", "is_error", "status")
+
 
 class OutputFilteredToolWrapper(AbstractBaseTool):
     """
@@ -89,15 +93,53 @@ class OutputFilteredToolWrapper(AbstractBaseTool):
         """Convert return value to string (delegates to target tool)."""
         return self._target.return_value_as_string(value)
 
+    def _filter_result(self, result: Any) -> Any:
+        """Filter a tool result and preserve failure classification.
+
+        Applies the output value filter, then restores any classification
+        key (``success``, ``is_error``, ``status``) that the field cap may
+        have dropped when the unfiltered result was a failure but the
+        filtered result reads as a success.
+        """
+        filtered = self._filter.filter(result, self._target.name)
+        return self._restore_failure_classification(result, filtered)
+
+    @staticmethod
+    def _restore_failure_classification(original: Any, filtered: Any) -> Any:
+        """Ensure filtering never changes ``tool_result_succeeded``'s verdict.
+
+        After filtering, if the unfiltered result was a failure and the
+        filtered one reads as a success, write back the classification key
+        that made the original a failure.
+        """
+        # Import locally to avoid a circular dependency at module load time.
+        from .....core.agent.result import tool_result_succeeded
+
+        if not isinstance(original, dict) or not isinstance(filtered, dict):
+            return filtered
+        if tool_result_succeeded(original):
+            return filtered  # original was a success; nothing to restore
+        if not tool_result_succeeded(filtered):
+            return filtered  # filtered still reads as failure; already correct
+
+        # The filtered dict lost every classification key that made the
+        # original a failure.  Restore the first one that applies.
+        for key in _FAILURE_CLASSIFICATION_KEYS:
+            if key in original:
+                filtered[key] = original[key]
+                break
+
+        return filtered
+
     def run_json_sync(self, args: Mapping[str, Any]) -> Any:
         """Execute tool synchronously with output filtering."""
         result = self._target.run_json_sync(args)
-        return self._filter.filter(result, self._target.name)
+        return self._filter_result(result)
 
     async def run_json_async(self, args: Mapping[str, Any]) -> Any:
         """Execute tool asynchronously with output filtering."""
         result = await self._target.run_json_async(args)
-        return self._filter.filter(result, self._target.name)
+        return self._filter_result(result)
 
     async def save_state_json(self) -> Mapping[str, Any]:
         """Save state (delegates to target tool)."""
@@ -140,7 +182,7 @@ class OutputFilteredToolWrapper(AbstractBaseTool):
 
         def wrapped_func(*args: Any, **kwargs: Any) -> Any:
             result = original_func(*args, **kwargs)
-            return self._filter.filter(result, self._target.name)
+            return self._filter_result(result)
 
         return wrapped_func
 
@@ -149,6 +191,6 @@ class OutputFilteredToolWrapper(AbstractBaseTool):
 
         async def wrapped_func_async(*args: Any, **kwargs: Any) -> Any:
             result = await original_func(*args, **kwargs)
-            return self._filter.filter(result, self._target.name)
+            return self._filter_result(result)
 
         return wrapped_func_async

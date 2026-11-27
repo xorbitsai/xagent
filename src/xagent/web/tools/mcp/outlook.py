@@ -6,6 +6,7 @@ from urllib.parse import quote
 
 import requests
 from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp.exceptions import ToolError
 
 from .utils import setup_proxy_env
 
@@ -123,7 +124,7 @@ def outlook_get_profile() -> str:
         return _success(user=me)
     except Exception as e:
         logger.error("Error getting Outlook profile: %s", e)
-        return _error(str(e))
+        raise ToolError(str(e)) from e
 
 
 @mcp.tool()
@@ -161,7 +162,7 @@ def outlook_list_messages(
         )
     except Exception as e:
         logger.error("Error listing Outlook messages: %s", e)
-        return _error(str(e))
+        raise ToolError(str(e)) from e
 
 
 @mcp.tool()
@@ -191,7 +192,7 @@ def outlook_get_message(
         return _success(message=result)
     except Exception as e:
         logger.error("Error getting Outlook message %s: %s", message_id, e)
-        return _error(str(e))
+        raise ToolError(str(e)) from e
 
 
 @mcp.tool()
@@ -227,7 +228,7 @@ def outlook_send_message(
         return _success(message="Message sent successfully")
     except Exception as e:
         logger.error("Error sending Outlook message: %s", e)
-        return _error(str(e))
+        raise ToolError(str(e)) from e
 
 
 @mcp.tool()
@@ -269,7 +270,7 @@ def outlook_list_events(
         )
     except Exception as e:
         logger.error("Error listing Outlook events: %s", e)
-        return _error(str(e))
+        raise ToolError(str(e)) from e
 
 
 @mcp.tool()
@@ -302,7 +303,7 @@ def outlook_create_event(
         return _success(event=result)
     except Exception as e:
         logger.error("Error creating Outlook event: %s", e)
-        return _error(str(e))
+        raise ToolError(str(e)) from e
 
 
 @mcp.tool()
@@ -346,7 +347,7 @@ def outlook_update_event(
         return _success(event=result)
     except Exception as e:
         logger.error("Error updating Outlook event %s: %s", event_id, e)
-        return _error(str(e))
+        raise ToolError(str(e)) from e
 
 
 @mcp.tool()
@@ -357,7 +358,7 @@ def outlook_delete_event(event_id: str) -> str:
         return _success(message="Event deleted successfully")
     except Exception as e:
         logger.error("Error deleting Outlook event %s: %s", event_id, e)
-        return _error(str(e))
+        raise ToolError(str(e)) from e
 
 
 @mcp.tool()
@@ -388,7 +389,7 @@ def outlook_list_contacts(top: int = 25, search: str | None = None) -> str:
         )
     except Exception as e:
         logger.error("Error listing Outlook contacts: %s", e)
-        return _error(str(e))
+        raise ToolError(str(e)) from e
 
 
 if __name__ == "__main__":

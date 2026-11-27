@@ -482,8 +482,10 @@ body .hover\:\text-\[\#E6EDF3\]:hover {
 }
 
 /* Ensure TabsTrigger button is visible. Radio group items are collection items
-   too; scoping to role="tab" keeps this padding and transparent border off them. */
-button[data-radix-collection-item][role="tab"] {
+   too, so only tab triggers match. :where() keeps the specificity at (0,1,1) so
+   Tailwind state utilities such as data-[state=active]:border-primary still
+   override this rule. */
+button[data-radix-collection-item]:where([role="tab"]) {
   display: inline-flex;
   align-items: center;
   justify-content: center;

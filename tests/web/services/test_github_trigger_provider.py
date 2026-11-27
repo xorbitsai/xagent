@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import threading
+import time
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from typing import Any
@@ -12,6 +13,7 @@ from unittest.mock import patch
 
 import pytest
 from fastapi import HTTPException
+from sqlalchemy.exc import InvalidRequestError
 
 from xagent.web.api.triggers import _read_callback_body
 from xagent.web.models.agent import Agent, AgentStatus
@@ -50,6 +52,9 @@ class FakeGithub:
         self.fail_status: int | None = None
         self.delete_status = 204
         self.patch_gate: Any = None  # called with the body before PATCH applies
+        self.post_gate: Any = None  # called before a hook is created
+        self.delete_gate: Any = None  # called before a DELETE applies
+        self.applied: list[tuple[str, int]] = []  # effects, in the order they land
         self.hooks: dict[int, dict[str, Any]] = {}
         self._next_id = 1000
         self.RequestException = Exception
@@ -62,6 +67,8 @@ class FakeGithub:
         assert headers["Authorization"] == "Bearer gho_test"
         if self.fail_status:
             return self._response(self.fail_status, {"message": "nope"})
+        if self.post_gate is not None:
+            self.post_gate()
         self._next_id += 1
         self.hooks[self._next_id] = json
         return self._response(201, {"id": self._next_id})
@@ -74,13 +81,18 @@ class FakeGithub:
         if self.patch_gate is not None:
             self.patch_gate(json)
         self.hooks[hook_id] = json
+        self.applied.append(("PATCH", hook_id))
         return self._response(200, {"id": hook_id})
 
     def delete(self, url, headers=None, timeout=None):
         self.calls.append(("DELETE", url, {}))
+        if self.delete_gate is not None:
+            self.delete_gate()
         if self.delete_status >= 400:
             return self._response(self.delete_status)
-        self.hooks.pop(int(url.rsplit("/", 1)[1]), None)
+        hook_id = int(url.rsplit("/", 1)[1])
+        self.hooks.pop(hook_id, None)
+        self.applied.append(("DELETE", hook_id))
         return self._response(204)
 
     def methods(self) -> list[str]:
@@ -603,12 +615,49 @@ def test_teardown_keeps_the_rotated_oauth_pair(
         fresh.close()
 
 
+def _in_thread(fn):
+    """Run fn in a thread; join() re-raises its exception."""
+    box: dict[str, Any] = {}
+
+    def _target():
+        try:
+            fn()
+        except BaseException as exc:  # noqa: BLE001 - re-raised by join
+            box["exc"] = exc
+
+    thread = threading.Thread(target=_target)
+    thread.start()
+
+    def _join(timeout: float = 20):
+        thread.join(timeout)
+        assert not thread.is_alive(), "worker still running"
+        if "exc" in box:
+            raise box["exc"]
+
+    return _join
+
+
+def _update_in_new_session(user_id, agent_id, trigger_id, updates):
+    db = next(get_db())
+    try:
+        update_agent_trigger(
+            db,
+            user_id=user_id,
+            agent_id=agent_id,
+            trigger_id=trigger_id,
+            updates=updates,
+        )
+    finally:
+        db.close()
+
+
 def test_stale_reassertion_cannot_overwrite_a_newer_secret(db_session, owner, github):
     """The earlier request's PATCH would land last; the lock must prevent it."""
     user, agent = owner
     _connect_github(db_session, user)
     trigger = _create(db_session, user, agent)
     trigger_id, agent_id, user_id = trigger.id, agent.id, user.id
+    initial_secret = _secret(trigger)
 
     entered = threading.Event()
     release = threading.Event()
@@ -622,47 +671,157 @@ def test_stale_reassertion_cannot_overwrite_a_newer_secret(db_session, owner, gi
 
     github.patch_gate = _gate
 
-    def _name_only():
-        db = next(get_db())
-        try:
-            update_agent_trigger(
-                db,
-                user_id=user_id,
-                agent_id=agent_id,
-                trigger_id=trigger_id,
-                updates={"name": "renamed"},
-            )
-        finally:
-            db.close()
-
-    def _rotate():
-        db = next(get_db())
-        try:
-            update_agent_trigger(
-                db,
-                user_id=user_id,
-                agent_id=agent_id,
-                trigger_id=trigger_id,
-                updates={"rotate_secret": True},
-            )
-        finally:
-            db.close()
-
-    older = threading.Thread(target=_name_only)
-    older.start()
+    older = _in_thread(
+        lambda: _update_in_new_session(
+            user_id, agent_id, trigger_id, {"name": "renamed"}
+        )
+    )
     assert entered.wait(20)
-    newer = threading.Thread(target=_rotate)
-    newer.start()
-    # Let the rotation commit its secret and reach the (blocked) hook write.
-    newer.join(timeout=2)
+    newer = _in_thread(
+        lambda: _update_in_new_session(
+            user_id, agent_id, trigger_id, {"rotate_secret": True}
+        )
+    )
+    time.sleep(1)  # the rotation commits, then waits on the busy hook
     release.set()
-    older.join(20)
-    newer.join(20)
-    assert not older.is_alive() and not newer.is_alive()
+    older()
+    newer()
 
     db_session.expire_all()
     stored = db_session.get(AgentTrigger, trigger_id)
+    assert _secret(stored) != initial_secret
     assert github.hooks[1001]["config"]["secret"] == _secret(stored)
+
+
+def test_delayed_disable_cannot_delete_a_re_enabled_hook(db_session, owner, github):
+    user, agent = owner
+    _connect_github(db_session, user)
+    trigger = _create(db_session, user, agent)
+    trigger_id, agent_id, user_id = trigger.id, agent.id, user.id
+
+    entered = threading.Event()
+    release = threading.Event()
+
+    def _gate():
+        entered.set()
+        assert release.wait(20)
+
+    github.delete_gate = _gate
+    disable = _in_thread(
+        lambda: _update_in_new_session(
+            user_id, agent_id, trigger_id, {"enabled": False}
+        )
+    )
+    assert entered.wait(20)
+    github.delete_gate = None
+    enable = _in_thread(
+        lambda: _update_in_new_session(user_id, agent_id, trigger_id, {"enabled": True})
+    )
+    time.sleep(1)
+    release.set()
+    disable()
+    enable()
+
+    db_session.expire_all()
+    stored = db_session.get(AgentTrigger, trigger_id)
+    _, _, hook = str(stored.resource_id).partition("#")
+    assert stored.enabled and int(hook) in github.hooks
+    # The stale disable must not delete a hook the re-enable already
+    # re-asserted, even if a later repair would recreate it.
+    deleted_at = github.applied.index(("DELETE", 1001))
+    assert ("PATCH", 1001) not in github.applied[:deleted_at]
+
+
+def test_unregister_skips_a_hook_the_enabled_trigger_still_owns(
+    db_session, owner, github
+):
+    user, agent = owner
+    _connect_github(db_session, user)
+    trigger = _create(db_session, user, agent)
+    github.calls.clear()
+
+    _run(
+        GithubProvider().unregister(
+            db_session,
+            trigger,
+            dict(trigger.config),
+            resource_id=str(trigger.resource_id),
+        )
+    )
+
+    assert github.calls == []
+    assert 1001 in github.hooks
+
+
+def test_delete_waits_for_a_first_registration_and_removes_its_hook(
+    db_session, owner, github
+):
+    user, agent = owner
+    _connect_github(db_session, user)
+    disabled = create_agent_trigger(
+        db_session,
+        user_id=user.id,
+        agent_id=agent.id,
+        trigger_type="github",
+        enabled=False,
+        config={"repository": "Acme/Widgets"},
+    )[0]
+    trigger_id, agent_id, user_id = disabled.id, agent.id, user.id
+    assert disabled.resource_id == "acme/widgets"
+
+    entered = threading.Event()
+    release = threading.Event()
+
+    def _gate():
+        entered.set()
+        assert release.wait(20)
+
+    github.post_gate = _gate
+    enable = _in_thread(
+        lambda: _update_in_new_session(user_id, agent_id, trigger_id, {"enabled": True})
+    )
+    assert entered.wait(20)
+
+    def _delete():
+        db = next(get_db())
+        try:
+            delete_agent_trigger(
+                db, user_id=user_id, agent_id=agent_id, trigger_id=trigger_id
+            )
+        finally:
+            db.close()
+
+    delete = _in_thread(_delete)
+    time.sleep(1)
+    release.set()
+    try:
+        enable()
+    except InvalidRequestError:
+        pass  # the update's final refresh found the row already deleted
+    delete()
+
+    db_session.expire_all()
+    assert db_session.get(AgentTrigger, trigger_id) is None
+    assert github.hooks == {}
+
+
+@pytest.mark.parametrize("signature", ["sha256=\xe9abc", "sha256=" + "\u00e9" * 8])
+def test_non_ascii_signature_is_a_rejection_not_an_error(
+    db_session, owner, github, signature
+):
+    user, agent = owner
+    _connect_github(db_session, user)
+    trigger = _create(db_session, user, agent)
+
+    context, body = _delivery(
+        trigger, "pull_request", _pr_payload(), signature=signature
+    )
+    result = _run(process_trigger_callback(db_session, context=context, raw_body=body))
+
+    assert result.status_code == 401
+    assert _audits(db_session)[-1].outcome == (
+        TriggerAuditOutcome.REJECTED_SIGNATURE.value
+    )
 
 
 def test_register_skips_remote_write_for_a_trigger_disabled_meanwhile(

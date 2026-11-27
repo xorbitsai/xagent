@@ -14,19 +14,13 @@ name for push, create and delete.
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import hashlib
 import hmac
 import json
 import logging
-import threading
-import weakref
-from collections.abc import AsyncIterator
 from typing import Any, Mapping
 
 from pydantic import ValidationError
-from sqlalchemy import text
-from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
 
 from ....config import get_trigger_callback_base_url
@@ -34,7 +28,10 @@ from ....core.utils.encryption import decrypt_value
 from ...models.trigger import AgentTrigger, TriggerProvisioningStatus, TriggerType
 from ..github_provisioning import (
     GithubProvisioningError,
+    async_provisioning_lock,
     create_hook,
+    lock_trigger_row,
+    release_non_row_locked_transaction,
     delete_hook,
     ensure_fresh_token,
     join_binding,
@@ -101,58 +98,6 @@ def _obj(value: object) -> dict[str, Any]:
 def _stored_config(trigger: AgentTrigger) -> dict[str, Any]:
     config = trigger.config
     return dict(config) if isinstance(config, dict) else {}
-
-
-_PROVISIONING_LOCK_TIMEOUT_SECONDS = 30
-_PG_ROW_LOCK_TIMEOUT = "5s"
-_provisioning_locks: "weakref.WeakValueDictionary[int, threading.Lock]" = (
-    weakref.WeakValueDictionary()
-)
-_provisioning_locks_guard = threading.Lock()
-
-
-@contextlib.asynccontextmanager
-async def _trigger_provisioning_lock(trigger_id: int) -> AsyncIterator[None]:
-    """In-process per-trigger lock (the only serialization on SQLite)."""
-    with _provisioning_locks_guard:
-        lock = _provisioning_locks.get(trigger_id)
-        if lock is None:
-            lock = threading.Lock()
-            _provisioning_locks[trigger_id] = lock
-    acquired = await asyncio.to_thread(
-        lock.acquire, True, _PROVISIONING_LOCK_TIMEOUT_SECONDS
-    )
-    if not acquired:
-        raise GithubProvisioningError(
-            "Another update of this trigger is in progress; retry shortly"
-        )
-    try:
-        yield
-    finally:
-        lock.release()
-
-
-def _lock_trigger_row(db: Session, trigger_id: int) -> AgentTrigger | None:
-    """Reload the trigger under a row lock (PostgreSQL; a no-op on SQLite).
-
-    The lock is held until the caller commits, so concurrent processes also
-    serialize their hook writes. The wait is bounded by ``lock_timeout``.
-    """
-    try:
-        if db.get_bind().dialect.name == "postgresql":
-            db.execute(text(f"SET LOCAL lock_timeout = '{_PG_ROW_LOCK_TIMEOUT}'"))
-        return (
-            db.query(AgentTrigger)
-            .filter(AgentTrigger.id == trigger_id)
-            .populate_existing()
-            .with_for_update()
-            .first()
-        )
-    except OperationalError as exc:
-        db.rollback()
-        raise GithubProvisioningError(
-            "Another update of this trigger is in progress; retry shortly"
-        ) from exc
 
 
 def _text(value: object) -> str | None:
@@ -362,6 +307,9 @@ class GithubProvider:
         signature = (context.header(SIGNATURE_HEADER) or "").strip()
         if not signature.startswith("sha256="):
             return VerificationResult.reject("Missing GitHub signature header")
+        if not signature.isascii():
+            # compare_digest raises TypeError on non-ASCII text.
+            return VerificationResult.reject("Invalid GitHub signature")
         secret = decrypt_value(str(trigger.secret_encrypted))
         expected = sign_github_payload(secret, raw_body)
         if not hmac.compare_digest(expected, signature):
@@ -408,8 +356,8 @@ class GithubProvider:
             # Serialize read secret -> hook write -> persist per trigger, so a
             # stale request cannot reinstall an older secret after a newer
             # one was committed and installed.
-            async with _trigger_provisioning_lock(trigger_id):
-                fresh = _lock_trigger_row(db, trigger_id)
+            async with async_provisioning_lock(trigger_id):
+                fresh = lock_trigger_row(db, trigger_id)
                 if fresh is None or not bool(fresh.enabled):
                     return RegistrationResult(status=TriggerProvisioningStatus.PENDING)
                 if not fresh.callback_id or not fresh.secret_encrypted:
@@ -424,6 +372,7 @@ class GithubProvider:
                 callback_url = github_callback_url(base_url, str(fresh.callback_id))
                 secret = decrypt_value(str(fresh.secret_encrypted))
                 events = hook_events_for(_stored_config(fresh))
+                release_non_row_locked_transaction(db)
                 hook = None
                 if hook_id is not None:
                     hook = await asyncio.to_thread(
@@ -483,6 +432,7 @@ class GithubProvider:
             return  # never provisioned; nothing exists on GitHub
         # Read before any commit: the trigger row may already be deleted.
         user_id = int(trigger.user_id)
+        trigger_id = int(trigger.id)
         raw_account_id = (
             config.get("oauth_account_id") if isinstance(config, dict) else None
         )
@@ -494,8 +444,24 @@ class GithubProvider:
                 if isinstance(raw_account_id, int)
                 else None,
             )
+            # Refresh commits, so it runs before the row lock is taken.
             token = await ensure_fresh_token(db, account)
-            await asyncio.to_thread(delete_hook, token, repository, hook_id)
+            async with async_provisioning_lock(trigger_id):
+                try:
+                    current = lock_trigger_row(db, trigger_id)
+                    if (
+                        current is not None
+                        and bool(current.enabled)
+                        and str(current.resource_id or "").lower()
+                        == str(resource_id).lower()
+                    ):
+                        # A concurrent re-enable already re-asserted this very
+                        # hook; deleting it now would silence a live trigger.
+                        return
+                    release_non_row_locked_transaction(db)
+                    await asyncio.to_thread(delete_hook, token, repository, hook_id)
+                finally:
+                    db.rollback()  # end the transaction holding the row lock
         except GithubProvisioningError as exc:
             # Raised so trigger CRUD logs the leak; the row is already gone or
             # re-bound, so there is nothing to roll back here.

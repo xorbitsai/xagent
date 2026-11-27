@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import calendar
+import contextlib
 import hashlib
 import json
 import logging
@@ -10,7 +11,7 @@ from collections.abc import Callable, Coroutine
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta, timezone, tzinfo
-from typing import Any
+from typing import Any, ContextManager
 from uuid import uuid4
 
 from pydantic import ValidationError
@@ -1351,13 +1352,30 @@ def delete_workforce_trigger(
     _delete_trigger(db, trigger)
 
 
+def _lifecycle_guard(trigger: AgentTrigger) -> ContextManager[None]:
+    """Serialize deletion with the provider's per-trigger provisioning."""
+    if str(trigger.type) == TriggerType.GITHUB.value:
+        from .github_provisioning import provisioning_lock
+
+        return provisioning_lock(int(trigger.id))
+    return contextlib.nullcontext()
+
+
 def _delete_trigger(db: Session, trigger: AgentTrigger) -> None:
     trigger_type = str(trigger.type)
     trigger_id = trigger.id
-    binding_config = dict(trigger.config or {})
-    binding_resource_id = str(trigger.resource_id) if trigger.resource_id else None
-    db.delete(trigger)
-    db.commit()
+    with _lifecycle_guard(trigger):
+        # Under the guard a concurrent first registration has finished, so the
+        # binding snapshot below includes any hook it created.
+        if trigger_type == TriggerType.GITHUB.value:
+            from .github_provisioning import lock_trigger_row
+
+            if lock_trigger_row(db, int(trigger_id)) is None:
+                return  # already deleted by a concurrent request
+        binding_config = dict(trigger.config or {})
+        binding_resource_id = str(trigger.resource_id) if trigger.resource_id else None
+        db.delete(trigger)
+        db.commit()
     try:
         _unregister_trigger_binding(
             db,

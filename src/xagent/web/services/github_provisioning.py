@@ -8,14 +8,22 @@ credential store exists. The hook id is recorded on the trigger as
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import logging
+import threading
+import weakref
+from collections.abc import AsyncIterator, Iterator
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
+from sqlalchemy import text
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
 
 from ...core.utils import public_requests as requests
+from ..models.trigger import AgentTrigger
 from ..models.user_oauth import (
     COMPOSIO_TOKEN_TYPE,
     UserOAuth,
@@ -239,3 +247,81 @@ def delete_hook(token: str, repository: str, hook_id: int) -> None:
     if int(response.status_code) in (204, 404):
         return
     _raise_for(response, repository, "delete the webhook")
+
+
+# --- per-trigger lifecycle serialization -----------------------------------
+# Registration, teardown and trigger deletion of one GitHub trigger share one
+# lock, so the hook binding they read cannot change under them. The in-process
+# lock is the only serialization on SQLite; PostgreSQL adds a row lock (taken
+# by ``lock_trigger_row``) so separate processes serialize too.
+
+_LOCK_TIMEOUT_SECONDS = 30
+_PG_ROW_LOCK_TIMEOUT = "5s"
+_locks: "weakref.WeakValueDictionary[int, threading.Lock]" = (
+    weakref.WeakValueDictionary()
+)
+_locks_guard = threading.Lock()
+BUSY_ERROR = "Another update of this trigger is in progress; retry shortly"
+
+
+def _lock_for(trigger_id: int) -> threading.Lock:
+    with _locks_guard:
+        lock = _locks.get(trigger_id)
+        if lock is None:
+            lock = threading.Lock()
+            _locks[trigger_id] = lock
+        return lock
+
+
+@contextlib.contextmanager
+def provisioning_lock(trigger_id: int) -> Iterator[None]:
+    lock = _lock_for(trigger_id)
+    if not lock.acquire(True, _LOCK_TIMEOUT_SECONDS):
+        raise GithubProvisioningError(BUSY_ERROR)
+    try:
+        yield
+    finally:
+        lock.release()
+
+
+@contextlib.asynccontextmanager
+async def async_provisioning_lock(trigger_id: int) -> AsyncIterator[None]:
+    lock = _lock_for(trigger_id)
+    if not await asyncio.to_thread(lock.acquire, True, _LOCK_TIMEOUT_SECONDS):
+        raise GithubProvisioningError(BUSY_ERROR)
+    try:
+        yield
+    finally:
+        lock.release()
+
+
+def lock_trigger_row(db: Session, trigger_id: int) -> AgentTrigger | None:
+    """Reload the trigger under a row lock (PostgreSQL; a no-op on SQLite).
+
+    The lock lasts until the caller ends the transaction; the wait is bounded
+    by ``lock_timeout``.
+    """
+    try:
+        if db.get_bind().dialect.name == "postgresql":
+            db.execute(text(f"SET LOCAL lock_timeout = '{_PG_ROW_LOCK_TIMEOUT}'"))
+        return (
+            db.query(AgentTrigger)
+            .filter(AgentTrigger.id == trigger_id)
+            .populate_existing()
+            .with_for_update()
+            .first()
+        )
+    except OperationalError as exc:
+        db.rollback()
+        raise GithubProvisioningError(BUSY_ERROR) from exc
+
+
+def release_non_row_locked_transaction(db: Session) -> None:
+    """End the read transaction before a slow HTTP call, except on PostgreSQL.
+
+    PostgreSQL keeps the row lock across the call on purpose; elsewhere an open
+    transaction would only hold a database-wide write lock for the duration of
+    the GitHub request, while the in-process lock already serializes callers.
+    """
+    if db.get_bind().dialect.name != "postgresql":
+        db.rollback()

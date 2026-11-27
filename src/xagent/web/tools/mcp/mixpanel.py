@@ -80,12 +80,31 @@ def _error(message: str, **details: Any) -> str:
     )
 
 
+_ENGAGE_REQUIRED_ROLE = "Analyst, Admin, or Owner"
+_ENGAGE_GRANT_INSTRUCTION = (
+    "give the service account the Analyst, Admin, or Owner role on this "
+    "project (Consumer cannot export user profiles); on a custom role, "
+    'enable "Export Users as CSV".'
+)
+_ENGAGE_PERMISSION_MESSAGE = (
+    "The Mixpanel service account's role lacks the download_users_csv "
+    "permission that user profile (Engage) queries need. To fix it, "
+    + _ENGAGE_GRANT_INSTRUCTION
+    + " Event queries such as mixpanel_query_user_activity do not need it."
+)
+
+
 def _engage_permission_error(error: Exception) -> dict[str, Any] | None:
     """Describe the known Engage-only permission failure.
 
     ``download_users_csv`` gates profile export through Engage. It does not
     gate event segmentation, so callers must not turn this failure into the
     broader claim that a named user's event activity cannot be queried.
+
+    The role guidance follows Mixpanel's roles table, where "Export Users
+    Report" is granted to Owner, Admin and Analyst but not Consumer, and a
+    custom role grants it as "Export Users as CSV":
+    https://docs.mixpanel.com/docs/orgs-and-projects/roles-and-permissions
     """
 
     if not isinstance(error, MixpanelAPIError) or error.status_code != 403:
@@ -96,13 +115,24 @@ def _engage_permission_error(error: Exception) -> dict[str, Any] | None:
     if "download_users_csv" in error.detail.lower():
         guidance.update(
             {
+                "message": _ENGAGE_PERMISSION_MESSAGE,
+                "mixpanel_error": str(error),
                 "error_code": "mixpanel_profile_permission_missing",
                 "required_permission": "download_users_csv",
+                "required_role": _ENGAGE_REQUIRED_ROLE,
                 "event_query_available": True,
             }
         )
     else:
-        guidance["event_query_may_be_available"] = True
+        guidance.update(
+            {
+                "event_query_may_be_available": True,
+                "possible_fix": (
+                    "If the service account lacks profile export, "
+                    + _ENGAGE_GRANT_INSTRUCTION
+                ),
+            }
+        )
     return guidance
 
 
@@ -749,7 +779,8 @@ def mixpanel_query_engage(
     profile properties, optionally filtered. Mixpanel paginates results
     server-side in fixed-size pages; there is no client-specified limit.
     This endpoint requires the Service Account's download_users_csv
-    permission. For a named person's event behavior, use
+    permission (the Analyst, Admin, or Owner project role, or a custom role
+    with "Export Users as CSV"). For a named person's event behavior, use
     mixpanel_query_user_activity instead; an Engage permission failure does
     not mean event-level filtering is unavailable.
     where: an optional Mixpanel expression to filter profiles by, e.g.
@@ -781,8 +812,9 @@ def mixpanel_query_engage(
         return success_with_capped_dict("engage", result)
     except Exception as e:
         logger.error(f"Error querying Mixpanel engage profiles: {e}")
-        permission_error = _engage_permission_error(e)
-        return _error(str(e), **(permission_error or {}))
+        details = _engage_permission_error(e) or {}
+        message = details.pop("message", str(e))
+        return _error(message, **details)
 
 
 @mcp.tool()

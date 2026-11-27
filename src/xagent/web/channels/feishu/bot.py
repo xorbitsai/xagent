@@ -66,6 +66,7 @@ from ...services.generation import (
     current_generation,
     other_generation_serves,
     tick_allowed,
+    wait_tick,
 )
 from ...services.llm_utils import AutoModelUnavailableError
 from ...services.managed_task_lease import ManagedTaskLease
@@ -1502,35 +1503,42 @@ class FeishuChannelManager:
             logger.info("Feishu channel ingress disabled on this host")
             return
         while get_channel_ingress_enabled():
-            await self._sync_bots_async()
+            serving = await self._sync_bots_async()
             # With generations on, a sync that found this process not serving
             # must be retried until serving is confirmed, even when shared
             # execution is off (which otherwise ends the loop after one sync).
             if not get_shared_task_execution_enabled():
                 if current_generation() is None:
                     return
-                await asyncio.sleep(30)
+                if serving:
+                    await asyncio.sleep(30)
+                else:
+                    await wait_tick("feishu-channels", 30)
                 continue
-            for bot in tuple(self.bots.values()):
-                if bot.channel_id is not None:
-                    await recover_channel_results(
-                        bot.channel_id, bot._deliver_shared_result
-                    )
+            if serving:
+                for bot in tuple(self.bots.values()):
+                    if bot.channel_id is not None:
+                        await recover_channel_results(
+                            bot.channel_id, bot._deliver_shared_result
+                        )
             # CRUD may reach another web replica. The designated ingress
             # observes its committed configuration without opening extra bots.
-            await asyncio.sleep(30)
+            if serving:
+                await asyncio.sleep(30)
+            else:
+                await wait_tick("feishu-channels", 30)
 
     async def stop(self) -> None:
         for app_id in list(self.bots.keys()):
             await self._stop_bot_for_appid(app_id)
 
-    async def _sync_bots_async(self) -> None:
+    async def _sync_bots_async(self) -> bool:
         if not get_channel_ingress_enabled():
-            return
+            return False
         # Finish-only mode ends chat intake for good (begin_finishing stopped
         # the channels); a later channel create/update sync must not reopen it.
         if release_hold.finishing:
-            return
+            return False
         async with self._sync_lock:
             # Chat intake belongs to the serving generation. An unreadable
             # record counts as not serving, so nothing new opens until serving
@@ -1539,7 +1547,7 @@ class FeishuChannelManager:
             if not await tick_allowed("feishu-channels"):
                 if await other_generation_serves("feishu-channels"):
                     await self.stop()
-                return
+                return False
             active_app_ids = set()
             channel_info_by_appid: Dict[str, Dict] = {}
 
@@ -1560,7 +1568,7 @@ class FeishuChannelManager:
                         }
             except Exception as e:
                 logger.error(f"Failed to load feishu channels for sync: {e}")
-                return
+                return True
 
             current_app_ids = set(self.bots.keys())
 
@@ -1572,6 +1580,7 @@ class FeishuChannelManager:
                 await self._start_bot_for_appid(
                     app_id, info["app_secret"], info["id"], info["name"]
                 )
+            return True
 
     async def _start_bot_for_appid(
         self, app_id: str, app_secret: str, channel_id: int, channel_name: str

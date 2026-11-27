@@ -10,6 +10,7 @@ dormant; they open only once this generation is confirmed as the serving one.
 from __future__ import annotations
 
 import asyncio
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -197,23 +198,73 @@ async def test_manager_loop_keeps_retrying_until_serving_is_confirmed(
 
     monkeypatch.setattr(generation, "serving_generation", read)
     sleeps: list[float] = []
-    real_sleep = asyncio.sleep
 
-    async def fast_sleep(delay: float) -> None:
-        # Only the manager's 30s retry interval is replaced; the test's own
-        # yields keep their real behaviour.
-        if delay == 30:
-            sleeps.append(delay)
-            delay = 0
-        await real_sleep(delay)
+    async def fast_wait(_component: str, delay: float) -> None:
+        sleeps.append(delay)
+        await asyncio.sleep(0)
 
-    monkeypatch.setattr(asyncio, "sleep", fast_sleep)
+    monkeypatch.setattr(mod, "wait_tick", fast_wait)
     task = asyncio.create_task(manager.start())
     for _ in range(200):
         if started:
             break
-        await real_sleep(0.01)
+        await asyncio.sleep(0.01)
     task.cancel()
     await asyncio.gather(task, return_exceptions=True)
     assert started == [kind]
     assert sleeps and set(sleeps) == {30}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", KINDS)
+async def test_refresh_wakes_dormant_channel_manager(monkeypatch, kind) -> None:
+    monkeypatch.setenv(generation.GENERATION_ENV, "green")
+    manager, started, mod = _arm(monkeypatch, kind)
+    monkeypatch.setattr(mod, "get_shared_task_execution_enabled", lambda: False)
+    record = {"value": "blue"}
+    monkeypatch.setattr(generation, "serving_generation", lambda: record["value"])
+    task = asyncio.create_task(manager.start())
+    try:
+        await asyncio.sleep(0.05)
+        assert started == []
+        record["value"] = "green"
+        assert await generation.refresh_serving()
+
+        async def opened() -> None:
+            while not started:
+                await asyncio.sleep(0.01)
+
+        await asyncio.wait_for(opened(), timeout=1)
+        assert started == [kind]
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", KINDS)
+async def test_dormant_manager_skips_shared_result_recovery(monkeypatch, kind) -> None:
+    monkeypatch.setenv(generation.GENERATION_ENV, "green")
+    manager, _, mod = _arm(monkeypatch, kind)
+    monkeypatch.setattr(mod, "get_shared_task_execution_enabled", lambda: True)
+    manager.bots["old"] = SimpleNamespace(
+        channel_id=1, _deliver_shared_result=lambda *_a: None
+    )
+    monkeypatch.setattr(
+        generation,
+        "serving_generation",
+        lambda: (_ for _ in ()).throw(RuntimeError("database down")),
+    )
+    recovered: list[int] = []
+
+    async def recover(channel_id, _deliver):
+        recovered.append(channel_id)
+
+    monkeypatch.setattr(mod, "recover_channel_results", recover)
+    task = asyncio.create_task(manager.start())
+    try:
+        await asyncio.sleep(0.05)
+        assert recovered == []
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)

@@ -92,6 +92,7 @@ from ...services.generation import (
     current_generation,
     other_generation_serves,
     tick_allowed,
+    wait_tick,
 )
 from ...services.managed_task_lease import ManagedTaskLease
 from ...services.release_hold import release_hold
@@ -3229,36 +3230,43 @@ class TelegramChannelManager:
             logger.info("Telegram channel ingress disabled on this host")
             return
         while get_channel_ingress_enabled():
-            await self._sync_bots_async()
+            serving = await self._sync_bots_async()
             # With generations on, a sync that found this process not serving
             # must be retried until serving is confirmed, even when shared
             # execution is off (which otherwise ends the loop after one sync).
             if not get_shared_task_execution_enabled():
                 if current_generation() is None:
                     return
-                await asyncio.sleep(30)
+                if serving:
+                    await asyncio.sleep(30)
+                else:
+                    await wait_tick("telegram-channels", 30)
                 continue
-            for bot in tuple(self.bots.values()):
-                if bot.channel_id is not None:
-                    await recover_channel_results(
-                        bot.channel_id, bot._deliver_shared_result
-                    )
+            if serving:
+                for bot in tuple(self.bots.values()):
+                    if bot.channel_id is not None:
+                        await recover_channel_results(
+                            bot.channel_id, bot._deliver_shared_result
+                        )
             # CRUD may reach another web replica. The designated ingress
             # observes its committed configuration without opening extra bots.
-            await asyncio.sleep(30)
+            if serving:
+                await asyncio.sleep(30)
+            else:
+                await wait_tick("telegram-channels", 30)
 
     async def stop(self) -> None:
         tokens = list(self.bots.keys())
         for token in tokens:
             await self._stop_bot_for_token(token)
 
-    async def _sync_bots_async(self) -> None:
+    async def _sync_bots_async(self) -> bool:
         if not get_channel_ingress_enabled():
-            return
+            return False
         # Finish-only mode ends chat intake for good (begin_finishing stopped
         # the channels); a later channel create/update sync must not reopen it.
         if release_hold.finishing:
-            return
+            return False
         async with self._sync_lock:
             # Chat intake belongs to the serving generation. An unreadable
             # record counts as not serving, so nothing new opens until serving
@@ -3267,7 +3275,7 @@ class TelegramChannelManager:
             if not await tick_allowed("telegram-channels"):
                 if await other_generation_serves("telegram-channels"):
                     await self.stop()
-                return
+                return False
             active_tokens = set()
             channel_info_by_token: Dict[str, Dict] = {}
 
@@ -3286,7 +3294,7 @@ class TelegramChannelManager:
                         }
             except Exception as e:
                 logger.error(f"Failed to load user channels for sync: {e}")
-                return  # Don't try to sync if we failed to load from db
+                return True  # The generation serves; retry config next cycle.
 
             current_tokens = set(self.bots.keys())
 
@@ -3308,6 +3316,7 @@ class TelegramChannelManager:
                     int(ch_id) if ch_id is not None else None,
                     str(ch_name) if ch_name is not None else None,
                 )
+            return True
 
     async def _start_bot_for_token(
         self,

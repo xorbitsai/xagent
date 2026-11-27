@@ -77,6 +77,7 @@ from ...services.generation import (
     current_generation,
     other_generation_serves,
     tick_allowed,
+    wait_tick,
 )
 from ...services.llm_utils import AutoModelUnavailableError
 from ...services.managed_task_lease import ManagedTaskLease
@@ -1504,23 +1505,30 @@ class SlackChannelManager:
             logger.info("Slack channel ingress disabled on this host")
             return
         while get_channel_ingress_enabled():
-            await self._sync_bots_async()
+            serving = await self._sync_bots_async()
             # With generations on, a sync that found this process not serving
             # must be retried until serving is confirmed, even when shared
             # execution is off (which otherwise ends the loop after one sync).
             if not get_shared_task_execution_enabled():
                 if current_generation() is None:
                     return
-                await asyncio.sleep(30)
+                if serving:
+                    await asyncio.sleep(30)
+                else:
+                    await wait_tick("slack-channels", 30)
                 continue
-            for bot in (*self.bots.values(), *self.oauth_bots.values()):
-                if bot.channel_id is not None:
-                    await recover_channel_results(
-                        bot.channel_id, bot._deliver_shared_result
-                    )
+            if serving:
+                for bot in (*self.bots.values(), *self.oauth_bots.values()):
+                    if bot.channel_id is not None:
+                        await recover_channel_results(
+                            bot.channel_id, bot._deliver_shared_result
+                        )
             # CRUD may reach another web replica. The designated ingress
             # observes its committed configuration without opening extra bots.
-            await asyncio.sleep(30)
+            if serving:
+                await asyncio.sleep(30)
+            else:
+                await wait_tick("slack-channels", 30)
 
     async def stop(self) -> None:
         await self._stop_oauth_gateway()
@@ -1529,13 +1537,13 @@ class SlackChannelManager:
         for bot_token in list(self.bots):
             await self._stop_bot_for_token(bot_token)
 
-    async def _sync_bots_async(self) -> None:
+    async def _sync_bots_async(self) -> bool:
         if not get_channel_ingress_enabled():
-            return
+            return False
         # Finish-only mode ends chat intake for good (begin_finishing stopped
         # the channels); a later channel create/update sync must not reopen it.
         if release_hold.finishing:
-            return
+            return False
         async with self._sync_lock:
             # Chat intake belongs to the serving generation. An unreadable
             # record counts as not serving, so nothing new opens until serving
@@ -1544,7 +1552,7 @@ class SlackChannelManager:
             if not await tick_allowed("slack-channels"):
                 if await other_generation_serves("slack-channels"):
                     await self.stop()
-                return
+                return False
             try:
                 # One load, partitioned on the declared installation_mode.
                 # Capability probing (which keys happen to be present) is not
@@ -1562,7 +1570,7 @@ class SlackChannelManager:
                 )
             except Exception:
                 logger.exception("Failed to load Slack channels for sync")
-                return
+                return True
 
             manual_channels = tuple(
                 channel
@@ -1576,6 +1584,7 @@ class SlackChannelManager:
             )
             await self._sync_manual_bots(manual_channels)
             await self._sync_oauth_bots(oauth_channels)
+            return True
 
     async def _sync_manual_bots(
         self,

@@ -129,7 +129,7 @@ from .services.conversation_storage_rollout import (
     report_unobserved_execution_events,
     validate_conversation_storage_rollout_at_startup,
 )
-from .services.generation import start_allowed, tick_allowed
+from .services.generation import start_allowed, tick_allowed, wait_tick
 from .services.interaction_rollout import (
     get_interaction_rollout_policy,
     is_native_schema_ready,
@@ -649,7 +649,7 @@ async def _run_trigger_dispatcher(
     tick_paused = False
     while True:
         if not await tick_allowed("trigger-dispatcher"):
-            await asyncio.sleep(poll_interval_seconds)
+            await wait_tick("trigger-dispatcher", poll_interval_seconds)
             continue
         # Trigger production pauses at the tick boundary while a planned
         # restart holds new execution: a tick already past this point runs to
@@ -2876,12 +2876,8 @@ async def _start_commands_and_channels() -> None:
         app.state.task_command_dispatcher_task = _task_command_dispatcher_task
     logger.info("Task command dispatch configured")
 
-    # Chat intake claims new conversations: only the serving generation takes
-    # it. A restarted old generation must not start receiving again. This is
-    # the cheap early refusal; when the record cannot be read it lets the start
-    # through, and the channel managers' own sync (which every start path,
-    # including channel CRUD, goes through) keeps the channels dormant until
-    # this generation is confirmed as the serving one.
+    # Start the managers in every generation. Their sync guards every intake
+    # path, including channel CRUD, and keeps a non-serving manager dormant.
     if not start_allowed("chat-channels"):
         return
 

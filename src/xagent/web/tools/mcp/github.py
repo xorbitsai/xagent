@@ -1675,13 +1675,18 @@ def github_list_commits(
 # themselves and fail closed -- an error, never a partial count presented as
 # the total -- when the scan cannot finish, the same contract as xero.py's
 # list_paid_invoices.
-MAX_COMPLETE_SCAN_PAGES = 10
+# 30 pages of 100 covers xorbitsai/xagent-saas's ~1,700 branches (measured
+# 2026-11-27: about 17 pages in 24 s) with room to grow, inside the time budget.
+MAX_COMPLETE_SCAN_PAGES = 30
 # Aggregate wall-clock budget for one scan, as MAX_ISSUE_LIST_SECONDS is for
 # github_list_issues: MAX_COMPLETE_SCAN_PAGES bounds request count, not time.
 MAX_COMPLETE_SCAN_SECONDS = 60
 # github_count_commits always counts every commit in the window but lists at
 # most this many, so a busy window cannot flood the model's context.
 MAX_LISTED_COMMITS = 100
+# Likewise for github_list_branches' names: the counts always cover every
+# branch, but ~1,000 names would be ~60 KB of the model's context.
+MAX_LISTED_BRANCHES = 300
 
 _ISO_DATE_RE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}")
 
@@ -1749,8 +1754,10 @@ def github_list_branches(repo: str, prefix: str = "") -> str:
 
     Use this for "how many branches are there" or "which branches start with
     X". It reads every page itself: total_count counts all branches in the
-    repository; branches (sorted) and matching_count cover the names that
-    start with prefix. A successful result is always complete. If the
+    repository and matching_count the names that start with prefix; both
+    are always complete. branches lists the matching names, sorted, up to
+    300 -- branches_listed_truncated is true when more matched than are
+    listed (narrow the prefix to see them). If the
     repository has more branches than this tool can read, it returns an
     error instead of a partial list -- report the count as unavailable.
     """
@@ -1781,8 +1788,9 @@ def github_list_branches(repo: str, prefix: str = "") -> str:
             prefix=prefix or None,
             total_count=len(names),
             matching_count=len(matching),
-            branches=matching,
             complete=True,
+            branches=matching[:MAX_LISTED_BRANCHES],
+            branches_listed_truncated=len(matching) > MAX_LISTED_BRANCHES,
         )
     except _IncompleteScanError as e:
         logger.warning(f"Incomplete GitHub branch scan for {repo}: {e}")

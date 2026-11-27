@@ -5130,6 +5130,7 @@ def test_list_branches_reads_every_page_and_matches_prefix(monkeypatch):
     assert result["total_count"] == 104
     assert result["matching_count"] == 2
     assert result["branches"] == ["xero/a", "xero/b"]
+    assert result["branches_listed_truncated"] is False
     assert [c["params"]["page"] for c in calls] == [1, 2]
     assert all(c["params"]["per_page"] == 100 for c in calls)
     assert calls[0]["url"] == (
@@ -5428,3 +5429,16 @@ def test_count_commits_limit_error_says_to_split_the_window(monkeypatch):
     )
 
     assert "shorter date ranges" in result["message"]
+
+
+def test_list_branches_caps_listed_names_but_not_the_counts(monkeypatch):
+    pages = [[{"name": f"b{p}-{i:03d}"} for i in range(100)] for p in range(4)]
+    fake, _ = _paged(pages)
+    monkeypatch.setattr(github.requests, "request", fake)
+
+    result = json.loads(github.github_list_branches("octocat/Hello-World"))
+
+    assert result["total_count"] == 400
+    assert result["matching_count"] == 400
+    assert len(result["branches"]) == github.MAX_LISTED_BRANCHES
+    assert result["branches_listed_truncated"] is True

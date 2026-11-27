@@ -846,7 +846,11 @@ async def get_tasks(
                     .replace("_", "\\_")
                 )
                 pattern = f"%{escaped}%"
-                legacy_messages = select(TaskChatMessage.task_id).where(
+                # Correlated to the outer task so the database only reads the
+                # messages of tasks already inside the user/visibility scope,
+                # instead of matching every user's messages first.
+                legacy_message_match = select(TaskChatMessage.id).where(
+                    TaskChatMessage.task_id == Task.id,
                     or_(
                         TaskChatMessage.role == "user",
                         and_(
@@ -927,7 +931,7 @@ async def get_tasks(
                         ),
                         and_(
                             Task.conversation_storage_version == 1,
-                            Task.id.in_(legacy_messages),
+                            legacy_message_match.exists(),
                         ),
                         and_(
                             Task.conversation_storage_version == 2,

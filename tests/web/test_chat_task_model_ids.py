@@ -1277,6 +1277,74 @@ def test_task_search_matches_messages_before_pagination_and_preserves_scope(
         db.close()
 
 
+def test_task_search_legacy_messages_stay_inside_task_scope(test_db, user1_headers):
+    from sqlalchemy import event
+
+    from xagent.web.models.chat_message import TaskChatMessage
+    from xagent.web.models.task import Task, TaskStatus
+    from xagent.web.models.user import User
+
+    db = next(get_db())
+    try:
+        user = db.query(User).filter(User.username == "user1").one()
+        admin = db.query(User).filter(User.username == "admin").one()
+        fixtures = {
+            "own visible": {"user_id": user.id},
+            "own hidden": {"user_id": user.id, "is_visible": False},
+            "foreign visible": {"user_id": admin.id},
+        }
+        for title, values in fixtures.items():
+            task = Task(
+                title=title,
+                status=TaskStatus.COMPLETED,
+                conversation_storage_version=1,
+                **values,
+            )
+            db.add(task)
+            db.flush()
+            db.add(
+                TaskChatMessage(
+                    task_id=task.id,
+                    user_id=values["user_id"],
+                    role="user",
+                    content="haystack marker",
+                    message_type="user",
+                )
+            )
+        db.commit()
+
+        statements: list[str] = []
+
+        def capture(conn, cursor, statement, parameters, context, executemany):
+            if "task_chat_messages" in statement:
+                statements.append(" ".join(statement.split()))
+
+        engine = get_engine()
+        event.listen(engine, "before_cursor_execute", capture)
+        try:
+            response = client.get(
+                "/api/chat/tasks",
+                params={"search": "marker", "per_page": 40},
+                headers=user1_headers,
+            )
+        finally:
+            event.remove(engine, "before_cursor_execute", capture)
+
+        assert response.status_code == 200, response.text
+        assert [task["title"] for task in response.json()["tasks"]] == ["own visible"]
+        assert response.json()["pagination"]["total_count"] == 1
+        # The message lookup is correlated to the candidate task, so answering
+        # one user's search never reads other tasks' messages.
+        assert statements
+        assert all("EXISTS (SELECT" in statement for statement in statements)
+        assert all(
+            "task_chat_messages.task_id = tasks.id" in statement
+            for statement in statements
+        )
+    finally:
+        db.close()
+
+
 @pytest.mark.parametrize("storage_version", [1, 2])
 def test_task_search_never_matches_redacted_assistant_diagnostics(
     test_db, user1_headers, storage_version

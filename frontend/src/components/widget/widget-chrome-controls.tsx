@@ -1,7 +1,7 @@
 "use client"
 
 import React, { useCallback, useEffect, useRef, useState } from "react"
-import { History, Loader2, Maximize2, MessageSquarePlus, Minimize2, Minus, MoreHorizontal } from "lucide-react"
+import { History, Loader2, Maximize2, MessageSquarePlus, Minimize2, Minus, MoreHorizontal, X } from "lucide-react"
 import { useI18n } from "@/contexts/i18n-context"
 import {
   listenForWidgetExpandState,
@@ -61,6 +61,10 @@ export function WidgetChromeControls({
   const { t } = useI18n()
   const [isMenuOpen, setIsMenuOpen] = useState(false)
   const [internalExpanded, setInternalExpanded] = useState(false)
+  // widget.js only hides the panel on widget_close, so the button reads as
+  // minimize. The one-time chat link page ends the session instead and says
+  // so with widget_close_ends_chat.
+  const [closeEndsChat, setCloseEndsChat] = useState(false)
   const isControlled = controlledExpanded !== undefined
   const isExpanded = isControlled ? controlledExpanded : internalExpanded
   const setIsExpanded = useCallback((next: boolean) => {
@@ -130,6 +134,10 @@ export function WidgetChromeControls({
     // this message, and widget.js's resize-to-mobile collapse still does.
     listenForWidgetHostMessage("widget_expand_rejected", () => setIsExpanded(false))
   ), [setIsExpanded])
+
+  useEffect(() => (
+    listenForWidgetHostMessage("widget_close_ends_chat", () => setCloseEndsChat(true))
+  ), [])
 
   useEffect(() => (
     // widget.js reports the panel's actual size after every size request,
@@ -239,11 +247,15 @@ export function WidgetChromeControls({
       <button
         type="button"
         onClick={handleClose}
-        title={t("widgetChat.minimize")}
-        aria-label={t("widgetChat.minimize")}
+        title={closeEndsChat ? t("widgetLink.close") : t("widgetChat.minimize")}
+        aria-label={closeEndsChat ? t("widgetLink.close") : t("widgetChat.minimize")}
         className={iconButtonClassName}
       >
-        <Minus className="w-4 h-4" data-icon="minimize" />
+        {closeEndsChat ? (
+          <X className="w-4 h-4" data-icon="close" />
+        ) : (
+          <Minus className="w-4 h-4" data-icon="minimize" />
+        )}
       </button>
     </div>
   )

@@ -607,12 +607,15 @@ describe("link session host iframe protocol", () => {
     expect(h.snapshots[h.snapshots.length - 1]).toEqual({ phase: "terminated", iframeSrc: null, closeButtonVisible: false })
   })
 
-  it("answers widget_chrome_ready with a collapsed state and hides the page's own close button", () => {
+  it("answers widget_chrome_ready with a collapsed state and close semantics, and hides the page's own close button", () => {
     const h = makeHost()
     connect(h)
     expect(h.snapshots[h.snapshots.length - 1].closeButtonVisible).toBe(true)
     iframeSays(h, "widget_chrome_ready")
-    expect(h.iframePosts).toEqual([{ xagent: true, v: 1, type: "widget_expand_state", expanded: false }])
+    expect(h.iframePosts).toEqual([
+      { xagent: true, v: 1, type: "widget_expand_state", expanded: false },
+      { xagent: true, v: 1, type: "widget_close_ends_chat" },
+    ])
     expect(h.snapshots[h.snapshots.length - 1].closeButtonVisible).toBe(false)
     iframeSays(h, "widget_chrome_not_ready")
     expect(h.snapshots[h.snapshots.length - 1].closeButtonVisible).toBe(true)

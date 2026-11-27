@@ -78,11 +78,14 @@ export function requestPromptContext(
 // widget_expand_state; that message carries a value, so
 // listenForWidgetExpandState below handles it.
 // prompt_context replies go through requestPromptContext instead.
+// widget_close_ends_chat comes only from the one-time chat link page, in reply
+// to widget_chrome_ready: there widget_close ends the session rather than
+// hiding a panel, so the header shows a close icon instead of minimize.
 // event.source, not origin, is the check here:
 // the embedding page is an arbitrary third-party origin the iframe can't
 // allowlist in advance (unlike the host, which set iframe.src itself and so
 // already knows this iframe's real origin for its own sends).
-export type WidgetHostMessageType = "widget_expand_rejected"
+export type WidgetHostMessageType = "widget_expand_rejected" | "widget_close_ends_chat"
 
 export function listenForWidgetHostMessage(
   type: WidgetHostMessageType,

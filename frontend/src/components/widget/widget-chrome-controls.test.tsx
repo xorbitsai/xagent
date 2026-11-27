@@ -56,6 +56,49 @@ describe("WidgetChromeControls", () => {
     )
   })
 
+  describe("when the host says widget_close ends the chat", () => {
+    const hostSays = (source: unknown) => {
+      fireEvent(window, new MessageEvent("message", {
+        data: { xagent: true, v: 1, type: "widget_close_ends_chat" },
+        source: source as MessageEventSource,
+      }))
+    }
+
+    it("shows a close button instead of minimize, and still posts widget_close", () => {
+      render(<WidgetChromeControls />)
+
+      hostSays(window.parent)
+
+      expect(screen.queryByRole("button", { name: "widgetChat.minimize" })).toBeNull()
+      const closeButton = screen.getByRole("button", { name: "widgetLink.close" })
+      expect(closeButton.querySelector('[data-icon="close"]')).not.toBeNull()
+      expect(closeButton.querySelector('[data-icon="minimize"]')).toBeNull()
+
+      fireEvent.click(closeButton)
+      expect(postMessageSpy).toHaveBeenCalledWith(
+        { xagent: true, v: 1, type: "widget_close" },
+        "*",
+      )
+    })
+
+    it("ignores the message when it does not come from window.parent", () => {
+      render(<WidgetChromeControls />)
+
+      hostSays(window)
+
+      expect(screen.getByRole("button", { name: "widgetChat.minimize" })).toBeInTheDocument()
+    })
+
+    it("ignores a same-window message on a direct (non-embedded) visit", () => {
+      vi.stubGlobal("parent", window)
+      render(<WidgetChromeControls />)
+
+      hostSays(window)
+
+      expect(screen.getByRole("button", { name: "widgetChat.minimize" })).toBeInTheDocument()
+    })
+  })
+
   it("announces chrome_ready exactly once on mount and chrome_not_ready exactly once on unmount", () => {
     // widget.js's mobile FAB-hiding guard keys off exactly this pair: without
     // a reliable not-ready signal when this component disappears (e.g. a

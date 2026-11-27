@@ -11,6 +11,7 @@ from googleapiclient.http import (  # type: ignore[import-not-found]
     MediaIoBaseUpload,
 )
 from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp.exceptions import ToolError
 
 from .utils import setup_proxy_env
 
@@ -69,7 +70,7 @@ def google_drive_search(query: str = "", max_results: int = 10) -> str:
         return json.dumps({"status": "success", "files": items})
     except Exception as e:
         logger.error(f"Error searching drive: {e}")
-        return json.dumps({"status": "error", "message": str(e)})
+        raise ToolError(str(e)) from e
 
 
 @mcp.tool()
@@ -107,7 +108,7 @@ def google_drive_get_file_content(file_id: str, mime_type: str = "text/plain") -
         )
     except Exception as e:
         logger.error(f"Error getting file content: {e}")
-        return json.dumps({"status": "error", "message": str(e)})
+        raise ToolError(str(e)) from e
 
 
 @mcp.tool()
@@ -144,7 +145,7 @@ def google_drive_create_file(
         return json.dumps({"status": "success", "file": file})
     except Exception as e:
         logger.error(f"Error creating file: {e}")
-        return json.dumps({"status": "error", "message": str(e)})
+        raise ToolError(str(e)) from e
 
 
 @mcp.tool()
@@ -170,7 +171,7 @@ def google_drive_create_folder(name: str, parent_id: str | None = None) -> str:
         return json.dumps({"status": "success", "folder": folder})
     except Exception as e:
         logger.error(f"Error creating folder: {e}")
-        return json.dumps({"status": "error", "message": str(e)})
+        raise ToolError(str(e)) from e
 
 
 @mcp.tool()
@@ -195,7 +196,7 @@ def google_drive_rename_file(file_id: str, new_name: str) -> str:
         return json.dumps({"status": "success", "file": updated_file})
     except Exception as e:
         logger.error(f"Error renaming file: {e}")
-        return json.dumps({"status": "error", "message": str(e)})
+        raise ToolError(str(e)) from e
 
 
 @mcp.tool()
@@ -235,7 +236,7 @@ def google_drive_delete_file(file_id: str) -> str:
         )
     except Exception as e:
         logger.error(f"Error deleting file: {e}")
-        return json.dumps({"status": "error", "message": str(e)})
+        raise ToolError(str(e)) from e
 
 
 if __name__ == "__main__":

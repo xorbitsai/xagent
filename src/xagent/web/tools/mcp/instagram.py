@@ -3,14 +3,14 @@ from typing import Any
 from urllib.parse import quote
 
 from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp.exceptions import ToolError
 
 from . import meta_graph
 from .meta_graph import (
     GraphAPIError,
 )
 from .meta_graph import bounded_limit as _bounded_limit
-from .meta_graph import error_response as _error
-from .meta_graph import graph_error_response as _graph_error
+from .meta_graph import redact_secrets
 from .meta_graph import graph_request as _graph_request
 from .meta_graph import is_public_image_url as _is_public_image_url
 from .meta_graph import success_response as _success
@@ -105,10 +105,12 @@ def instagram_auth_status() -> str:
         )
     except GraphAPIError as e:
         logger.error("Error checking Instagram auth status: %s", e)
-        return _graph_error(e)
+        raise ToolError(
+            redact_secrets(str(e), sensitive_values=e.sensitive_values)
+        ) from e
     except Exception as e:
         logger.error("Error checking Instagram auth status: %s", e)
-        return _error(str(e))
+        raise ToolError(str(e)) from e
 
 
 @mcp.tool()
@@ -118,10 +120,12 @@ def instagram_list_linked_accounts() -> str:
         return _success(accounts=_list_pages_with_instagram_accounts())
     except GraphAPIError as e:
         logger.error("Error listing Instagram linked accounts: %s", e)
-        return _graph_error(e)
+        raise ToolError(
+            redact_secrets(str(e), sensitive_values=e.sensitive_values)
+        ) from e
     except Exception as e:
         logger.error("Error listing Instagram linked accounts: %s", e)
-        return _error(str(e))
+        raise ToolError(str(e)) from e
 
 
 @mcp.tool()
@@ -138,12 +142,14 @@ def instagram_get_profile(instagram_account_id: str) -> str:
         logger.error(
             "Error getting Instagram profile for %s: %s", instagram_account_id, e
         )
-        return _graph_error(e)
+        raise ToolError(
+            redact_secrets(str(e), sensitive_values=e.sensitive_values)
+        ) from e
     except Exception as e:
         logger.error(
             "Error getting Instagram profile for %s: %s", instagram_account_id, e
         )
-        return _error(str(e))
+        raise ToolError(str(e)) from e
 
 
 @mcp.tool()
@@ -163,12 +169,14 @@ def instagram_list_media(instagram_account_id: str, limit: int = 10) -> str:
         logger.error(
             "Error listing Instagram media for %s: %s", instagram_account_id, e
         )
-        return _graph_error(e)
+        raise ToolError(
+            redact_secrets(str(e), sensitive_values=e.sensitive_values)
+        ) from e
     except Exception as e:
         logger.error(
             "Error listing Instagram media for %s: %s", instagram_account_id, e
         )
-        return _error(str(e))
+        raise ToolError(str(e)) from e
 
 
 @mcp.tool()
@@ -204,12 +212,14 @@ def instagram_publish_image(
         logger.error(
             "Error publishing Instagram image for %s: %s", instagram_account_id, e
         )
-        return _graph_error(e)
+        raise ToolError(
+            redact_secrets(str(e), sensitive_values=e.sensitive_values)
+        ) from e
     except Exception as e:
         logger.error(
             "Error publishing Instagram image for %s: %s", instagram_account_id, e
         )
-        return _error(str(e))
+        raise ToolError(str(e)) from e
 
 
 if __name__ == "__main__":

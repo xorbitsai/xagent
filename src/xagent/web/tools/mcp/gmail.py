@@ -8,6 +8,7 @@ from typing import Any
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build  # type: ignore[import-not-found]
 from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp.exceptions import ToolError
 
 from .utils import setup_proxy_env
 
@@ -121,7 +122,7 @@ def gmail_search_messages(
 
     except Exception as e:
         logger.error(f"Error searching messages: {e}")
-        return json.dumps({"status": "error", "message": str(e)})
+        raise ToolError(str(e)) from e
 
 
 @mcp.tool()
@@ -155,7 +156,7 @@ def gmail_read_threads(thread_ids: list[str]) -> str:
         )
     except Exception as e:
         logger.error(f"Error reading threads: {e}")
-        return json.dumps({"status": "error", "message": str(e)})
+        raise ToolError(str(e)) from e
 
 
 @mcp.tool()
@@ -204,7 +205,7 @@ def gmail_send_messages(messages: list[dict], action: str = "draft") -> str:
         return json.dumps({"status": "success", "results": results})
     except Exception as e:
         logger.error(f"Error sending/drafting messages: {e}")
-        return json.dumps({"status": "error", "message": str(e)})
+        raise ToolError(str(e)) from e
 
 
 @mcp.tool()
@@ -290,13 +291,11 @@ def gmail_manage_labels(
             return json.dumps({"status": "success", "message": result})
 
         else:
-            return json.dumps(
-                {"status": "error", "message": f"Unknown action: {action}"}
-            )
+            raise ToolError(f"Unknown action: {action}")
 
     except Exception as e:
         logger.error(f"Error managing labels: {e}")
-        return json.dumps({"status": "error", "message": str(e)})
+        raise ToolError(str(e)) from e
 
 
 if __name__ == "__main__":

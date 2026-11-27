@@ -3,6 +3,9 @@ from unittest.mock import Mock
 
 import requests
 
+import pytest
+from mcp.server.fastmcp.exceptions import ToolError
+
 from xagent.web.tools.mcp import facebook
 
 
@@ -211,6 +214,7 @@ def test_publish_image_post_uses_public_url_payload(monkeypatch):
 
 
 def test_graph_api_errors_are_structured_and_redact_tokens(monkeypatch):
+    """GraphAPIError must raise ToolError with redacted token (isError=true)."""
     monkeypatch.setenv("META_ACCESS_TOKEN", "user-token")
     monkeypatch.setattr(
         facebook.requests,
@@ -229,12 +233,11 @@ def test_graph_api_errors_are_structured_and_redact_tokens(monkeypatch):
         ),
     )
 
-    result = _payload(facebook.facebook_auth_status())
+    with pytest.raises(ToolError) as exc_info:
+        facebook.facebook_auth_status()
 
-    assert result["status"] == "error"
-    assert "user-token" not in json.dumps(result)
-    assert "[redacted]" in json.dumps(result)
-    assert result["details"]["error"]["code"] == 190
+    assert "user-token" not in str(exc_info.value)
+    assert "[redacted]" in str(exc_info.value)
 
 
 def test_graph_api_error_message_truncates_large_response_text(monkeypatch):
@@ -246,14 +249,15 @@ def test_graph_api_error_message_truncates_large_response_text(monkeypatch):
         Mock(return_value=MockResponse(text=long_response_text, status_code=502)),
     )
 
-    result = _payload(facebook.facebook_auth_status())
+    with pytest.raises(ToolError) as exc_info:
+        facebook.facebook_auth_status()
 
-    assert result["status"] == "error"
-    assert "... [truncated]" in result["message"]
-    assert "x" * 1001 not in result["message"]
+    assert "... [truncated]" in str(exc_info.value)
+    assert "x" * 1001 not in str(exc_info.value)
 
 
 def test_page_token_is_redacted_from_publish_errors(monkeypatch):
+    """GraphAPIError during publish must raise ToolError with redacted page token."""
     monkeypatch.setenv("META_ACCESS_TOKEN", "user-token")
 
     def request(method, url, **kwargs):
@@ -274,26 +278,22 @@ def test_page_token_is_redacted_from_publish_errors(monkeypatch):
 
     monkeypatch.setattr(facebook.requests, "request", Mock(side_effect=request))
 
-    result = _payload(facebook.facebook_publish_text_post("page-1", "Launch update"))
+    with pytest.raises(ToolError) as exc_info:
+        facebook.facebook_publish_text_post("page-1", "Launch update")
 
-    serialized = json.dumps(result)
-    assert result["status"] == "error"
+    serialized = str(exc_info.value)
     assert "page-token" not in serialized
     assert "[redacted]" in serialized
-    assert result["details"]["error"]["code"] == 190
 
 
 def test_publish_image_post_rejects_non_public_url(monkeypatch):
+    """Non-public image URL must raise ToolError instead of returning error JSON."""
     monkeypatch.setenv("META_ACCESS_TOKEN", "user-token")
     mock_request = Mock()
     monkeypatch.setattr(facebook.requests, "request", mock_request)
 
-    result = _payload(
+    with pytest.raises(ToolError) as exc_info:
         facebook.facebook_publish_image_post("page-1", "/tmp/local-image.png")
-    )
 
-    assert result == {
-        "status": "error",
-        "message": "image_url must be a public http or https URL",
-    }
+    assert "image_url must be a public http or https URL" in str(exc_info.value)
     mock_request.assert_not_called()

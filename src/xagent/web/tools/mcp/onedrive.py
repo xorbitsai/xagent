@@ -7,6 +7,7 @@ from urllib.parse import quote
 
 import requests
 from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp.exceptions import ToolError
 
 from .utils import setup_proxy_env
 
@@ -23,13 +24,6 @@ DEFAULT_TIMEOUT_SECONDS = 30
 
 def _success(**payload: Any) -> str:
     return json.dumps({"status": "success", **payload}, ensure_ascii=False)
-
-
-def _error(message: str, *, details: Any = None) -> str:
-    payload: dict[str, Any] = {"status": "error", "message": message}
-    if details is not None:
-        payload["details"] = details
-    return json.dumps(payload, ensure_ascii=False)
 
 
 def _graph_headers(extra_headers: dict[str, str] | None = None) -> dict[str, str]:
@@ -129,7 +123,7 @@ def onedrive_get_profile() -> str:
         return _success(user=me)
     except Exception as e:
         logger.error("Error getting OneDrive profile: %s", e)
-        return _error(str(e))
+        raise ToolError(str(e)) from e
 
 
 @mcp.tool()
@@ -144,7 +138,7 @@ def onedrive_list_items(folder_path: str | None = None, top: int = 50) -> str:
         return _success(items=result.get("value", []))
     except Exception as e:
         logger.error("Error listing OneDrive items under %s: %s", folder_path, e)
-        return _error(str(e))
+        raise ToolError(str(e)) from e
 
 
 @mcp.tool()
@@ -162,7 +156,7 @@ def onedrive_search_files(query: str, top: int = 25) -> str:
         return _success(items=result.get("value", []))
     except Exception as e:
         logger.error("Error searching OneDrive files: %s", e)
-        return _error(str(e))
+        raise ToolError(str(e)) from e
 
 
 @mcp.tool()
@@ -181,7 +175,7 @@ def onedrive_get_item(path: str | None = None, item_id: str | None = None) -> st
         return _success(item=result)
     except Exception as e:
         logger.error("Error getting OneDrive item: %s", e)
-        return _error(str(e))
+        raise ToolError(str(e)) from e
 
 
 @mcp.tool()
@@ -198,7 +192,7 @@ def onedrive_get_file_content(file_path: str) -> str:
         )
     except Exception as e:
         logger.error("Error downloading OneDrive file %s: %s", file_path, e)
-        return _error(str(e))
+        raise ToolError(str(e)) from e
 
 
 @mcp.tool()
@@ -217,7 +211,7 @@ def onedrive_upload_text_file(
         return _success(item=result)
     except Exception as e:
         logger.error("Error uploading OneDrive text file %s: %s", file_path, e)
-        return _error(str(e))
+        raise ToolError(str(e)) from e
 
 
 @mcp.tool()
@@ -245,7 +239,7 @@ def onedrive_create_folder(
         return _success(folder=result)
     except Exception as e:
         logger.error("Error creating OneDrive folder %s: %s", folder_name, e)
-        return _error(str(e))
+        raise ToolError(str(e)) from e
 
 
 @mcp.tool()
@@ -262,7 +256,7 @@ def onedrive_rename_item(item_id: str, new_name: str) -> str:
         return _success(item=result)
     except Exception as e:
         logger.error("Error renaming OneDrive item %s: %s", item_id, e)
-        return _error(str(e))
+        raise ToolError(str(e)) from e
 
 
 @mcp.tool()
@@ -273,7 +267,7 @@ def onedrive_delete_item(item_id: str) -> str:
         return _success(message="Item deleted successfully")
     except Exception as e:
         logger.error("Error deleting OneDrive item %s: %s", item_id, e)
-        return _error(str(e))
+        raise ToolError(str(e)) from e
 
 
 if __name__ == "__main__":

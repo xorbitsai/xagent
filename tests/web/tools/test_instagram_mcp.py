@@ -3,6 +3,9 @@ from unittest.mock import Mock
 
 import requests
 
+import pytest
+from mcp.server.fastmcp.exceptions import ToolError
+
 from xagent.web.tools.mcp import instagram
 
 
@@ -236,20 +239,20 @@ def test_publish_image_creates_container_then_publishes(monkeypatch):
 
 
 def test_publish_image_rejects_non_public_url(monkeypatch):
+    """Non-public image URL must raise ToolError instead of returning error JSON."""
     monkeypatch.setenv("META_ACCESS_TOKEN", "user-token")
     mock_request = Mock()
     monkeypatch.setattr(instagram.requests, "request", mock_request)
 
-    result = _payload(instagram.instagram_publish_image("ig-1", "/tmp/image.png"))
+    with pytest.raises(ToolError) as exc_info:
+        instagram.instagram_publish_image("ig-1", "/tmp/image.png")
 
-    assert result == {
-        "status": "error",
-        "message": "image_url must be a public http or https URL",
-    }
+    assert "image_url must be a public http or https URL" in str(exc_info.value)
     mock_request.assert_not_called()
 
 
 def test_graph_api_errors_are_structured_and_redact_tokens(monkeypatch):
+    """GraphAPIError must raise ToolError with redacted token (isError=true)."""
     monkeypatch.setenv("META_ACCESS_TOKEN", "user-token")
     monkeypatch.setattr(
         instagram.requests,
@@ -268,12 +271,11 @@ def test_graph_api_errors_are_structured_and_redact_tokens(monkeypatch):
         ),
     )
 
-    result = _payload(instagram.instagram_auth_status())
+    with pytest.raises(ToolError) as exc_info:
+        instagram.instagram_auth_status()
 
-    assert result["status"] == "error"
-    assert "user-token" not in json.dumps(result)
-    assert "[redacted]" in json.dumps(result)
-    assert result["details"]["error"]["code"] == 190
+    assert "user-token" not in str(exc_info.value)
+    assert "[redacted]" in str(exc_info.value)
 
 
 def test_graph_api_error_message_truncates_large_response_text(monkeypatch):
@@ -285,8 +287,8 @@ def test_graph_api_error_message_truncates_large_response_text(monkeypatch):
         Mock(return_value=MockResponse(text=long_response_text, status_code=502)),
     )
 
-    result = _payload(instagram.instagram_auth_status())
+    with pytest.raises(ToolError) as exc_info:
+        instagram.instagram_auth_status()
 
-    assert result["status"] == "error"
-    assert "... [truncated]" in result["message"]
-    assert "x" * 1001 not in result["message"]
+    assert "... [truncated]" in str(exc_info.value)
+    assert "x" * 1001 not in str(exc_info.value)

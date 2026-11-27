@@ -24,6 +24,11 @@ from xagent.core.model.video.adapter import (
 )
 from xagent.core.model.video.base import BilledVideoTaskError, BilledVideoTaskTimeout
 from xagent.core.model.video.xinference import XinferenceVideoModel
+from xagent.core.tools.core.media_errors import (
+    PROVIDER_QUOTA,
+    classify_media_failure,
+    media_error_fields,
+)
 
 pytestmark = pytest.mark.asyncio
 
@@ -433,6 +438,23 @@ async def test_client_error_on_submit_is_a_plain_failure(server):
         await _build().generate_video(prompt="a fox")
     assert retry_on(info.value) is False
     assert len(server.calls) == 1
+
+
+async def test_insufficient_balance_on_submit_says_the_account_is_out_of_credit(
+    server,
+):
+    """Production 2026-11-27: every Toby video answered 402
+    credit_insufficient_balance, and the user was told "the reason is not
+    available"."""
+    server.post_replies = [
+        FakeResponse(402, {"error": {"code": "credit_insufficient_balance"}})
+    ]
+    with pytest.raises(RuntimeError, match="credit_insufficient_balance") as info:
+        await _build().generate_video(prompt="a fox", seconds=4)
+    assert retry_on(info.value) is False
+    assert len(server.calls) == 1
+    assert classify_media_failure(info.value) == PROVIDER_QUOTA
+    assert "run out of credit" in media_error_fields(PROVIDER_QUOTA)["error"]
 
 
 @pytest.mark.parametrize(

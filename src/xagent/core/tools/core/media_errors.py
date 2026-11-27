@@ -58,6 +58,7 @@ from ...utils.security import is_credential_key, redact_sensitive_text
 MODEL_NOT_ENABLED = "model_not_enabled"
 INVALID_REQUEST = "invalid_request"
 PROVIDER_UNAVAILABLE = "provider_unavailable"
+PROVIDER_QUOTA = "provider_quota"
 UNKNOWN = "unknown"
 
 MEDIA_FAILURE_CATEGORIES = frozenset(
@@ -65,6 +66,7 @@ MEDIA_FAILURE_CATEGORIES = frozenset(
         MODEL_NOT_ENABLED,
         INVALID_REQUEST,
         PROVIDER_UNAVAILABLE,
+        PROVIDER_QUOTA,
         UNKNOWN,
     }
 )
@@ -84,6 +86,11 @@ _FAILURE_MESSAGES = {
     ),
     PROVIDER_UNAVAILABLE: (
         "The media service failed to answer. The same request may work later."
+    ),
+    PROVIDER_QUOTA: (
+        "The account that pays for this model has run out of credit. Retrying "
+        "or changing the request will not help until an administrator adds "
+        "credit."
     ),
     UNKNOWN: "The request failed, and the reason is not available.",
 }
@@ -174,26 +181,33 @@ _PROVIDER_UNAVAILABLE_CLASS_NAMES = (
 
 # A structured quota or spend-limit code: the request may be perfectly well
 # formed, and the account cannot pay for it. Retrying the same request cannot
-# help, so this must not become ``provider_unavailable``; the media categories
-# have no quota member, and adding one would change the public contract, so
-# the honest existing answer is ``unknown``. Matched against the provider's
-# ``code``/``type`` fields only: an ordinary per-minute 429 can mention a
-# quota in its message, and that one is still an outage.
+# help, so this must not become ``provider_unavailable``; it is
+# ``provider_quota``, which tells the caller that only a top-up fixes it.
+# Matched against the provider's ``code``/``type`` fields only: an ordinary
+# per-minute 429 can mention a quota in its message, and that one is still an
+# outage.
 _QUOTA_CODES = frozenset(
     {
         "insufficient_quota",
         "insufficient_balance",
+        "credit_insufficient_balance",
         "billing_hard_limit_reached",
         "quota_exceeded",
     }
 )
+
+# HTTP 402 Payment Required: the provider refused because the account cannot
+# pay. Xinference's prepaid video API answers it with
+# ``credit_insufficient_balance``; the status alone is enough to say so.
+_PAYMENT_REQUIRED_STATUS = 402
 
 # HTTP statuses that mean the caller has to change the request.
 _INVALID_REQUEST_STATUSES = frozenset({400, 409, 413, 415, 422})
 # Transient by definition: 408 request timeout, 425 too early, 429 too many
 # requests, and every 5xx. 401/402/403 are deliberately absent: they are a
 # deployment's problem with a credential or a bill, retrying will not fix them,
-# and calling them "unavailable" would promise a retry that cannot work.
+# and calling them "unavailable" would promise a retry that cannot work (402
+# is ``provider_quota``; 401/403 stay ``unknown``).
 _PROVIDER_UNAVAILABLE_STATUSES = frozenset({408, 425, 429})
 
 _MAX_CAUSE_DEPTH = 8
@@ -589,7 +603,9 @@ def classify_media_failure(exc: BaseException) -> str:
     # status rules: the structured 429 that names a quota is otherwise
     # collected by the generic 429 branch and reads as "try again later".
     if any(code.strip().lower() in _QUOTA_CODES for code in _provider_codes(exc)):
-        return UNKNOWN
+        return PROVIDER_QUOTA
+    if _PAYMENT_REQUIRED_STATUS in statuses:
+        return PROVIDER_QUOTA
     if any(status in _INVALID_REQUEST_STATUSES for status in statuses):
         return INVALID_REQUEST
     if any(marker in lowered for marker in _INVALID_REQUEST_MARKERS):

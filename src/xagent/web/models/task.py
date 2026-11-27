@@ -32,7 +32,12 @@ from sqlalchemy.orm import deferred, relationship
 from sqlalchemy.sql import func
 from sqlalchemy.sql.elements import ColumnElement
 
-from ...db.preview_lookup_ddl import CREATE_PREVIEW_CONFIG_TEXT
+from ...db.preview_lookup_ddl import (
+    CREATE_PREVIEW_CONFIG_TEXT,
+    PREVIEW_LOOKUP_KEYS,
+    PREVIEW_LOOKUP_PREDICATE,
+    preview_lookup_expression,
+)
 from .database import Base
 
 # Trace payload columns are jsonb on PostgreSQL (#1248): jsonb decodes JSON
@@ -721,15 +726,18 @@ event.listen(
     DDL(CREATE_PREVIEW_CONFIG_TEXT).execute_if(dialect="postgresql"),
 )
 
-for _key in ("preview_agent_id", "preview_history_agent_id"):
-    Index(
-        f"ix_tasks_{_key}_lookup",
-        Task.user_id,
-        func.md5(preview_task_config_text(_key, postgresql=True)),
-        Task.id.desc(),
-        postgresql_where=Task.is_visible.is_(False)
-        & preview_task_flag(postgresql=True),
-    ).ddl_if(dialect="postgresql")
+# Keep these indexes off Table.indexes. SQLite batch rebuilds can copy an
+# Index without its conditional DDL rule.
+for _key in PREVIEW_LOOKUP_KEYS:
+    event.listen(
+        Task.__table__,
+        "after_create",
+        DDL(
+            f"CREATE INDEX ix_tasks_{_key}_lookup ON %(fullname)s "
+            f"(user_id, {preview_lookup_expression(_key)}, id DESC) "
+            f"WHERE {PREVIEW_LOOKUP_PREDICATE}"
+        ).execute_if(dialect="postgresql"),
+    )
 
 
 def _require_task_status(status: Any) -> TaskStatus:

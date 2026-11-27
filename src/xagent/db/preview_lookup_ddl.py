@@ -16,3 +16,13 @@ EXCEPTION
 END;
 $function$
 """
+
+PREVIEW_LOOKUP_KEYS = ("preview_agent_id", "preview_history_agent_id")
+PREVIEW_LOOKUP_PREDICATE = (
+    "is_visible IS false AND "
+    "xagent_preview_config_text_v1(agent_config, 'is_preview') IN ('true', '1')"
+)
+
+
+def preview_lookup_expression(key: str) -> str:
+    return f"md5(xagent_preview_config_text_v1(agent_config, '{key}'))"

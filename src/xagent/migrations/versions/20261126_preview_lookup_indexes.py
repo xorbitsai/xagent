@@ -3,15 +3,18 @@
 import sqlalchemy as sa
 from alembic import op
 
-from xagent.db.preview_lookup_ddl import CREATE_PREVIEW_CONFIG_TEXT
+from xagent.db.preview_lookup_ddl import (
+    CREATE_PREVIEW_CONFIG_TEXT,
+    PREVIEW_LOOKUP_KEYS,
+    PREVIEW_LOOKUP_PREDICATE,
+    preview_lookup_expression,
+)
 
 revision = "20261126_preview_lookup_indexes"
 down_revision = "20261119_shopify_store_locks"
 branch_labels = None
 depends_on = None
 
-_KEYS = ("preview_agent_id", "preview_history_agent_id")
-_PREDICATE = "is_visible IS false AND xagent_preview_config_text_v1(agent_config, 'is_preview') IN ('true', '1')"
 _INDEX = sa.text("""
     SELECT i.indisvalid, i.indrelid = pg_catalog.to_regclass('tasks') AS on_tasks,
            am.amname, i.indisunique, i.indnkeyatts, i.indnatts,
@@ -48,9 +51,13 @@ def upgrade() -> None:
     if context.dialect.name != "postgresql":
         return
 
+    # The migration-only chain can run before metadata creates tasks.
+    if not context.as_sql and not sa.inspect(op.get_bind()).has_table("tasks"):
+        return
+
     op.execute(CREATE_PREVIEW_CONFIG_TEXT)
     with context.autocommit_block():
-        for key in _KEYS:
+        for key in PREVIEW_LOOKUP_KEYS:
             name = f"ix_tasks_{key}_lookup"
             if not context.as_sql:
                 bind = op.get_bind()
@@ -74,12 +81,10 @@ def upgrade() -> None:
                 "tasks",
                 [
                     "user_id",
-                    sa.text(
-                        f"md5(xagent_preview_config_text_v1(agent_config, '{key}'))"
-                    ),
+                    sa.text(preview_lookup_expression(key)),
                     sa.text("id DESC"),
                 ],
-                postgresql_where=sa.text(_PREDICATE),
+                postgresql_where=sa.text(PREVIEW_LOOKUP_PREDICATE),
                 postgresql_concurrently=True,
             )
 
@@ -90,7 +95,7 @@ def downgrade() -> None:
         return
 
     with context.autocommit_block():
-        for key in _KEYS:
+        for key in PREVIEW_LOOKUP_KEYS:
             op.drop_index(
                 f"ix_tasks_{key}_lookup",
                 table_name="tasks",

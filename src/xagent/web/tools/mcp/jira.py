@@ -2599,6 +2599,97 @@ def jira_update_issue(
 
 
 @mcp.tool()
+def jira_list_status_changes(
+    issue_key: str,
+    cloud_id: str = "",
+    limit: int = 50,
+    start_at: int | None = None,
+) -> str:
+    """Read dated status transitions from an issue's Jira changelog.
+
+    By default fetch the latest page. Each result gives previous_start_at;
+    pass it as start_at to inspect older history until the requested time
+    window is covered. A page may have no status changes even when older
+    pages do. If latest_page_complete is false, follow next_start_at on each
+    page until it is true, then page backward. This is historical data,
+    unlike jira_list_transitions, which lists transitions currently available
+    to perform.
+    """
+    try:
+        page_size = clamp_limit(limit, max_limit=MAX_LIMIT)
+        if start_at is not None and (not isinstance(start_at, int) or start_at < 0):
+            return _error("start_at must be a non-negative integer")
+        path = _issue_path(issue_key, "/changelog")
+        latest_requested = start_at is None
+        if latest_requested:
+            first = _request(
+                "GET", cloud_id, path, params={"startAt": 0, "maxResults": 1}
+            )
+            if not isinstance(first, dict) or not isinstance(first.get("total"), int):
+                return _error("Unexpected response format from Jira changelog API")
+            offset = max(0, first["total"] - page_size)
+        else:
+            offset = start_at
+
+        for relocation in range(3 if latest_requested else 1):
+            result = _request(
+                "GET",
+                cloud_id,
+                path,
+                params={"startAt": offset, "maxResults": page_size},
+            )
+            if (
+                not isinstance(result, dict)
+                or not isinstance(result.get("values"), list)
+                or not isinstance(result.get("total"), int)
+            ):
+                return _error("Unexpected response format from Jira changelog API")
+            desired_offset = max(0, result["total"] - page_size)
+            if not latest_requested or desired_offset == offset or relocation == 2:
+                break
+            offset = desired_offset
+
+        latest_page_complete = offset + len(result["values"]) >= result["total"]
+        if not latest_page_complete and not result["values"]:
+            return _error("Jira returned an empty changelog page before the end")
+        changes = [
+            {
+                "at": history.get("created"),
+                "from": item.get("fromString"),
+                "to": item.get("toString"),
+            }
+            for history in result["values"]
+            if isinstance(history, dict)
+            for item in history.get("items", [])
+            if isinstance(item, dict) and item.get("field") == "status"
+        ]
+        response = _success(
+            issue_key=issue_key,
+            status_changes=changes,
+            start_at=offset,
+            returned_history_count=len(result["values"]),
+            total_history_count=result.get("total"),
+            previous_start_at=max(0, offset - page_size) if offset else None,
+            latest_page_complete=latest_page_complete,
+            next_start_at=(offset + len(result["values"]))
+            if not latest_page_complete
+            else None,
+        )
+        if len(response) > get_tool_max_output_length():
+            return _bounded_search_error(
+                "Status history page exceeds output limit; retry with a smaller limit",
+                get_tool_max_output_length(),
+            )
+        return response
+    except Exception as e:
+        safe_message = _safe_text(e)
+        logger.error(
+            f"Error listing Jira status history for {issue_key}: {safe_message}"
+        )
+        return _error(safe_message)
+
+
+@mcp.tool()
 def jira_list_transitions(issue_key: str, cloud_id: str = "") -> str:
     """
     List an issue's available workflow transitions (e.g. "Start Progress",

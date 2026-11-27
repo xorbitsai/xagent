@@ -108,6 +108,10 @@ class AgentTrigger(Base):  # type: ignore
     secret_hash = Column(String(64), nullable=True)
 
     provider = Column(String(64), nullable=True, index=True)
+    # Kind of host executor that runs this trigger's runs instead of the
+    # engine's default agent task (see services/trigger_executors.py). NULL
+    # (the default) keeps the engine behavior.
+    executor = Column(String(64), nullable=True)
     callback_id = Column(String(128), nullable=True, unique=True, index=True)
     resource_id = Column(String(255), nullable=True, index=True)
     secret_encrypted = Column(Text, nullable=True)

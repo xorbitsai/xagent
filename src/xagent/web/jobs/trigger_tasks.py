@@ -90,6 +90,9 @@ def handle_trigger_event(db: Session, job: BackgroundJob) -> dict[str, Any]:
             "trigger_id": int(trigger.id),
             "trigger_run_id": int(run.id),
             "task_id": int(run.task_id) if run.task_id is not None else None,
+            # Host-executed triggers have no engine task; the backend
+            # dispatcher hands the run to the registered host executor.
+            "executor": str(trigger.executor) if trigger.executor else None,
             "processed_at": datetime.now(timezone.utc).isoformat(),
         }
 

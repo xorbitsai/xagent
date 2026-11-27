@@ -57,6 +57,11 @@ from .task_orchestrator import (
     TurnKind,
 )
 from .time_utils import coerce_utc as _coerce_utc
+from .trigger_executors import (
+    HostTriggerRun,
+    get_trigger_executor,
+    registered_trigger_executor_kinds,
+)
 from .trigger_providers.base import TriggerConfigError
 from .trigger_providers.registry import maybe_get_trigger_provider
 from .trigger_providers.schemas import (
@@ -142,12 +147,15 @@ def _payload_snapshot(
     event_type: str | None,
     resource_id: str | None,
     received_at: datetime | None = None,
+    force_full_payload: bool = False,
 ) -> dict[str, Any]:
     """Conservative trigger-run snapshot: stable hash plus allow-listed metadata.
 
     Event content (e.g. Gmail sender/subject/snippet/body/headers) is never
     stored by default. Full payload content is stored only when the trigger
     explicitly opts in via store_full_payload, and then only encrypted.
+    Triggers run by a host executor always store it (encrypted): the run may
+    be started later from the database, which needs the original event.
     """
     snapshot: dict[str, Any] = {
         "payload_sha256": _payload_hash(payload),
@@ -158,7 +166,7 @@ def _payload_snapshot(
             "received_at": (received_at or _now()).isoformat(),
         },
     }
-    if _store_full_payload_enabled(trigger):
+    if force_full_payload or _store_full_payload_enabled(trigger):
         snapshot["encrypted_payload"] = encrypt_value(_json_dumps(payload))
     return snapshot
 
@@ -941,6 +949,7 @@ def create_agent_trigger(
     config: dict[str, Any] | None = None,
     prompt_template: str | None = None,
     secret: str | None = None,
+    executor: str | None = None,
 ) -> tuple[AgentTrigger, str | None]:
     agent = get_owned_agent(db, user_id=user_id, agent_id=agent_id)
     if agent is None:
@@ -955,6 +964,7 @@ def create_agent_trigger(
         config=config,
         prompt_template=prompt_template,
         secret=secret,
+        executor=executor,
     )
 
 
@@ -969,6 +979,7 @@ def create_workforce_trigger(
     config: dict[str, Any] | None = None,
     prompt_template: str | None = None,
     secret: str | None = None,
+    executor: str | None = None,
 ) -> tuple[AgentTrigger, str | None]:
     """Create a workforce-owned trigger (workforce access checked by caller).
 
@@ -990,6 +1001,7 @@ def create_workforce_trigger(
         config=config,
         prompt_template=prompt_template,
         secret=secret,
+        executor=executor,
     )
 
 
@@ -1005,6 +1017,7 @@ def _create_trigger(
     config: dict[str, Any] | None = None,
     prompt_template: str | None = None,
     secret: str | None = None,
+    executor: str | None = None,
 ) -> tuple[AgentTrigger, str | None]:
     if (agent_id is None) == (workforce_id is None):
         raise TriggerServiceError(
@@ -1050,6 +1063,7 @@ def _create_trigger(
         resource_id=resource_id,
         secret_encrypted=secret_encrypted,
         next_run_at=next_run_at,
+        executor=(executor or "").strip() or None,
     )
     db.add(trigger)
     db.commit()
@@ -1445,6 +1459,7 @@ def _get_or_create_trigger_run(
             if resource_id is not None
             else (str(trigger.resource_id) if trigger.resource_id else None),
             received_at=received_at,
+            force_full_payload=bool(trigger.executor),
         ),
         idempotency_key=idempotency_key,
     )
@@ -1693,6 +1708,11 @@ def prepare_trigger_run(
         resource_id=resource_id,
         received_at=received_at,
     )
+    if trigger.executor:
+        # Host-executed trigger: the run stays PENDING with no engine task;
+        # the host executor runs it once it is started (fire_trigger or the
+        # dispatcher).
+        return run, created
     if not created and run.task_id is not None:
         return run, False
 
@@ -2025,6 +2045,167 @@ async def _start_prepared_trigger_run_id(
     return True
 
 
+_host_run_tasks: set[asyncio.Task[None]] = set()
+
+
+def _claim_host_trigger_run(run_id: int, executor_kind: str) -> HostTriggerRun | None:
+    """Atomically claim a PENDING host run and build its executor input."""
+    db = _with_session()
+    try:
+        if not _claim_pending_trigger_run(db, run_id):
+            return None
+        run = db.query(TriggerRun).filter(TriggerRun.id == run_id).first()
+        if run is None:
+            return None
+        trigger = (
+            db.query(AgentTrigger)
+            .filter(AgentTrigger.id == int(run.trigger_id))
+            .first()
+        )
+        if trigger is None:
+            return None
+        try:
+            payload = decrypt_trigger_run_payload(run)
+            if not isinstance(payload, dict):
+                raise TriggerServiceError("Stored trigger payload is not an object")
+        except Exception as exc:
+            _mark_run_failed(
+                db,
+                trigger=trigger,
+                run=run,
+                error_message=f"{type(exc).__name__}: {exc}",
+            )
+            return None
+        snapshot = (
+            run.payload_snapshot if isinstance(run.payload_snapshot, dict) else {}
+        )
+        metadata = snapshot.get("metadata")
+        meta: dict[str, Any] = metadata if isinstance(metadata, dict) else {}
+        received_raw = meta.get("received_at")
+        try:
+            received_at = (
+                datetime.fromisoformat(received_raw)
+                if isinstance(received_raw, str)
+                else None
+            )
+        except ValueError:
+            received_at = None
+        test = str(run.idempotency_key).startswith(TEST_TRIGGER_RUN_KEY_PREFIX)
+        source_event_id = run.source_event_id
+        setattr(trigger, "last_run_at", run.started_at or _now())
+        setattr(trigger, "last_error", None)
+        db.add(trigger)
+        db.commit()
+        return HostTriggerRun(
+            run_id=int(run.id),
+            trigger_id=int(trigger.id),
+            user_id=int(trigger.user_id),
+            executor=executor_kind,
+            trigger_type=str(trigger.type),
+            provider=str(trigger.provider) if trigger.provider else None,
+            resource_id=meta.get("resource_id"),
+            event_type=meta.get("event_type"),
+            source_event_id=str(source_event_id) if source_event_id else None,
+            received_at=received_at,
+            payload=payload,
+            prompt=render_trigger_prompt(
+                trigger,
+                event_payload=payload,
+                source_event_id=str(source_event_id) if source_event_id else None,
+                test=test,
+            ),
+            test=test,
+        )
+    finally:
+        db.close()
+
+
+def _finish_host_trigger_run(run_id: int, error_message: str | None) -> None:
+    """Record the host executor's outcome; never overwrite a settled run."""
+    db = _with_session()
+    try:
+        status = (
+            TriggerRunStatus.FAILED.value
+            if error_message is not None
+            else TriggerRunStatus.COMPLETED.value
+        )
+        result = db.execute(
+            update(TriggerRun)
+            .where(TriggerRun.id == run_id)
+            .where(TriggerRun.status == TriggerRunStatus.RUNNING.value)
+            .values(
+                status=status,
+                error_message=error_message,
+                finished_at=_now(),
+            )
+            .execution_options(synchronize_session=False)
+        )
+        if error_message is not None and _rowcount(result) == 1:
+            run = db.query(TriggerRun).filter(TriggerRun.id == run_id).first()
+            if run is not None:
+                db.execute(
+                    update(AgentTrigger)
+                    .where(AgentTrigger.id == int(run.trigger_id))
+                    .values(last_error=error_message)
+                    .execution_options(synchronize_session=False)
+                )
+        db.commit()
+    finally:
+        db.close()
+
+
+async def _execute_host_trigger_run(host_run: HostTriggerRun) -> None:
+    executor = get_trigger_executor(host_run.executor)
+    error_message: str | None = None
+    try:
+        if executor is None:  # unregistered between claim and execution
+            raise TriggerServiceError(
+                f"Trigger executor {host_run.executor!r} is not registered"
+            )
+        await executor(host_run)
+    except asyncio.CancelledError:
+        await asyncio.shield(
+            run_tracked(
+                _finish_host_trigger_run, host_run.run_id, "Cancelled: executor stopped"
+            )
+        )
+        raise
+    except Exception as exc:
+        error_message = f"{type(exc).__name__}: {exc}"
+        logger.exception("Host executor failed for trigger run %s", host_run.run_id)
+    await run_tracked(_finish_host_trigger_run, host_run.run_id, error_message)
+
+
+async def _start_host_trigger_run_id(
+    run_id: int,
+    executor_kind: str,
+    *,
+    wait_for_completion: bool = False,
+) -> bool:
+    """Hand one PENDING host-executed run to its executor, exactly once.
+
+    A run whose executor kind is not registered in this process stays PENDING
+    for a process that has it.
+    """
+    if get_trigger_executor(executor_kind) is None:
+        return False
+    host_run = await run_tracked(_claim_host_trigger_run, run_id, executor_kind)
+    if host_run is None:
+        return False
+    try:
+        from .quota_hooks import record_trigger
+
+        record_trigger(host_run.user_id)
+    except Exception:
+        logger.debug("Trigger quota record failed", exc_info=True)
+    task = asyncio.ensure_future(_execute_host_trigger_run(host_run))
+    _host_run_tasks.add(task)
+    task.add_done_callback(_host_run_tasks.discard)
+    if wait_for_completion:
+        await task
+    return True
+
+
 async def start_prepared_trigger_run(
     db: Session,
     *,
@@ -2032,6 +2213,13 @@ async def start_prepared_trigger_run(
     wait_for_completion: bool = False,
 ) -> bool:
     """Start one prepared trigger task from the backend process."""
+    executor_kind = run.trigger.executor if run.trigger is not None else None
+    if executor_kind:
+        return await _start_host_trigger_run_id(
+            int(run.id),
+            str(executor_kind),
+            wait_for_completion=wait_for_completion,
+        )
     return await _start_prepared_trigger_run_id(
         int(run.id),
         wait_for_completion=wait_for_completion,
@@ -2107,6 +2295,28 @@ def _get_pending_trigger_run_ids(limit: int) -> list[int]:
         db.close()
 
 
+def _get_pending_host_trigger_runs(
+    limit: int, kinds: list[str]
+) -> list[tuple[int, str]]:
+    """Pending runs of triggers whose host executor kind is registered here."""
+    db = _with_session()
+    try:
+        rows = (
+            db.query(TriggerRun.id, AgentTrigger.executor)
+            .join(AgentTrigger, TriggerRun.trigger_id == AgentTrigger.id)
+            .filter(
+                TriggerRun.status == TriggerRunStatus.PENDING.value,
+                AgentTrigger.executor.in_(kinds),
+            )
+            .order_by(TriggerRun.created_at.asc(), TriggerRun.id.asc())
+            .limit(limit)
+            .all()
+        )
+        return [(int(row[0]), str(row[1])) for row in rows]
+    finally:
+        db.close()
+
+
 async def dispatch_pending_trigger_runs(
     db: Session,
     *,
@@ -2114,14 +2324,21 @@ async def dispatch_pending_trigger_runs(
     wait_for_completion: bool = False,
 ) -> int:
     """Start prepared trigger tasks from the backend process."""
-    pending_run_ids = await run_tracked(
-        _get_pending_trigger_run_ids,
-        max(1, min(limit, 100)),
-    )
-    if not pending_run_ids:
-        return 0
-
+    batch = max(1, min(limit, 100))
     started_count = 0
+    host_kinds = registered_trigger_executor_kinds()
+    if host_kinds:
+        for run_id, kind in await run_tracked(
+            _get_pending_host_trigger_runs, batch, host_kinds
+        ):
+            if await _start_host_trigger_run_id(
+                run_id, kind, wait_for_completion=wait_for_completion
+            ):
+                started_count += 1
+    pending_run_ids = await run_tracked(_get_pending_trigger_run_ids, batch)
+    if not pending_run_ids:
+        return started_count
+
     for run_id in pending_run_ids:
         if await _start_prepared_trigger_run_id(
             run_id,

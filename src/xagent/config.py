@@ -198,6 +198,7 @@ _STANDARD_OTEL_EXPORTER_OTLP_ENDPOINT = "OTEL_EXPORTER_OTLP_ENDPOINT"
 _STANDARD_OTEL_METRIC_EXPORT_INTERVAL = "OTEL_METRIC_EXPORT_INTERVAL"
 _STANDARD_OTEL_SERVICE_NAME = "OTEL_SERVICE_NAME"
 MCP_TOOL_INIT_TIMEOUT_SECONDS = "XAGENT_MCP_TOOL_INIT_TIMEOUT_SECONDS"
+MCP_REMOTE_TOOL_CALL_TIMEOUT_SECONDS = "XAGENT_MCP_REMOTE_TOOL_CALL_TIMEOUT_SECONDS"
 MCP_TOOL_DISCOVERY_CACHE_SECONDS = "XAGENT_MCP_TOOL_DISCOVERY_CACHE_SECONDS"
 CONNECTOR_PROBE_USERS = "XAGENT_CONNECTOR_PROBE_USERS"
 CONNECTOR_SMOKE_WRITE_APPS = "XAGENT_CONNECTOR_SMOKE_WRITE_APPS"
@@ -4506,6 +4507,26 @@ def get_mcp_tool_init_timeout_seconds() -> int:
         Seconds allowed per MCP server; 0 disables the timeout.
     """
     return _get_positive_int_env(MCP_TOOL_INIT_TIMEOUT_SECONDS, 60, minimum=0)
+
+
+def get_mcp_remote_tool_call_timeout_seconds() -> int:
+    """Get the overall per-call timeout for a remote MCP tool call, in seconds.
+
+    A remote MCP tool call can hang a turn past the SSE read timeout if the
+    call blocks on session init, an OAuth token refresh, or a reconnect that
+    the transport-level read timeout does not cover (issue #3251).  This
+    bounds the entire create-session + initialize + call-tool sequence so a
+    hung remote tool returns a model-readable timeout error within a bounded
+    time and the turn continues to a reply.
+
+    Priority:
+        1. XAGENT_MCP_REMOTE_TOOL_CALL_TIMEOUT_SECONDS environment variable
+        2. 300  (matches DEFAULT_STREAMABLE_HTTP_SSE_READ_TIMEOUT)
+
+    Returns:
+        Seconds allowed per remote MCP tool call; 0 disables the timeout.
+    """
+    return _get_positive_int_env(MCP_REMOTE_TOOL_CALL_TIMEOUT_SECONDS, 300, minimum=0)
 
 
 def get_mcp_tool_discovery_cache_seconds() -> int:

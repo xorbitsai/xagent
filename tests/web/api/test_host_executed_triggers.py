@@ -416,12 +416,12 @@ def test_cancelled_claim_after_commit_still_reaches_the_executor() -> None:
 
     gate = threading.Event()
     in_thread = threading.Event()
-    real_claim = triggers._claim_host_trigger_run
+    real_claim = triggers._claim_pending_host_run
 
-    def slow_claim(run_id: int, kind: str):
+    def slow_claim(run_id: int):
         in_thread.set()
         gate.wait(10)
-        return real_claim(run_id, kind)
+        return real_claim(run_id)
 
     async def run_it() -> None:
         starter = asyncio.ensure_future(
@@ -437,7 +437,7 @@ def test_cancelled_claim_after_commit_still_reaches_the_executor() -> None:
                 break
             await asyncio.sleep(0.01)
 
-    with patch.object(triggers, "_claim_host_trigger_run", slow_claim):
+    with patch.object(triggers, "_claim_pending_host_run", slow_claim):
         asyncio.run(run_it())
 
     assert len(recorder.calls) == 1
@@ -548,7 +548,9 @@ def test_unconfirmed_terminal_write_is_recorded_as_unsettled() -> None:
     assert entry["identity"] == f"run:{int(run.id)}"
 
 
-def test_shutdown_joins_an_in_flight_claim_and_drains_its_execution() -> None:
+def test_shutdown_waits_for_an_in_flight_claim_and_settles_it_without_executing() -> (
+    None
+):
     started = threading.Event()
     cancelled: list[bool] = []
 
@@ -568,12 +570,12 @@ def test_shutdown_joins_an_in_flight_claim_and_drains_its_execution() -> None:
 
     gate = threading.Event()
     in_thread = threading.Event()
-    real_claim = triggers._claim_host_trigger_run
+    real_claim = triggers._claim_pending_host_run
 
-    def slow_claim(run_id: int, kind: str):
+    def slow_claim(run_id: int):
         in_thread.set()
         gate.wait(10)
-        return real_claim(run_id, kind)
+        return real_claim(run_id)
 
     out: dict[str, object] = {}
 
@@ -583,6 +585,9 @@ def test_shutdown_joins_an_in_flight_claim_and_drains_its_execution() -> None:
         )
         while not in_thread.is_set():
             await asyncio.sleep(0.01)
+        # A second start of the same run (dispatcher racing direct fire) is
+        # refused while the first still owns it.
+        out["second_attempt"] = await _start_host_trigger_run_id(int(run.id), "hostx")
         starter.cancel()
         await asyncio.gather(starter, return_exceptions=True)
         stopper = asyncio.ensure_future(triggers.shutdown_host_trigger_runs())
@@ -591,14 +596,16 @@ def test_shutdown_joins_an_in_flight_claim_and_drains_its_execution() -> None:
         gate.set()
         await stopper
         out["tasks"] = len(triggers._host_run_tasks)
-        out["claims"] = len(triggers._host_claims)
 
-    with patch.object(triggers, "_claim_host_trigger_run", slow_claim):
+    with patch.object(triggers, "_claim_pending_host_run", slow_claim):
         asyncio.run(run_it())
 
+    assert out["second_attempt"] is False
     assert out["returned_before_claim_finished"] is False
-    assert started.is_set() and cancelled == [True]
-    assert out["tasks"] == 0 and out["claims"] == 0
+    # Cancelled during the claim: the committed claim is settled by its owner
+    # and nothing launches after shutdown returned.
+    assert not started.is_set() and cancelled == []
+    assert out["tasks"] == 0
     row = _run_row(int(run.id))
     assert row.status == TriggerRunStatus.FAILED.value
     assert "Cancelled" in str(row.error_message)
@@ -624,3 +631,71 @@ def test_no_host_run_is_claimed_after_shutdown_started() -> None:
         _start_host_trigger_run_id(int(run.id), "hostx", wait_for_completion=True)
     )
     assert len(recorder.calls) == 1
+
+
+def test_failure_after_a_committed_claim_settles_the_run() -> None:
+    from sqlalchemy.exc import OperationalError
+
+    recorder = Recorder()
+    register_trigger_executor("hostx", recorder)
+    trigger_id = _make_trigger(executor="hostx")
+
+    def broken_load(run_id: int, kind: str):
+        raise OperationalError("SELECT", {}, Exception("connection lost"))
+
+    before = _unsettled_total()
+    with patch.object(triggers, "_load_host_trigger_run", broken_load):
+        run, _ = _fire_waiting(trigger_id, "evt-postclaim")
+
+    # The claim committed RUNNING; the failure before the executor ran must
+    # settle it (never execute without the materialized input, never leave it
+    # RUNNING with no owner).
+    row = _run_row(int(run.id))
+    assert row.status == TriggerRunStatus.FAILED.value
+    assert "OperationalError" in str(row.error_message)
+    assert recorder.calls == []
+    assert _unsettled_total() == before
+    assert not triggers._host_run_tasks
+
+
+def test_post_claim_failure_with_unwritable_terminal_state_is_unsettled() -> None:
+    from sqlalchemy.exc import OperationalError
+
+    recorder = Recorder()
+    register_trigger_executor("hostx", recorder)
+    trigger_id = _make_trigger(executor="hostx")
+
+    def broken(*_args):
+        raise OperationalError("X", {}, Exception("connection lost"))
+
+    before = _unsettled_total()
+    with (
+        patch.object(triggers, "_load_host_trigger_run", broken),
+        patch.object(triggers, "_finish_host_trigger_run", broken),
+    ):
+        run, _ = _fire_waiting(trigger_id, "evt-postclaim-unsettled")
+
+    assert _run_row(int(run.id)).status == TriggerRunStatus.RUNNING.value
+    assert _unsettled_total() == before + 1
+    assert recorder.calls == []
+
+
+def test_start_cancelled_before_the_lifecycle_runs_returns_false() -> None:
+    recorder = Recorder()
+    register_trigger_executor("hostx", recorder)
+    trigger_id = _make_trigger(executor="hostx")
+    unregister_trigger_executor("hostx")
+    run, _ = _fire(trigger_id, event_payload={"a": 1}, source_event_id="evt-early")
+    register_trigger_executor("hostx", recorder)
+
+    async def run_it() -> bool:
+        starter = asyncio.ensure_future(
+            _start_host_trigger_run_id(int(run.id), "hostx")
+        )
+        await asyncio.sleep(0)  # the lifecycle task exists but has not run yet
+        await triggers.shutdown_host_trigger_runs()
+        return await asyncio.wait_for(starter, 5)
+
+    assert asyncio.run(run_it()) is False
+    assert recorder.calls == []
+    assert _run_row(int(run.id)).status == TriggerRunStatus.PENDING.value

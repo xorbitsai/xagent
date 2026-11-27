@@ -2043,10 +2043,6 @@ async def _start_prepared_trigger_run_id(
     return True
 
 
-_host_run_tasks: dict[int, asyncio.Task[None]] = {}
-# Claims whose worker thread may still commit RUNNING, by run id, until their
-# handoff callback has launched the executor (or found nothing to launch).
-_host_claims: dict[int, asyncio.Future[HostTriggerRun | None]] = {}
 # Set once shutdown starts: no new host run is claimed by this process. Runs
 # stay PENDING for the successor, like the release hold's deferral.
 _host_runs_closed = False
@@ -2060,12 +2056,19 @@ def accept_host_trigger_runs() -> None:
     _host_runs_closed = False
 
 
-def _claim_host_trigger_run(run_id: int, executor_kind: str) -> HostTriggerRun | None:
-    """Atomically claim a PENDING host run and build its executor input."""
+def _claim_pending_host_run(run_id: int) -> bool:
+    """Atomically move one PENDING run to RUNNING; True when this call won it."""
     db = _with_session()
     try:
-        if not _claim_pending_trigger_run(db, run_id):
-            return None
+        return _claim_pending_trigger_run(db, run_id)
+    finally:
+        db.close()
+
+
+def _load_host_trigger_run(run_id: int, executor_kind: str) -> HostTriggerRun | None:
+    """Build the executor input of a run this process has claimed (RUNNING)."""
+    db = _with_session()
+    try:
         run = db.query(TriggerRun).filter(TriggerRun.id == run_id).first()
         if run is None:
             return None
@@ -2222,25 +2225,73 @@ async def _execute_host_trigger_run(host_run: HostTriggerRun) -> None:
     await _settle_host_trigger_run(host_run.run_id, error_message)
 
 
-def _launch_host_trigger_run(host_run: HostTriggerRun) -> asyncio.Task[None]:
-    """Run the executor as an engine-owned task counted by the release ledger.
+class _HostStageFailed(Exception):
+    """A claimed host run failed before its executor ran; already settled."""
 
-    The responsibility stays in the ledger until the task returns, and the task
-    returns only after the outcome is durably settled, so a planned release
-    never sees an active host execution as idle.
+
+async def _host_stage(run_id: int, fn: Callable[..., Any], *args: Any) -> Any:
+    """Run one database stage of a claimed host run in a worker thread.
+
+    The thread keeps going if this coroutine is cancelled, so a cancellation
+    first waits for the thread and then settles the run by id (a no-op unless
+    the stage left it RUNNING). A failure settles the run FAILED with the
+    error, or records it as unsettled when that write cannot be confirmed.
     """
-    from .release_hold import release_hold
+    fut = asyncio.ensure_future(run_tracked(fn, *args))
+    try:
+        return await asyncio.shield(fut)
+    except asyncio.CancelledError:
+        await asyncio.wait({fut})
+        if not fut.cancelled():
+            fut.exception()
+        await _settle_host_trigger_run(run_id, "Cancelled: executor stopped")
+        raise
+    except Exception as exc:
+        await _settle_host_trigger_run(run_id, f"{type(exc).__name__}: {exc}")
+        raise _HostStageFailed from exc
 
-    task = asyncio.ensure_future(_execute_host_trigger_run(host_run))
-    _host_run_tasks[host_run.run_id] = task
-    release_hold.adopt("host_trigger_run", f"run:{host_run.run_id}", task)
 
-    def _forget(done: asyncio.Future[Any]) -> None:
-        if _host_run_tasks.get(host_run.run_id) is done:
-            del _host_run_tasks[host_run.run_id]
+async def _host_run_lifecycle(
+    run_id: int, executor_kind: str, started: asyncio.Future[bool]
+) -> None:
+    """Own one run from claim to durable outcome; one task per run.
 
-    task.add_done_callback(_forget)
-    return task
+    Claim, materialize, execute and settle all happen here, so there is a
+    single owner to adopt into the release ledger, to join at shutdown, and to
+    settle or flag as unsettled on every exit path.
+    """
+
+    def signal(value: bool) -> None:
+        if not started.done():
+            started.set_result(value)
+
+    try:
+        try:
+            claimed = await _host_stage(run_id, _claim_pending_host_run, run_id)
+            if not claimed:
+                return
+            signal(True)
+            host_run = await _host_stage(
+                run_id, _load_host_trigger_run, run_id, executor_kind
+            )
+        except _HostStageFailed:
+            return
+        if host_run is None:
+            return
+        try:
+            from .quota_hooks import record_trigger
+
+            record_trigger(host_run.user_id)
+        except Exception:
+            logger.debug("Trigger quota record failed", exc_info=True)
+        await _execute_host_trigger_run(host_run)
+    finally:
+        signal(False)
+
+
+# One lifecycle task per run id: a second start of a run already owned here
+# (direct fire racing the dispatcher) is refused instead of racing the claim.
+_host_run_tasks: dict[int, asyncio.Task[None]] = {}
 
 
 async def _start_host_trigger_run_id(
@@ -2252,80 +2303,54 @@ async def _start_host_trigger_run_id(
     """Hand one PENDING host-executed run to its executor, exactly once.
 
     A run whose executor kind is not registered in this process stays PENDING
-    for a process that has it. The claim runs in a worker thread that keeps
-    going if this coroutine is cancelled, so the claim-to-executor handoff is
-    done by a callback on the claim future, not by this coroutine: a claim that
-    commits always reaches the executor.
+    for a process that has it, and so does one offered after shutdown started.
+    The lifecycle runs as its own task, so a cancelled caller (a dispatcher
+    being stopped) cannot drop a claim that already committed.
     """
     if _host_runs_closed or get_trigger_executor(executor_kind) is None:
         return False
+    if run_id in _host_run_tasks:
+        return False
     from .release_hold import release_hold
 
-    claim_token = release_hold.track("host_trigger_claim", f"run:{run_id}")
-    launched: list[asyncio.Task[None]] = []
-    try:
-        claim = asyncio.ensure_future(
-            run_tracked(_claim_host_trigger_run, run_id, executor_kind)
-        )
-    except BaseException:
-        claim_token.release()
-        raise
+    started: asyncio.Future[bool] = asyncio.get_running_loop().create_future()
+    task = asyncio.ensure_future(_host_run_lifecycle(run_id, executor_kind, started))
+    _host_run_tasks[run_id] = task
+    release_hold.adopt("host_trigger_run", f"run:{run_id}", task)
 
-    def _handoff(done: asyncio.Future[HostTriggerRun | None]) -> None:
-        try:
-            if done.cancelled() or done.exception() is not None:
-                return
-            host_run = done.result()
-            if host_run is None:
-                return
-            try:
-                from .quota_hooks import record_trigger
+    def _forget(done: asyncio.Future[Any]) -> None:
+        if _host_run_tasks.get(run_id) is done:
+            del _host_run_tasks[run_id]
+        if not started.done():
+            # Cancelled before the lifecycle ever ran: nothing was claimed.
+            started.set_result(False)
+        if not done.cancelled():
+            done.exception()
 
-                record_trigger(host_run.user_id)
-            except Exception:
-                logger.debug("Trigger quota record failed", exc_info=True)
-            launched.append(_launch_host_trigger_run(host_run))
-        finally:
-            # The execution task now carries the responsibility (adopt ran
-            # first), or there is nothing left to carry.
-            if _host_claims.get(run_id) is done:
-                del _host_claims[run_id]
-            claim_token.release()
-
-    _host_claims[run_id] = claim
-    claim.add_done_callback(_handoff)
-    host_run = await asyncio.shield(claim)
-    if host_run is None:
+    task.add_done_callback(_forget)
+    if not await asyncio.shield(started):
         return False
-    if wait_for_completion and launched:
-        await launched[0]
+    if wait_for_completion:
+        await asyncio.shield(task)
     return True
 
 
 async def shutdown_host_trigger_runs() -> None:
-    """Fence, join in-flight claims, then cancel and drain host executions.
+    """Fence new claims, then cancel and drain every host run lifecycle.
 
     No new host run is claimed from here on (they stay PENDING for the
-    successor). A claim whose worker thread is still running is joined first:
-    its handoff callback launches the executor, which is then cancelled and
-    drained with the rest. A cancelled execution records its run FAILED
-    ("Cancelled"), including one cancelled before it first ran. Mirrors how
-    owned agent executions are cancelled and drained at shutdown.
+    successor). Each lifecycle is the single owner of its run, claims in
+    flight included: cancelling it waits for a claim thread that is still
+    running and settles the run ("Cancelled"), so nothing launches after this
+    returns and no committed claim is left without an owner. Mirrors how owned
+    agent executions are cancelled and drained at shutdown.
     """
     global _host_runs_closed
     _host_runs_closed = True
-    claims = list(_host_claims.values())
-    if claims:
-        await asyncio.gather(
-            *(asyncio.shield(c) for c in claims), return_exceptions=True
-        )
-    tasks = dict(_host_run_tasks)
-    for task in tasks.values():
+    tasks = list(_host_run_tasks.values())
+    for task in tasks:
         task.cancel()
-    await asyncio.gather(*tasks.values(), return_exceptions=True)
-    for run_id, task in tasks.items():
-        if task.cancelled():
-            await _settle_host_trigger_run(run_id, "Cancelled: executor stopped")
+    await asyncio.gather(*tasks, return_exceptions=True)
 
 
 async def start_prepared_trigger_run(

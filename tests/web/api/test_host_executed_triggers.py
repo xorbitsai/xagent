@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import asyncio
 import threading
+import time
 from datetime import datetime, timedelta, timezone
 from typing import Iterator
 from unittest.mock import MagicMock, patch
@@ -329,6 +330,23 @@ def test_webhook_callback_pipeline_hands_run_to_host_executor() -> None:
     with client:
         first = client.post(url, headers=event_headers, content=raw_body)
         second = client.post(url, headers=event_headers, content=raw_body)
+        # The acknowledgement is nonblocking by design: wait for the executor's
+        # terminal state before leaving the client context (which stops the
+        # loop that runs the lifecycle).
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            probe = _direct_db_session()
+            try:
+                settled = (
+                    probe.query(TriggerRun)
+                    .filter(TriggerRun.status == TriggerRunStatus.COMPLETED.value)
+                    .count()
+                )
+            finally:
+                probe.close()
+            if settled:
+                break
+            time.sleep(0.02)
 
     assert first.status_code == 200, first.text
     assert first.json()["outcome"] == "accepted"

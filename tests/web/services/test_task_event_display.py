@@ -402,7 +402,7 @@ async def test_v2_log_detail_and_list_use_event_counts_activity_and_compaction(
             )
         )
         db.commit()
-        detail = await get_conversation_log_detail(task_id, db=db, user=user)
+        detail = get_conversation_log_detail(task_id, db=db, user=user)
         assert [row["id"] for row in detail["transcript"]] == [
             first.sequence,
             f"compact-{compact.event_id}",
@@ -410,7 +410,7 @@ async def test_v2_log_detail_and_list_use_event_counts_activity_and_compaction(
         ]
         assert detail["log"]["message_count"] == 2
         assert "legacy secret" not in repr(detail)
-        listed = await list_conversation_logs(
+        listed = list_conversation_logs(
             source="all",
             agent_id=None,
             search=None,
@@ -472,7 +472,7 @@ async def test_v2_export_message_count_matches_the_listing(canonical):
             },
         )
         db.commit()
-        listed = await list_conversation_logs(
+        listed = list_conversation_logs(
             source="all",
             agent_id=None,
             search=None,
@@ -545,7 +545,7 @@ async def test_v2_activity_window_matches_displayed_last_activity(
         db.commit()
 
         async def listed(**window):
-            return await list_conversation_logs(
+            return list_conversation_logs(
                 source="all",
                 agent_id=None,
                 search=None,

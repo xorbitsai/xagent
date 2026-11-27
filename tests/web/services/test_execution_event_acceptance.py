@@ -254,7 +254,7 @@ async def test_all_v2_readers_share_facts_with_legacy_content_blocked(
         assert steps.storage_version == 2
         with factory() as db:
             user = db.get(User, owner)
-            detail = await get_conversation_log_detail(tid, db=db, user=user)
+            detail = get_conversation_log_detail(tid, db=db, user=user)
             assert [m["content"] for m in detail["transcript"]] == [
                 "earlier",
                 "answer",

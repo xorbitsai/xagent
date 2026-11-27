@@ -525,6 +525,35 @@ async def _load_mcp_connection_test_tools(connection: dict[str, Any]) -> Any:
     return _mcp_connection_test_timeout_result()
 
 
+# ---------------------------------------------------------------------------
+# Concurrency cap for GET /servers/{id}/tools (issue #3265)
+#
+# The connection-test endpoint caps itself at ``_MCP_CONNECTION_TEST_MAX_INFLIGHT``
+# loads per event loop.  The saved-server tool-listing route had no equivalent,
+# so an authenticated user could hold many subprocess or remote sessions on the
+# web process by calling it concurrently.  Cap it the same way and answer 503
+# when the cap is reached so the caller is not blocked indefinitely.
+_MCP_SERVER_TOOLS_MAX_INFLIGHT = 4
+
+# Slot-acquire timeout: a caller waits this long for a slot before getting 503.
+# The MCP loader itself is bounded by ``get_mcp_tool_init_timeout_seconds`` (60 s
+# by default), so under contention a caller either gets a slot quickly or
+# learns to retry rather than hanging for up to a minute.
+_MCP_SERVER_TOOLS_ACQUIRE_TIMEOUT = 5.0
+
+_mcp_server_tools_gates: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, asyncio.Semaphore]" = weakref.WeakKeyDictionary()
+
+
+def _mcp_server_tools_gate() -> asyncio.Semaphore:
+    """Per-event-loop semaphore for tool listing loads."""
+    loop = asyncio.get_running_loop()
+    gate = _mcp_server_tools_gates.get(loop)
+    if gate is None:
+        gate = asyncio.Semaphore(_MCP_SERVER_TOOLS_MAX_INFLIGHT)
+        _mcp_server_tools_gates[loop] = gate
+    return gate
+
+
 class MCPOAuthDiscoverRequest(BaseModel):
     """Request model for MCP OAuth metadata discovery."""
 
@@ -7067,12 +7096,29 @@ async def get_mcp_server_tools(
             list_connector_tools,
         )
 
-        listing = await list_connector_tools(
-            db,
-            user=current_user,
-            server_id=server_id,
-            name_prefix=f"server_{server_id}_",
-        )
+        # Cap concurrent tool loads on this route (issue #3265).
+        gate = _mcp_server_tools_gate()
+        try:
+            await asyncio.wait_for(gate.acquire(), _MCP_SERVER_TOOLS_ACQUIRE_TIMEOUT)
+        except TimeoutError:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail={
+                    "code": "too_many_concurrent_loads",
+                    "message": (
+                        "Too many concurrent MCP tool loads. Please retry shortly."
+                    ),
+                },
+            )
+        try:
+            listing = await list_connector_tools(
+                db,
+                user=current_user,
+                server_id=server_id,
+                name_prefix=f"server_{server_id}_",
+            )
+        finally:
+            gate.release()
         if listing.outcome is ConnectorToolsOutcome.NOT_FOUND:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,

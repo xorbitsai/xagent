@@ -93,6 +93,9 @@ export interface ChatMessageProps {
   rawContent?: string;
   traceEvents?: TraceEvent[];
   showProcessView?: boolean;
+  // Handed to the trace renderer only: steps start folded. It takes no part in
+  // any other decision this message makes.
+  collapseProcessSteps?: boolean;
   // Whether an interrupted process draws its own "Interrupted" line. A caller
   // whose turn already shows the interruption elsewhere passes false; the
   // message row then has nothing left to draw, so only the trace renders (and
@@ -356,6 +359,7 @@ export function ChatMessage({
   // Default matches TaskConversationPanelProps: an unwired caller gets the
   // internal-page behavior; public surfaces opt out explicitly.
   showProcessView = true,
+  collapseProcessSteps = false,
   showInterruptedStatus = true,
   taskStatus,
   processStatus,
@@ -597,6 +601,7 @@ export function ChatMessage({
         <TraceEventRenderer
           events={traceEvents}
           taskStatus={resolvedProcessStatus}
+          collapseSteps={collapseProcessSteps}
           onOpenExecutionPlan={onOpenExecutionPlan}
           onAgentExecutionClick={onAgentExecutionClick}
         />

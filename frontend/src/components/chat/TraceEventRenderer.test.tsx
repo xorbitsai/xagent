@@ -1802,4 +1802,114 @@ describe("TraceEventRenderer", () => {
 
     expect(screen.getByText("Worker timed out")).toBeInTheDocument()
   })
+  describe("collapsed steps", () => {
+    const events = [
+      { event_id: "start", event_type: "react_task_start", step_id: "s1", timestamp: 1000, data: {} },
+      {
+        event_id: "tool",
+        event_type: "tool_execution_start",
+        step_id: "s1",
+        timestamp: 2000,
+        data: { tool_name: "web_search", tool_args: { query: "collapse-probe" } },
+      },
+    ]
+
+    it.each([
+      ["running", "running", false],
+      ["completed", "completed", false],
+      ["failed", "failed", false],
+      ["paused", "paused", false],
+      ["waiting_for_user", "waiting_for_user", false],
+      ["interrupted", "interrupted", false],
+      ["completed with defaultExpandSteps", "completed", true],
+    ])("starts a %s step", (_label, taskStatus, defaultExpandSteps) => {
+      const expandedWithoutCollapse = defaultExpandSteps || taskStatus !== "completed"
+      const open = (collapseSteps: boolean) => {
+        const view = render(
+          <TraceEventRenderer
+            events={events}
+            taskStatus={taskStatus}
+            collapseSteps={collapseSteps}
+            defaultExpandSteps={defaultExpandSteps}
+          />,
+        )
+        const expanded = screen.queryByText("traceEventRenderer.hideProcess") !== null
+        const folded = screen.queryByText("traceEventRenderer.showProcess") !== null
+        // Exactly one of the two labels is drawn, and aria-expanded follows it.
+        expect(expanded).not.toBe(folded)
+        const toggle = screen.getByText(expanded
+          ? "traceEventRenderer.hideProcess"
+          : "traceEventRenderer.showProcess").closest("button")
+        expect(toggle).toHaveAttribute("aria-expanded", String(expanded))
+        view.unmount()
+        return expanded
+      }
+
+      expect(open(false)).toBe(expandedWithoutCollapse)
+      // collapseSteps folds every step; defaultExpandSteps still wins.
+      expect(open(true)).toBe(defaultExpandSteps)
+    })
+
+    it("opens a folded step on request", () => {
+      render(<TraceEventRenderer events={events} taskStatus="running" collapseSteps />)
+      fireEvent.click(screen.getByRole("button", { name: "traceEventRenderer.showProcess" }))
+      expect(screen.getByText("traceEventRenderer.searchQuery")).toBeInTheDocument()
+      expect(screen.getByRole("button", { name: "traceEventRenderer.hideProcess" })).toHaveAttribute(
+        "aria-expanded",
+        "true",
+      )
+    })
+
+    it("keeps the skill selection and delegated summaries visible when steps start collapsed", () => {
+      render(
+        <TraceEventRenderer
+          collapseSteps
+          taskStatus="running"
+          events={[
+            {
+              event_id: "skill",
+              event_type: "skill_select_end",
+              timestamp: 500,
+              data: { selected: true, skill_name: "roster-skill" },
+            },
+            { event_id: "manager-start", event_type: "react_task_start", step_id: "manager", timestamp: 1000, data: {} },
+            {
+              event_id: "research-start",
+              event_type: "workforce_delegation_start",
+              timestamp: 2000,
+              data: { worker_task_id: "agent_research_run", worker_alias: "Researcher" },
+            },
+            {
+              event_id: "research-end",
+              event_type: "workforce_delegation_end",
+              timestamp: 3000,
+              data: { worker_task_id: "agent_research_run", output: '{"status":"complete"}' },
+            },
+            {
+              event_id: "research-summary",
+              event_type: "agent_progress",
+              step_id: "manager",
+              timestamp: 4000,
+              data: { message: "The evidence is ready." },
+            },
+            {
+              event_id: "tool",
+              event_type: "tool_execution_start",
+              step_id: "manager",
+              timestamp: 5000,
+              data: { tool_name: "web_search", tool_args: { query: "collapse-probe" } },
+            },
+          ]}
+        />,
+      )
+
+      expect(screen.getByText("roster-skill")).toBeInTheDocument()
+      expect(screen.getByText("The evidence is ready.")).toBeInTheDocument()
+      expect(screen.queryByText("traceEventRenderer.searchQuery")).toBeNull()
+      expect(screen.queryByText("traceEventRenderer.hideProcess")).toBeNull()
+
+      fireEvent.click(screen.getAllByRole("button", { name: "traceEventRenderer.showProcess" })[0])
+      expect(screen.getAllByText("traceEventRenderer.searchQuery").length).toBeGreaterThan(0)
+    })
+  })
 })

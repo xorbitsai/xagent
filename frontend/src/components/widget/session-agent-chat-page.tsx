@@ -98,6 +98,8 @@ const isNotificationHandled = (error: unknown): boolean =>
   typeof error === "object" && error !== null
   && (error as { notificationHandled?: unknown }).notificationHandled === true
 
+type ProcessView = "show" | "collapsed" | "hidden"
+
 interface SessionConversationContentProps {
   status: WidgetSessionStatus
   agent: WidgetSessionAgent | null
@@ -120,6 +122,9 @@ interface SessionConversationContentProps {
   readCurrentToken: () => string | null
   // Whether a voice call is offered to this session (voice=1, the page may use the microphone, and the server's voice capability).
   voiceOffered: boolean
+  // How the conversation panel shows the agent's processing steps: "show"
+  // (the default), "collapsed" (steps start folded) or "hidden" (no steps).
+  processView: ProcessView
   // Ends the session as expired when the voice recognition socket is closed with 4408.
   onSessionExpired: () => void
 }
@@ -136,6 +141,7 @@ function SessionConversationContent({
   historyAvailable,
   readCurrentToken,
   voiceOffered,
+  processView,
   onSessionExpired,
 }: SessionConversationContentProps) {
   const {
@@ -714,6 +720,10 @@ function SessionConversationContent({
               showTokenUsage={false}
               showDagPreview={false}
               showTaskFiles={false}
+              // "hidden" only changes what the window draws: the process
+              // events still reach the browser over the session socket.
+              showProcessView={processView !== "hidden"}
+              collapseProcessSteps={processView === "collapsed"}
               hideFileUpload={!attachments}
               hideConfig={true}
               compactInput={true}
@@ -849,6 +859,16 @@ export function SessionAgentChatPage() {
     setHeldVoice(advertisedVoice)
   }
   const voiceOffered = voiceRequested && (bridge.session ? advertisedVoice : heldVoice)
+
+  // Held like the voice flag, whatever the status: the conversation stays on
+  // screen while the bridge has no session, and falling back to "show" for
+  // that moment would draw the steps of a window the server asked to hide.
+  const advertisedProcessView: ProcessView = bridge.session?.capabilities?.processView ?? "show"
+  const [heldProcessView, setHeldProcessView] = useState(advertisedProcessView)
+  if (bridge.session && heldProcessView !== advertisedProcessView) {
+    setHeldProcessView(advertisedProcessView)
+  }
+  const processView = bridge.session ? advertisedProcessView : heldProcessView
   const uploads = useMemo<SessionUploadControls>(() => ({
     ensureFreshSession: bridge.ensureFreshSession,
     refreshSession: bridge.refreshSession,
@@ -923,6 +943,7 @@ export function SessionAgentChatPage() {
         historyAvailable={historyAvailable}
         readCurrentToken={readCurrentToken}
         voiceOffered={voiceOffered}
+        processView={processView}
         onSessionExpired={bridge.handleSessionExpired}
       />
     </AppProvider>

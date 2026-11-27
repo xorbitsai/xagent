@@ -1639,3 +1639,11 @@ def test_status_questions_are_sent_to_get_ticket():
     assert "into the number to search for" in fields
     assert "usually starting with cf_" in fields
     assert "the lower levels of a dependent (nested) field are not listed" in fields
+    assert (
+        "a query by `name` can return nothing for a custom field that was created "
+        "recently or moved to Freshdesk's new infrastructure" in fields
+    )
+    assert (
+        "querying custom_string instead, which matches the value in any single-line "
+        "text custom field, not only this one" in fields
+    )

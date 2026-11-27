@@ -1008,7 +1008,11 @@ def freshdesk_list_ticket_fields() -> str:
     type}; the lower levels of a dependent (nested) field are not listed.
     `name` is the key a ticket's custom_fields uses and a
     freshdesk_search_tickets query takes, usually starting with cf_;
-    `label` is the name agents see in Freshdesk.
+    `label` is the name agents see in Freshdesk. Freshdesk documents one
+    exception: a query by `name` can return nothing for a custom field that
+    was created recently or moved to Freshdesk's new infrastructure. For
+    that case it suggests querying custom_string instead, which matches the
+    value in any single-line text custom field, not only this one.
     """
     try:
         fields = _validated_list(_request("GET", "/ticket_fields"), "/ticket_fields")

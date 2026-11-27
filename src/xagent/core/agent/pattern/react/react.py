@@ -66,7 +66,7 @@ import uuid
 from collections.abc import Iterable, Iterator
 from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass, replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 from typing import Any, Callable, cast
 from uuid import uuid4
@@ -111,6 +111,7 @@ from ....tools.user_interaction import (
     tool_result_waits_for_user,
     user_interaction_resume_callable,
 )
+from ....utils.timezones import weekday_name
 from ...checkpoint import CheckpointPersistenceError, ExecutionEventPersistenceError
 from ...clarification import draft_from_waiting_request
 from ...context import ExecutionContext
@@ -2365,6 +2366,12 @@ class ReActPattern(AgentPattern):
                 "and judging source relevance. If the "
                 "exact current time matters or the turn may have crossed midnight, call "
                 "the get_current_time tool if it is available. "
+                "For a weekday or a relative deadline ('by Friday', 'next Monday', "
+                "'this week'), take its date from the turn-start date and the Next 7 "
+                "days list in the turn context and state that date in your answer; "
+                "a 'by' or 'until' deadline includes items due on that date. "
+                "When you say how many items you are listing, that number must equal "
+                "the items listed. "
                 "Only call tools that are present in the current tool schema for this "
                 "LLM call, whose names the turn context lists; "
                 "tool names mentioned in memory, previous tasks, plans, or error "
@@ -4751,13 +4758,16 @@ class ReActPattern(AgentPattern):
             else tool_names
         )
         clock_zone = context.clock_zone()
-        current_date = (
-            context.created_at.astimezone(clock_zone or timezone.utc).date().isoformat()
+        current_date = context.created_at.astimezone(clock_zone or timezone.utc).date()
+        next_days = (current_date + timedelta(days=offset) for offset in range(1, 8))
+        next_days_text = ", ".join(
+            f"{weekday_name(day)[:3]} {day}" for day in next_days
         )
         clock_zone_label = clock_zone.key if clock_zone is not None else "UTC"
         names = ", ".join(stable_tool_names) or "(none)"
         parts = [
-            f"Turn-start date ({clock_zone_label}): {current_date}.",
+            f"Turn-start date ({clock_zone_label}): {current_date} "
+            f"({weekday_name(current_date)}). Next 7 days: {next_days_text}.",
             f"Available tool names for this LLM call are exactly: {names}."
             f"{AVAILABLE_NAMES_SUFFIX if self._deferred_tool_names else ''}"
             f"{SPILL_READ_AVAILABLE_NOTE if self._spill_reader_present else ''}",

@@ -28,6 +28,7 @@ from xagent.core.agent.runner import UserMessageInjectionOutcome
 from xagent.core.agent.service import AgentService
 from xagent.core.memory.in_memory import InMemoryMemoryStore
 from xagent.core.task_runtime import PREFERRED_INPUT_MODALITIES_METADATA_KEY
+from xagent.core.utils.timezones import weekday_name
 
 
 def _without_turn_context(content: object) -> str:
@@ -642,8 +643,7 @@ async def test_request_context_timezone_reaches_both_prompt_clocks() -> None:
     )
 
     assert result["success"] is True
-    # The turn clock is in the turn context and the turn-start date in the
-    # system message; read the prompt as a whole.
+    # Both the turn clock and the turn-start date use the request timezone.
     system_prompt = _all_text(llm.calls[0]["messages"])
 
     # created_at is a dataclass default_factory, so it cannot be monkeypatched
@@ -658,15 +658,13 @@ async def test_request_context_timezone_reaches_both_prompt_clocks() -> None:
         .replace(tzinfo=timezone.utc)
         .astimezone(ZoneInfo("Australia/Melbourne"))
     )
+    local_date = f"{expected_local.date()} ({weekday_name(expected_local)})"
 
     assert (
-        f"Turn started at: {expected_local.strftime('%Y-%m-%d %H:%M:%S')} "
+        f"Turn started at: {local_date} {expected_local:%H:%M:%S} "
         f"(Australia/Melbourne, UTC+" in system_prompt
     )
-    assert (
-        f"Turn-start date (Australia/Melbourne): {expected_local.date().isoformat()}."
-        in system_prompt
-    )
+    assert f"Turn-start date (Australia/Melbourne): {local_date}." in system_prompt
 
 
 @pytest.mark.asyncio

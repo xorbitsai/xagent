@@ -2265,7 +2265,7 @@ def _clock_context(timezone_name: str | None) -> ExecutionContext:
 
 
 UTC_ONLY_CLOCK_LINE = (
-    "Turn started at: 2026-08-24 22:03:37 UTC. "
+    "Turn started at: 2026-08-24 (Monday) 22:03:37 UTC. "
     "Real time keeps advancing while this turn runs, so treat this as "
     "the start of the turn rather than the exact current time. Use it "
     "as the reference for relative dates such as today, recent, latest, "
@@ -2277,6 +2277,28 @@ UTC_ONLY_CLOCK_LINE = (
 
 def test_clock_line_is_byte_identical_to_utc_wording_without_a_timezone() -> None:
     assert _clock_context(None)._current_time_context() == UTC_ONLY_CLOCK_LINE
+
+
+@pytest.mark.parametrize(
+    ("metadata", "expected"),
+    [
+        ({}, "2026-03-03 (Tuesday) 13:30:00 UTC"),
+        (
+            {CLOCK_TIMEZONE_METADATA_KEY: "Australia/Sydney"},
+            "2026-03-04 (Wednesday) 00:30:00 (Australia/Sydney, UTC+11:00), "
+            "which is 2026-03-03 13:30:00 UTC",
+        ),
+    ],
+)
+def test_current_clock_text_includes_the_local_weekday(
+    metadata: dict[str, str], expected: str
+) -> None:
+    context = ExecutionContext(
+        created_at=datetime(2026, 3, 3, 13, 30, tzinfo=timezone.utc),
+        metadata=metadata,
+    )
+
+    assert context._current_clock_text() == expected
 
 
 def test_clock_line_is_honest_about_being_the_turn_start() -> None:
@@ -2294,7 +2316,7 @@ def test_clock_line_leads_with_local_date_for_a_caller_timezone() -> None:
     line = _clock_context("Australia/Melbourne")._current_time_context()
 
     assert line.startswith(
-        "Turn started at: 2026-08-25 08:03:37 "
+        "Turn started at: 2026-08-25 (Tuesday) 08:03:37 "
         "(Australia/Melbourne, UTC+10:00), which is 2026-08-24 22:03:37 UTC."
     )
     # The wrong answer in production came from the model reading 08-24 as today.
@@ -2316,7 +2338,7 @@ def test_clock_line_follows_daylight_saving_for_the_same_zone() -> None:
 
     assert "UTC+10:00" in winter
     assert "UTC+11:00" in summer
-    assert "2026-12-25 09:03:37" in summer
+    assert "2026-12-25 (Friday) 09:03:37" in summer
 
 
 def test_clock_line_renders_a_negative_offset() -> None:

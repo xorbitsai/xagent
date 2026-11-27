@@ -46,9 +46,7 @@ from .connector_runtime import (
     reject_ephemeral_connector_runtime_payload,
 )
 from .conversation_storage_rollout import new_task_conversation_storage_version
-from .routine_history_provenance import (
-    TRIGGER_TURN_ID_CONFIG_KEY,
-)
+from .routine_history_provenance import TRIGGER_TURN_ID_CONFIG_KEY
 from .task_orchestrator import (
     TaskTurnError,
     TaskTurnNotFoundError,

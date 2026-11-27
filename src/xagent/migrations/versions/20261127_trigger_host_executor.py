@@ -1,7 +1,7 @@
 """Add agent_triggers.executor for host-executed trigger runs.
 
 Revision ID: 20261127_trigger_host_executor
-Revises: 20261126_preview_lookup_indexes
+Revises: 20261127_mixpanel_description
 
 MIGRATION_OVERLAP_REVIEW: additive nullable column on agent_triggers. The older
 release inserts and updates triggers without it and its reads are unaffected;
@@ -24,7 +24,7 @@ from xagent.migrations.ddl_lock_retry import (
 )
 
 revision = "20261127_trigger_host_executor"
-down_revision = "20261126_preview_lookup_indexes"
+down_revision = "20261127_mixpanel_description"
 branch_labels = None
 depends_on = None
 

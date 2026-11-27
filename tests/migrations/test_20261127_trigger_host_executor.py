@@ -55,7 +55,7 @@ def test_revision_chains_onto_the_previous_head(tmp_path) -> None:
     engine = sa.create_engine(f"sqlite:///{tmp_path / 'h.db'}")
     script = ScriptDirectory.from_config(create_alembic_config(engine))
     revision = script.get_revision("20261127_trigger_host_executor")
-    assert revision.down_revision == "20261126_preview_lookup_indexes"
+    assert revision.down_revision == "20261127_mixpanel_description"
     assert len(script.get_heads()) == 1
 
 

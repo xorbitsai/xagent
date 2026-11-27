@@ -932,6 +932,79 @@ def test_list_ticket_conversations_pages_the_ticket_subpath(
     assert recorder.call["params"]["per_page"] == 10
 
 
+def test_list_ticket_fields_returns_status_names_and_custom_fields(
+    monkeypatch: pytest.MonkeyPatch, configured_env: None
+):
+    fields = [
+        {
+            "name": "priority",
+            "label": "Priority",
+            "type": "default_priority",
+            "default": True,
+        },
+        {
+            "name": "status",
+            "label": "Status",
+            "type": "default_status",
+            "default": True,
+            "choices": {
+                "5": ["Closed", "Closed"],
+                "29": ["Internal review", "Under review"],
+                "3": ["Pending", "Awaiting your Reply"],
+                "2": ["Open", "Being Processed"],
+            },
+        },
+        {
+            "name": "cf_product",
+            "label": "Product",
+            "type": "custom_dropdown",
+            "default": False,
+            "choices": ["A", "B"],
+        },
+        {
+            "name": "cf_jira_key",
+            "label": "Jira key",
+            "type": "custom_text",
+            "default": False,
+        },
+        {
+            "name": "department",
+            "label": "Department",
+            "type": "custom_text",
+            "default": False,
+        },
+    ]
+    recorder = _install(monkeypatch, _json_response(fields))
+
+    result = _payload(freshdesk.freshdesk_list_ticket_fields())
+
+    assert recorder.call["method"] == "GET"
+    assert recorder.call["url"].endswith("/api/v2/ticket_fields")
+    assert result["status"] == "success"
+    ticket_fields = result["ticket_fields"]
+    assert ticket_fields["statuses"] == [
+        {"id": 2, "name": "Open"},
+        {"id": 3, "name": "Pending"},
+        {"id": 5, "name": "Closed"},
+        {"id": 29, "name": "Internal review"},
+    ]
+    assert all(isinstance(status["id"], int) for status in ticket_fields["statuses"])
+    assert ticket_fields["custom_fields"] == [
+        {"name": "cf_product", "label": "Product", "type": "custom_dropdown"},
+        {"name": "cf_jira_key", "label": "Jira key", "type": "custom_text"},
+        {"name": "department", "label": "Department", "type": "custom_text"},
+    ]
+
+
+def test_list_ticket_fields_reports_a_vendor_error(
+    monkeypatch: pytest.MonkeyPatch, configured_env: None
+):
+    _install(monkeypatch, _json_response({"description": "Forbidden"}, status_code=403))
+    result = _payload(freshdesk.freshdesk_list_ticket_fields())
+    assert result["status"] == "error"
+    assert "Forbidden" in result["message"]
+
+
 def test_reply_posts_to_the_reply_subpath(
     monkeypatch: pytest.MonkeyPatch, configured_env: None
 ):
@@ -1530,3 +1603,47 @@ def test_create_ticket_cleans_tags_too(
     recorder = _install(monkeypatch, _json_response({"id": 1}))
     freshdesk.freshdesk_create_ticket("s", "d", email="a@b.c", tags=["vip ", ""])
     assert recorder.call["json"]["tags"] == ["vip"]
+
+
+def test_status_questions_are_sent_to_get_ticket():
+    ticket = " ".join(freshdesk.freshdesk_get_ticket.__doc__.split())
+    search = " ".join(freshdesk.freshdesk_search_tickets.__doc__.split())
+    conversations = " ".join(
+        freshdesk.freshdesk_list_ticket_conversations.__doc__.split()
+    )
+    fields = " ".join(freshdesk.freshdesk_list_ticket_fields.__doc__.split())
+
+    assert "Read the ticket here to report its current status" in ticket
+    assert (
+        "2 Open, 3 Pending, 4 Resolved and 5 Closed are the four every helpdesk has"
+        in ticket
+    )
+    assert (
+        "look the name up with freshdesk_list_ticket_fields rather than guessing it"
+        in ticket
+    )
+    assert (
+        "If that lookup fails, give the number and say it is a custom status" in ticket
+    )
+    assert (
+        "To report one ticket's current status, read it with freshdesk_get_ticket "
+        "rather than quoting a search result" in search
+    )
+    assert (
+        "To filter on a status someone names, look its number up with "
+        "freshdesk_list_ticket_fields" in search
+    )
+    assert "search index" not in search
+    assert "The newest entries are on the last page" in conversations
+    assert "follow has_more to the end" in conversations
+    assert "into the number to search for" in fields
+    assert "usually starting with cf_" in fields
+    assert "the lower levels of a dependent (nested) field are not listed" in fields
+    assert (
+        "a query by `name` can return nothing for a custom field that was created "
+        "recently or moved to Freshdesk's new infrastructure" in fields
+    )
+    assert (
+        "querying custom_string instead, which matches the value in any single-line "
+        "text custom field, not only this one" in fields
+    )

@@ -659,6 +659,13 @@ def freshdesk_get_ticket(ticket_id: int, include: str | None = None) -> str:
     """
     Fetch one ticket by its numeric id, including its description.
 
+    Read the ticket here to report its current status. `status` is a number: 2
+    Open, 3 Pending, 4 Resolved and 5 Closed are the four every helpdesk has;
+    any other number is a status this helpdesk defined itself, and the ticket
+    does not carry its name, so look the name up with
+    freshdesk_list_ticket_fields rather than guessing it. If that lookup
+    fails, give the number and say it is a custom status.
+
     ticket_id: the ticket's numeric id (the number in its Freshdesk URL).
     include: comma-separated side-loads, e.g. "conversations,requester,stats".
     Note that "conversations" returns only the OLDEST ten ("up to ten
@@ -685,6 +692,10 @@ def freshdesk_get_ticket(ticket_id: int, include: str | None = None) -> str:
 def freshdesk_search_tickets(query: str, page: int = 1) -> str:
     """
     Search tickets with Freshdesk's filter query language.
+
+    To report one ticket's current status, read it with freshdesk_get_ticket
+    rather than quoting a search result. To filter on a status someone names,
+    look its number up with freshdesk_list_ticket_fields.
 
     query: the filter expression WITHOUT the enclosing double quotes this
     tool adds, e.g. status:2 AND priority:4, or
@@ -958,6 +969,9 @@ def freshdesk_list_ticket_conversations(
     """
     List a ticket's conversation entries -- replies and notes -- oldest first.
 
+    The newest entries are on the last page: follow has_more to the end
+    when you need the latest reply or note.
+
     ticket_id: the ticket's numeric id.
     page: 1-based page number.
     per_page: entries per page (default 30, hard cap 100).
@@ -974,6 +988,49 @@ def freshdesk_list_ticket_conversations(
         )
     except Exception as exc:
         logger.error("Error in freshdesk_list_ticket_conversations: %s", exc)
+        return _error(str(exc))
+
+
+@mcp.tool()
+def freshdesk_list_ticket_fields() -> str:
+    """
+    List the names this helpdesk gives its ticket statuses and its custom
+    ticket fields.
+
+    statuses: every status number the helpdesk has, built-in and
+    helpdesk-defined, as {id, name}. Use it to report a ticket's numeric
+    `status` (from freshdesk_get_ticket, freshdesk_list_tickets or
+    freshdesk_search_tickets) by the name agents see, and to turn a status
+    someone names, such as "In progress", into the number to search for
+    (status:<id> in a freshdesk_search_tickets query).
+
+    custom_fields: each top-level custom ticket field as {name, label,
+    type}; the lower levels of a dependent (nested) field are not listed.
+    `name` is the key a ticket's custom_fields uses and a
+    freshdesk_search_tickets query takes, usually starting with cf_;
+    `label` is the name agents see in Freshdesk. Freshdesk documents one
+    exception: a query by `name` can return nothing for a custom field that
+    was created recently or moved to Freshdesk's new infrastructure. For
+    that case it suggests querying custom_string instead, which matches the
+    value in any single-line text custom field, not only this one.
+    """
+    try:
+        fields = _validated_list(_request("GET", "/ticket_fields"), "/ticket_fields")
+        choices = next(f["choices"] for f in fields if f["type"] == "default_status")
+        statuses = [
+            {"id": int(status_id), "name": choices[status_id][0]}
+            for status_id in sorted(choices, key=int)
+        ]
+        custom_fields = [
+            {"name": f["name"], "label": f["label"], "type": f["type"]}
+            for f in fields
+            if not f["default"]
+        ]
+        return success_with_capped_dict(
+            "ticket_fields", {"statuses": statuses, "custom_fields": custom_fields}
+        )
+    except Exception as exc:
+        logger.error("Error in freshdesk_list_ticket_fields: %s", exc)
         return _error(str(exc))
 
 

@@ -6743,3 +6743,10 @@ def test_get_issue_reports_many_custom_fields_shortened_at_the_output_cap(
             assert result.get("custom_fields_truncated") is True
             shortened += 1
     assert shortened > 0
+
+
+def test_search_sends_current_status_questions_to_get_issue():
+    doc = jira.jira_search_issues.__doc__
+    text = " ".join(doc.split())
+    assert "does not guarantee that this search is read-after-write consistent" in text
+    assert "read it with jira_get_issue instead of quoting a search result" in text

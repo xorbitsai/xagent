@@ -177,6 +177,7 @@ async def test_create_post_with_image_uploads_and_attaches_media(monkeypatch, tm
 
 @pytest.mark.asyncio
 async def test_create_post_rejects_image_outside_allowed_dirs(monkeypatch, tmp_path):
+    """A path outside the allowlist raises PermissionError (not returned as success)."""
     monkeypatch.setenv("LINKEDIN_ACCESS_TOKEN", "token")
     allowed_dir = tmp_path / "allowed"
     blocked_dir = tmp_path / "blocked"
@@ -198,15 +199,17 @@ async def test_create_post_rejects_image_outside_allowed_dirs(monkeypatch, tmp_p
     monkeypatch.setattr(linkedin.requests, "post", mock_post)
     monkeypatch.setattr(linkedin.requests, "put", mock_put)
 
-    result = await linkedin.call_tool(
-        "create_post",
-        {
-            "text": "hello with image",
-            "image_path": str(image_path),
-        },
-    )
+    with pytest.raises(PermissionError) as exc_info:
+        await linkedin.call_tool(
+            "create_post",
+            {
+                "text": "hello with image",
+                "image_path": str(image_path),
+            },
+        )
 
-    assert "outside allowed directories" in result[0].text
+    # The error message must not leak the actual allowed directory paths.
+    assert str(allowed_dir) not in str(exc_info.value)
     mock_put.assert_not_called()
 
 
@@ -234,3 +237,146 @@ async def test_create_comment_escapes_parentheses_before_publishing(monkeypatch)
     assert result[0].text == "Comment created successfully! ID: comment-1"
     comment_body = mock_post.call_args.kwargs["json"]
     assert comment_body["message"]["text"] == "Nice work \\(team\\)!"
+
+
+# ---------------------------------------------------------------------------
+# Tests for issue #3949 — failure propagation, image validation, path leakage
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_missing_access_token_raises_value_error(monkeypatch):
+    """A missing LINKEDIN_ACCESS_TOKEN raises ValueError instead of returning success."""
+    monkeypatch.delenv("LINKEDIN_ACCESS_TOKEN", raising=False)
+
+    with pytest.raises(ValueError, match="LINKEDIN_ACCESS_TOKEN"):
+        await linkedin.call_tool("get_profile", {})
+
+
+@pytest.mark.asyncio
+async def test_api_error_propagates_as_exception(monkeypatch):
+    """An HTTP error from LinkedIn propagates instead of being returned as success text."""
+    import requests as req_module
+
+    monkeypatch.setenv("LINKEDIN_ACCESS_TOKEN", "token")
+
+    error_response = MockResponse(text="Unauthorized", status_code=401)
+    mock_get = Mock(return_value=error_response)
+
+    # Make raise_for_status raise a real HTTPError so the test is realistic.
+    def raise_http_error():
+        http_err = req_module.HTTPError(
+            "401 Client Error", response=Mock(text="Unauthorized")
+        )
+        raise http_err
+
+    error_response.raise_for_status = raise_http_error
+
+    monkeypatch.setattr(linkedin.requests, "get", mock_get)
+
+    with pytest.raises(req_module.HTTPError):
+        await linkedin.call_tool("get_profile", {})
+
+
+@pytest.mark.asyncio
+async def test_non_image_file_rejected_before_upload(monkeypatch, tmp_path):
+    """A PDF file is rejected before initializeUpload is called."""
+    monkeypatch.setenv("LINKEDIN_ACCESS_TOKEN", "token")
+    monkeypatch.setenv("XAGENT_LINKEDIN_IMAGE_ALLOWED_DIRS", str(tmp_path))
+
+    pdf_path = tmp_path / "document.pdf"
+    pdf_path.write_bytes(b"%PDF-1.4 fake pdf")
+
+    mock_get = Mock(
+        return_value=MockResponse(
+            json_data={"sub": "person-1"}, text='{"sub":"person-1"}'
+        )
+    )
+    mock_post = Mock(return_value=MockResponse())
+    mock_put = Mock(return_value=MockResponse())
+
+    monkeypatch.setattr(linkedin.requests, "get", mock_get)
+    monkeypatch.setattr(linkedin.requests, "post", mock_post)
+    monkeypatch.setattr(linkedin.requests, "put", mock_put)
+
+    with pytest.raises(ValueError, match="not an image"):
+        await linkedin.call_tool(
+            "create_post",
+            {"text": "post with pdf", "image_path": str(pdf_path)},
+        )
+
+    # initializeUpload (POST to IMAGES_URL) must not have been called.
+    for call in mock_post.call_args_list:
+        assert call.args[0] != linkedin.IMAGES_URL
+    mock_put.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_oversized_image_rejected_before_upload(monkeypatch, tmp_path):
+    """An image exceeding the size limit is rejected before initializeUpload."""
+    monkeypatch.setenv("LINKEDIN_ACCESS_TOKEN", "token")
+    monkeypatch.setenv("XAGENT_LINKEDIN_IMAGE_ALLOWED_DIRS", str(tmp_path))
+
+    large_image = tmp_path / "big.png"
+    # Write a file larger than the 10 MB limit.
+    large_image.write_bytes(b"\x00" * (11 * 1024 * 1024))
+
+    mock_get = Mock(
+        return_value=MockResponse(
+            json_data={"sub": "person-1"}, text='{"sub":"person-1"}'
+        )
+    )
+    mock_post = Mock(return_value=MockResponse())
+    mock_put = Mock(return_value=MockResponse())
+
+    monkeypatch.setattr(linkedin.requests, "get", mock_get)
+    monkeypatch.setattr(linkedin.requests, "post", mock_post)
+    monkeypatch.setattr(linkedin.requests, "put", mock_put)
+
+    with pytest.raises(ValueError, match="exceeds the"):
+        await linkedin.call_tool(
+            "create_post",
+            {"text": "post with big image", "image_path": str(large_image)},
+        )
+
+    mock_put.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_permission_error_does_not_leak_allowed_dirs(monkeypatch, tmp_path):
+    """The PermissionError message must not include the allowed directory path."""
+    monkeypatch.setenv("LINKEDIN_ACCESS_TOKEN", "token")
+    allowed_dir = tmp_path / "my_secret_allowed_dir"
+    allowed_dir.mkdir()
+    blocked_dir = tmp_path / "blocked"
+    blocked_dir.mkdir()
+    image_path = blocked_dir / "img.png"
+    image_path.write_bytes(b"png-bytes")
+    monkeypatch.setenv("XAGENT_LINKEDIN_IMAGE_ALLOWED_DIRS", str(allowed_dir))
+
+    with pytest.raises(PermissionError) as exc_info:
+        linkedin._resolve_allowed_image_path(str(image_path))
+
+    error_str = str(exc_info.value)
+    assert "my_secret_allowed_dir" not in error_str
+    assert "outside the allowed directories" in error_str
+
+
+@pytest.mark.asyncio
+async def test_validate_image_file_accepts_png(tmp_path):
+    """_validate_image_file returns the MIME type for a valid image filename."""
+    png_path = tmp_path / "photo.png"
+    png_path.write_bytes(b"\x89PNG\r\n\x1a\n")
+
+    mime = linkedin._validate_image_file(png_path)
+    assert mime == "image/png"
+
+
+@pytest.mark.asyncio
+async def test_validate_image_file_rejects_txt(tmp_path):
+    """_validate_image_file raises ValueError for non-image files."""
+    txt_path = tmp_path / "notes.txt"
+    txt_path.write_bytes(b"hello world")
+
+    with pytest.raises(ValueError, match="not an image"):
+        linkedin._validate_image_file(txt_path)

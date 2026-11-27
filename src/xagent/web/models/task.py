@@ -2,6 +2,7 @@ import enum
 from typing import Any, Collection
 
 from sqlalchemy import (
+    DDL,
     JSON,
     BigInteger,
     Boolean,
@@ -17,16 +18,26 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    cast,
+    event,
 )
 from sqlalchemy import inspect as sa_inspect
 from sqlalchemy import (
+    literal,
     text,
 )
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.engine import Connection
 from sqlalchemy.orm import deferred, relationship
 from sqlalchemy.sql import func
+from sqlalchemy.sql.elements import ColumnElement
 
+from ...db.preview_lookup_ddl import (
+    CREATE_PREVIEW_CONFIG_TEXT,
+    PREVIEW_LOOKUP_KEYS,
+    PREVIEW_LOOKUP_PREDICATE,
+    preview_lookup_expression,
+)
 from .database import Base
 
 # Trace payload columns are jsonb on PostgreSQL (#1248): jsonb decodes JSON
@@ -678,6 +689,55 @@ class Task(Base):  # type: ignore
 
     def __repr__(self) -> str:
         return f"<Task(id={self.id}, title='{self.title}', status='{self.status}')>"
+
+
+def preview_task_config_text(key: str, *, postgresql: bool) -> ColumnElement[str]:
+    if postgresql:
+        # Keep the helper call and the fixed JSON key visible in generic
+        # PostgreSQL plans so they match the expression indexes below.
+        return func.xagent_preview_config_text_v1(
+            Task.agent_config, literal(key, literal_execute=True), type_=String()
+        )
+    return cast(Task.agent_config[key], String)
+
+
+def preview_task_flag(*, postgresql: bool) -> ColumnElement[bool]:
+    return preview_task_config_text("is_preview", postgresql=postgresql).in_(
+        (literal("true", literal_execute=True), literal("1", literal_execute=True))
+    )
+
+
+def preview_task_agent_matches(
+    key: str, agent_id: int, *, postgresql: bool
+) -> ColumnElement[bool]:
+    value = preview_task_config_text(key, postgresql=postgresql)
+    matches = value == str(agent_id)
+    if postgresql:
+        # Hash only the index key. The original comparison rules out collisions.
+        return (func.md5(value) == func.md5(literal(str(agent_id), String))) & matches
+    return matches
+
+
+# create_all handles fresh installs. The migration builds the same indexes
+# concurrently for existing PostgreSQL databases.
+event.listen(
+    Task.__table__,
+    "before_create",
+    DDL(CREATE_PREVIEW_CONFIG_TEXT).execute_if(dialect="postgresql"),
+)
+
+# Keep these indexes off Table.indexes. SQLite batch rebuilds can copy an
+# Index without its conditional DDL rule.
+for _key in PREVIEW_LOOKUP_KEYS:
+    event.listen(
+        Task.__table__,
+        "after_create",
+        DDL(
+            f"CREATE INDEX ix_tasks_{_key}_lookup ON %(fullname)s "
+            f"(user_id, {preview_lookup_expression(_key)}, id DESC) "
+            f"WHERE {PREVIEW_LOOKUP_PREDICATE}"
+        ).execute_if(dialect="postgresql"),
+    )
 
 
 def _require_task_status(status: Any) -> TaskStatus:

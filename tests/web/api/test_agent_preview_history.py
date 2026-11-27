@@ -1,13 +1,17 @@
 """Builder history reuses owner-scoped tasks and their persisted transcript."""
 
 import asyncio
+from hashlib import sha256
+from importlib import import_module
 from threading import Event
 from unittest.mock import MagicMock
 
 import pytest
+from alembic.migration import MigrationContext
+from alembic.operations import Operations
 from fastapi import Depends, FastAPI
 from httpx import ASGITransport, AsyncClient
-from sqlalchemy import event
+from sqlalchemy import event, text
 from sqlalchemy.orm import Session
 
 from tests.shared.postgres_disposable import (
@@ -277,7 +281,10 @@ def test_original_failed_or_unknown_sample_can_be_retried(delivery_status):
 
 
 def malformed_preview_configs(agent_id):
+    oversized = "".join(sha256(str(i).encode()).hexdigest() for i in range(100))
     return [
+        {"is_preview": True, "preview_agent_id": oversized},
+        {"is_preview": True, "preview_history_agent_id": oversized},
         {"is_preview": "abc", "preview_agent_id": agent_id},
         {"is_preview": "true", "preview_agent_id": agent_id},
         {"is_preview": True, "preview_agent_id": "abc"},
@@ -300,11 +307,53 @@ def test_malformed_preview_metadata_does_not_break_history():
     assert response.json()["task_id"] == task_id
 
 
+def _insert_unreadable_preview_json(db, user_id, agent_id):
+    for code in ("0000", "d800", "dc00"):
+        escaped = chr(92) + "u" + code
+        task_id = db.execute(
+            text(
+                "INSERT INTO tasks (user_id, title, is_visible, agent_config) "
+                "VALUES (:user_id, 'Invalid Unicode', false, CAST(:config AS json)) "
+                "RETURNING id"
+            ),
+            {
+                "user_id": user_id,
+                "config": (
+                    f'{{"is_preview": true, "preview_agent_id": {agent_id}, '
+                    f'"unrelated": "{escaped}"}}'
+                ),
+            },
+        ).scalar_one()
+        db.add(
+            TaskChatMessage(
+                task_id=task_id,
+                user_id=user_id,
+                role="user",
+                content="Invalid Unicode",
+                message_type="message",
+            )
+        )
+    db.commit()
+
+
 @pytest.mark.postgresql
-def test_postgresql_preview_query_ignores_malformed_metadata():
+@pytest.mark.parametrize("migrated", [False, True], ids=["fresh", "migrated"])
+def test_postgresql_preview_query_ignores_malformed_metadata(migrated):
     with disposable_database_factory("preview_history") as make_database:
         engine = make_database("metadata")
         Base.metadata.create_all(engine)
+        migration = import_module(
+            "xagent.migrations.versions.20261126_preview_lookup_indexes"
+        )
+
+        def run_migration(operation):
+            with engine.connect() as connection:
+                context = MigrationContext.configure(connection)
+                with context.begin_transaction(), Operations.context(context):
+                    operation()
+
+        if migrated:
+            run_migration(migration.downgrade)
         with Session(engine) as db:
             user = User(username="preview-history-test", password_hash="unused")
             db.add(user)
@@ -356,6 +405,11 @@ def test_postgresql_preview_query_ignores_malformed_metadata():
                 )
             )
             db.commit()
+            _insert_unreadable_preview_json(db, user.id, agent.id)
+            if migrated:
+                run_migration(migration.upgrade)
+                run_migration(migration.upgrade)
+                _insert_unreadable_preview_json(db, user.id, agent.id)
             result = get_agent_preview_task(agent.id, user, db)
             assert result is not None
             assert result.task_id == task.id
@@ -470,15 +524,28 @@ def test_postgresql_slow_preview_route_releases_session(monkeypatch):
                     message_type="message",
                 )
             )
-            user_id, task_id = user.id, task.id
-            url = f"/api/agents/{agent.id}/preview-task"
+            user_id, agent_id, task_id = user.id, agent.id, task.id
+            url = f"/api/agents/{agent_id}/preview-task"
             token = create_access_token(user_session_claims(user))
 
         preview_query_started = Event()
 
         @event.listens_for(engine, "before_cursor_execute")
         def bound_preview_lock_wait(conn, cursor, statement, parameters, context, many):
-            if "FROM tasks" in statement and "FROM task_chat_messages" in statement:
+            if "FROM tasks" in statement and "ORDER BY tasks.id DESC" in statement:
+                # A generic plan must see the fixed expressions and predicate
+                # to match the partial indexes. Request IDs remain bound.
+                assert (
+                    "xagent_preview_config_text_v1(tasks.agent_config, 'is_preview') IN ('true', '1')"
+                    in statement
+                )
+                for key in ("preview_agent_id", "preview_history_agent_id"):
+                    assert (
+                        f"xagent_preview_config_text_v1(tasks.agent_config, '{key}')"
+                        in statement
+                    )
+                assert user_id in parameters.values()
+                assert str(agent_id) in parameters.values()
                 cursor.execute("SET LOCAL lock_timeout = '5s'")
                 preview_query_started.set()
 

@@ -10,6 +10,7 @@ This image is that starting template. It has no service of its own: its `CMD` is
 
 - **Node.js 22** (`node:22-slim` base) and **Python 3.11**, both on `PATH` as `node` and `python`
 - **`uv` / `uvx`**, for sandboxed `uvx` MCP server connections
+- **Git**, for cloning repositories, inspecting changes, and installing Git-based dependencies
 - A deliberately small, lockfile-pinned Python set: `pydantic`, `pydantic-settings`, `cloudpickle`, `mcp`, `pandas`, `numpy`, `matplotlib`, `openpyxl`, `python-docx`, `fsspec`
 - `ca-certificates`, `tzdata`, `netbase`, and `openssh-client`
 - user-site `pip install` support, so tools can pull their own declared dependencies without writing system packages

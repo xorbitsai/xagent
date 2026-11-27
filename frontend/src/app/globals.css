@@ -481,8 +481,9 @@ body .hover\:\text-\[\#E6EDF3\]:hover {
   justify-content: center;
 }
 
-/* Ensure TabsTrigger button is visible */
-button[data-radix-collection-item] {
+/* Ensure TabsTrigger button is visible. Radio group items are collection items
+   too; scoping to role="tab" keeps this padding and transparent border off them. */
+button[data-radix-collection-item][role="tab"] {
   display: inline-flex;
   align-items: center;
   justify-content: center;

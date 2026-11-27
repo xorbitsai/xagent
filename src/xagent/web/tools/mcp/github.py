@@ -4,12 +4,15 @@ import logging
 import os
 import re
 import time
+from datetime import UTC, date, datetime
 from typing import Any
 from urllib.parse import quote
 
 from mcp.server.fastmcp import FastMCP
 
 from ....core.utils import public_requests as requests
+from .utils import calendar_day_bounds as _calendar_day_bounds
+from .utils import resolve_zoneinfo as _resolve_zoneinfo
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("github-mcp")
@@ -654,6 +657,23 @@ def _summarize_pull_request(pr: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+# Whole-PR change statistics, only present on the single-PR endpoint (the
+# list endpoint omits them), in the order they are reported.
+_PULL_REQUEST_STAT_KEYS = ("changed_files", "additions", "deletions", "commits")
+
+
+def _pull_request_change_stats(pr: dict[str, Any]) -> dict[str, int | None]:
+    """A non-integer or absent statistic becomes None (unknown) rather than
+    0 -- a missing value must not read as "nothing changed"."""
+    stats: dict[str, int | None] = {}
+    for key in _PULL_REQUEST_STAT_KEYS:
+        value = pr.get(key)
+        stats[key] = (
+            value if isinstance(value, int) and not isinstance(value, bool) else None
+        )
+    return stats
+
+
 @mcp.tool()
 def github_get_current_user() -> str:
     """
@@ -1080,7 +1100,8 @@ def github_list_pull_requests(
     repo: str, state: str = "open", limit: int = 30, page: int = 1
 ) -> str:
     """
-    List pull requests in a repository.
+    List pull requests in a repository. List results carry no change
+    statistics; use github_get_pull_request for a PR's file and line counts.
     repo: "owner/repo".
     state: "open", "closed", or "all" (default "open").
     limit: max pull requests to return (default 30, capped at 100).
@@ -1121,13 +1142,24 @@ def github_get_pull_request(repo: str, pull_number: int) -> str:
     """
     Get a single pull request by number.
     repo: "owner/repo".
+
+    Also returns change_stats -- changed_files, additions, deletions and
+    commits as GitHub reports them for the whole PR. Use these to answer
+    "how many files/lines did this PR change"; github_list_pull_requests
+    does not carry them. A statistic GitHub did not return is null and named
+    in missing_stats -- report it as unavailable, never as 0.
     """
     try:
         owner, name = _parse_repo(repo)
         pull_number = _validate_positive_number(pull_number, field="pull_number")
         result = _request("GET", f"/repos/{owner}/{name}/pulls/{pull_number}")
         _require_object(result, context=f"pull request {repo}#{pull_number}")
-        return _success(pull_request=_summarize_pull_request(result))
+        change_stats = _pull_request_change_stats(result)
+        return _success(
+            pull_request=_summarize_pull_request(result),
+            change_stats=change_stats,
+            missing_stats=[key for key, value in change_stats.items() if value is None],
+        )
     except Exception as e:
         logger.error(
             f"Error fetching GitHub pull request {repo}#{pull_number}: {e}",
@@ -1584,6 +1616,7 @@ def github_list_commits(
 ) -> str:
     """
     List recent commits in a repository.
+    To count commits within a date range, use github_count_commits instead.
     repo: "owner/repo".
     path: optional file or directory path to restrict history to.
     limit: max commits to return (default 30, capped at 100).
@@ -1631,6 +1664,273 @@ def github_list_commits(
         )
     except Exception as e:
         logger.error(f"Error listing GitHub commits for {repo}: {e}", exc_info=True)
+        return _error(str(e))
+
+
+# Complete scans behind the statistics tools (github_list_branches,
+# github_count_commits). The paged list tools return one page with
+# truncated=true and leave paging to the model, which has undercounted in
+# production (it stopped early, or never had a tool to page with). These
+# tools answer "how many"/"which" questions, so they read every page
+# themselves and fail closed -- an error, never a partial count presented as
+# the total -- when the scan cannot finish, the same contract as xero.py's
+# list_paid_invoices.
+# 30 pages of 100 covers xorbitsai/xagent-saas's ~1,700 branches (measured
+# 2026-11-27: about 17 pages in 24 s) with room to grow, inside the time budget.
+MAX_COMPLETE_SCAN_PAGES = 30
+# Aggregate wall-clock budget for one scan, as MAX_ISSUE_LIST_SECONDS is for
+# github_list_issues: MAX_COMPLETE_SCAN_PAGES bounds request count, not time.
+# At ~1.4 s a page the budget, not the page cap, is what binds near 30 pages,
+# so a repository that size may fail closed when GitHub is slow -- an error,
+# never a wrong count.
+MAX_COMPLETE_SCAN_SECONDS = 60
+# github_count_commits always counts every commit in the window but lists at
+# most this many, so a busy window cannot flood the model's context.
+MAX_LISTED_COMMITS = 100
+# Likewise for github_list_branches' names: the counts always cover every
+# branch, but ~1,000 names would be ~60 KB of the model's context.
+MAX_LISTED_BRANCHES = 300
+
+_ISO_DATE_RE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}")
+
+
+_NO_ESTIMATE_HINT = "Tell the user the result is unavailable rather than estimating it."
+
+
+class _IncompleteScanError(RuntimeError):
+    """A complete scan stopped before GitHub's last page."""
+
+
+def _collect_all_pages(
+    path: str, params: dict[str, Any], *, what: str, narrow_hint: str = ""
+) -> list[dict[str, Any]]:
+    """GET every page of a GitHub list endpoint, following the Link header.
+
+    Raises _IncompleteScanError when MAX_COMPLETE_SCAN_PAGES or
+    MAX_COMPLETE_SCAN_SECONDS is reached with pages still left, so callers
+    never report a partial list as complete. Rate-limit retries are off for
+    the same reason github_list_issues turns them off: the retry's sleep is
+    invisible to this scan's own deadline.
+    """
+    items: list[dict[str, Any]] = []
+    deadline = _monotonic() + MAX_COMPLETE_SCAN_SECONDS
+    for page in range(1, MAX_COMPLETE_SCAN_PAGES + 1):
+        remaining = deadline - _monotonic()
+        if page > 1 and remaining <= 0:
+            raise _IncompleteScanError(
+                f"Result incomplete: reading {what} hit the "
+                f"{MAX_COMPLETE_SCAN_SECONDS}s time limit after {page - 1} "
+                "page(s), so no count is returned. "
+                + (narrow_hint or _NO_ESTIMATE_HINT)
+            )
+        response = _request_raw(
+            "GET",
+            path,
+            params={**params, "per_page": MAX_PER_PAGE, "page": page},
+            timeout=max(1.0, min(DEFAULT_TIMEOUT_SECONDS, remaining)),
+            allow_retry=False,
+        )
+        body = response.json() if response.content else []
+        if not isinstance(body, list):
+            raise ValueError(
+                f"GitHub returned a non-list page ({type(body).__name__}) for {what}"
+            )
+        _require_object_items(body, context=what)
+        items.extend(body)
+        if "next" not in _link_header_rels(response.headers.get("Link")):
+            return items
+    raise _IncompleteScanError(
+        f"Result incomplete: {what} span more than {MAX_COMPLETE_SCAN_PAGES} "
+        f"pages ({MAX_COMPLETE_SCAN_PAGES * MAX_PER_PAGE} items), so no count "
+        "is returned. " + (narrow_hint or _NO_ESTIMATE_HINT)
+    )
+
+
+@mcp.tool()
+def github_list_branches(repo: str, prefix: str = "") -> str:
+    """
+    Count a repository's branches and list every branch name, or every name
+    starting with `prefix`.
+    repo: "owner/repo".
+    prefix: optional literal, case-sensitive name prefix, e.g. "xero/"
+    (default: all). Pass the bare branch-name prefix -- not "refs/heads/..."
+    -- and no wildcards such as "xero/*".
+
+    Use this for "how many branches are there" or "which branches start with
+    X". It reads every page itself: total_count counts all branches in the
+    repository and matching_count the names that start with prefix; both
+    are always complete. branches lists the matching names, sorted, up to
+    300 -- branches_listed_truncated is true when more matched than are
+    listed (narrow the prefix to see them). If the
+    repository has more branches than this tool can read, it returns an
+    error instead of a partial list -- report the count as unavailable.
+    """
+    try:
+        owner, name = _parse_repo(repo)
+        if _FORBIDDEN_BRANCH_CHARS.search(prefix):
+            # No branch name can contain these, so a "0 matches, complete"
+            # answer would state a false fact about the repository.
+            raise ValueError(
+                f"prefix contains characters no branch name can contain: "
+                f"{prefix!r} (pass a literal prefix such as 'xero/', no "
+                "wildcards or spaces)"
+            )
+        raw = _collect_all_pages(
+            f"/repos/{owner}/{name}/branches", {}, what=f"the branches of {repo}"
+        )
+        names: list[str] = []
+        for branch in raw:
+            branch_name = branch.get("name")
+            if not isinstance(branch_name, str):
+                raise ValueError(f"GitHub returned a branch without a name for {repo}")
+            names.append(branch_name)
+        matching = sorted(
+            branch_name for branch_name in names if branch_name.startswith(prefix)
+        )
+        return _success(
+            repo=repo,
+            prefix=prefix or None,
+            total_count=len(names),
+            matching_count=len(matching),
+            complete=True,
+            branches=matching[:MAX_LISTED_BRANCHES],
+            branches_listed_truncated=len(matching) > MAX_LISTED_BRANCHES,
+        )
+    except _IncompleteScanError as e:
+        logger.warning(f"Incomplete GitHub branch scan for {repo}: {e}")
+        return _error(str(e))
+    except Exception as e:
+        logger.error(f"Error listing GitHub branches for {repo}: {e}", exc_info=True)
+        return _error(str(e))
+
+
+def _parse_iso_date(value: str, *, field: str) -> date:
+    text = (value or "").strip()
+    if _ISO_DATE_RE.fullmatch(text):
+        try:
+            return date.fromisoformat(text)
+        except ValueError:
+            pass
+    raise ValueError(
+        f"{field} must be a calendar date in YYYY-MM-DD format, got {value!r}"
+    )
+
+
+def _utc_timestamp(moment: datetime) -> str:
+    return moment.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+@mcp.tool()
+def github_count_commits(
+    repo: str,
+    since_date: str,
+    until_date: str,
+    timezone: str,
+    branch: str = "",
+) -> str:
+    """
+    Count the commits on a branch dated on the calendar days since_date
+    through until_date (both inclusive) in a named time zone.
+    repo: "owner/repo".
+    since_date, until_date: local dates in `timezone`, YYYY-MM-DD.
+    timezone: IANA zone name such as "Australia/Sydney", "America/New_York"
+    or "UTC" -- the user's zone when known; if it is not, ask rather than
+    assume one.
+    branch: branch name (default: the repository's default branch).
+
+    Use this, not github_list_commits, for "how many commits between X and
+    Y". It converts the local days to exact instants itself, including any
+    daylight-saving change inside the window -- do not convert times
+    yourself. Dates are committer dates, which is what GitHub filters by. A
+    commit's committer date is set when it is created (or rebased, squashed
+    or cherry-picked); a commit brought in by a plain merge keeps its own
+    date rather than the merge time, and author dates can differ.
+
+    Returns commit_count, the exact window_start/window_end, and up to 100
+    commits in GitHub's order with committed_at shown in `timezone`;
+    commits_listed_truncated is true when more were counted than listed.
+    A successful result is always complete -- if the window holds more
+    commits than this tool can read, it returns an error instead of a
+    partial count; count shorter date ranges and add them up instead.
+    Always state the time zone when reporting the result.
+    """
+    try:
+        owner, name = _parse_repo(repo)
+        start_day = _parse_iso_date(since_date, field="since_date")
+        end_day = _parse_iso_date(until_date, field="until_date")
+        if end_day < start_day:
+            raise ValueError(
+                f"until_date ({end_day}) must be on or after since_date ({start_day})"
+            )
+        zone_name = (timezone or "").strip()
+        if not zone_name:
+            raise ValueError(
+                "timezone is required: an IANA zone name such as "
+                "'Australia/Sydney' or 'UTC'"
+            )
+        zone = _resolve_zoneinfo(zone_name)
+        window_start, window_end = _calendar_day_bounds(
+            start_day.isoformat(), zone_name, days=(end_day - start_day).days + 1
+        )
+        start = datetime.fromisoformat(window_start)
+        end = datetime.fromisoformat(window_end)
+        params: dict[str, Any] = {
+            "since": _utc_timestamp(start),
+            "until": _utc_timestamp(end),
+        }
+        branch_name = None
+        if branch:
+            branch_name = _validate_branch_name(branch, field="branch")
+            params["sha"] = branch_name
+        raw = _collect_all_pages(
+            f"/repos/{owner}/{name}/commits",
+            params,
+            what=f"the commits of {repo} in this date window",
+            narrow_hint=(
+                "Split the window into shorter date ranges, count each, and "
+                "add the counts; do not estimate."
+            ),
+        )
+        counted: list[dict[str, Any]] = []
+        for commit in raw:
+            details = commit.get("commit") or {}
+            committed = (details.get("committer") or {}).get("date")
+            if not isinstance(committed, str):
+                raise ValueError(
+                    f"GitHub returned commit {commit.get('sha')} without a "
+                    "committer date"
+                )
+            when = datetime.fromisoformat(committed.replace("Z", "+00:00"))
+            # GitHub's `until` is inclusive; the window's end is the next
+            # local midnight, which belongs to the following day.
+            if not start <= when < end:
+                continue
+            counted.append(
+                {
+                    "sha": commit.get("sha"),
+                    "title": str(details.get("message") or "").split("\n", 1)[0],
+                    "author": (details.get("author") or {}).get("name"),
+                    "committed_at": when.astimezone(zone).isoformat(),
+                    "html_url": commit.get("html_url"),
+                }
+            )
+        return _success(
+            repo=repo,
+            branch=branch_name,
+            timezone=zone_name,
+            date_basis="committer_date",
+            window_start=window_start,
+            window_end=window_end,
+            commit_count=len(counted),
+            complete=True,
+            commits=counted[:MAX_LISTED_COMMITS],
+            commits_listed_truncated=len(counted) > MAX_LISTED_COMMITS,
+        )
+    except _IncompleteScanError as e:
+        logger.warning(f"Incomplete GitHub commit scan for {repo}: {e}")
+        return _error(str(e))
+    except Exception as e:
+        logger.error(f"Error counting GitHub commits for {repo}: {e}", exc_info=True)
         return _error(str(e))
 
 

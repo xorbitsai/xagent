@@ -5037,3 +5037,408 @@ def test_update_submodule_write_error_mapping(monkeypatch, route, status, needle
     result = _bump()
     assert result["status"] == "error"
     assert needle in result["message"]
+
+
+# --- Change statistics, branch listing and date-window commit counts --------
+# (xagent-saas#3583, #3584, #3585: Toby answered GitHub statistics questions
+# from data the connector dropped or never fetched completely.)
+
+
+def test_get_pull_request_reports_change_stats(monkeypatch):
+    """The single-PR endpoint carries changed_files/additions/deletions; the
+    tool must pass them through instead of dropping them in the summary."""
+    monkeypatch.setattr(
+        github.requests,
+        "request",
+        Mock(
+            return_value=MockResponse(
+                json_data={
+                    "number": 12,
+                    "changed_files": 7,
+                    "additions": 240,
+                    "deletions": 0,
+                    "commits": 3,
+                }
+            )
+        ),
+    )
+
+    result = json.loads(github.github_get_pull_request("octocat/Hello-World", 12))
+
+    assert result["status"] == "success"
+    assert result["change_stats"] == {
+        "changed_files": 7,
+        "additions": 240,
+        "deletions": 0,
+        "commits": 3,
+    }
+    assert result["missing_stats"] == []
+
+
+def test_get_pull_request_names_missing_change_stats_instead_of_zero(monkeypatch):
+    monkeypatch.setattr(
+        github.requests,
+        "request",
+        Mock(return_value=MockResponse(json_data={"number": 12, "additions": 5})),
+    )
+
+    result = json.loads(github.github_get_pull_request("octocat/Hello-World", 12))
+
+    assert result["change_stats"]["changed_files"] is None
+    assert result["change_stats"]["deletions"] is None
+    assert result["change_stats"]["additions"] == 5
+    assert result["missing_stats"] == ["changed_files", "deletions", "commits"]
+
+
+def _paged(pages, *, path_check=None):
+    """Mock requests.request serving `pages` in order; every page except the
+    last carries a Link rel="next"."""
+    calls = []
+
+    def fake_request(**kwargs):
+        calls.append(kwargs)
+        index = len(calls) - 1
+        if path_check is not None:
+            path_check(kwargs)
+        headers = (
+            {"Link": '<https://api.github.com/x?page=2>; rel="next"'}
+            if index < len(pages) - 1
+            else {}
+        )
+        return MockResponse(json_data=pages[index], headers=headers)
+
+    return fake_request, calls
+
+
+def test_list_branches_reads_every_page_and_matches_prefix(monkeypatch):
+    first = [{"name": f"feature-{i:03d}"} for i in range(99)] + [{"name": "xero/a"}]
+    second = [
+        {"name": "xero/b"},
+        {"name": "main"},
+        {"name": "xeroish"},
+        {"name": "feature/xero/c"},
+    ]
+    fake, calls = _paged([first, second])
+    monkeypatch.setattr(github.requests, "request", fake)
+
+    result = json.loads(
+        github.github_list_branches("octocat/Hello-World", prefix="xero/")
+    )
+
+    assert result["status"] == "success"
+    assert result["complete"] is True
+    assert result["total_count"] == 104
+    assert result["matching_count"] == 2
+    assert result["branches"] == ["xero/a", "xero/b"]
+    assert result["branches_listed_truncated"] is False
+    assert [c["params"]["page"] for c in calls] == [1, 2]
+    assert all(c["params"]["per_page"] == 100 for c in calls)
+    assert calls[0]["url"] == (
+        f"{github.GITHUB_BASE_URL}/repos/octocat/Hello-World/branches"
+    )
+
+
+def test_list_branches_without_prefix_returns_all_names(monkeypatch):
+    fake, _ = _paged([[{"name": "main"}, {"name": "dev"}]])
+    monkeypatch.setattr(github.requests, "request", fake)
+
+    result = json.loads(github.github_list_branches("octocat/Hello-World"))
+
+    assert result["total_count"] == 2
+    assert result["branches"] == ["dev", "main"]
+
+
+def test_list_branches_fails_closed_at_page_limit(monkeypatch):
+    pages = [[{"name": f"b{p}-{i}"} for i in range(100)] for p in range(50)]
+    fake, calls = _paged(pages)
+    monkeypatch.setattr(github.requests, "request", fake)
+
+    result = json.loads(
+        github.github_list_branches("octocat/Hello-World", prefix="xero/")
+    )
+
+    assert result["status"] == "error"
+    assert "incomplete" in result["message"]
+    assert "total_count" not in result
+    assert len(calls) == github.MAX_COMPLETE_SCAN_PAGES
+
+
+def test_complete_scan_fails_closed_when_time_budget_runs_out(monkeypatch):
+    clock = itertools.count(0, github.MAX_COMPLETE_SCAN_SECONDS)
+    monkeypatch.setattr(github, "_monotonic", lambda: next(clock))
+    fake, calls = _paged([[{"name": "a"}], [{"name": "b"}], [{"name": "c"}]])
+    monkeypatch.setattr(github.requests, "request", fake)
+
+    result = json.loads(github.github_list_branches("octocat/Hello-World"))
+
+    assert result["status"] == "error"
+    assert "incomplete" in result["message"]
+    assert "rather than estimating" in result["message"]
+    assert len(calls) == 1
+
+
+def _commit(sha, committed_at, message="change"):
+    return {
+        "sha": sha,
+        "html_url": f"https://github.com/octocat/Hello-World/commit/{sha}",
+        "commit": {
+            "message": message,
+            "author": {"name": "Ada", "date": committed_at},
+            "committer": {"name": "GitHub", "date": committed_at},
+        },
+    }
+
+
+def test_count_commits_uses_local_day_bounds_across_dst_change(monkeypatch):
+    """Sydney moves from +10:00 to +11:00 at 02:00 on 2026-10-04, inside the
+    1-10 October window: the window starts at local midnight +10:00 and ends
+    at local midnight +11:00, and each commit is shown with its own offset."""
+    page_one = [
+        _commit("end-excluded", "2026-10-10T13:00:00Z"),
+        _commit("end-included", "2026-10-10T12:59:59Z"),
+        _commit("after-dst", "2026-10-04T16:30:00Z"),
+    ]
+    page_two = [
+        _commit("before-dst", "2026-10-03T15:30:00Z"),
+        _commit("start-included", "2026-09-30T14:00:00Z"),
+    ]
+    fake, calls = _paged([page_one, page_two])
+    monkeypatch.setattr(github.requests, "request", fake)
+
+    result = json.loads(
+        github.github_count_commits(
+            "octocat/Hello-World",
+            since_date="2026-10-01",
+            until_date="2026-10-10",
+            timezone="Australia/Sydney",
+            branch="main",
+        )
+    )
+
+    assert result["status"] == "success"
+    assert result["complete"] is True
+    assert result["timezone"] == "Australia/Sydney"
+    assert result["date_basis"] == "committer_date"
+    assert result["window_start"] == "2026-10-01T00:00:00+10:00"
+    assert result["window_end"] == "2026-10-11T00:00:00+11:00"
+    assert result["commit_count"] == 4
+    assert [c["sha"] for c in result["commits"]] == [
+        "end-included",
+        "after-dst",
+        "before-dst",
+        "start-included",
+    ]
+    local_times = {c["sha"]: c["committed_at"] for c in result["commits"]}
+    assert local_times["after-dst"] == "2026-10-05T03:30:00+11:00"
+    assert local_times["before-dst"] == "2026-10-04T01:30:00+10:00"
+    assert local_times["start-included"] == "2026-10-01T00:00:00+10:00"
+    params = calls[0]["params"]
+    assert params["sha"] == "main"
+    assert params["since"] == "2026-09-30T14:00:00Z"
+    assert params["until"] == "2026-10-10T13:00:00Z"
+    assert [c["params"]["page"] for c in calls] == [1, 2]
+
+
+def test_count_commits_omits_sha_for_default_branch(monkeypatch):
+    fake, calls = _paged([[]])
+    monkeypatch.setattr(github.requests, "request", fake)
+
+    result = json.loads(
+        github.github_count_commits(
+            "octocat/Hello-World", "2026-10-01", "2026-10-01", "UTC"
+        )
+    )
+
+    assert result["commit_count"] == 0
+    assert result["complete"] is True
+    assert result["branch"] is None
+    assert "sha" not in calls[0]["params"]
+
+
+@pytest.mark.parametrize(
+    ("since_date", "until_date", "tz", "expected"),
+    [
+        ("2026-10-01", "2026-10-10", "Mars/Olympus", "IANA"),
+        ("2026-10-10", "2026-10-01", "UTC", "until_date"),
+        ("1 Oct", "2026-10-10", "UTC", "YYYY-MM-DD"),
+        ("2026-10-01", "2026-10-10", "", "timezone"),
+    ],
+)
+def test_count_commits_rejects_bad_window(
+    monkeypatch, since_date, until_date, tz, expected
+):
+    mock_request = Mock()
+    monkeypatch.setattr(github.requests, "request", mock_request)
+
+    result = json.loads(
+        github.github_count_commits("octocat/Hello-World", since_date, until_date, tz)
+    )
+
+    assert result["status"] == "error"
+    assert expected in result["message"]
+    mock_request.assert_not_called()
+
+
+def test_count_commits_fails_closed_at_page_limit(monkeypatch):
+    pages = [
+        [_commit(f"c{p}-{i}", "2026-10-02T00:00:00Z") for i in range(100)]
+        for p in range(50)
+    ]
+    fake, calls = _paged(pages)
+    monkeypatch.setattr(github.requests, "request", fake)
+
+    result = json.loads(
+        github.github_count_commits(
+            "octocat/Hello-World", "2026-10-01", "2026-10-10", "UTC"
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "incomplete" in result["message"]
+    assert "commit_count" not in result
+    assert len(calls) == github.MAX_COMPLETE_SCAN_PAGES
+
+
+def test_count_commits_caps_listed_commits_but_not_the_count(monkeypatch):
+    commits = [_commit(f"c{i}", "2026-10-02T00:00:00Z") for i in range(150)]
+    fake, _ = _paged([commits[:100], commits[100:]])
+    monkeypatch.setattr(github.requests, "request", fake)
+
+    result = json.loads(
+        github.github_count_commits(
+            "octocat/Hello-World", "2026-10-01", "2026-10-10", "UTC"
+        )
+    )
+
+    assert result["commit_count"] == 150
+    assert len(result["commits"]) == github.MAX_LISTED_COMMITS
+    assert result["commits_listed_truncated"] is True
+
+
+def test_get_pull_request_does_not_take_a_boolean_for_a_statistic(monkeypatch):
+    monkeypatch.setattr(
+        github.requests,
+        "request",
+        Mock(
+            return_value=MockResponse(
+                json_data={
+                    "changed_files": True,
+                    "additions": 1,
+                    "deletions": 1,
+                    "commits": 1,
+                }
+            )
+        ),
+    )
+
+    result = json.loads(github.github_get_pull_request("octocat/Hello-World", 1))
+
+    assert result["change_stats"]["changed_files"] is None
+    assert result["missing_stats"] == ["changed_files"]
+
+
+@pytest.mark.parametrize("prefix", ["xero/*", " xero/", "xero/[ab]"])
+def test_list_branches_rejects_a_prefix_no_branch_can_match(monkeypatch, prefix):
+    """A wildcard or a space would otherwise come back as a confident
+    "0 matches, complete" -- a false statement about the repository."""
+    mock_request = Mock()
+    monkeypatch.setattr(github.requests, "request", mock_request)
+
+    result = json.loads(github.github_list_branches("octocat/Hello-World", prefix))
+
+    assert result["status"] == "error"
+    assert "literal prefix" in result["message"]
+    mock_request.assert_not_called()
+
+
+def test_complete_scan_fails_closed_on_mid_scan_rate_limit(monkeypatch):
+    """A rate limit on page 2 must not sleep inside the scan (its deadline
+    cannot see that sleep) and must not hand back page 1 as the total."""
+    mock_request = Mock(
+        side_effect=[
+            MockResponse(
+                json_data=[{"name": "a"}],
+                headers={"Link": '<https://api.github.com/x?page=2>; rel="next"'},
+            ),
+            MockResponse(
+                json_data={"message": "rate limited"},
+                status_code=429,
+                headers={"Retry-After": "1"},
+            ),
+        ]
+    )
+    monkeypatch.setattr(github.requests, "request", mock_request)
+    sleep_mock = Mock()
+    monkeypatch.setattr(github, "_sleep", sleep_mock)
+
+    result = json.loads(github.github_list_branches("octocat/Hello-World"))
+
+    assert result["status"] == "error"
+    assert "rate limited" in result["message"]
+    assert "total_count" not in result
+    assert mock_request.call_count == 2
+    sleep_mock.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("page", "expected"),
+    [
+        ({"message": "not a list"}, "non-list page"),
+        ([{"name": "main"}, {"protected": False}], "without a name"),
+    ],
+)
+def test_list_branches_rejects_malformed_pages(monkeypatch, page, expected):
+    monkeypatch.setattr(
+        github.requests, "request", Mock(return_value=MockResponse(json_data=page))
+    )
+
+    result = json.loads(github.github_list_branches("octocat/Hello-World"))
+
+    assert result["status"] == "error"
+    assert expected in result["message"]
+
+
+def test_count_commits_rejects_a_commit_without_committer_date(monkeypatch):
+    broken = _commit("broken", "2026-10-02T00:00:00Z")
+    del broken["commit"]["committer"]
+    fake, _ = _paged([[broken]])
+    monkeypatch.setattr(github.requests, "request", fake)
+
+    result = json.loads(
+        github.github_count_commits(
+            "octocat/Hello-World", "2026-10-01", "2026-10-10", "UTC"
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "without a committer date" in result["message"]
+
+
+def test_count_commits_limit_error_says_to_split_the_window(monkeypatch):
+    pages = [
+        [_commit(f"c{p}-{i}", "2026-10-02T00:00:00Z") for i in range(100)]
+        for p in range(50)
+    ]
+    fake, _ = _paged(pages)
+    monkeypatch.setattr(github.requests, "request", fake)
+
+    result = json.loads(
+        github.github_count_commits(
+            "octocat/Hello-World", "2026-10-01", "2026-10-10", "UTC"
+        )
+    )
+
+    assert "shorter date ranges" in result["message"]
+
+
+def test_list_branches_caps_listed_names_but_not_the_counts(monkeypatch):
+    pages = [[{"name": f"b{p}-{i:03d}"} for i in range(100)] for p in range(4)]
+    fake, _ = _paged(pages)
+    monkeypatch.setattr(github.requests, "request", fake)
+
+    result = json.loads(github.github_list_branches("octocat/Hello-World"))
+
+    assert result["total_count"] == 400
+    assert result["matching_count"] == 400
+    assert len(result["branches"]) == github.MAX_LISTED_BRANCHES
+    assert result["branches_listed_truncated"] is True

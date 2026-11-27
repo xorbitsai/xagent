@@ -234,3 +234,97 @@ async def test_create_comment_escapes_parentheses_before_publishing(monkeypatch)
     assert result[0].text == "Comment created successfully! ID: comment-1"
     comment_body = mock_post.call_args.kwargs["json"]
     assert comment_body["message"]["text"] == "Nice work \\(team\\)!"
+
+
+@pytest.mark.asyncio
+async def test_get_profile_passes_timeout(monkeypatch):
+    """Every LinkedIn request must include an explicit timeout."""
+    monkeypatch.setenv("LINKEDIN_ACCESS_TOKEN", "token")
+    mock_get = Mock(
+        return_value=MockResponse(
+            json_data={"sub": "person-1"}, text='{"sub":"person-1"}'
+        )
+    )
+    monkeypatch.setattr(linkedin.requests, "get", mock_get)
+
+    await linkedin.call_tool("get_profile", {})
+
+    assert mock_get.call_args.kwargs["timeout"] == linkedin.DEFAULT_TIMEOUT_SECONDS
+
+
+@pytest.mark.asyncio
+async def test_create_post_passes_timeout_on_every_request(monkeypatch):
+    """Both the userinfo GET and the POST must carry a timeout."""
+    monkeypatch.setenv("LINKEDIN_ACCESS_TOKEN", "token")
+    mock_get = Mock(
+        return_value=MockResponse(
+            json_data={"sub": "person-1"}, text='{"sub":"person-1"}'
+        )
+    )
+    mock_post = Mock(
+        return_value=MockResponse(headers={"x-restli-id": "urn:li:share:post-1"})
+    )
+    monkeypatch.setattr(linkedin.requests, "get", mock_get)
+    monkeypatch.setattr(linkedin.requests, "post", mock_post)
+
+    await linkedin.call_tool("create_post", {"text": "hello"})
+
+    assert mock_get.call_args.kwargs["timeout"] == linkedin.DEFAULT_TIMEOUT_SECONDS
+    assert mock_post.call_args.kwargs["timeout"] == linkedin.DEFAULT_TIMEOUT_SECONDS
+
+
+@pytest.mark.asyncio
+async def test_hung_endpoint_raises_timeout_error(monkeypatch):
+    """A hanging LinkedIn endpoint must fail with a timeout, not block indefinitely."""
+    import requests as req
+
+    monkeypatch.setenv("LINKEDIN_ACCESS_TOKEN", "token")
+    monkeypatch.setattr(
+        linkedin.requests,
+        "get",
+        Mock(side_effect=req.Timeout("connect timeout after 30s")),
+    )
+
+    result = await linkedin.call_tool("get_profile", {})
+
+    assert "timeout" in result[0].text.lower() or "Timeout" in result[0].text
+
+
+@pytest.mark.asyncio
+async def test_image_upload_uses_longer_timeout(monkeypatch, tmp_path):
+    """File uploads use UPLOAD_TIMEOUT_SECONDS, not the default 30s."""
+    monkeypatch.setenv("LINKEDIN_ACCESS_TOKEN", "token")
+    monkeypatch.setenv("XAGENT_LINKEDIN_IMAGE_ALLOWED_DIRS", str(tmp_path))
+    image_path = tmp_path / "generated.png"
+    image_path.write_bytes(b"png-bytes")
+
+    mock_get = Mock(
+        return_value=MockResponse(
+            json_data={"sub": "person-1"}, text='{"sub":"person-1"}'
+        )
+    )
+
+    def mock_post(url, **kwargs):
+        if url == linkedin.IMAGES_URL:
+            return MockResponse(
+                json_data={
+                    "value": {
+                        "uploadUrl": "https://upload.linkedin.example/image",
+                        "image": "urn:li:image:image-1",
+                    }
+                }
+            )
+        return MockResponse(headers={"x-restli-id": "post-1"})
+
+    mock_put = Mock(return_value=MockResponse())
+
+    monkeypatch.setattr(linkedin.requests, "get", mock_get)
+    monkeypatch.setattr(linkedin.requests, "post", Mock(side_effect=mock_post))
+    monkeypatch.setattr(linkedin.requests, "put", mock_put)
+
+    await linkedin.call_tool(
+        "create_post",
+        {"text": "hello", "image_path": str(image_path)},
+    )
+
+    assert mock_put.call_args.kwargs["timeout"] == linkedin.UPLOAD_TIMEOUT_SECONDS

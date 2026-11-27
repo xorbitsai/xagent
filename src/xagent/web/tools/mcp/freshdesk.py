@@ -659,6 +659,12 @@ def freshdesk_get_ticket(ticket_id: int, include: str | None = None) -> str:
     """
     Fetch one ticket by its numeric id, including its description.
 
+    Read the ticket here to report its current status. `status` is a
+    number: 2 Open, 3 Pending, 4 Resolved and 5 Closed are the four every
+    helpdesk has; any other number is a status this helpdesk defined
+    itself, and the ticket does not carry its name, so report it as a
+    custom status with its number rather than guessing a name.
+
     ticket_id: the ticket's numeric id (the number in its Freshdesk URL).
     include: comma-separated side-loads, e.g. "conversations,requester,stats".
     Note that "conversations" returns only the OLDEST ten ("up to ten
@@ -685,6 +691,10 @@ def freshdesk_get_ticket(ticket_id: int, include: str | None = None) -> str:
 def freshdesk_search_tickets(query: str, page: int = 1) -> str:
     """
     Search tickets with Freshdesk's filter query language.
+
+    Results come from Freshdesk's search index, which can trail a just-made
+    update; to report one ticket's current status, read it with
+    freshdesk_get_ticket.
 
     query: the filter expression WITHOUT the enclosing double quotes this
     tool adds, e.g. status:2 AND priority:4, or
@@ -957,6 +967,9 @@ def freshdesk_list_ticket_conversations(
 ) -> str:
     """
     List a ticket's conversation entries -- replies and notes -- oldest first.
+
+    The newest entries are on the last page: follow has_more to the end
+    when you need the latest reply or note.
 
     ticket_id: the ticket's numeric id.
     page: 1-based page number.

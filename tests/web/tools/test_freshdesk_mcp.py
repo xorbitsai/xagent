@@ -1530,3 +1530,25 @@ def test_create_ticket_cleans_tags_too(
     recorder = _install(monkeypatch, _json_response({"id": 1}))
     freshdesk.freshdesk_create_ticket("s", "d", email="a@b.c", tags=["vip ", ""])
     assert recorder.call["json"]["tags"] == ["vip"]
+
+
+def test_status_questions_are_sent_to_get_ticket():
+    ticket = " ".join(freshdesk.freshdesk_get_ticket.__doc__.split())
+    search = " ".join(freshdesk.freshdesk_search_tickets.__doc__.split())
+    conversations = " ".join(
+        freshdesk.freshdesk_list_ticket_conversations.__doc__.split()
+    )
+
+    assert (
+        "2 Open, 3 Pending, 4 Resolved and 5 Closed are the four every helpdesk has"
+        in ticket
+    )
+    assert (
+        "report it as a custom status with its number rather than guessing a name"
+        in ticket
+    )
+    assert (
+        "to report one ticket's current status, read it with freshdesk_get_ticket"
+        in search
+    )
+    assert "The newest entries are on the last page" in conversations

@@ -1527,6 +1527,38 @@ async def test_openrouter_direct_relaxes_tool_choice_on_endpoint_404(
     assert second_call["tool_choice"] == "auto"
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("method", ["chat", "vision_chat", "stream_chat"])
+async def test_openrouter_does_not_repeat_auto_choice_after_provider_rejection(
+    method, mocker
+):
+    mock_client = mocker.AsyncMock()
+    create = mock_client.chat.completions.create
+    create.side_effect = RuntimeError(_OPENROUTER_TOOL_CHOICE_ERROR)
+    mocker.patch(
+        "xagent.core.model.chat.basic.openai.AsyncOpenAI", return_value=mock_client
+    )
+    llm = OpenRouterLLM(
+        model_name="anthropic/claude-opus-5.5",
+        api_key="test-key",
+        abilities=["chat", "vision", "tool_calling"],
+    )
+
+    messages = [{"role": "user", "content": "score?"}]
+    with pytest.raises(RuntimeError, match="No endpoints found"):
+        result = getattr(llm, method)(
+            messages, tools=_two_tool_schema(), tool_choice="required"
+        )
+        if method == "stream_chat":
+            async for _ in result:
+                pass
+        else:
+            await result
+
+    create.assert_awaited_once()
+    assert create.call_args.kwargs["tool_choice"] == "auto"
+
+
 def _bad_request_error(message: str) -> openai.BadRequestError:
     return openai.BadRequestError(
         f"Error code: 400 - {{'error': {{'message': '{message}'}}}}",

@@ -793,10 +793,8 @@ class OpenAICompatibleLLM(BaseLLM):
         # Add optional parameters
         if tools:
             completion_params["tools"] = tools
-            if tool_choice:
-                completion_params["tool_choice"] = tool_choice
-        elif tool_choice:
-            completion_params["tool_choice"] = tool_choice
+        if tool_choice:
+            completion_params["tool_choice"] = self.compatible_tool_choice(tool_choice)
         if response_format:
             completion_params["response_format"] = response_format
 
@@ -1169,10 +1167,8 @@ class OpenAICompatibleLLM(BaseLLM):
         # Add optional parameters
         if tools:
             completion_params["tools"] = tools
-            if tool_choice:
-                completion_params["tool_choice"] = tool_choice
-        elif tool_choice:
-            completion_params["tool_choice"] = tool_choice
+        if tool_choice:
+            completion_params["tool_choice"] = self.compatible_tool_choice(tool_choice)
         if response_format:
             completion_params["response_format"] = response_format
 
@@ -1423,10 +1419,8 @@ class OpenAICompatibleLLM(BaseLLM):
         # Add tools if provided
         if tools:
             completion_params["tools"] = tools
-            if tool_choice:
-                completion_params["tool_choice"] = tool_choice
-        elif tool_choice:
-            completion_params["tool_choice"] = tool_choice
+        if tool_choice:
+            completion_params["tool_choice"] = self.compatible_tool_choice(tool_choice)
 
         if response_format:
             completion_params["response_format"] = response_format

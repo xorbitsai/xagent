@@ -7,6 +7,7 @@ from typing import Any
 from urllib.parse import quote
 
 from mcp.server.fastmcp import FastMCP
+from mcp.types import ToolAnnotations
 
 from ....core.utils import public_requests as requests
 from ....core.utils.security import redact_sensitive_text
@@ -318,7 +319,7 @@ def _paginated_results(payload: dict[str, Any], limit: int) -> tuple[list[Any], 
     return data[:limit], truncated
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
 def stripe_get_account_info() -> str:
     """
     Get the Stripe account this connector's API key belongs to (id,
@@ -342,7 +343,7 @@ def stripe_get_account_info() -> str:
         return _error(str(e))
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
 def stripe_get_balance() -> str:
     """
     Get the current Stripe balance (available and pending amounts per
@@ -358,7 +359,7 @@ def stripe_get_balance() -> str:
         return _error(str(e))
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
 def stripe_list_customers(
     email: str = "", limit: int = 10, starting_after: str = ""
 ) -> str:
@@ -382,7 +383,7 @@ def stripe_list_customers(
         return _error(str(e))
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
 def stripe_get_customer(customer_id: str) -> str:
     """
     Get one customer's full details by id.
@@ -453,7 +454,7 @@ def stripe_create_customer(
         return _error(str(e))
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
 def stripe_list_charges(
     customer_id: str = "", limit: int = 10, starting_after: str = ""
 ) -> str:
@@ -482,7 +483,7 @@ def stripe_list_charges(
         return _error(str(e))
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
 def stripe_get_charge(charge_id: str) -> str:
     """
     Get one charge's full details by id.
@@ -586,7 +587,7 @@ def stripe_create_refund(
         return _error(str(e))
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
 def stripe_list_payment_intents(
     customer_id: str = "", limit: int = 10, starting_after: str = ""
 ) -> str:
@@ -616,7 +617,7 @@ def stripe_list_payment_intents(
         return _error(str(e))
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
 def stripe_list_invoices(
     customer_id: str = "",
     status: str = "",
@@ -652,7 +653,7 @@ def stripe_list_invoices(
         return _error(str(e))
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
 def stripe_get_invoice(invoice_id: str) -> str:
     """
     Get one invoice's full details by id.
@@ -671,7 +672,7 @@ def stripe_get_invoice(invoice_id: str) -> str:
         return _error(str(e))
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
 def stripe_list_subscriptions(
     customer_id: str = "",
     status: str = "",
@@ -709,7 +710,7 @@ def stripe_list_subscriptions(
         return _error(str(e))
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
 def stripe_list_products(
     active: bool | None = None, limit: int = 10, starting_after: str = ""
 ) -> str:
@@ -734,7 +735,7 @@ def stripe_list_products(
         return _error(str(e))
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
 def stripe_list_prices(
     product_id: str = "",
     active: bool | None = None,

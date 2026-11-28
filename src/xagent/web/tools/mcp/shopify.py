@@ -9,6 +9,7 @@ from os import environ
 from typing import Any, NoReturn
 
 from mcp.server.fastmcp import FastMCP
+from mcp.types import ToolAnnotations
 
 from ....config import get_tool_max_output_length
 from ....core.utils import public_requests as requests
@@ -410,7 +411,7 @@ def _require_admin_scopes(*accepted_scopes: str) -> None:
         )
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
 def shopify_validate_connection() -> str:
     """Validate the token and its Admin API scopes before using tools.
 
@@ -990,7 +991,7 @@ def _collection_summary(collection: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
 def shopify_get_shop() -> str:
     """
     Get basic info about the connected Shopify store (name, domain,
@@ -1010,7 +1011,7 @@ def shopify_get_shop() -> str:
         return _error(str(exc))
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
 def shopify_list_products(query: str = "", limit: int = 25, after: str = "") -> str:
     """
     List/search products.
@@ -1030,7 +1031,7 @@ def shopify_list_products(query: str = "", limit: int = 25, after: str = "") -> 
         return _error(str(exc))
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
 def shopify_get_product(product_id: str) -> str:
     """
     Get a Shopify product by id (numeric id or full gid://shopify/Product/...).
@@ -1152,7 +1153,7 @@ def shopify_update_product(
         return _error(str(exc))
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
 def shopify_list_orders(query: str = "", limit: int = 25, after: str = "") -> str:
     """
     List/search orders. Shopify's Admin API only returns orders from
@@ -1174,7 +1175,7 @@ def shopify_list_orders(query: str = "", limit: int = 25, after: str = "") -> st
         return _error(str(exc))
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
 def shopify_get_order(order_id: str) -> str:
     """
     Get a Shopify order by id (numeric id or full gid://shopify/Order/...).
@@ -1229,7 +1230,7 @@ def shopify_update_order(
         return _error(str(exc))
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
 def shopify_list_customers(query: str = "", limit: int = 25, after: str = "") -> str:
     """
     List/search customers.
@@ -1249,7 +1250,7 @@ def shopify_list_customers(query: str = "", limit: int = 25, after: str = "") ->
         return _error(str(exc))
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
 def shopify_get_customer(customer_id: str) -> str:
     """
     Get a Shopify customer by id (numeric id or full gid://shopify/Customer/...).
@@ -1269,7 +1270,7 @@ def shopify_get_customer(customer_id: str) -> str:
         return _error(str(exc))
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
 def shopify_list_collections(query: str = "", limit: int = 25, after: str = "") -> str:
     """
     List collections (product groupings) -- id, title, handle, and how many

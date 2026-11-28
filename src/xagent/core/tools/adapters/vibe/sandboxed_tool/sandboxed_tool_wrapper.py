@@ -9,6 +9,7 @@ import copy
 import json
 import logging
 import os
+import shlex
 import time
 import uuid
 from pathlib import Path
@@ -692,6 +693,8 @@ class SandboxedToolWrapper(AbstractBaseTool):
         call_id = uuid.uuid4().hex
         result_file = f"/tmp/xagent_result_{call_id}.json"
         args_file = f"/tmp/xagent_args_{call_id}.json"
+        stdout_file = f"/tmp/xagent_stdout_{call_id}.log"
+        stderr_file = f"/tmp/xagent_stderr_{call_id}.log"
 
         try:
             async with self._lease_sandbox() as sandbox:
@@ -724,9 +727,34 @@ class SandboxedToolWrapper(AbstractBaseTool):
                             *command,
                         ]
                     started = time.monotonic()
+                    # Redirect the runner's stdio to files inside the sandbox so
+                    # that a child left behind by a finished runner cannot keep
+                    # the docker exec stream open.  Children that inherit the
+                    # runner's FDs will write to these files, not to the exec
+                    # stream, so the stream closes when the runner exits and
+                    # the per-sandbox exec_lock is released promptly.
+                    quoted = " ".join(shlex.quote(c) for c in command)
                     result = await sandbox.exec(
-                        command[0], *command[1:], env=self._build_execution_env()
+                        "sh",
+                        "-c",
+                        f"exec {quoted} >{shlex.quote(stdout_file)} 2>{shlex.quote(stderr_file)}",
+                        env=self._build_execution_env(),
                     )
+
+                    # Read the redirected stdio from files.  The exec result's
+                    # own stdout/stderr carry only the shell wrapper's output.
+                    log_stdout = await sandbox.exec("cat", stdout_file)
+                    log_stderr = await sandbox.exec("cat", stderr_file)
+                    runner_stdout = (
+                        log_stdout.stdout if log_stdout.exit_code == 0 else ""
+                    )
+                    stderr = log_stderr.stdout if log_stderr.exit_code == 0 else ""
+                    if runner_stdout:
+                        logger.debug(
+                            "Sandbox runner stdout for call %s:\n%s",
+                            call_id,
+                            runner_stdout,
+                        )
 
                     if (
                         timeout_seconds is not None
@@ -742,9 +770,7 @@ class SandboxedToolWrapper(AbstractBaseTool):
 
                     # Check execution result
                     if result.exit_code != 0:
-                        error_msg = (
-                            result.stderr or result.error_message or "Unknown error"
-                        )
+                        error_msg = stderr or result.error_message or "Unknown error"
                         logger.error(f"Tool execution failed: {error_msg}")
                         raise RuntimeError(f"Tool execution failed: {error_msg}")
 
@@ -783,6 +809,8 @@ class SandboxedToolWrapper(AbstractBaseTool):
                             result_file,
                             args_file,
                             result_file + ".runtime.pyz",
+                            stdout_file,
+                            stderr_file,
                         )
                     except Exception:
                         pass

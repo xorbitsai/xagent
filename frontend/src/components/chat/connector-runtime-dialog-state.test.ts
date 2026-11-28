@@ -862,7 +862,7 @@ describe("deriveGates for a first gate", () => {
 // A first gate and a session check add no phase and no event: the dialog's
 // state machine is the one the turn-failure dialog already had.
 describe("keeps the dialog's phases and events as they were", () => {
-  const stateSource = readFileSync(path.resolve(__dirname, "./connector-runtime-dialog-state.ts"), "utf8")
+  const stateSource = readFileSync(path.resolve(__dirname, "./connector-runtime-dialog-state.ts"), "utf8").replace(/\r\n/g, "\n")
   const between = (from: string, to: string) => stateSource.slice(stateSource.indexOf(from), stateSource.indexOf(to, stateSource.indexOf(from)))
   it("names the same phases", () => {
     expect(Array.from(between("export type Phase =", "\n\n").matchAll(/kind: "([a-z-]+)"/g), m => m[1]))

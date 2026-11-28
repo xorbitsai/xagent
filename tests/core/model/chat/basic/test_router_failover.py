@@ -5,11 +5,15 @@ from __future__ import annotations
 import asyncio
 from types import SimpleNamespace
 from typing import Any, AsyncIterator
+from unittest.mock import AsyncMock
 
 import httpx
 import openai
 import pytest
 
+from xagent.core.agent.context import ExecutionContext
+from xagent.core.agent.pattern.react import ReActPattern
+from xagent.core.agent.runtime import PatternRuntime
 from xagent.core.model.chat.basic import router as router_module
 from xagent.core.model.chat.basic.adapter import attach_chat_retry_wrapper
 from xagent.core.model.chat.basic.base import BaseLLM
@@ -173,6 +177,70 @@ async def test_sequential_failover_uses_the_first_success_in_order(
         *(0 for _ in range(3 - failed_count)),
     ]
     assert router.selections == []
+
+
+@pytest.mark.asyncio
+async def test_react_end_trace_names_the_model_that_served_after_failover(monkeypatch):
+    models = {
+        PRIMARY: _FakeLLM(
+            PRIMARY,
+            error=openai.APIConnectionError(request=_REQUEST),
+            context_window=32_000,
+        ),
+        FALLBACK: _FakeLLM(
+            FALLBACK,
+            context_window=64_000,
+            chunks=[
+                StreamChunk(
+                    type=ChunkType.TOOL_CALL,
+                    tool_calls=[
+                        {
+                            "id": "answer",
+                            "function": {
+                                "name": "final_answer",
+                                "arguments": (
+                                    '{"response_language":"English",'
+                                    '"answer":"The fallback served the call."}'
+                                ),
+                            },
+                        }
+                    ],
+                ),
+                StreamChunk(
+                    type=ChunkType.USAGE,
+                    usage={"prompt_tokens": 27, "completion_tokens": 9},
+                ),
+                StreamChunk(type=ChunkType.END),
+            ],
+        ),
+    }
+    router = _router(monkeypatch, models, mode="sequential_failover")
+    context = ExecutionContext(system_prompt="You are helpful.", execution_id="trace")
+    context.add_user_message(MESSAGES[0]["content"])
+    trace_event = AsyncMock(return_value="event-id")
+    runtime = PatternRuntime(
+        execution_id="trace", tracer=SimpleNamespace(trace_event=trace_event)
+    )
+
+    result = await ReActPattern(max_iterations=1).run(
+        context=context, tools=[], llm=router, runtime=runtime
+    )
+
+    assert result["response"] == "The fallback served the call."
+    assert [models[profile].calls for profile in (PRIMARY, FALLBACK)] == [1, 1]
+    (start,) = [
+        event.kwargs["data"]
+        for event in trace_event.await_args_list
+        if event.args[0].value == "action_start_llm"
+    ]
+    (end,) = [
+        event.kwargs["data"]
+        for event in trace_event.await_args_list
+        if event.args[0].value == "action_end_llm"
+    ]
+    assert (start["selected_model"], start["context_window"]) == (PRIMARY, 32_000)
+    assert (end["selected_model"], end["context_window"]) == (FALLBACK, 64_000)
+    assert (end["input_tokens"], end["output_tokens"]) == (27, 9)
 
 
 @pytest.mark.asyncio

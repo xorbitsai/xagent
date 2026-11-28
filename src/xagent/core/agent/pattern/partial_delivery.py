@@ -11,6 +11,7 @@ from ...model.chat.tool_protocol import get_tool_protocol_error
 from ..runtime import (
     ExecutionInterrupted,
     PatternRuntime,
+    llm_end_metadata,
     prepare_llm_for_context,
     resolved_llm_metadata,
 )
@@ -72,7 +73,7 @@ async def request_partial_delivery(
             context=context,
             response=response,
             metadata={
-                **metadata,
+                **llm_end_metadata(call_llm, metadata),
                 "success": args is not None,
                 **(
                     {"protocol_code": protocol_error.get("code")}

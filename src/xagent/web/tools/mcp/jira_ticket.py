@@ -42,6 +42,7 @@ import os
 import re
 import socket
 from pathlib import Path
+from time import sleep
 from typing import Any
 
 from mcp.server.fastmcp import FastMCP
@@ -85,6 +86,7 @@ _ISSUE_KEY_PATTERN = re.compile(r"\A[A-Z][A-Z0-9_]*-[0-9]+\Z")
 _EMAIL_PATTERN = re.compile(r"\A[^@\s:]+@[^@\s:]+\Z")
 
 CREATE_TIMEOUT_SECONDS = 30
+UPLOAD_MAX_RETRY_AFTER_SECONDS = 30
 DEFAULT_ISSUE_TYPE = "Task"
 # Jira's own limit for the summary field.
 MAX_SUMMARY_CHARS = 255
@@ -503,14 +505,39 @@ def _read_attachments(paths: dict[str, str]) -> list[tuple[str, str, bytes]]:
 
 
 def _upload(site: str, key: str, filename: str, data: bytes) -> dict[str, Any]:
-    """Upload one pre-read file to ``key``; raises on any failure."""
-    response = _send(
-        site,
-        "POST",
-        f"/rest/api/3/issue/{key}/attachments",
-        files={"file": (filename, data)},
-        timeout=UPLOAD_TIMEOUT_SECONDS,
-    )
+    """Upload one pre-read file to ``key``, retrying only a known non-write."""
+    # Each attempt gets the full upload timeout. Budget for two attempts
+    # per file and up to 30 seconds of waiting after a rate-limit response.
+    for attempt in range(2):
+        try:
+            response = _send(
+                site,
+                "POST",
+                f"/rest/api/3/issue/{key}/attachments",
+                files={"file": (filename, data)},
+                timeout=UPLOAD_TIMEOUT_SECONDS,
+            )
+        except RuntimeError as exc:
+            if attempt == 1:
+                raise
+            if isinstance(exc, _NothingSentError):
+                continue
+            cause = exc.__cause__
+            if not isinstance(cause, requests.HTTPError):
+                raise
+            rejection = cause.response
+            if rejection is None or rejection.status_code != 429:
+                raise
+            try:
+                retry_after = int(rejection.headers.get("Retry-After", "0"))
+            except ValueError:
+                retry_after = 0
+            if not 0 < retry_after <= UPLOAD_MAX_RETRY_AFTER_SECONDS:
+                raise
+            sleep(retry_after)
+        else:
+            break
+
     return confirmed_attachment(response.json(), len(data))
 
 

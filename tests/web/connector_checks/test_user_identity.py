@@ -31,7 +31,10 @@ from xagent.web.connector_checks.identity import (
     IdentitySetupError,
     SessionPurpose,
 )
-from xagent.web.connector_checks.user_identity import UserIdentityAdapter
+from xagent.web.connector_checks.user_identity import (
+    UserIdentityAdapter,
+    is_catalog_row,
+)
 from xagent.web.models.mcp import MCPServer
 from xagent.web.models.public_mcp import PublicMCPApp
 from xagent.web.services.mcp_connector_session import (
@@ -52,7 +55,9 @@ async def test_the_users_connected_catalog_connectors_run_their_checks(
 ):
     db, user, _ = db_users
     _connect_catalog_chartmogul(db, user)
-    _connect_catalog_stripe(db, user)
+    server = _connect_catalog_stripe(db, user)
+    assert is_catalog_row(db, server, "stripe")
+    assert not is_catalog_row(db, server, "chartmogul")
     chartmogul, stripe = _chartmogul_ok(), _stripe_ok()
     loader = _Loader(chartmogul, stripe)
     monkeypatch.setattr(LOADER, loader)
@@ -242,6 +247,7 @@ async def test_a_catalog_row_whose_command_drifted_is_skipped(
     server.command = command
     server.args = ["-y", "some-pkg"]
     db.commit()
+    assert not is_catalog_row(db, server, "stripe")
     loader = _Loader(_stripe_ok())
     monkeypatch.setattr(LOADER, loader)
 
@@ -261,6 +267,7 @@ async def test_a_user_owned_row_under_a_catalog_id_is_skipped(db_users, monkeypa
     db.add(server)
     db.commit()
     _link(db, user, server)
+    assert not is_catalog_row(db, server, "stripe")
     loader = _Loader(_stripe_ok())
     monkeypatch.setattr(LOADER, loader)
 

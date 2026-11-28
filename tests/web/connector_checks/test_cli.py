@@ -7,6 +7,8 @@ against a seeded database.
 
 from __future__ import annotations
 
+import argparse
+import asyncio
 import contextlib
 import json
 import logging
@@ -19,6 +21,7 @@ from typing import Any
 
 import jsonschema
 import pytest
+from sqlalchemy import text
 
 from tests.web.services.test_connector_probe import (
     _connect_catalog_stripe,
@@ -31,9 +34,18 @@ from tests.web.services.test_mcp_connector_session import (
     _connect_github,
 )
 from xagent.web.connector_checks import cli
+from xagent.web.connector_checks.cli import (
+    flatten_selectors,
+    open_smoke_database,
+    parse_selector_names,
+    parse_timeout_seconds,
+    redirect_stdout_to_stderr,
+)
+from xagent.web.connector_checks.engine import run_checks
 from xagent.web.connector_checks.identity import ConnectorTarget
 from xagent.web.connector_checks.results import RunResult, load_result_schema
-from xagent.web.connector_checks.sweeper import load_sweep_schema
+from xagent.web.connector_checks.sweeper import load_sweep_schema, run_sweep
+from xagent.web.models import database
 from xagent.web.services.mcp_connector_session import ConnectorToolsOutcome
 
 from .fakes import FakeAdapter, FakeTool, failed, listed
@@ -46,7 +58,7 @@ def _with_database(monkeypatch: pytest.MonkeyPatch, db: Any) -> None:
     def database() -> Iterator[Any]:
         yield db
 
-    monkeypatch.setattr(cli, "_database", database)
+    monkeypatch.setattr(cli, "open_smoke_database", database)
 
 
 def _install_adapter(
@@ -94,6 +106,52 @@ def _stripe() -> FakeAdapter:
     """A legacy connector, whose one check is its L3 probe."""
     tool = FakeTool("stripe_list_customers")
     return FakeAdapter([ConnectorTarget("stripe")], {"stripe": listed(tool)})
+
+
+@pytest.mark.parametrize("sweep", [False, True], ids=["run", "sweep"])
+def test_an_external_adapter_command_can_print_one_document(
+    monkeypatch, capfd, tmp_path, sweep
+):
+    monkeypatch.setattr(database, "_engine", None)
+    monkeypatch.setattr(database, "_SessionLocal", None)
+    monkeypatch.setenv("DATABASE_URL", f"sqlite:///{tmp_path / 'external-adapter.db'}")
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--connector", action="append", type=parse_selector_names)
+    parser.add_argument("--total-timeout", type=parse_timeout_seconds)
+    if sweep:
+        selected = "jira"
+        adapter = FakeAdapter(
+            [ConnectorTarget("jira"), ConnectorTarget("google-drive")]
+        )
+    else:
+        selected = "stripe"
+        adapter = _stripe()
+        adapter.targets = [*adapter.targets, ConnectorTarget("slack")]
+    args = parser.parse_args(
+        ["--connector", f"{selected}, {selected}", "--total-timeout", "30"]
+    )
+
+    with redirect_stdout_to_stderr(), open_smoke_database() as db:
+        assert db.scalar(text("SELECT 1")) == 1
+        print("external adapter setup")
+        run = run_sweep if sweep else run_checks
+        result = asyncio.run(
+            run(
+                adapter,
+                connectors=flatten_selectors(args.connector),
+                total_timeout=args.total_timeout,
+            )
+        )
+    print(json.dumps(result.to_document()))
+
+    out, err = capfd.readouterr()
+    document = json.loads(out)
+    jsonschema.validate(
+        document, load_sweep_schema() if sweep else load_result_schema()
+    )
+    assert "external adapter setup" in err
+    assert document["complete"] is True
+    assert {row.connector for row in result.rows} == {selected}
 
 
 def test_a_passing_run_prints_its_document_and_exits_0(monkeypatch, capfd):
@@ -234,7 +292,7 @@ def test_a_database_that_cannot_open_is_a_run_failure(monkeypatch, capfd, caplog
         raise RuntimeError(SECRET)
         yield
 
-    monkeypatch.setattr(cli, "_database", broken)
+    monkeypatch.setattr(cli, "open_smoke_database", broken)
 
     code = cli.main(["--user", "monitor", "--environment", "stage"])
 
@@ -349,7 +407,7 @@ def test_a_sweep_that_cannot_open_the_database_prints_a_sweep_failure(
         raise RuntimeError(SECRET)
         yield
 
-    monkeypatch.setattr(cli, "_database", database)
+    monkeypatch.setattr(cli, "open_smoke_database", database)
 
     code = cli.main(["--user", "monitor", "--sweep"])
 

@@ -337,6 +337,21 @@ The `user` adapter (`user_identity.py`):
 - starts each connector as the user's own task would start it, with no actor policy and no team (`list_connector_tools`);
 - resolves no fixture yet. The server-side source comes with #3284, so until then a check that needs a value is `skip`/`fixture_missing`.
 
+### Commands for other identities
+
+Import `redirect_stdout_to_stderr` and `open_smoke_database` from
+`xagent.web.connector_checks.cli`. Set up the adapter and call `run_checks` or
+`run_sweep` inside the stdout guard. Open the database context there if the
+adapter needs a service database session. Once the contexts exit, print
+`json.dumps(result.to_document())` to stdout. The guard redirects output for
+the entire process and is intended for standalone commands.
+
+The same module provides `parse_selector_names` and `parse_timeout_seconds`
+for `argparse`, and `flatten_selectors` to combine repeated selectors. Import
+`is_catalog_row(db, server, app_id)` from
+`xagent.web.connector_checks.user_identity` to apply the same catalog identity
+check as the `user` adapter.
+
 ## Result document
 
 `results.RunResult.to_document()` builds one document per run and identity. It validates against the packaged JSON Schema, `src/xagent/web/connector_checks/result.schema.json` (`results.load_result_schema()`).

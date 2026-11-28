@@ -217,6 +217,45 @@ def _read(**changes: Any) -> ReadCheck:
 @pytest.mark.parametrize(
     ("checks", "message"),
     [
+        pytest.param(
+            _checks(
+                writes=(
+                    _write(
+                        expected_verdicts={
+                            "jira_create_issue": ["deny"],
+                            "jira_delete_issue": "deny",
+                        }
+                    ),
+                )
+            ),
+            "expected verdict",
+            id="unhashable-verdict",
+        ),
+        pytest.param(
+            _checks(reads=(_read(assertions=StatusSuccess()),)),
+            "assertions must be a tuple",
+            id="assertions-not-a-tuple",
+        ),
+        pytest.param(
+            _checks(reads=(_read(assertions=("status",)),)),
+            "unknown assertion str",
+            id="unknown-assertion",
+        ),
+        pytest.param(
+            _checks(reads=(_read(assertions=(Length((), min=None),)),)),  # type: ignore[arg-type]
+            "length bounds",
+            id="length-min-not-an-integer",
+        ),
+        pytest.param(
+            _checks(reads=(_read(assertions=(Length((), max="1"),)),)),  # type: ignore[arg-type]
+            "length bounds",
+            id="length-max-not-an-integer",
+        ),
+        pytest.param(
+            _checks(reads=(_read(assertions=(L3Envelope(None),)),)),  # type: ignore[arg-type]
+            "keys must be a tuple",
+            id="l3-envelope-keys-not-a-tuple",
+        ),
         (_checks(app_id="Jira"), "app id"),
         (_checks(reads=(_read(id="gmail.extra"),)), "must start with 'jira.'"),
         (_checks(reads=(_read(id="jira.Extra"),)), "check id"),

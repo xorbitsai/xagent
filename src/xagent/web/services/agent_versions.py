@@ -79,6 +79,10 @@ VERSIONED_FIELDS: tuple[str, ...] = (
 # - suggested_prompts: ``None`` equals ``[]``; order and empty entries matter.
 # - prompt_context_fields: compared after ``clean_prompt_context_fields``,
 #   the parser every reader uses.
+#
+# Canonical values are compared as JSON (``same_value``), so ``True`` differs
+# from ``1`` and ``1.0`` from ``1``: a model slot holding ``True`` does not
+# name model 1, and replacing it with ``1`` is a change.
 _EMPTY_VALUES: dict[str, Any] = {
     "instructions": "",
     "models": {},
@@ -235,11 +239,18 @@ def canonical_value(field: str, value: Any) -> Any:
     return value
 
 
+def same_value(field: str, first: Any, second: Any) -> bool:
+    """Whether two values of versioned ``field`` are equal in canonical form,
+    compared as JSON."""
+    return _sort_key(canonical_value(field, first)) == _sort_key(
+        canonical_value(field, second)
+    )
+
+
 def same_content(first: Mapping[str, Any], second: Mapping[str, Any]) -> bool:
     """Whether two states of the versioned fields are the same version."""
     return all(
-        canonical_value(field, first.get(field))
-        == canonical_value(field, second.get(field))
+        same_value(field, first.get(field), second.get(field))
         for field in VERSIONED_FIELDS
     )
 
@@ -340,8 +351,8 @@ def apply_agent_change(
        column the ``agents`` table does not have raises ``ValueError``, even
        when other values would be dropped in step 4.
     4. Drop versioned values whose canonical form equals the stored one,
-       and other values equal (``==``) to the stored one; they are not
-       written.
+       compared as JSON (:func:`same_value`), and other values equal
+       (``==``) to the stored one; they are not written.
     5. Decide: ``validate(row, change)`` (both deep copies) may raise; it
        must not commit, roll back, open another session or await, and a
        transaction it ends raises :class:`SessionBoundaryError`. It sees only
@@ -381,7 +392,7 @@ def apply_agent_change(
         field: value
         for field, value in requested.items()
         if (
-            canonical_value(field, value) != canonical_value(field, row[field])
+            not same_value(field, value, row[field])
             if field in VERSIONED_FIELDS
             else value != row[field]
         )

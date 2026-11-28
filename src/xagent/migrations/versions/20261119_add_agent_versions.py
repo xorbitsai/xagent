@@ -4,7 +4,7 @@ Existing agents get no rows: having none is a normal state, and the first
 change made through ``apply_agent_change`` records the state before it.
 
 Revision ID: 20261119_agent_versions
-Revises: 20261118_seed_cosmos_mcp_app
+Revises: 20261127_trigger_host_executor
 Create Date: 2026-11-19
 
 """
@@ -15,7 +15,7 @@ import sqlalchemy as sa
 from alembic import op
 
 revision: str = "20261119_agent_versions"
-down_revision: Union[str, None] = "20261118_seed_cosmos_mcp_app"
+down_revision: Union[str, None] = "20261127_trigger_host_executor"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 

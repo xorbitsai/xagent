@@ -482,8 +482,8 @@ class AgentStore:
         The change goes through ``apply_agent_change`` under ``OwnedBy``: the
         row is locked and re-read with the ownership predicate, and the checks
         below run against that locked row. Versioned values equal to the
-        stored ones in canonical form, and other values equal to the stored
-        ones, are not written; a change to a
+        stored ones in canonical form, compared as JSON (``same_value``), and
+        other values equal to the stored ones, are not written; a change to a
         versioned field records a new version attributed to ``actor``
         (``unspecified`` when omitted). A field callers may not write raises
         ``ValueError`` whatever its value; the visibility and team-sharing

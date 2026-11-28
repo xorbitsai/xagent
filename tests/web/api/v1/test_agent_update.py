@@ -25,6 +25,7 @@ from tests.shared.postgres_disposable import disposable_database_factory
 from xagent.core.tools.adapters.vibe.agent_model_resolution import AGENT_MODEL_KEYS
 from xagent.web import models as _all_models  # noqa: F401  (registers every table)
 from xagent.web.models.agent import Agent
+from xagent.web.models.agent_version import AgentVersion
 from xagent.web.models.database import Base
 from xagent.web.models.user import User, UserModel
 from xagent.web.schemas.v1 import V1AgentModelSlots, V1AgentUpdateRequest
@@ -584,6 +585,44 @@ def test_update_log_line(caplog, body, fields):
     assert records[0].args == (holder.prefix, holder.user_id, agent_id, fields)
     assert records[0].levelno == logging.INFO
     assert "SECRET" not in _logged_text(caplog)
+
+
+# (id, stored columns, request body) that update_agent_fields keeps as stored.
+_KEPT_AS_STORED = [
+    (
+        "instructions-whitespace",
+        {"instructions": "stored i"},
+        {"instructions": "  stored i\n"},
+    ),
+    ("cleared-empty-slot", {"models": {"general": 0}}, {"models": {"general": None}}),
+]
+
+
+@pytest.mark.parametrize(
+    ("stored", "body"),
+    [row[1:] for row in _KEPT_AS_STORED],
+    ids=[row[0] for row in _KEPT_AS_STORED],
+)
+def test_a_value_kept_as_stored_is_not_written_or_logged(caplog, stored, body):
+    holder = Holder()
+    agent_id = _seed(holder.user_id, **stored)
+    before = _row(agent_id)
+
+    with patch(CACHE_CLEAR) as cleared, caplog.at_level(logging.INFO):
+        resp = _patch(holder, agent_id, body)
+
+    assert resp.status_code == 200, resp.text
+    assert _row(agent_id) == before
+    cleared.assert_not_called()
+    assert _update_records(caplog) == []
+    db = _direct_db_session()
+    try:
+        assert (
+            db.query(AgentVersion).filter(AgentVersion.agent_id == agent_id).count()
+            == 0
+        )
+    finally:
+        db.close()
 
 
 def test_cancelled_update_still_logs(caplog):

@@ -24,7 +24,7 @@ from xagent.web.models.agent_version import AgentVersion
 from xagent.web.models.database import Base
 
 REVISION = "20261119_agent_versions"
-DOWN_REVISION = "20261118_seed_cosmos_mcp_app"
+DOWN_REVISION = "20261127_trigger_host_executor"
 TABLE = "agent_versions"
 MIGRATION = (
     Path(__file__).parents[2]

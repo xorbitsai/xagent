@@ -169,6 +169,9 @@ CANONICAL_MATRIX: dict[str, list[tuple[Any, Any, bool]]] = {
         (None, {}, False),
         ({"general": 1, "compact": None}, {"general": 1}, False),
         ({"general": 1}, {"general": 2}, True),
+        # Compared as JSON: ``True`` and ``1.0`` do not name model 1.
+        ({"general": True}, {"general": 1}, True),
+        ({"general": 1.0}, {"general": 1}, True),
     ],
     "knowledge_bases": [
         (None, [], False),
@@ -281,6 +284,32 @@ def test_raw_sql_bypass_is_recorded_as_untracked(
     assert versions[2].content["instructions"] == "bypass"
     assert (versions[2].actor_kind, versions[2].actor_source) == ("system", "baseline")
     assert versions[3].content["instructions"] == "v3"
+
+
+def test_a_bypass_that_changes_only_a_value_type_is_recorded_as_untracked(
+    sessions: sessionmaker[Session],
+) -> None:
+    with sessions() as db:
+        user_id = _user(db)
+        agent_id = _agent(db, user_id)
+        _save(db, user_id, agent_id, {"models": {"general": 1}})
+        # ``True == 1`` in Python; the baseline check compares as JSON.
+        db.execute(
+            Agent.__table__.update()
+            .where(Agent.__table__.c.id == agent_id)
+            .values(models={"general": True})
+        )
+        db.commit()
+        _save(db, user_id, agent_id, {"instructions": "v3"})
+        versions = _versions(db, agent_id)
+
+    assert [(v.version_no, v.kind) for v in versions] == [
+        (1, "initial"),
+        (2, "save"),
+        (3, "untracked"),
+        (4, "save"),
+    ]
+    assert versions[2].content["models"]["general"] is True
 
 
 @pytest.mark.parametrize("updates", [{"name": "renamed"}, {"instructions": "v2"}])
@@ -685,9 +714,10 @@ def _shell_calls() -> list[ast.Call]:
 
 def test_every_wrapper_call_names_its_actor() -> None:
     calls = _shell_calls()
-    # web agents API 8, builder tool 1, personal-key skills and connectors 2,
-    # import tool 1. A new call site updates this count and passes ``actor``.
-    assert len(calls) == 12
+    # web agents API 8, builder tool 1, personal-key skills, connectors and
+    # update 3, import tool 1. A new call site updates this count and passes
+    # ``actor``.
+    assert len(calls) == 13
     assert all(any(k.arg == "actor" for k in call.keywords) for call in calls)
 
 
@@ -705,7 +735,7 @@ def _holder_names() -> Any:
     )
 
 
-@pytest.mark.parametrize("entry", ["skills", "connectors"])
+@pytest.mark.parametrize("entry", ["skills", "connectors", "update"])
 def test_personal_key_entries_record_api_key_versions(
     sqlite_sessions: sessionmaker[Session],
     monkeypatch: pytest.MonkeyPatch,
@@ -737,6 +767,14 @@ def test_personal_key_entries_record_api_key_versions(
             visible=frozenset({"a", "c"}),
         )
         assert written == (("a", "c"), ("c",))
+    elif entry == "update":
+        detail = AgentManagementRuntime._update_agent_sync(
+            user_id=user_id,
+            key_prefix="xk_abc",
+            agent_id=agent_id,
+            changes={"instructions": "changed through the personal key"},
+        )
+        assert detail is not None
     else:
         snapshot = AgentManagementRuntime._set_agent_connectors_sync(
             user_id=user_id,

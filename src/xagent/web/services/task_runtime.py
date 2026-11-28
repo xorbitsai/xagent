@@ -21,10 +21,12 @@ from typing import Any, Literal, cast
 from sqlalchemy.sql import ColumnElement
 
 from ...config import (
+    get_task_runtime_hook_execution_timeout_seconds,
     get_task_runtime_hook_max_workers,
     get_task_runtime_hook_queue_timeout_seconds,
 )
 from ...core.execution_scope import EXECUTION_SCOPE_AGENT_CONFIG_KEY
+from ...core.runtime_performance import runtime_performance
 
 # Compatibility re-exports for callers using the former web-layer paths.
 from ...core.task_runtime import (
@@ -65,14 +67,10 @@ _PROVIDER_METHODS = (
 )
 _task_runtime_extensions: dict[str, TaskRuntimeExtensionProvider] = {}
 _task_runtime_extensions_lock = RLock()
-_TASK_RUNTIME_HOOK_TIMEOUT_SECONDS = {
-    "on_task_created": 30.0,
-    "build_runtime": 10.0,
-    "public_metadata": 10.0,
-    "on_task_deleted": 30.0,
-}
 _task_runtime_hook_executor: ThreadPoolExecutor | None = None
 _task_runtime_hook_executor_lock = RLock()
+_overrun_hook_workers: set[Future[Any]] = set()
+_overrun_hook_workers_lock = RLock()
 _PUBLIC_METADATA_STATUS_RESERVE_BYTES = 2 * 1024
 # Reserved ``tasks.agent_config`` key holding the sorted list of runtime
 # extension names one task actually bound to. Reusing the existing JSON column
@@ -801,6 +799,32 @@ async def _maybe_await(value: Any) -> Any:
     return value
 
 
+def _count_overrun_hook_workers() -> float:
+    with _overrun_hook_workers_lock:
+        return float(len(_overrun_hook_workers))
+
+
+def _track_overrun_hook_worker(worker: Future[Any]) -> None:
+    def _forget(completed: Future[Any]) -> None:
+        with _overrun_hook_workers_lock:
+            _overrun_hook_workers.discard(completed)
+
+    with _overrun_hook_workers_lock:
+        if worker.done():
+            return  # The worker already exited, as with a cancelled async hook.
+        _overrun_hook_workers.add(worker)
+    # This also runs immediately if the worker finished before registration.
+    worker.add_done_callback(_forget)
+
+
+runtime_performance.register_observable_gauge(
+    "xagent.task_runtime.hooks.overrun_workers",
+    _count_overrun_hook_workers,
+    unit="{thread}",
+    description="Workers still running a synchronous hook after its execution deadline",
+)
+
+
 async def _invoke_provider_hook(
     provider: TaskRuntimeExtensionProvider,
     operation: str,
@@ -815,8 +839,7 @@ async def _invoke_provider_hook(
     """
 
     hook = getattr(provider, operation)
-    timeout = _TASK_RUNTIME_HOOK_TIMEOUT_SECONDS[operation]
-    loop = asyncio.get_running_loop()
+    timeout = get_task_runtime_hook_execution_timeout_seconds(operation)
     started: Future[None] = Future()
 
     def _call_hook() -> Any:
@@ -838,10 +861,8 @@ async def _invoke_provider_hook(
             # observe them. Carry then re-raise them outside ``wait_for``.
             return _ProviderHookRaised(exc)
 
-    execution_future = loop.run_in_executor(
-        _get_task_runtime_hook_executor(),
-        _call_hook,
-    )
+    worker = _get_task_runtime_hook_executor().submit(_call_hook)
+    execution_future = asyncio.wrap_future(worker)
     started_future = asyncio.wrap_future(started)
     queue_timeout = get_task_runtime_hook_queue_timeout_seconds()
     try:
@@ -850,11 +871,14 @@ async def _invoke_provider_hook(
             timeout=queue_timeout,
         )
     except TimeoutError as exc:
+        worker.cancel()
         execution_future.cancel()
+        runtime_performance.increment("xagent.task_runtime.hooks.queue_timeouts")
         raise TimeoutError(
             f"Provider hook queue wait exceeded the {queue_timeout:g}-second timeout"
         ) from exc
     except asyncio.CancelledError:
+        worker.cancel()
         execution_future.cancel()
         raise
 
@@ -864,6 +888,7 @@ async def _invoke_provider_hook(
             timeout=timeout,
         )
     except TimeoutError as exc:
+        _track_overrun_hook_worker(worker)
         raise TimeoutError(
             f"Provider hook execution exceeded the {timeout:g}-second timeout"
         ) from exc

@@ -445,11 +445,7 @@ async def test_provider_hook_timeout_is_attributed_and_bounded(
             raise AssertionError("unreachable")
 
     _register("hanging_runtime", _HangingProvider("hanging"), registered_names)
-    monkeypatch.setitem(
-        task_runtime._TASK_RUNTIME_HOOK_TIMEOUT_SECONDS,
-        "build_runtime",
-        0.01,
-    )
+    monkeypatch.setenv("XAGENT_TASK_RUNTIME_HOOK_BUILD_RUNTIME_TIMEOUT_SECONDS", "0.01")
 
     with caplog.at_level(logging.ERROR):
         contribution = await build_task_runtime(_context())
@@ -457,6 +453,7 @@ async def test_provider_hook_timeout_is_attributed_and_bounded(
     assert contribution == TaskRuntimeContribution()
     assert "hanging_runtime" in caplog.text
     assert "0.01-second timeout" in caplog.text
+    assert task_runtime._count_overrun_hook_workers() == 0
 
 
 @pytest.mark.asyncio
@@ -489,12 +486,11 @@ async def test_blocking_provider_timeout_does_not_consume_default_executor(
         _BlockingProvider("blocking"),
         registered_names,
     )
-    monkeypatch.setitem(
-        task_runtime._TASK_RUNTIME_HOOK_TIMEOUT_SECONDS,
-        "build_runtime",
-        0.01,
-    )
+    monkeypatch.setenv("XAGENT_TASK_RUNTIME_HOOK_BUILD_RUNTIME_TIMEOUT_SECONDS", "0.01")
 
+    shutdown_task_runtime_hook_executor()
+    monkeypatch.setattr(task_runtime, "get_task_runtime_hook_max_workers", lambda: 1)
+    hook_executor = task_runtime._get_task_runtime_hook_executor()
     loop = asyncio.get_running_loop()
     original_executor = loop._default_executor
     probe_executor = ThreadPoolExecutor(max_workers=1)
@@ -503,6 +499,7 @@ async def test_blocking_provider_timeout_does_not_consume_default_executor(
         contribution = await build_task_runtime(_context())
         await asyncio.wait_for(hook_started.wait(), timeout=30)
         assert not hook_finished.is_set()
+        assert task_runtime._count_overrun_hook_workers() == 1
         # A single default worker exposes accidental use by the blocked hook;
         # extra idle workers would let this probe pass despite that regression.
         default_executor_result = await asyncio.wait_for(
@@ -512,13 +509,19 @@ async def test_blocking_provider_timeout_does_not_consume_default_executor(
     finally:
         release_hook.set()
         try:
-            assert await asyncio.to_thread(hook_finished.wait, 30)
+            # The pool has one worker, so this probe completes only after the
+            # timed-out hook exits and its done callback clears the gauge.
+            await asyncio.wait_for(
+                asyncio.wrap_future(hook_executor.submit(lambda: None)), timeout=30
+            )
+            assert hook_finished.is_set()
         finally:
             monkeypatch.setattr(loop, "_default_executor", original_executor)
             probe_executor.shutdown(wait=True)
 
     assert contribution == TaskRuntimeContribution()
     assert default_executor_result == "available"
+    assert task_runtime._count_overrun_hook_workers() == 0
 
 
 @pytest.mark.asyncio
@@ -545,11 +548,7 @@ async def test_provider_execution_timeout_excludes_executor_queue_wait(
         "get_task_runtime_hook_queue_timeout_seconds",
         lambda: 1,
     )
-    monkeypatch.setitem(
-        task_runtime._TASK_RUNTIME_HOOK_TIMEOUT_SECONDS,
-        "build_runtime",
-        0.05,
-    )
+    monkeypatch.setenv("XAGENT_TASK_RUNTIME_HOOK_BUILD_RUNTIME_TIMEOUT_SECONDS", "0.05")
     _register(
         "blocking_runtime",
         _BlockingProvider("blocking"),
@@ -955,6 +954,10 @@ async def test_saturated_hook_pool_fails_fast_on_queue_wait(
 
     import xagent.web.services.task_runtime as task_runtime
 
+    increments: list[str] = []
+    monkeypatch.setattr(
+        task_runtime.runtime_performance, "increment", increments.append
+    )
     max_workers = 2
     release_pool = threading.Event()
     occupied = threading.Barrier(max_workers + 1)
@@ -972,11 +975,7 @@ async def test_saturated_hook_pool_fails_fast_on_queue_wait(
     )
     # Long enough that a fired execution timeout would be unmistakable: only
     # the queue-wait deadline can end this call quickly.
-    monkeypatch.setitem(
-        task_runtime._TASK_RUNTIME_HOOK_TIMEOUT_SECONDS,
-        "build_runtime",
-        30.0,
-    )
+    monkeypatch.setenv("XAGENT_TASK_RUNTIME_HOOK_BUILD_RUNTIME_TIMEOUT_SECONDS", "30.0")
 
     executor = task_runtime._get_task_runtime_hook_executor()
 
@@ -1008,3 +1007,5 @@ async def test_saturated_hook_pool_fails_fast_on_queue_wait(
     assert "build:starved" not in provider.events
     assert "Dropping task runtime contribution" in caplog.text
     assert "queue wait exceeded" in caplog.text
+    assert increments == ["xagent.task_runtime.hooks.queue_timeouts"]
+    assert task_runtime._count_overrun_hook_workers() == 0

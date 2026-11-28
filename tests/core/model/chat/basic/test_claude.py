@@ -35,6 +35,11 @@ class TestClaudeLLM:
         """Fixture providing Claude LLM instance."""
         return ClaudeLLM(**claude_llm_config)
 
+    def test_default_model_is_not_retired(self):
+        """The default model must be a currently available Claude model."""
+        llm = ClaudeLLM(api_key="test-key")
+        assert llm.model_name == "claude-sonnet-5-5"
+
     @pytest.mark.asyncio
     async def test_auto_only_model_normalizes_required_tool_choice(self, mocker):
         llm = ClaudeLLM(model_name="claude-opus-5-5-20261001", api_key="test-key")

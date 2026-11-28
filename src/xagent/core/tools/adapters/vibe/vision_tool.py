@@ -619,9 +619,7 @@ def get_default_vision_model() -> Optional[BaseLLM]:
         try:
             from xagent.core.model.chat.basic.claude import ClaudeLLM
 
-            model_name = os.getenv(
-                "CLAUDE_VISION_MODEL_NAME", "claude-3-5-sonnet-20241022"
-            )
+            model_name = os.getenv("CLAUDE_VISION_MODEL_NAME", "claude-sonnet-5-5")
             base_url = os.getenv("CLAUDE_BASE_URL")
 
             return attach_chat_retry_wrapper(

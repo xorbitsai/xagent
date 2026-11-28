@@ -1426,76 +1426,112 @@
   function createGuestMode(scriptTag, host) {
     var token = scriptTag.getAttribute('data-token') || 'default';
     var widgetKey = scriptTag.getAttribute('data-widget-key');
+    var guestScope = scriptTag.getAttribute('data-guest-scope');
+    var storageKey = 'xagent_guest_id';
 
     if (!widgetKey && token === 'default') {
       console.error('Xagent Widget: Missing data-widget-key attribute. Re-copy the embed snippet from the agent widget settings.');
       return null;
     }
 
+    if (guestScope !== null) {
+      if (!guestScope.trim()) {
+        console.error('Xagent Widget: data-guest-scope must be non-empty.');
+        return null;
+      }
+      if (!window.crypto || !window.crypto.subtle || typeof TextEncoder === 'undefined') {
+        console.error('Xagent Widget: data-guest-scope requires Web Crypto on a secure host page.');
+        return null;
+      }
+    }
+
+    function getOrCreateGuestId(key) {
+      var guestId = localStorage.getItem(key);
+      if (!guestId) {
+        guestId = 'guest_' + Math.random().toString(36).substring(2, 15) + Math.random().toString(36).substring(2, 15);
+        localStorage.setItem(key, guestId);
+      }
+      return guestId;
+    }
+
+    function attachGuest(iframe, guestId) {
+      function loadIframe(ticket, agentId) {
+        // The widget key is deliberately NOT placed in the iframe URL: the ticket
+        // is sufficient to authenticate, and keeping the key out of the frame
+        // means the embedded widget has no credential to fall back on.
+        var url = host + '/widget/chat/' + token + '?guest_id=' + guestId;
+        if (agentId) {
+          url += '&agent_id=' + encodeURIComponent(agentId);
+        }
+        if (ticket) {
+          url += '&embed_ticket=' + encodeURIComponent(ticket);
+        }
+        iframe.src = withTimezone(withVoice(url));
+      }
+
+      // Request a short-lived embed ticket from the top-level page. This fetch
+      // carries the embedding page's real, browser-enforced Origin header, which
+      // the backend validates against allowed_domains before signing the ticket.
+      // Fetches inside the iframe carry the iframe's own origin instead, so the
+      // ticket is how the validated embedding origin reaches the auth call.
+      if (widgetKey) {
+        fetch(host + '/api/widget/embed-ticket', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ widget_key: widgetKey })
+        })
+          .then(function (res) {
+            if (!res.ok) {
+              // Fail closed: no ticket means auth would fail, and loading the
+              // iframe anyway would let a non-allowlisted embed slip through the
+              // direct-visit path. Surface an actionable error instead — 429 is
+              // rate limiting (transient, high traffic), distinct from the
+              // domain-allowlist / stale-snippet causes behind a 403.
+              if (res.status === 429) {
+                console.error('Xagent Widget: embed authorization rate-limited (HTTP 429), usually transient under high traffic. Reload the page to try again.');
+              } else {
+                console.error('Xagent Widget: embed authorization failed (HTTP ' + res.status + '). Check that this page is in the agent\'s allowed domains and that the embed snippet is current.');
+              }
+              return null;
+            }
+            return res.json();
+          })
+          .then(function (data) {
+            if (!data || !data.ticket) {
+              return;
+            }
+            loadIframe(data.ticket, data.agent_id);
+          })
+          .catch(function (err) {
+            console.error('Xagent Widget: embed authorization request failed (' + err + ').');
+          });
+      } else {
+        // Deprecated data-token channel (dead server-side); loaded without a ticket.
+        loadIframe(null, null);
+      }
+    }
+
     return {
       guest: true,
       attach: function (iframe) {
-        // Generate guest_id if not exists
-        var guestId = localStorage.getItem('xagent_guest_id');
-        if (!guestId) {
-          guestId = 'guest_' + Math.random().toString(36).substring(2, 15) + Math.random().toString(36).substring(2, 15);
-          localStorage.setItem('xagent_guest_id', guestId);
+        if (guestScope === null) {
+          attachGuest(iframe, getOrCreateGuestId(storageKey));
+          return;
         }
 
-        function loadIframe(ticket, agentId) {
-          // The widget key is deliberately NOT placed in the iframe URL: the ticket
-          // is sufficient to authenticate, and keeping the key out of the frame
-          // means the embedded widget has no credential to fall back on.
-          var url = host + '/widget/chat/' + token + '?guest_id=' + guestId;
-          if (agentId) {
-            url += '&agent_id=' + encodeURIComponent(agentId);
-          }
-          if (ticket) {
-            url += '&embed_ticket=' + encodeURIComponent(ticket);
-          }
-          iframe.src = withTimezone(withVoice(url));
-        }
-
-        // Request a short-lived embed ticket from the top-level page. This fetch
-        // carries the embedding page's real, browser-enforced Origin header, which
-        // the backend validates against allowed_domains before signing the ticket.
-        // Fetches inside the iframe carry the iframe's own origin instead, so the
-        // ticket is how the validated embedding origin reaches the auth call.
-        if (widgetKey) {
-          fetch(host + '/api/widget/embed-ticket', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ widget_key: widgetKey })
+        // Keep the host's scope out of storage and requests. If it cannot be
+        // resolved, leave the iframe unloaded rather than reuse a shared guest.
+        window.crypto.subtle.digest('SHA-256', new TextEncoder().encode(guestScope))
+          .then(function (digest) {
+            if (torndown || !iframe.isConnected) return;
+            var hex = Array.from(new Uint8Array(digest), function (byte) {
+              return byte.toString(16).padStart(2, '0');
+            }).join('');
+            attachGuest(iframe, getOrCreateGuestId(storageKey + ':' + hex));
           })
-            .then(function (res) {
-              if (!res.ok) {
-                // Fail closed: no ticket means auth would fail, and loading the
-                // iframe anyway would let a non-allowlisted embed slip through the
-                // direct-visit path. Surface an actionable error instead — 429 is
-                // rate limiting (transient, high traffic), distinct from the
-                // domain-allowlist / stale-snippet causes behind a 403.
-                if (res.status === 429) {
-                  console.error('Xagent Widget: embed authorization rate-limited (HTTP 429), usually transient under high traffic. Reload the page to try again.');
-                } else {
-                  console.error('Xagent Widget: embed authorization failed (HTTP ' + res.status + '). Check that this page is in the agent\'s allowed domains and that the embed snippet is current.');
-                }
-                return null;
-              }
-              return res.json();
-            })
-            .then(function (data) {
-              if (!data || !data.ticket) {
-                return;
-              }
-              loadIframe(data.ticket, data.agent_id);
-            })
-            .catch(function (err) {
-              console.error('Xagent Widget: embed authorization request failed (' + err + ').');
-            });
-        } else {
-          // Deprecated data-token channel (dead server-side); loaded without a ticket.
-          loadIframe(null, null);
-        }
+          .catch(function () {
+            console.error('Xagent Widget: could not initialize data-guest-scope. Check that local storage is available.');
+          });
       }
     };
   }

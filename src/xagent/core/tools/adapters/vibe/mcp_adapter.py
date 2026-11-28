@@ -4004,11 +4004,22 @@ class MCPToolAdapter(AbstractBaseTool):
         else:
             async with create_session(connection) as session:
                 await session.initialize()
-                result = await session.call_tool(
-                    self.mcp_tool.name,
-                    dict(tool_args),
-                    meta=dict(tool_meta) or None,
-                )
+                call_timeout = _root_config.get_mcp_remote_tool_call_timeout_seconds()
+                if call_timeout > 0:
+                    result = await asyncio.wait_for(
+                        session.call_tool(
+                            self.mcp_tool.name,
+                            dict(tool_args),
+                            meta=dict(tool_meta) or None,
+                        ),
+                        timeout=call_timeout,
+                    )
+                else:
+                    result = await session.call_tool(
+                        self.mcp_tool.name,
+                        dict(tool_args),
+                        meta=dict(tool_meta) or None,
+                    )
         normalized = _normalized_mcp_call_result(
             result,
             detect_legacy_plain_text_error=self._detect_legacy_plain_text_error,
@@ -4182,11 +4193,22 @@ class MCPToolAdapter(AbstractBaseTool):
         """
         async with create_session(connection) as session:
             await session.initialize()
-            result = await session.call_tool(
-                tool_name,
-                dict(tool_args),
-                meta=dict(tool_meta) or None,
-            )
+            call_timeout = _root_config.get_mcp_remote_tool_call_timeout_seconds()
+            if call_timeout > 0:
+                result = await asyncio.wait_for(
+                    session.call_tool(
+                        tool_name,
+                        dict(tool_args),
+                        meta=dict(tool_meta) or None,
+                    ),
+                    timeout=call_timeout,
+                )
+            else:
+                result = await session.call_tool(
+                    tool_name,
+                    dict(tool_args),
+                    meta=dict(tool_meta) or None,
+                )
             return _normalized_mcp_call_result(result)
 
     async def _call_issuing_tool_with_authorization_retry(

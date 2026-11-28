@@ -118,14 +118,26 @@ def test_read_and_delete_paths_tolerate_legacy_db_keys(monkeypatch, tmp_path):
     assert not storage.exists(legacy_key)
 
 
-def test_local_file_storage_round_trips_file(monkeypatch, tmp_path):
+@pytest.mark.parametrize("use_home_relative_path", [False, True])
+def test_local_file_storage_round_trips_file(
+    monkeypatch, tmp_path, use_home_relative_path
+):
     storage_root = tmp_path / "objects"
-    materialize_dir = tmp_path / "materialized"
+    home = tmp_path / "home"
+    materialize_dir = home / "materialized"
     source = tmp_path / "source.txt"
     source.write_text("hello durable storage", encoding="utf-8")
 
+    if use_home_relative_path:
+        home.mkdir()
+        monkeypatch.setenv("HOME", str(home))
+        monkeypatch.setenv("USERPROFILE", str(home))
+        monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("XAGENT_FILE_STORAGE_URI", storage_root.as_uri())
-    monkeypatch.setenv("XAGENT_FILE_MATERIALIZE_DIR", str(materialize_dir))
+    monkeypatch.setenv(
+        "XAGENT_FILE_MATERIALIZE_DIR",
+        "~/materialized" if use_home_relative_path else str(materialize_dir),
+    )
     get_unscoped_file_storage.cache_clear()
 
     storage = get_unscoped_file_storage()

@@ -378,6 +378,44 @@ async def test_registry_cancelled_execution_cannot_resume(tmp_path: Path) -> Non
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("cancel_through_registry", [True, False])
+async def test_registry_cleans_up_a_cancelled_resume(
+    tmp_path: Path, cancel_through_registry: bool
+) -> None:
+    pattern = BlockingPattern()
+    registry = ExecutionRegistry()
+    runner = AgentRunner(
+        agent=Agent(name="writer", patterns=[pattern]),
+        workspace_manager=FakeWorkspaceManager(tmp_path),
+    )
+    execution_id = "exec-cancel-running-resume"
+    handle = registry.register(execution_id, runner)
+    handle.status = ExecutionLifecycleStatus.INTERRUPTED
+    events: list[dict[str, Any]] = []
+    registry.subscribe(events.append)
+
+    caller = asyncio.create_task(registry.resume(execution_id, task="Block forever"))
+    try:
+        await asyncio.wait_for(pattern.started.wait(), timeout=5)
+        assert handle.is_running
+        assert handle.status is ExecutionLifecycleStatus.RUNNING
+        assert await registry.resume(execution_id, task="Duplicate") is None
+        if cancel_through_registry:
+            assert registry.cancel(execution_id, reason="test cancellation")
+        else:
+            caller.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(caller, timeout=5)
+        assert handle.task is None
+        assert registry.get(execution_id) is None
+        assert [event["type"] for event in events] == ["execution.cancelled"]
+    finally:
+        if not caller.done():
+            caller.cancel()
+            await asyncio.gather(caller, return_exceptions=True)
+
+
+@pytest.mark.asyncio
 async def test_registry_resume_settles_a_checkpoint_failure_as_non_resumable(
     tmp_path: Path,
 ) -> None:

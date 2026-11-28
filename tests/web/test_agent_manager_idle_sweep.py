@@ -16,6 +16,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from tests.core.agent.test_agent_service_pause import _build_service, _start_live_run
 from tests.web.test_agent_manager_reconstruction import _build_reconstruction_snapshot
 from xagent.web.models.task import Task, TaskStatus, TraceEvent
 from xagent.web.models.user import User
@@ -206,6 +207,43 @@ async def test_protected_runtime_never_evicted(manager, clock, kind) -> None:
 
     assert 1 in manager._agents
     assert 1 in manager._agent_run_generations
+
+
+async def test_resumed_runtime_survives_idle_sweep_and_can_pause_again(
+    manager, clock, tmp_path
+) -> None:
+    task_id = 1
+    execution_id = str(task_id)
+    service, registry, tracer = _build_service(tmp_path)
+    service._current_task_id = execution_id
+    manager._agents[task_id] = service
+    manager._agent_last_active_at[task_id] = clock()
+    pattern, initial = await _start_live_run(
+        registry, tracer, tmp_path, execution_id=execution_id, task="long task"
+    )
+    try:
+        assert await service.pause_execution()
+        assert (await asyncio.wait_for(initial, timeout=5))["status"] == "interrupted"
+    finally:
+        if not initial.done():
+            initial.cancel()
+            await asyncio.gather(initial, return_exceptions=True)
+
+    pattern.started.clear()
+    resumed = asyncio.create_task(service.resume_execution_by_id(execution_id))
+    try:
+        await asyncio.wait_for(pattern.started.wait(), timeout=5)
+        clock.now += RESUMABLE_SECONDS + 1
+        manager._sweep_idle_runtimes(reason="periodic")
+        assert manager._agents.get(task_id) is service
+        assert manager._agent_last_active_at[task_id] == clock()
+        assert await manager._agents[task_id].pause_execution()
+        result = await asyncio.wait_for(resumed, timeout=5)
+        assert result is not None and result["status"] == "interrupted"
+    finally:
+        if not resumed.done():
+            resumed.cancel()
+            await asyncio.gather(resumed, return_exceptions=True)
 
 
 @pytest.mark.parametrize("state", ["interrupted", "waiting_for_user"])

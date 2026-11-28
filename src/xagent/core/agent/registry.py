@@ -192,31 +192,27 @@ class ExecutionRegistry:
 
     async def resume(self, execution_id: str, **kwargs: Any) -> dict[str, Any] | None:
         handle = self.get(execution_id)
-        if handle is None:
+        if handle is None or handle.status is ExecutionLifecycleStatus.CANCELLED:
             return None
-        if handle.status == ExecutionLifecycleStatus.CANCELLED:
+        if handle.task is not None:
             return None
+
+        # Cache eviction and cancellation use the live task on the handle.
+        # Track this continuation just like the initial execution.
+        run_task = asyncio.create_task(handle.runner.resume(execution_id, **kwargs))
+        handle.task = run_task
+        handle.status = ExecutionLifecycleStatus.RUNNING
+        handle.last_error = None
+        handle.updated_at = _utcnow()
         try:
-            result = await handle.runner.resume(execution_id, **kwargs)
-        except Exception:
-            # A raised exception (for example CheckpointPersistenceError)
-            # means this resume never reached a normalized result, so
-            # ``_apply_result`` below never runs. Leaving the handle in its
-            # previous ``is_resumable`` state would let a caller resume it
-            # again and repeat whatever non-idempotent work already
-            # happened before the failure -- settle it the same way
-            # ``_on_task_done`` already does for the async ``start()`` path,
-            # then let the caller see the original exception.
-            handle.status = ExecutionLifecycleStatus.FAILED
-            handle.last_error = "Execution resume failed without a normalized result."
-            handle.updated_at = _utcnow()
-            self._emit_event("execution.failed", handle)
-            self.unregister(execution_id)
-            raise
-        self._apply_result(handle, result)
-        if not handle.is_resumable:
-            self.unregister(execution_id)
-        return result
+            return await run_task
+        finally:
+            # Settle the handle before the caller sees the result or exception.
+            self._on_task_done(
+                execution_id,
+                run_task,
+                failure_message="Execution resume failed without a normalized result.",
+            )
 
     async def inject_user_message(
         self,
@@ -328,9 +324,11 @@ class ExecutionRegistry:
         self,
         execution_id: str,
         task: asyncio.Task[dict[str, Any]],
+        *,
+        failure_message: str = "Execution task failed without a normalized result.",
     ) -> None:
         handle = self.get(execution_id)
-        if handle is None:
+        if handle is None or handle.task is not task:
             return
 
         handle.task = None
@@ -346,7 +344,7 @@ class ExecutionRegistry:
             result = task.result()
         except Exception:  # noqa: BLE001
             handle.status = ExecutionLifecycleStatus.FAILED
-            handle.last_error = "Execution task failed without a normalized result."
+            handle.last_error = failure_message
             self._emit_event("execution.failed", handle)
             self.unregister(execution_id)
             return

@@ -114,7 +114,9 @@ def _build_service(tmp_path: Path) -> tuple[AgentService, ExecutionRegistry, Any
 
     tracer = TracerCheckpointStore()
     registry = ExecutionRegistry()
-    service = AgentService(name="stopper", id="svc-1", tools=[], llm=StubLLM())
+    service = AgentService(
+        name="stopper", id="svc-1", tools=[], llm=StubLLM(), enable_workspace=False
+    )
     service._current_task_id = "task-1"
     service._execution_adapter = AgentExecutionAdapter(
         AgentExecutionConfig(

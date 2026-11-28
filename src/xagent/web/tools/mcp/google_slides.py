@@ -23,6 +23,7 @@ from googleapiclient.http import MediaIoBaseUpload  # type: ignore[import-not-fo
 from pydantic import BeforeValidator, StrictInt
 
 from mcp.server.fastmcp import FastMCP
+from mcp.types import ToolAnnotations
 
 from ....core.tools.core.web_content import get_trusted_proxy_url, public_fetch_client
 from ....core.utils.security import fetch_public_http_bytes, host_matches_suffix
@@ -666,7 +667,7 @@ def _slide_is_titled_default(slide: dict[str, Any], deck_title: object) -> bool:
     return titled
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
 def google_slides_get_presentation(presentation_id: str) -> str:
     """
     Read a Google Slides presentation by id or full URL.

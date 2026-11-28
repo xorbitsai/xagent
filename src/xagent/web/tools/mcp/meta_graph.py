@@ -22,6 +22,7 @@ INSTAGRAM_GRAPH_BASE_URL = "https://graph.instagram.com/v25.0"
 ALLOWED_GRAPH_BASE_URLS = frozenset({GRAPH_BASE_URL, INSTAGRAM_GRAPH_BASE_URL})
 DEFAULT_TIMEOUT_SECONDS = 30
 MAX_ERROR_RESPONSE_TEXT_CHARS = 1000
+_FOLLOWED_REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
 
 # A Composio-backed grant (#3531) launches with the COMPOSIO_* variables
 # (composio_proxy) instead of META_ACCESS_TOKEN. Composio keeps the user token
@@ -384,6 +385,14 @@ def _composio_proxy_request(
     # Composio accepted this call; a Graph error in the body is the provider's
     # answer, not a refusal, so the request is billed either way.
     composio_proxy.record_accepted_request()
+
+    # The direct transport follows these redirects. A status relayed through
+    # Composio was not followed, and its body may look like an empty result.
+    if upstream_status in _FOLLOWED_REDIRECT_STATUSES:
+        raise GraphAPIError(
+            "the request was redirected and the redirect not followed",
+            sensitive_values=sensitive_values,
+        )
 
     upstream_data = body.get("data")
     _remember_proxy_response_secrets(upstream_data)

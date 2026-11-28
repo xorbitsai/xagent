@@ -22,14 +22,14 @@ _mcp_stub = types.ModuleType("xagent.core.tools.adapters.vibe.mcp_adapter")
 _mcp_stub.MCPToolAdapter = type("MCPToolAdapter", (), {})
 sys.modules.setdefault("xagent.core.tools.adapters.vibe.mcp_adapter", _mcp_stub)
 
-from xagent.core.tools.adapters.vibe.sandboxed_tool.sandboxed_tool_wrapper import (  # noqa: E402
-    SandboxedToolWrapper,
+from xagent.core.tools.adapters.vibe.python_executor import (  # noqa: E402
+    PythonExecutorToolForBasic,
 )
 from xagent.core.tools.adapters.vibe.sandboxed_tool.sandbox_config import (  # noqa: E402
     sandbox_config,
 )
-from xagent.core.tools.adapters.vibe.python_executor import (  # noqa: E402
-    PythonExecutorToolForBasic,
+from xagent.core.tools.adapters.vibe.sandboxed_tool.sandboxed_tool_wrapper import (  # noqa: E402
+    SandboxedToolWrapper,
 )
 
 _ENSURE_REQUIREMENTS = (

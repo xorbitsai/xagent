@@ -6532,6 +6532,34 @@ describe("AppProvider websocket message routing", () => {
       ])
     })
 
+    it("passes a spoken send to the chat frame with the voice marker as the ninth argument", async () => {
+      mount("session")
+
+      expect(await send({ clientMessageId: "spoken", inputMode: "voice" })).toBe("ok")
+
+      expect(sendChatMessageMock.mock.calls).toEqual([
+        ["continue", undefined, undefined, "spoken", undefined, undefined, undefined, undefined, "voice"],
+      ])
+    })
+
+    it.each([
+      ["a new-turn declaration", { delivery: "new_turn" }],
+      ["a send-now declaration", { delivery: "send_now" }],
+      ["a conversation source", { sourceTaskId: 101 }],
+    ] as const)("a spoken send refuses %s", async (_label, extra) => {
+      mount("session")
+      announce(NEW_TURN_CAPABILITIES)
+
+      const outcome = await send({ clientMessageId: "spoken-both", inputMode: "voice", ...extra })
+
+      expect(outcome).toBeInstanceOf(MessageDeliveryError)
+      expect(outcome).toMatchObject({
+        message: "A spoken message cannot carry a delivery declaration or a source.",
+        disposition: "not_sent",
+      })
+      expect(sendChatMessageMock).not.toHaveBeenCalled()
+    })
+
     it("passes a declaration together with uploaded files", async () => {
       const transport = makeSessionTransport()
       const fileId = "0b1e5c9e-3f1a-4a63-9b0e-6c1d2f3a4b5c"

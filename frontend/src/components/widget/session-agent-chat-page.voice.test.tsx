@@ -401,19 +401,91 @@ describe("session widget voice call wiring", () => {
     { label: "waiting on this task's question", status: "waiting_for_user", id: "71", metadata: { request_id: "question-9" } },
     { label: "waiting on another task's question", status: "waiting_for_user", id: "70", metadata: undefined },
     { label: "running", status: "running", id: "71", metadata: undefined },
-  ])("answers like a typed message while the task is $label", async ({ status: taskStatus, id, metadata }) => {
+  ])("answers like a typed message, marked as spoken, while the task is $label", async ({ status: taskStatus, id, metadata }) => {
     app.state.taskId = 71
     app.state.currentTask = { id, status: taskStatus, waitingRequestId: "question-9" }
     renderPage()
     await act(async () => { await voice.props!.onSend("my answer", "voice-id") })
     expect(app.sendMessage).toHaveBeenCalledExactlyOnceWith(
-      "my answer", { clientMessageId: "voice-id", ...(metadata ? { metadata } : {}) }, [])
+      "my answer", { clientMessageId: "voice-id", inputMode: "voice", ...(metadata ? { metadata } : {}) }, [])
   })
 
-  it("sends the first spoken message the way the start page sends a typed one", async () => {
+  it("sends the first spoken message the way the start page sends a typed one, marked as spoken", async () => {
     renderPage()
     await act(async () => { await voice.props!.onSend("hello", "voice-id") })
-    expect(app.sendMessage).toHaveBeenCalledExactlyOnceWith("hello", { clientMessageId: "voice-id" }, [])
+    expect(app.sendMessage).toHaveBeenCalledExactlyOnceWith("hello", { clientMessageId: "voice-id", inputMode: "voice" }, [])
+  })
+
+  // The voice call's only way out is `onSend`; every other sender leaves the
+  // config without the marker, so the transport sends it as typed.
+  it.each([
+    { sender: "voice, start page", spoken: true, send: async () => { await voice.props!.onSend("hi", "m-1") } },
+    {
+      sender: "voice, conversation panel",
+      spoken: true,
+      setup: () => { app.state.taskId = 71; app.sessionConversationState = "bound" },
+      send: async () => { await voice.props!.onSend("hi", "m-1") },
+    },
+    {
+      sender: "voice, answering a question",
+      spoken: true,
+      setup: () => {
+        app.state.taskId = 71
+        app.state.currentTask = { id: "71", status: "waiting_for_user", waitingRequestId: "question-9" }
+      },
+      send: async () => { await voice.props!.onSend("hi", "m-1") },
+    },
+    {
+      sender: "typed, conversation panel",
+      spoken: false,
+      capabilities: { voice: true, fileUploads: { allowedExtensions: [".txt"], maxFileBytes: 1024, maxFilesPerMessage: 1 } },
+      setup: () => { app.state.taskId = 71; app.sessionConversationState = "bound" },
+      send: async () => { await panel.onSend!("hi", { clientMessageId: "m-1" }, []) },
+    },
+    {
+      sender: "typed, continuing from history",
+      spoken: false,
+      capabilities: { voice: true, conversationHistory: true },
+      // Clicks open a menu, which needs the events outside one shared act.
+      bare: true,
+      send: async () => {
+        fireEvent.click(screen.getByRole("button", { name: "widgetChat.moreOptions" }))
+        fireEvent.click(screen.getByRole("menuitem", { name: "widgetSession.history.menuLabel" }))
+        fireEvent.click(screen.getByText("list-open"))
+        fireEvent.click(screen.getByText("view-continue"))
+      },
+    },
+  ] as Array<{
+    sender: string
+    spoken: boolean
+    capabilities?: unknown
+    bare?: boolean
+    setup?: () => void
+    send: () => Promise<void>
+  }>)("each sender declares its input method: $sender", async ({ spoken, capabilities, bare, setup, send }) => {
+    setup?.()
+    renderPage(capabilities === undefined ? {} : { capabilities })
+    if (bare) await send()
+    else await act(send)
+    expect(app.sendMessage).toHaveBeenCalledTimes(1)
+    const config = app.sendMessage.mock.calls[0][1] as Record<string, unknown>
+    if (spoken) expect(config.inputMode).toBe("voice")
+    else expect(config).not.toHaveProperty("inputMode")
+  })
+
+  it("marks the one message a voice call sends as spoken", async () => {
+    app.state.taskId = 71
+    renderPage()
+    await openCall("panel")
+    vi.useFakeTimers()
+    try {
+      act(() => voice.callbacks!.transcript("final", "Hello", 1))
+      await act(async () => { await vi.advanceTimersByTimeAsync(350) })
+    } finally {
+      vi.useRealTimers()
+    }
+    expect(app.sendMessage).toHaveBeenCalledExactlyOnceWith(
+      "Hello", { clientMessageId: expect.any(String), inputMode: "voice" }, [])
   })
 
   it("shows the start page's failure line when the first spoken message cannot be sent", async () => {
@@ -512,7 +584,7 @@ describe("session widget voice call across the session", () => {
     app.isConnected = true
     setBridge("active", session({ voice: true }, "st_renewed"))
     rerender()
-    await waitFor(() => expect(app.sendMessage).toHaveBeenCalledWith("Hello", { clientMessageId: expect.any(String) }, []))
+    await waitFor(() => expect(app.sendMessage).toHaveBeenCalledWith("Hello", { clientMessageId: expect.any(String), inputMode: "voice" }, []))
     expect(voice.audios[0].close).not.toHaveBeenCalled()
     expect(voice.audios).toHaveLength(1)
   })

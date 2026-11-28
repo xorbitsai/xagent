@@ -2937,6 +2937,8 @@ export interface AppProviderTransportConfig {
     files: "disabled"
     attachments?: SessionAttachmentsConfig
     agentCards: "disabled"
+    // Stays "disabled": dictation would put spoken words through the typing
+    // path, and the voice call is how a spoken message is marked.
     voice: "disabled"
     taskControls: "disabled"
   }
@@ -7924,6 +7926,12 @@ export function AppProvider({
     if (delivery !== undefined && requestId !== undefined) {
       throw new MessageDeliveryError("A delivery declaration cannot accompany an answer to a request.", "not_sent")
     }
+    // A message spoken in a voice call is marked as such on the Session
+    // window's chat frame. A voice call sends neither a declaration nor a source.
+    const spoken = config?.inputMode === "voice"
+    if (spoken && (delivery !== undefined || sourceTaskId !== undefined)) {
+      throw new MessageDeliveryError("A spoken message cannot carry a delivery declaration or a source.", "not_sent")
+    }
     // A server that does not take the declaration ignores it and may take the
     // message as an answer, so a send carries it only when the current
     // connection announced it. A resend after a lost connection reuses these
@@ -8122,13 +8130,16 @@ export function AppProvider({
         })
       }
       const fileIds = uploadedFiles.map(file => file.fileId)
-      // A send with neither a source nor a declaration passes the same five
+      // A spoken send passes the voice marker as the ninth argument. Any other
+      // send with neither a source nor a declaration passes the same five
       // arguments as always.
-      const chatArgs: Parameters<typeof sendChatMessage> = delivery !== undefined
-        ? [message, files, config?.force, clientMessageId, requestId, undefined, sourceTaskId, delivery]
-        : sourceTaskId === undefined
-          ? [message, files, config?.force, clientMessageId, requestId]
-          : [message, files, config?.force, clientMessageId, requestId, undefined, sourceTaskId]
+      const chatArgs: Parameters<typeof sendChatMessage> = spoken
+        ? [message, files, config?.force, clientMessageId, requestId, undefined, undefined, undefined, "voice"]
+        : delivery !== undefined
+          ? [message, files, config?.force, clientMessageId, requestId, undefined, sourceTaskId, delivery]
+          : sourceTaskId === undefined
+            ? [message, files, config?.force, clientMessageId, requestId]
+            : [message, files, config?.force, clientMessageId, requestId, undefined, sourceTaskId]
       // Where messages queued while this send is in flight start: one of them
       // must not go out first if this send fails.
       const queuedFrom = nextQueuedSeqRef.current

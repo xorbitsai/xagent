@@ -266,6 +266,23 @@ type LoginKind = "auth" | "external" | "widget-session"
 // Only the Session window omits the task id; the embedding page owns its reconnects.
 const isSessionConnection = (connection: WebSocketConnection) => connection.chatTaskIdMode === "omit"
 
+// The session chat server closes the connection on a chat frame above this many
+// UTF-8 bytes. Mirrors that server's limit; a frame is never cut to fit it.
+const SESSION_CHAT_FRAME_MAX_BYTES = 64 * 1024
+
+const utf8Bytes = (text: string) => new TextEncoder().encode(text).byteLength
+
+// The frame text to send. The input marker is only a label: when carrying it is
+// what pushes a frame over the limit, the frame goes without it.
+function chatFrameText(messageData: Record<string, unknown>): string {
+  const text = JSON.stringify(messageData)
+  if (!("input_mode" in messageData) || utf8Bytes(text) <= SESSION_CHAT_FRAME_MAX_BYTES) return text
+  const rest = { ...messageData }
+  delete rest.input_mode
+  const unmarked = JSON.stringify(rest)
+  return utf8Bytes(unmarked) <= SESSION_CHAT_FRAME_MAX_BYTES ? unmarked : text
+}
+
 const loginKindOf = (connection: WebSocketConnection): LoginKind => {
   if (isSessionConnection(connection)) return "widget-session"
   return connection.credentialOwner.kind === "auth-context" ? "auth" : "external"
@@ -1692,6 +1709,9 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
     // Declares the frame a new message that is never taken as the answer to a
     // pending question. The same on every attempt of one send.
     chatDelivery?: ChatDelivery,
+    // Marks a message spoken in a voice call. The same on every attempt of one
+    // send; every other Session message is sent as typed.
+    inputMode?: "voice",
   ): Promise<MessageDeliveryAck> => {
     const timestamp = Date.now()
     const owner = socketOwnerRef.current
@@ -1836,6 +1856,8 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
         ...(fileIds ? { file_ids: [...fileIds] } : {}),
         ...(sourceTaskId !== undefined ? { source_task_id: sourceTaskId } : {}),
         ...(chatDelivery ? { delivery: chatDelivery } : {}),
+        // The session window marks a message spoken in a voice call; every other session message is typed.
+        ...(isSessionConnection(connection) ? { input_mode: inputMode ?? "text" } : {}),
         ...(reportedTimezone ? { context: { timezone: reportedTimezone } } : {}),
         ...(connection.chatTaskIdMode === "required" ? { task_id: currentTaskId } : {}),
       }
@@ -2009,7 +2031,7 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
       }
 
       try {
-        socket.send(JSON.stringify(messageData))
+        socket.send(chatFrameText(messageData))
       } catch (error) {
         const pending = pendingDeliveriesRef.current.get(clientMessageId)
         if (

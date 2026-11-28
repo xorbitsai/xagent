@@ -542,9 +542,10 @@ function SessionConversationContent({
   // Spoken words take the path typed ones take: the start page's send before
   // a conversation exists, the panel's send after, with the call's client
   // message id and the request id of the question this task is waiting on.
+  // The config marks the message as spoken in a voice call.
   const sendSpoken = useCallback((text: string, clientMessageId: string) => {
     const requestId = widgetVoiceAnswerRequestId(state.currentTask, state.taskId)
-    const config = { clientMessageId, ...(requestId ? { metadata: { request_id: requestId } } : {}) }
+    const config = { clientMessageId, inputMode: "voice", ...(requestId ? { metadata: { request_id: requestId } } : {}) }
     return conversationEstablished
       ? sendWithAttachments(text, config, [])
       : handleStartMessage(text, [], config)

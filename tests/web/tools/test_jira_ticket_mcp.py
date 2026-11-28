@@ -514,7 +514,7 @@ def test_failed_attachments_name_the_argument(
     (allowed_dir / "two").mkdir()
     a = _write(allowed_dir / "one", "image.png", b"hello")
     b = _write(allowed_dir / "two", "image.png", b"world")
-    session.queue = [_created(), _nothing_sent(), _nothing_sent()]
+    session.queue = [_created(), *(_nothing_sent() for _ in range(4))]
     result = _call(attachment_path=a, attachment_path_2=b)
     assert [(x["argument"], x["path"]) for x in result["failed_attachments"]] == [
         ("attachment_path", "image.png"),
@@ -613,14 +613,26 @@ _CHECK = "ask the user to check the ticket's attachments"
     ],
 )
 def test_failed_upload_reason_comes_from_the_fixed_vocabulary(
-    session: _FakeSession, allowed_dir: Path, outcome: Any, expected: str
+    session: _FakeSession,
+    allowed_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    outcome: Any,
+    expected: str,
 ) -> None:
     a = _write(allowed_dir, "a.txt", b"hello")
+    waits: list[int] = []
+    monkeypatch.setattr(jira_ticket, "sleep", waits.append)
+    rate_limited = getattr(outcome, "status_code", None) == 429
+    should_retry = rate_limited or isinstance(outcome, jira_ticket._NothingSentError)
     session.queue = [_created(), outcome]
+    if should_retry:
+        session.queue.append(outcome)
     result = _call(attachment_path=a)
     assert result["status"] == "success"
     assert result["key"] == "SUP-7"
     assert result["attachments"] == []
+    assert len(session.calls) == (3 if should_retry else 2)
+    assert waits == ([12] if rate_limited else [])
     (failure,) = result["failed_attachments"]
     assert failure["path"] == "a.txt"
     assert failure["argument"] == "attachment_path"
@@ -631,6 +643,61 @@ def test_failed_upload_reason_comes_from_the_fixed_vocabulary(
         assert phrase not in lowered
     assert "12s" not in error
     assert "cloud_id" not in error and "issue_key" not in error
+
+
+@pytest.mark.parametrize(
+    "outcome, expected_waits",
+    [
+        (_http(429, headers={"Retry-After": "12"}), [12]),
+        (_http(429, headers={"Retry-After": "30"}), [30]),
+        (requests.ConnectTimeout("connect timed out"), []),
+    ],
+)
+def test_upload_retries_once_and_attaches_to_the_created_ticket(
+    session: _FakeSession,
+    allowed_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    outcome: Any,
+    expected_waits: list[int],
+) -> None:
+    a = _write(allowed_dir, "a.txt", b"hello")
+    waits: list[int] = []
+    monkeypatch.setattr(jira_ticket, "sleep", waits.append)
+    session.queue = [_created(), outcome, _attached(5)]
+
+    result = _call(attachment_path=a)
+
+    assert result["status"] == "success"
+    assert result["failed_attachments"] == []
+    assert [item["filename"] for item in result["attachments"]] == ["a.txt"]
+    create, first_upload, second_upload = session.calls
+    assert create["url"] == f"{SITE}/rest/api/3/issue"
+    assert first_upload["url"] == f"{SITE}/rest/api/3/issue/SUP-7/attachments"
+    assert first_upload["files"] == {"file": ("a.txt", b"hello")}
+    assert first_upload == second_upload
+    assert waits == expected_waits
+
+
+@pytest.mark.parametrize("retry_after", [None, "", "0", "-1", "31", "1.5", "soon"])
+def test_upload_does_not_retry_429_without_a_short_integer_delay(
+    session: _FakeSession,
+    allowed_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    retry_after: str | None,
+) -> None:
+    a = _write(allowed_dir, "a.txt", b"hello")
+    waits: list[int] = []
+    monkeypatch.setattr(jira_ticket, "sleep", waits.append)
+    headers = {} if retry_after is None else {"Retry-After": retry_after}
+    session.queue = [_created(), _http(429, headers=headers)]
+
+    result = _call(attachment_path=a)
+
+    assert result["attachments"] == []
+    (failure,) = result["failed_attachments"]
+    assert failure["error"].startswith("Jira rate-limited the upload")
+    assert len(session.calls) == 2
+    assert waits == []
 
 
 def test_unclassified_upload_failure_is_a_generic_reason(
@@ -669,7 +736,12 @@ def test_one_failed_upload_does_not_stop_the_next(
 ) -> None:
     a = _write(allowed_dir, "a.txt", b"hello")
     b = _write(allowed_dir, "b.txt", b"world")
-    session.queue = [_created(), _nothing_sent(), _attached(5, "b.txt")]
+    session.queue = [
+        _created(),
+        _nothing_sent(),
+        _nothing_sent(),
+        _attached(5, "b.txt"),
+    ]
     result = _call(attachment_path=a, attachment_path_2=b)
     assert [x["filename"] for x in result["attachments"]] == ["b.txt"]
     assert [x["path"] for x in result["failed_attachments"]] == ["a.txt"]

@@ -70,6 +70,7 @@ from xagent.web.services.turn_settlement import (
     set_turn_settled_hook,
     settled_outcome,
     settlement_turn_for_run,
+    turn_usage_payload,
 )
 
 HOOK_METRIC = "xagent.turn_settlement.hook"
@@ -2286,4 +2287,40 @@ def test_settlement_turn_is_bound_where_runs_execute() -> None:
     assert found == {
         ("task_orchestrator.py", "execute_owned_run"),
         ("task_execution.py", "execute_resume_background"),
+    }
+
+
+def test_turn_usage_payload_mirrors_turn_usage_field_for_field() -> None:
+    usage = TurnUsage(
+        input_tokens=3900,
+        output_tokens=380,
+        llm_calls=3,
+        tool_calls=2,
+        tool_errors=1,
+        by_model=(
+            TurnModelUsage("7", "model-a", 3000, 300),
+            TurnModelUsage("9", "model-b", 900, 80),
+        ),
+    )
+
+    assert turn_usage_payload(usage) == {
+        "input_tokens": 3900,
+        "output_tokens": 380,
+        "llm_calls": 3,
+        "tool_calls": 2,
+        "tool_errors": 1,
+        "by_model": [
+            {
+                "model_id": "7",
+                "model_name": "model-a",
+                "input_tokens": 3000,
+                "output_tokens": 300,
+            },
+            {
+                "model_id": "9",
+                "model_name": "model-b",
+                "input_tokens": 900,
+                "output_tokens": 80,
+            },
+        ],
     }

@@ -88,9 +88,11 @@ class TaskChatMessage(Base):  # type: ignore
     attachments = Column(JSON, nullable=True)
     # Server-set metadata, by row kind. A user message: ``display``, ``kind``,
     # ``interaction_id``; ``display: "none"`` means not displayed, not hidden from
-    # the model. A result card row: ``display``, ``result_card``. An answer row:
-    # ``run_usage``, the usage of the run that produced the answer, for display
-    # and not a billing record. Stored and replayed unchanged; NULL when absent.
+    # the model. A result card row: ``display``, ``result_card``. These two are
+    # stored and replayed unchanged. An answer or failure row written by a run's
+    # settlement: ``run_usage``, the usage of the run that produced it, for
+    # display and not a billing record; stored for the embedding application and
+    # never sent to clients. NULL when absent.
     message_metadata = Column(JSON, nullable=True)
     # Transitional projection identity; NULL for legacy transcript rows.
     execution_event_id = Column(String(36), nullable=True, unique=True, index=True)

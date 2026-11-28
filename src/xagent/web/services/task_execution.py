@@ -2226,7 +2226,8 @@ def _finalize_task_execution_result_isolated(
     """Persist one task result in a worker-owned, ownership-fenced session.
 
     ``run_usage`` is the usage of the run that produced ``result``; when given,
-    the answer row stores it in its ``message_metadata``.
+    the answer or failure row stores it in its ``message_metadata``. It is
+    stored for the embedding application and never sent to clients.
     """
     from ..models.chat_message import TaskChatMessage
     from .chat_history_service import (

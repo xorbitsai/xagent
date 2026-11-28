@@ -1,8 +1,8 @@
 """The usage stored on an answer row never leaves the server.
 
 ``message_metadata["run_usage"]`` is written for the embedding application to
-read from the database. The replay, the audience projection, the owner export
-and the model context all read the same rows and must not carry it.
+read from the database. The replay, the conversation log detail and the model
+context all read the same rows and must not carry it.
 """
 
 import json
@@ -15,7 +15,6 @@ from xagent.web.models.task import Task
 from xagent.web.services.chat_history_service import (
     persist_assistant_message_no_commit,
 )
-from xagent.web.services.public_trace_events import public_audience_frame
 from xagent.web.services.task_conversation_context_service import (
     load_task_conversation_context_sync,
 )
@@ -101,7 +100,7 @@ def _output_text(value: Any) -> str:
 
 @pytest.mark.parametrize(
     "surface",
-    ["web_replay_v1", "web_replay_v2", "public_audience", "export", "model_context"],
+    ["web_replay_v1", "web_replay_v2", "conversation_log_detail", "model_context"],
 )
 def test_run_usage_never_leaves_server(surface: str) -> None:
     headers = _admin_headers()
@@ -111,14 +110,10 @@ def test_run_usage_never_leaves_server(surface: str) -> None:
     output: Any
     if surface in ("web_replay_v1", "web_replay_v2"):
         output = _replayed_events(task_id, user_id)
-    elif surface == "public_audience":
-        output = [
-            public_audience_frame(event) for event in _replayed_events(task_id, user_id)
-        ]
-    elif surface == "export":
-        response = client.get("/api/conversation-logs/export", headers=headers)
+    elif surface == "conversation_log_detail":
+        response = client.get(f"/api/conversation-logs/{task_id}", headers=headers)
         assert response.status_code == 200, response.text
-        output = response.content.decode("utf-8-sig")
+        output = response.text
     else:
         with _direct_db_session() as db:
             output = load_task_conversation_context_sync(db, task_id)

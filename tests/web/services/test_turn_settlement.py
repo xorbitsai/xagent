@@ -2335,18 +2335,6 @@ def test_turn_usage_payload_mirrors_turn_usage_field_for_field() -> None:
 # The usage a run reports is also stored on the answer row it wrote.
 # ---------------------------------------------------------------------------
 
-RUN_USAGE = TurnUsage(
-    input_tokens=17,
-    output_tokens=6,
-    llm_calls=2,
-    tool_calls=0,
-    tool_errors=0,
-    by_model=(
-        TurnModelUsage("7", "model-a", 12, 4),
-        TurnModelUsage("9", "model-b", 5, 2),
-    ),
-)
-
 
 def _metered_manager(outcome: dict[str, Any] | BaseException) -> Any:
     """The real manager over an agent that spends tokens on two models."""
@@ -2439,6 +2427,7 @@ async def _drive_resume_on_db(
 
 RUN_USAGE_PATHS = {
     "new_run": ("schedule", {"success": True, "output": "4"}, "sdk"),
+    "new_run_v1": ("schedule", {"success": True, "output": "4"}, "sdk"),
     "new_run_failure": (
         "schedule",
         {"success": False, "output": "", "error": "model refused"},
@@ -2467,6 +2456,14 @@ async def test_finalize_records_run_usage_on_answer(
 ) -> None:
     kind, outcome, source = RUN_USAGE_PATHS[path]
     received = _capture()
+
+    if path == "new_run_v1":
+        # Tasks created where the storage rollout is off keep the legacy
+        # version 1 conversation store.
+        factory, tid = canonical
+        with factory() as db:
+            db.get(Task, tid).conversation_storage_version = 1
+            db.commit()
 
     if kind == "schedule":
         await _schedule_turn(canonical, _metered_manager(outcome), task_source=source)

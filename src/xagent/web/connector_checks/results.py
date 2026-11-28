@@ -142,11 +142,11 @@ class SessionRow:
     duration_ms: int = 0
 
     def __post_init__(self) -> None:
-        _validate_connector(self.connector)
-        _validate_outcome(
-            self.outcome, self.failure_class, self.reason, unprobeable=False
+        validate_connector(self.connector)
+        validate_outcome(
+            self.outcome, self.failure_class, self.reason, row_kind="session"
         )
-        _validate_duration(self.duration_ms)
+        validate_nonnegative_int("duration_ms", self.duration_ms)
 
     def to_json(self) -> dict[str, Any]:
         return _row_json("session", self)
@@ -167,17 +167,17 @@ class CheckRow:
     duration_ms: int = 0
 
     def __post_init__(self) -> None:
-        _validate_connector(self.connector)
+        validate_connector(self.connector)
         if not is_check_id(self.connector, self.check):
             raise ValueError(f"invalid check id for {self.connector}: {self.check!r}")
         if self.kind not in ("read", "write"):
             raise ValueError(f"invalid check kind: {self.kind!r}")
         if self.tool is not None and not TOOL_NAME_PATTERN.fullmatch(self.tool):
             raise ValueError(f"invalid tool name: {self.tool!r}")
-        _validate_outcome(
-            self.outcome, self.failure_class, self.reason, unprobeable=True
+        validate_outcome(
+            self.outcome, self.failure_class, self.reason, row_kind="check"
         )
-        _validate_duration(self.duration_ms)
+        validate_nonnegative_int("duration_ms", self.duration_ms)
 
     def to_json(self) -> dict[str, Any]:
         return _row_json("check", self)
@@ -204,22 +204,16 @@ class RunResult:
     failure: str | None = None
 
     def __post_init__(self) -> None:
-        if not IDENTITY_PATTERN.fullmatch(self.identity):
-            raise ValueError(f"invalid identity label: {self.identity!r}")
-        if self.environment is not None and not ENVIRONMENT_PATTERN.fullmatch(
-            self.environment
-        ):
-            raise ValueError(f"invalid environment label: {self.environment!r}")
-        for moment in (self.started_at, self.finished_at):
-            if moment.utcoffset() is None:
-                raise ValueError("run times must be timezone-aware")
-        if self.finished_at < self.started_at:
-            raise ValueError("a run cannot finish before it starts")
-        if self.failure is not None:
-            if not is_code(self.failure):
-                raise ValueError("a run failure must be a code")
-            if self.complete or self.rows:
-                raise ValueError("a run that failed to set up is incomplete and empty")
+        validate_run_header(
+            self.identity,
+            self.environment,
+            self.started_at,
+            self.finished_at,
+            complete=self.complete,
+            has_rows=bool(self.rows),
+            failure=self.failure,
+            document="run",
+        )
         self._check_rows()
 
     def _check_rows(self) -> None:
@@ -250,8 +244,8 @@ class RunResult:
             "declaration_format_version": DECLARATION_FORMAT_VERSION,
             "identity": self.identity,
             "environment": self.environment,
-            "started_at": _timestamp(self.started_at),
-            "finished_at": _timestamp(self.finished_at),
+            "started_at": format_timestamp(self.started_at),
+            "finished_at": format_timestamp(self.finished_at),
             "complete": self.complete,
             "failure": self.failure,
             "rows": [row.to_json() for row in self.rows],
@@ -260,48 +254,88 @@ class RunResult:
 
 def load_result_schema() -> dict[str, Any]:
     """The JSON Schema every result document validates against."""
-    text = (
-        resources.files(__package__)
-        .joinpath("result.schema.json")
-        .read_text(encoding="utf-8")
-    )
+    return load_document_schema("result.schema.json")
+
+
+def load_document_schema(filename: str) -> dict[str, Any]:
+    """Load a packaged connector smoke schema."""
+    text = resources.files(__package__).joinpath(filename).read_text(encoding="utf-8")
     schema: dict[str, Any] = json.loads(text)
     return schema
 
 
-def _validate_connector(connector: str) -> None:
+def validate_run_header(
+    identity: str,
+    environment: str | None,
+    started_at: datetime,
+    finished_at: datetime,
+    *,
+    complete: bool,
+    has_rows: bool,
+    failure: str | None,
+    document: Literal["run", "sweep"],
+) -> None:
+    """Validate identity, timing, and setup failure for either document."""
+    if not IDENTITY_PATTERN.fullmatch(identity):
+        raise ValueError(f"invalid identity label: {identity!r}")
+    if environment is not None and not ENVIRONMENT_PATTERN.fullmatch(environment):
+        raise ValueError(f"invalid environment label: {environment!r}")
+    for moment in (started_at, finished_at):
+        if moment.utcoffset() is None:
+            raise ValueError(f"{document} times must be timezone-aware")
+    if finished_at < started_at:
+        raise ValueError(f"a {document} cannot finish before it starts")
+    if failure is not None:
+        if not is_code(failure):
+            raise ValueError(f"a {document} failure must be a code")
+        if complete or has_rows:
+            raise ValueError(
+                f"a {document} that failed to set up is incomplete and empty"
+            )
+
+
+def validate_connector(connector: str, *, label: str = "connector app id") -> None:
     if not APP_ID_PATTERN.fullmatch(connector):
-        raise ValueError(f"invalid connector app id: {connector!r}")
+        raise ValueError(f"invalid {label}: {connector!r}")
 
 
-def _validate_outcome(
+_OUTCOME_CLASSES = {
+    Outcome.PASS: frozenset({None}),
+    Outcome.FAIL: FAIL_CLASSES,
+    Outcome.SKIP: SKIP_CLASSES,
+}
+
+
+def validate_outcome(
     outcome: Outcome,
     failure_class: FailureClass | None,
     reason: str | None,
     *,
-    unprobeable: bool,
+    row_kind: Literal["session", "check", "sweep"],
 ) -> None:
     if reason is not None and not is_code(reason):
         raise ValueError("a reason must be a code")
-    if outcome is Outcome.PASS:
-        valid = failure_class is None
-    elif outcome is Outcome.FAIL:
-        valid = failure_class in FAIL_CLASSES
-    elif outcome is Outcome.SKIP:
-        valid = failure_class in SKIP_CLASSES
+    if row_kind == "sweep" or isinstance(outcome, Outcome):
+        allowed = _OUTCOME_CLASSES.get(outcome)
     else:
-        valid = unprobeable and failure_class is None and reason in UNPROBEABLE_REASONS
+        allowed = None
+    if allowed is not None:
+        valid = failure_class in allowed
+    else:
+        valid = (
+            row_kind == "check"
+            and failure_class is None
+            and reason in UNPROBEABLE_REASONS
+        )
     if not valid:
+        if row_kind == "sweep":
+            raise ValueError(f"{outcome} cannot carry {failure_class}")
         raise ValueError(f"{outcome.value} cannot carry class {failure_class}")
 
 
-def _validate_duration(duration_ms: int) -> None:
-    if (
-        isinstance(duration_ms, bool)
-        or not isinstance(duration_ms, int)
-        or duration_ms < 0
-    ):
-        raise ValueError("duration_ms must be a non-negative integer")
+def validate_nonnegative_int(field: str, value: int) -> None:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(f"{field} must be a non-negative integer")
 
 
 def _row_json(row_type: str, row: SessionRow | CheckRow) -> dict[str, Any]:
@@ -321,5 +355,5 @@ def _row_json(row_type: str, row: SessionRow | CheckRow) -> dict[str, Any]:
     }
 
 
-def _timestamp(moment: datetime) -> str:
+def format_timestamp(moment: datetime) -> str:
     return moment.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")

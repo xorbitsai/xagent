@@ -12,6 +12,7 @@ from typing import Any
 
 import pytest
 import requests
+from mcp.server.fastmcp.exceptions import ToolError
 from urllib3.exceptions import (
     ConnectTimeoutError,
     MaxRetryError,
@@ -112,6 +113,12 @@ def _call(**kwargs: Any) -> dict[str, Any]:
     args = {"summary": "Login broken", "description": "Cannot sign in."}
     args.update(kwargs)
     return json.loads(jira_ticket.jira_ticket_create(**args))
+
+
+def _definite_error(**kwargs: Any) -> str:
+    with pytest.raises(ToolError) as caught:
+        _call(**kwargs)
+    return str(caught.value)
 
 
 # ---------------------------------------------------------------------------
@@ -257,9 +264,8 @@ def test_bad_config_is_a_tool_error_and_sends_nothing(
     monkeypatch: pytest.MonkeyPatch, session: _FakeSession
 ) -> None:
     monkeypatch.setenv("JIRA_TICKET_PROJECT_KEY", "nope")
-    result = _call()
-    assert result["status"] == "error"
-    assert "JIRA_TICKET_PROJECT_KEY" in result["message"]
+    message = _definite_error()
+    assert "JIRA_TICKET_PROJECT_KEY" in message
     assert session.calls == []
 
 
@@ -328,9 +334,8 @@ def test_issue_type_and_labels_are_forwarded(session: _FakeSession) -> None:
 def test_invalid_arguments_are_rejected_before_any_request(
     session: _FakeSession, kwargs: dict[str, Any], fragment: str
 ) -> None:
-    result = _call(**kwargs)
-    assert result["status"] == "error"
-    assert fragment in result["message"]
+    message = _definite_error(**kwargs)
+    assert fragment in message
     assert session.calls == []
 
 
@@ -409,22 +414,20 @@ def test_attachment_outside_allowed_dirs_creates_nothing(
     outside = _write(tmp_path, "secret.txt", b"nope")
     ok = _write(allowed_dir, "ok.txt", b"fine")
 
-    result = _call(attachment_path=ok, attachment_path_2=outside)
+    message = _definite_error(attachment_path=ok, attachment_path_2=outside)
 
-    assert result["status"] == "error"
-    assert "attachment_path_2" in result["message"]
-    assert "outside the allowed" in result["message"]
-    assert "No ticket was created" in result["message"]
-    assert str(tmp_path) not in json.dumps(result)
+    assert "attachment_path_2" in message
+    assert "outside the allowed" in message
+    assert "No ticket was created" in message
+    assert str(tmp_path) not in message
     assert session.calls == []
 
 
 def test_missing_attachment_creates_nothing(
     session: _FakeSession, allowed_dir: Path
 ) -> None:
-    result = _call(attachment_path_3=str(allowed_dir / "gone.txt"))
-    assert result["status"] == "error"
-    assert "attachment_path_3" in result["message"]
+    message = _definite_error(attachment_path_3=str(allowed_dir / "gone.txt"))
+    assert "attachment_path_3" in message
     assert session.calls == []
 
 
@@ -434,11 +437,10 @@ def test_attachment_over_the_size_limit_creates_nothing(
     monkeypatch.setattr(jira_attachment, "MAX_ATTACHMENT_BYTES", 4)
     big = _write(allowed_dir, "big.bin", b"12345")
 
-    result = _call(attachment_path=big)
+    message = _definite_error(attachment_path=big)
 
-    assert result["status"] == "error"
-    assert "attachment_path" in result["message"]
-    assert "over the local upload limit" in result["message"]
+    assert "attachment_path" in message
+    assert "over the local upload limit" in message
     assert session.calls == []
 
 
@@ -446,8 +448,7 @@ def test_empty_json_allowlist_denies_every_attachment(
     session: _FakeSession, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setenv(jira_attachment.UPLOAD_ALLOWED_DIRS_ENV_VAR, "[]")
-    result = _call(attachment_path=_write(tmp_path, "a.txt", b"hi"))
-    assert result["status"] == "error"
+    _definite_error(attachment_path=_write(tmp_path, "a.txt", b"hi"))
     assert session.calls == []
 
 
@@ -482,10 +483,9 @@ def test_unset_blank_or_empty_allowlist_refuses_without_opening_the_file(
     monkeypatch.setattr(Path, "open", _spy_open)
     monkeypatch.setattr(Path, "read_bytes", _spy_read_bytes)
 
-    result = _call(attachment_path=".env")
+    message = _definite_error(attachment_path=".env")
 
-    assert result["status"] == "error"
-    assert "No ticket was created" in result["message"]
+    assert "No ticket was created" in message
     assert not any(p.name == ".env" for p in opened)
     assert session.calls == []
 
@@ -715,18 +715,22 @@ def test_http_errors_map_to_short_messages(
 ) -> None:
     body = f"<html>raw body sentinel {TOKEN}</html>"
     session.queue = [_FakeResponse(status_code=status, text=body)]
-    result = _call()
-    assert result["status"] == "error"
-    assert fragment in result["message"]
-    assert "sentinel" not in result["message"]
-    assert TOKEN not in result["message"]
+    if status >= 500:
+        result = _call()
+        assert result["status"] == "error"
+        message = result["message"]
+    else:
+        message = _definite_error()
+    assert fragment in message
+    assert "sentinel" not in message
+    assert TOKEN not in message
 
 
 def test_rate_limit_surfaces_retry_after(session: _FakeSession) -> None:
     session.queue = [
         _FakeResponse(status_code=429, text="slow down", headers={"Retry-After": "12"})
     ]
-    assert "12" in _call()["message"]
+    assert "12" in _definite_error()
 
 
 @pytest.mark.parametrize("status", [500, 501, 502, 503, 504, 599])
@@ -796,11 +800,10 @@ def test_failure_before_anything_was_sent_is_not_outcome_unknown(
     session: _FakeSession, exc: Exception
 ) -> None:
     session.queue = [exc]
-    result = _call()
-    assert result["status"] == "error"
-    assert result["message"].startswith("Jira request failed")
-    assert "may already have been created" not in result["message"]
-    assert TOKEN not in result["message"]
+    message = _definite_error()
+    assert message.startswith("Jira request failed")
+    assert "may already have been created" not in message
+    assert TOKEN not in message
 
 
 @pytest.mark.parametrize(
@@ -820,11 +823,10 @@ def test_real_facade_refusals_before_sending_are_not_outcome_unknown(
         raise failure
 
     monkeypatch.setattr(public_requests, "validate_public_http_url_sync", refuse)
-    result = _call()
-    assert result["status"] == "error"
-    assert result["message"].startswith("Jira request failed")
-    assert "may already have been created" not in result["message"]
-    assert TOKEN not in result["message"]
+    message = _definite_error()
+    assert message.startswith("Jira request failed")
+    assert "may already have been created" not in message
+    assert TOKEN not in message
 
 
 @pytest.mark.parametrize("exc", _NOTHING_SENT)
@@ -935,7 +937,7 @@ def test_create_advice_survives_a_very_long_underlying_message(
 
 def test_rate_limit_on_create_is_not_outcome_unknown(session: _FakeSession) -> None:
     session.queue = [_FakeResponse(status_code=429, text="slow")]
-    assert "may already have been created" not in _call()["message"]
+    assert "may already have been created" not in _definite_error()
 
 
 def test_base_url_resolves_the_site_once_per_call(
@@ -966,7 +968,7 @@ def test_400_names_the_offending_fields(session: _FakeSession) -> None:
             },
         )
     ]
-    message = _call(issue_type="Nope")["message"]
+    message = _definite_error(issue_type="Nope")
     assert "issuetype" in message
     assert "Specify a valid issue type" in message
     assert "Project is required" in message
@@ -974,7 +976,7 @@ def test_400_names_the_offending_fields(session: _FakeSession) -> None:
 
 def test_400_does_not_dump_unstructured_bodies(session: _FakeSession) -> None:
     session.queue = [_FakeResponse(status_code=400, text="<html>" + "x" * 5000)]
-    message = _call()["message"]
+    message = _definite_error()
     assert "<html>" not in message
     assert len(message) < 400
 
@@ -986,14 +988,14 @@ def test_400_message_is_capped(session: _FakeSession) -> None:
             payload={"errors": {f"f{i}": "y" * 1000 for i in range(50)}},
         )
     ]
-    assert len(_call()["message"]) < 1500
+    assert len(_definite_error()) < 1500
 
 
 def test_redirect_is_refused(session: _FakeSession) -> None:
     session.queue = [
         _FakeResponse(status_code=302, headers={"Location": "https://evil.example/"})
     ]
-    message = _call()["message"]
+    message = _definite_error()
     assert "redirect" in message
     assert "evil.example" not in message
 
@@ -1007,10 +1009,9 @@ def test_400_field_error_never_echoes_the_token(session: _FakeSession) -> None:
             payload={"errorMessages": [], "errors": {"summary": f"bad {TOKEN}"}},
         )
     ]
-    result = _call()
-    assert result["status"] == "error"
-    assert "summary" in result["message"]
-    assert TOKEN not in result["message"]
+    message = _definite_error()
+    assert "summary" in message
+    assert TOKEN not in message
 
 
 def test_transport_error_never_echoes_the_token(session: _FakeSession) -> None:

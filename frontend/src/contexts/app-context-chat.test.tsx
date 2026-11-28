@@ -6805,6 +6805,33 @@ describe("AppProvider websocket message routing", () => {
         ["resent-source", 101],
       ])
     })
+
+    it("resends a spoken send with the voice marker on the new connection", async () => {
+      sendChatMessageMock.mockRejectedValueOnce(
+        new MessageDeliveryError("lost", "outcome_unknown", { connectionLost: true }),
+      )
+      const sessionTree = (identity: string) => (
+        <AppProvider token="token" transport={makeSessionTransport(makeSessionConnection(identity))}>
+          <SessionControlsProbe />
+        </AppProvider>
+      )
+      const { rerender } = render(sessionTree("session-one"))
+      act(() => webSocketOptions.current?.onConnect?.())
+      expect(screen.getByTestId("session-conversation-state").textContent).toBe("unbound")
+      const outcome = getSessionControls()
+        .sendMessage("hello", { clientMessageId: "resent-spoken", inputMode: "voice" })
+        .then(() => "ok", (error: Error) => error)
+      await act(async () => {})
+
+      rerender(sessionTree("session-two"))
+      act(() => webSocketOptions.current?.onConnect?.())
+      await act(async () => { expect(await outcome).toBe("ok") })
+
+      expect(sendChatMessageMock.mock.calls.map((call) => [call[3], call[8]])).toEqual([
+        ["resent-spoken", "voice"],
+        ["resent-spoken", "voice"],
+      ])
+    })
   })
 
   it("refuses a second send from the same call stack while the first one starts the replacement conversation", async () => {

@@ -44,6 +44,12 @@ const app = vi.hoisted(() => ({
 const panel = vi.hoisted(() => ({
   onSend: null as null | ((text: string, config: Record<string, unknown>, files: File[]) => Promise<void>),
 }))
+// The send handler the start page was given, and the callback the page
+// registered for the host page's initial message.
+const start = vi.hoisted(() => ({
+  onSend: null as null | ((text: string, files: File[]) => Promise<void>),
+  initialMessage: null as null | ((message: string) => void),
+}))
 const voice = vi.hoisted(() => ({
   props: null as null | WidgetVoiceCallOptions,
   transport: null as null | VoiceAudioTransport,
@@ -137,9 +143,17 @@ function Composer({ where, open }: { where: string; open?: () => void }) {
   )
 }
 vi.mock("@/components/chat/ChatStartScreen", () => ({
-  ChatStartScreen: (props: Opener) => (
-    <Composer where="start" open={props.voiceConversationSource === "provided" ? props.onVoiceConversation : undefined} />
-  ),
+  ChatStartScreen: (props: Opener & { onSend?: typeof start.onSend }) => {
+    start.onSend = props.onSend ?? null
+    return <Composer where="start" open={props.voiceConversationSource === "provided" ? props.onVoiceConversation : undefined} />
+  },
+}))
+vi.mock("@/lib/widget-parent-message", async () => ({
+  ...await vi.importActual<typeof import("@/lib/widget-parent-message")>("@/lib/widget-parent-message"),
+  requestInitialMessage: (onMessage: (message: string) => void) => {
+    start.initialMessage = onMessage
+    return () => undefined
+  },
 }))
 vi.mock("@/components/task/task-conversation-panel", () => ({
   TaskConversationPanel: (props: Opener & { onSend?: typeof panel.onSend }) => {
@@ -443,6 +457,27 @@ describe("session widget voice call wiring", () => {
       send: async () => { await panel.onSend!("hi", { clientMessageId: "m-1" }, []) },
     },
     {
+      sender: "typed, start page and suggested prompts",
+      spoken: false,
+      send: async () => { await start.onSend!("hi", []) },
+    },
+    {
+      sender: "typed, answering a question in the conversation panel",
+      spoken: false,
+      capabilities: { voice: true, fileUploads: { allowedExtensions: [".txt"], maxFileBytes: 1024, maxFilesPerMessage: 1 } },
+      setup: () => {
+        app.state.taskId = 71
+        app.state.currentTask = { id: "71", status: "waiting_for_user", waitingRequestId: "question-9" }
+        app.sessionConversationState = "bound"
+      },
+      send: async () => { await panel.onSend!("hi", { clientMessageId: "m-1", metadata: { request_id: "question-9" } }, []) },
+    },
+    {
+      sender: "typed, initial message from the host page",
+      spoken: false,
+      send: async () => { start.initialMessage!("hi") },
+    },
+    {
       sender: "typed, continuing from history",
       spoken: false,
       capabilities: { voice: true, conversationHistory: true },
@@ -468,7 +503,8 @@ describe("session widget voice call wiring", () => {
     if (bare) await send()
     else await act(send)
     expect(app.sendMessage).toHaveBeenCalledTimes(1)
-    const config = app.sendMessage.mock.calls[0][1] as Record<string, unknown>
+    // A sender with nothing to declare may pass no config at all.
+    const config = (app.sendMessage.mock.calls[0][1] ?? {}) as Record<string, unknown>
     if (spoken) expect(config.inputMode).toBe("voice")
     else expect(config).not.toHaveProperty("inputMode")
   })

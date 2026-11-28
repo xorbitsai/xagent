@@ -27,6 +27,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Literal, Mapping, get_args
 
+JIRA_TICKET_PROBE_ARG = "--connection-probe"
+
 UnprobeableReason = Literal[
     "covered_by_l2",
     "sandboxed",
@@ -45,8 +47,7 @@ UnprobeableReason = Literal[
 # - execution_scoped: needs a task's execution identity (chrome-devtools).
 # - needs_fixture: every read-only tool takes a vendor object id (a document,
 #   a spreadsheet, a file path) the monitor account would have to own.
-# - write_only: the connector has no read-only tool at all (jira-ticket only
-#   creates tickets), so any probe call would write vendor data.
+# - write_only: the connector has no read-only tool that a probe can call.
 UNPROBEABLE_REASONS: frozenset[str] = frozenset(get_args(UnprobeableReason))
 
 
@@ -56,12 +57,15 @@ class ConnectorProbe:
 
     ``arguments`` are the fixed call arguments. ``expect_keys`` names keys the
     result object must carry, checked whenever declared; it is required for a
-    tool that does not use the ``{"status": ...}`` envelope.
+    tool that does not use the ``{"status": ...}`` envelope. A connector may
+    declare fixed ``failure_reasons`` that can be returned safely to callers
+    when its error envelope carries a matching ``reason``.
     """
 
     tool: str
     arguments: Mapping[str, Any] = field(default_factory=dict)
     expect_keys: tuple[str, ...] = ()
+    failure_reasons: tuple[str, ...] = ()
 
 
 CONNECTOR_PROBES: Mapping[str, ConnectorProbe] = {
@@ -94,6 +98,15 @@ CONNECTOR_PROBES: Mapping[str, ConnectorProbe] = {
     "zoom": ConnectorProbe("zoom_get_current_user"),
     "slack": ConnectorProbe("slack_list_channels", {"limit": 1}),
     "github": ConnectorProbe("github_get_current_user"),
+    "jira-ticket": ConnectorProbe(
+        "jira_ticket_check_connection",
+        failure_reasons=(
+            "jira_ticket_invalid_configuration",
+            "jira_ticket_credentials_rejected",
+            "jira_ticket_site_or_project_not_found",
+            "jira_ticket_project_permission_required",
+        ),
+    ),
     # A read through Intercom's POST /conversations/search, the only listing
     # the API offers.
     "intercom": ConnectorProbe("intercom_list_conversations", {"limit": 1}),
@@ -133,7 +146,6 @@ UNPROBEABLE_CONNECTORS: Mapping[str, UnprobeableReason] = {
     "fireflies": "covered_by_l2",
     "rocketlane": "covered_by_l2",
     "google-maps": "sandboxed",
-    "jira-ticket": "write_only",
     "chrome-devtools": "execution_scoped",
     "google-docs": "needs_fixture",
     "google-sheets": "needs_fixture",

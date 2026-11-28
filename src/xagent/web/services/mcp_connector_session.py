@@ -26,6 +26,8 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import TYPE_CHECKING, Any, AsyncIterator, Callable, Mapping, cast
 
+from ..connector_probes import JIRA_TICKET_PROBE_ARG
+
 if TYPE_CHECKING:
     from ...core.execution_scope import ExecutionScope
     from ...core.tools.adapters.vibe.mcp_adapter import MCPLoadResult
@@ -102,6 +104,7 @@ async def list_connector_tools(
     mcp_actor_execution_identity: MCPActorExecutionIdentity | None = None,
     connector_team_id: int | None = None,
     execution_scope: ExecutionScope | None = None,
+    probe_mode: bool = False,
 ) -> ConnectorToolsResult:
     """Start ``server_id`` for ``user`` as a task would and list its tools.
 
@@ -142,6 +145,9 @@ async def list_connector_tools(
     ``mcp_actor_execution_identity``. Nothing here checks that the two match:
     the Slack grant resolver is the only consumer that receives both, and the
     OAuth token resolver hook receives the scope alone.
+
+    ``probe_mode`` selects a dedicated launch where the builtin connector
+    provides one. Callers must first verify the catalog identity of the row.
 
     The sandbox lease is released when this returns, so a caller that goes on
     to call a tool would open a new session on the web host. Such a caller
@@ -212,6 +218,7 @@ async def list_connector_tools(
         server_name=server_name,
         name_prefix=name_prefix,
         refuse_sandboxed=refuse_sandboxed,
+        probe_mode=probe_mode,
         result=result,
     )
 
@@ -227,6 +234,7 @@ async def list_actor_stdio_connector_tools(
     mcp_actor_execution_identity: MCPActorExecutionIdentity | None = None,
     connector_team_id: int | None = None,
     refuse_sandboxed: bool = False,
+    probe_mode: bool = False,
 ) -> ConnectorToolsResult:
     """Start the actor stdio connection for catalog ``app_id`` as a task would.
 
@@ -248,7 +256,8 @@ async def list_actor_stdio_connector_tools(
     lifecycle generation was stale. NOT_FOUND therefore does not prove the
     actor never connected the app. A failure to resolve the team scope
     raises the config's typed ``ConnectorRuntimeError``, as in
-    ``list_connector_tools``; ``refuse_sandboxed`` behaves as it does there.
+    ``list_connector_tools``; ``refuse_sandboxed`` and ``probe_mode`` behave
+    as they do there.
 
     The team id, policy and adapter are trusted as given, under the same
     contract as ``list_connector_tools``: they must come from an agent or
@@ -316,6 +325,7 @@ async def list_actor_stdio_connector_tools(
         server_name=app_id,
         name_prefix=name_prefix,
         refuse_sandboxed=refuse_sandboxed,
+        probe_mode=probe_mode,
         result=result,
     )
 
@@ -410,6 +420,7 @@ async def _start_and_list(
     server_name: str,
     name_prefix: str,
     refuse_sandboxed: bool,
+    probe_mode: bool,
     result: Callable[..., ConnectorToolsResult],
 ) -> ConnectorToolsResult:
     """Start one built task config and list its tools, as a task would."""
@@ -422,6 +433,14 @@ async def _start_and_list(
 
     (server_config,) = _apply_stdio_output_limit_env([server_config], tool_config)
     connection = _connection_from_config(server_config)
+    if (
+        probe_mode
+        and server_name == "jira-ticket"
+        and connection.get("transport") == "stdio"
+        and connection.get("command") == "python"
+        and connection.get("args") == ["-m", "xagent.web.tools.mcp.jira_ticket"]
+    ):
+        connection["args"] = [*connection["args"], JIRA_TICKET_PROBE_ARG]
     if refuse_sandboxed and should_sandbox_mcp_connection(
         cast("Connection", connection)
     ):

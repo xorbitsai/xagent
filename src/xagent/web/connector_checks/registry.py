@@ -1448,11 +1448,11 @@ CONNECTOR_CHECKS: Mapping[str, ConnectorChecks] = {
         ),
     ),
     "jira": _jira_checks(),
-    # Create-only (#3655): its one tool files a ticket no tool of the server
-    # can delete, and its L3 slot stays unprobeable for the same reason.
+    # The ordinary launch can create but cannot delete tickets. Its separate
+    # probe launch checks the connection without writing any vendor data.
     "jira-ticket": ConnectorChecks(
         "jira-ticket",
-        reads=(UnprobeableCheck("jira-ticket.l3_probe", "write_only"),),
+        reads=(_declared_l3("jira-ticket"),),
         exemptions=(ToolExemption("jira_ticket_create", WRITE_WITHOUT_CLEANUP),),
     ),
     "miro": ConnectorChecks(

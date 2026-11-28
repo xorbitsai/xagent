@@ -49,10 +49,15 @@ def _module_name(row: dict[str, Any]) -> str | None:
     return None
 
 
-async def _registered_tools(module_name: str) -> dict[str, dict[str, set[str]]]:
+async def _registered_tools(
+    module_name: str,
+) -> dict[str, dict[str, set[str]]]:
     """Tool name -> accepted and required argument names, per the server's schema."""
     module = importlib.import_module(module_name)
-    fastmcp = getattr(module, "mcp", None)
+    if module_name == "xagent.web.tools.mcp.jira_ticket":
+        fastmcp = module.probe_mcp
+    else:
+        fastmcp = getattr(module, "mcp", None)
     if fastmcp is not None and hasattr(fastmcp, "list_tools"):
         tools = await fastmcp.list_tools()
     else:

@@ -298,6 +298,7 @@ async def test_a_sandboxed_connection_is_refused_only_when_tools_will_be_called(
     assert call["user"].id == user.id
     assert call["server_id"] == server.id
     assert call["refuse_sandboxed"] is refused
+    assert call["probe_mode"] is refused
     # The user's own connectors: no team scope and no actor policy.
     assert "connector_team_id" not in call
     assert "mcp_runtime_authorization_policy" not in call

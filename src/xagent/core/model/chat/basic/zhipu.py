@@ -1,6 +1,5 @@
 import asyncio
 import contextvars
-import json
 import logging
 import os
 import threading
@@ -63,6 +62,30 @@ def _zhipu_stream_tool_calls(
             item["index"] = index
         tool_calls_list.append(item)
     return tool_calls_list
+
+
+def _zhipu_tool_call_response(
+    response: Any, choice: Any, tool_calls: list[Any]
+) -> dict[str, Any]:
+    """Use the same lossless function-call envelope as the streaming path."""
+    return {
+        "type": "tool_call",
+        "tool_calls": [
+            {
+                "id": getattr(call, "id", None) or f"call_{uuid.uuid4().hex}",
+                "type": "function",
+                "function": {
+                    "name": call.function.name,
+                    "arguments": call.function.arguments,
+                },
+            }
+            for call in tool_calls
+        ],
+        "finish_reason": getattr(choice, "finish_reason", None),
+        "raw": response.model_dump()
+        if hasattr(response, "model_dump")
+        else str(response),
+    }
 
 
 class ZhipuLLM(BaseLLM):
@@ -351,51 +374,8 @@ class ZhipuLLM(BaseLLM):
 
             logger.debug(f"Final tool_calls result: {tool_calls}")
 
-            # Debug: Print tool_calls structure if found
             if tool_calls:
-                logger.debug(f"Tool calls structure: {tool_calls}")
-                for i, tool_call in enumerate(tool_calls):
-                    logger.debug(f"Tool call {i}: {tool_call}")
-                    if hasattr(tool_call, "function"):
-                        logger.debug(f"Tool call {i} function: {tool_call.function}")
-                        if hasattr(tool_call.function, "name"):
-                            logger.debug(
-                                f"Tool call {i} name: {tool_call.function.name}"
-                            )
-                        if hasattr(tool_call.function, "arguments"):
-                            logger.debug(
-                                f"Tool call {i} arguments: {tool_call.function.arguments}"
-                            )
-
-            if tool_calls:
-                # Convert Zhipu tool calls to ReAct format
-                for tool_call in tool_calls:
-                    tool_name = tool_call.function.name
-                    try:
-                        # Parse arguments as JSON
-                        args = json.loads(tool_call.function.arguments)
-                    except (json.JSONDecodeError, TypeError):
-                        args = {}
-
-                    # Return ReAct-compatible tool call format
-                    return {
-                        "type": "tool_call",
-                        "tool_calls": [
-                            {
-                                "id": getattr(
-                                    tool_call, "id", f"call_{uuid.uuid4().hex}"
-                                ),
-                                "function": {
-                                    "name": tool_name,
-                                    "arguments": json.dumps(args),
-                                },
-                                "type": "function",
-                            }
-                        ],
-                        "raw": response.model_dump()
-                        if hasattr(response, "model_dump")
-                        else str(response),
-                    }
+                return _zhipu_tool_call_response(response, choice, tool_calls)
 
             # Handle text content
             content = message.content
@@ -1050,51 +1030,8 @@ class ZhipuLLM(BaseLLM):
 
             logger.debug(f"Final tool_calls result: {tool_calls}")
 
-            # Debug: Print tool_calls structure if found
             if tool_calls:
-                logger.debug(f"Tool calls structure: {tool_calls}")
-                for i, tool_call in enumerate(tool_calls):
-                    logger.debug(f"Tool call {i}: {tool_call}")
-                    if hasattr(tool_call, "function"):
-                        logger.debug(f"Tool call {i} function: {tool_call.function}")
-                        if hasattr(tool_call.function, "name"):
-                            logger.debug(
-                                f"Tool call {i} name: {tool_call.function.name}"
-                            )
-                        if hasattr(tool_call.function, "arguments"):
-                            logger.debug(
-                                f"Tool call {i} arguments: {tool_call.function.arguments}"
-                            )
-
-            if tool_calls:
-                # Convert Zhipu tool calls to ReAct format
-                for tool_call in tool_calls:
-                    tool_name = tool_call.function.name
-                    try:
-                        # Parse arguments as JSON
-                        args = json.loads(tool_call.function.arguments)
-                    except (json.JSONDecodeError, TypeError):
-                        args = {}
-
-                    # Return ReAct-compatible tool call format
-                    return {
-                        "type": "tool_call",
-                        "tool_calls": [
-                            {
-                                "id": getattr(
-                                    tool_call, "id", f"call_{uuid.uuid4().hex}"
-                                ),
-                                "function": {
-                                    "name": tool_name,
-                                    "arguments": json.dumps(args),
-                                },
-                                "type": "function",
-                            }
-                        ],
-                        "raw": response.model_dump()
-                        if hasattr(response, "model_dump")
-                        else str(response),
-                    }
+                return _zhipu_tool_call_response(response, choice, tool_calls)
 
             # Handle text content
             content = message.content

@@ -16,13 +16,13 @@ from ...providers import (
 )
 from ..error import retry_on
 from .azure_openai import AzureOpenAILLM
-from .base import BaseLLM
+from .base import BaseLLM, ChatRequestIdentity
 from .bedrock import BedrockLLM
 from .claude import ClaudeLLM
 from .dashscope import DashScopeLLM
 from .deepseek import DeepSeekLLM
 from .gemini import GeminiLLM
-from .openai import OpenAILLM
+from .openai import OpenAICompatibleLLM, OpenAILLM
 from .openrouter import OpenRouterLLM
 from .router import RouterLLM, is_auto_failover_failure
 from .xinference import XinferenceLLM
@@ -279,6 +279,16 @@ def create_base_llm(
     # Stamp the unique model id so token-usage details can disambiguate models
     # that share a model_name (e.g. a platform model vs a user's own).
     llm._model_id = model.id
+    # Phase one observes the adapters that preserve full function call batches.
+    if isinstance(llm, (OpenAICompatibleLLM, ZhipuLLM)):
+        llm._request_identity = ChatRequestIdentity(
+            provider=provider,
+            model_name=llm.model_name,
+            configuration_id=llm.model_id,
+            protocol="zhipu"
+            if isinstance(llm, ZhipuLLM)
+            else "openai_chat_completions",
+        )
     return attach_chat_retry_wrapper(
         llm,
         model.max_retries,

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from typing import Any, AsyncIterator, List
 
 from ..types import ChunkType, StreamChunk
@@ -19,6 +20,16 @@ def compatible_tool_choice_for_llm(
     return "auto"
 
 
+@dataclass(frozen=True)
+class ChatRequestIdentity:
+    """Identity of the concrete request target, without credentials or URLs."""
+
+    provider: str
+    model_name: str
+    configuration_id: str
+    protocol: str
+
+
 class BaseLLM(ABC):
     """
     Abstract base class for Large Language Models (LLMs) with ability-based support.
@@ -34,6 +45,11 @@ class BaseLLM(ABC):
     # Unique model id, set from model config by create_base_llm. Threaded into
     # token-usage details so identically-named models can be told apart.
     _model_id: str | None = None
+    _request_identity: ChatRequestIdentity | None = None
+
+    @property
+    def request_identity(self) -> ChatRequestIdentity | None:
+        return self._request_identity
 
     @property
     def model_id(self) -> str:

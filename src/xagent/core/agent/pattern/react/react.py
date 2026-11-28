@@ -208,6 +208,7 @@ from .duplicate_write_guard import (
     build_suppression_envelope,
     tool_requires_duplicate_write_guard,
 )
+from .tool_call_observation import observe_tool_call_batch, tool_call_parts
 from .truncation import (
     TRUNCATED_TOOL_ARGUMENTS,
     TRUNCATED_TOOL_ARGUMENTS_ERROR,
@@ -1581,7 +1582,10 @@ class ReActPattern(AgentPattern):
                 await runtime.on_llm_end(
                     context=context,
                     response=response,
-                    metadata=end_metadata,
+                    metadata={
+                        **end_metadata,
+                        **observe_tool_call_batch(call_llm, response, tool_schemas),
+                    },
                 )
             if requires_protocol_retry:
                 if protocol_retry_performed:
@@ -2681,7 +2685,7 @@ class ReActPattern(AgentPattern):
         await runtime.on_llm_end(
             context=context,
             response=response,
-            metadata=end_metadata,
+            metadata={**end_metadata, **observe_tool_call_batch(llm, response, tools)},
         )
         return response, answer_streamer
 
@@ -4384,25 +4388,10 @@ class ReActPattern(AgentPattern):
         normalized: list[dict[str, Any]] = []
         issued_at = datetime.now(timezone.utc).timestamp()
         for index, tool_call in enumerate(tool_calls):
-            # Three provider shapes: a dict with a nested ``function`` payload, a
-            # flat dict, and an object with a ``function`` attribute. Each yields
-            # the same (id, name, arguments) triple.
-            if isinstance(tool_call, dict):
-                call_id = tool_call.get("id")
-                function_payload = tool_call.get("function")
-                if isinstance(function_payload, dict):
-                    name = function_payload.get("name")
-                    arguments = function_payload.get("arguments", {})
-                else:
-                    name = tool_call.get("name")
-                    arguments = tool_call.get("args", tool_call.get("arguments", {}))
-            else:
-                function_payload = getattr(tool_call, "function", None)
-                if function_payload is None:
-                    continue
-                call_id = getattr(tool_call, "id", None)
-                name = getattr(function_payload, "name", None)
-                arguments = getattr(function_payload, "arguments", {})
+            parts = tool_call_parts(tool_call)
+            if parts is None:
+                continue
+            call_id, name, arguments = parts
 
             normalized.append(
                 {

@@ -65,7 +65,7 @@ import httpx
 from ..error import is_context_length_error, retry_on
 from ..exceptions import LLMContextLengthError, LLMToolProtocolError
 from ..types import ChunkType, StreamChunk
-from .base import BaseLLM
+from .base import BaseLLM, ChatRequestIdentity
 
 logger = logging.getLogger(__name__)
 
@@ -418,6 +418,10 @@ class BoundaryLLM(BaseLLM):
     @property
     def model_name(self) -> str:
         return self._inner.model_name
+
+    @property
+    def request_identity(self) -> ChatRequestIdentity | None:
+        return self._inner.request_identity
 
     @property
     def supports_thinking_mode(self) -> bool:

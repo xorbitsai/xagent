@@ -5,6 +5,11 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from xagent.core.agent import PatternRuntime
+from xagent.core.agent.pattern.react.tool_call_observation import (
+    observe_tool_call_batch,
+)
+from xagent.core.model.chat.basic.base import ChatRequestIdentity
 from xagent.core.model.chat.basic.zhipu import ZhipuLLM
 from xagent.core.model.chat.types import ChunkType
 
@@ -583,3 +588,73 @@ class TestZhipuPromptCacheUsage:
             c.usage for c in chunks if c.type == ChunkType.USAGE and c.usage
         ]
         assert usage_payloads and usage_payloads[0]["cached_input_tokens"] == 60
+
+
+@pytest.mark.asyncio
+async def test_chat_and_stream_preserve_the_same_complete_tool_batch():
+    llm = ZhipuLLM(model_name="glm-5", api_key="test-key")
+    llm._request_identity = ChatRequestIdentity("zhipu", "glm-5", "test", "zhipu")
+    client = MagicMock()
+    llm._client = client
+    messages = [{"role": "user", "content": "Read and list files"}]
+    tools = [
+        {
+            "type": "function",
+            "function": {"name": name, "parameters": {"type": "object"}},
+        }
+        for name in ("read_file", "list_files")
+    ]
+
+    def call(index, name, arguments, call_id=None):
+        return SimpleNamespace(
+            id=call_id,
+            index=index,
+            function=SimpleNamespace(name=name, arguments=arguments),
+        )
+
+    def event(calls, finish_reason=None):
+        return SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    delta=SimpleNamespace(content=None, tool_calls=calls),
+                    finish_reason=finish_reason,
+                )
+            ],
+            usage=None,
+        )
+
+    complete = [
+        call(0, "read_file", '{"path":', "call-read"),
+        call(1, "list_files", "", "call-list"),
+    ]
+    client.chat.completions.create.return_value = SimpleNamespace(
+        choices=[
+            SimpleNamespace(
+                message=SimpleNamespace(content=None, tool_calls=complete),
+                finish_reason="tool_calls",
+            )
+        ]
+    )
+    nonstreamed = await llm.chat(messages, tools=tools)
+    client.chat.completions.create.return_value = [
+        event([call(0, "read_file", '{"pa', "call-read")]),
+        event([call(0, None, 'th":'), call(1, "list_files", "", "call-list")]),
+        event(None, "tool_calls"),
+    ]
+    streamed = await PatternRuntime().run_streaming_llm_call(
+        llm, messages=messages, tools=tools
+    )
+
+    for response in (nonstreamed, streamed):
+        assert [tool_call["id"] for tool_call in response["tool_calls"]] == [
+            "call-read",
+            "call-list",
+        ]
+        assert [
+            tool_call["function"]["arguments"] for tool_call in response["tool_calls"]
+        ] == ['{"path":', ""]
+    expected = observe_tool_call_batch(llm, nonstreamed, tools)
+    assert expected["tool_call_observation"]["findings"] == [
+        {"call_index": 0, "reason": "invalid_json"}
+    ]
+    assert observe_tool_call_batch(llm, streamed, tools) == expected

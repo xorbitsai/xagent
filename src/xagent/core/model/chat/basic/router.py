@@ -99,7 +99,7 @@ from ....model import ChatModelConfig
 from ....task_runtime import normalize_input_modalities
 from ...providers import default_base_url_for_provider
 from ..types import ChunkType, StreamChunk
-from .base import BaseLLM
+from .base import BaseLLM, ChatRequestIdentity
 from .call_boundary import (
     CREDENTIAL_REJECTED,
     MODEL_NOT_AVAILABLE,
@@ -1311,6 +1311,12 @@ class _ResolvedRouterLLM(BaseLLM):
     @property
     def model_id(self) -> str:
         return self._downstream.model_id
+
+    @property
+    def request_identity(self) -> ChatRequestIdentity | None:
+        # A successful response may have come from a different downstream
+        # after failover. The selection label is not the request model name.
+        return self._downstream.request_identity
 
     @property
     def timeout(self) -> float:

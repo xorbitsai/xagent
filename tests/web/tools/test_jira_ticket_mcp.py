@@ -9,6 +9,7 @@ import asyncio
 import json
 from pathlib import Path
 from typing import Any
+from urllib.parse import parse_qs, urlsplit
 
 import pytest
 import requests
@@ -122,6 +123,102 @@ def _call(**kwargs: Any) -> dict[str, Any]:
 def test_exposes_only_the_create_tool() -> None:
     tools = asyncio.run(jira_ticket.mcp.list_tools())
     assert [tool.name for tool in tools] == ["jira_ticket_create"]
+
+
+def test_probe_has_its_own_read_only_tool_surface() -> None:
+    (tool,) = asyncio.run(jira_ticket.probe_mcp.list_tools())
+    assert tool.name == "jira_ticket_check_connection"
+    assert tool.annotations and tool.annotations.readOnlyHint is True
+    assert not tool.inputSchema.get("properties")
+
+
+def _permissions(*, browse: Any = True, create: Any = True) -> _FakeResponse:
+    return _FakeResponse(
+        payload={
+            "permissions": {
+                "BROWSE_PROJECTS": {"havePermission": browse},
+                "CREATE_ISSUES": {"havePermission": create},
+            }
+        }
+    )
+
+
+def test_probe_checks_the_configured_project_without_a_write(session) -> None:
+    session.queue = [_FakeResponse(payload={"accountId": "private-id"}), _permissions()]
+
+    assert json.loads(jira_ticket.jira_ticket_check_connection()) == {
+        "status": "success"
+    }
+    myself, permissions = session.calls
+    assert myself["url"] == f"{SITE}/rest/api/3/myself"
+    url = urlsplit(permissions["url"])
+    assert (
+        f"{url.scheme}://{url.netloc}{url.path}" == f"{SITE}/rest/api/3/mypermissions"
+    )
+    assert parse_qs(url.query) == {
+        "projectKey": ["SUP"],
+        "permissions": ["BROWSE_PROJECTS,CREATE_ISSUES"],
+    }
+    for call in session.calls:
+        assert call["method"] == "GET"
+        assert call["auth"] == (EMAIL, TOKEN)
+        assert call["allow_redirects"] is False
+        assert call["json"] is None and call["files"] is None
+
+
+@pytest.mark.parametrize("status", [200, 401])
+def test_probe_stops_before_permissions_when_authentication_fails(
+    session, status
+) -> None:
+    session.queue = [_FakeResponse(status_code=status, payload={"emailAddress": EMAIL})]
+
+    result = json.loads(jira_ticket.jira_ticket_check_connection())
+
+    assert result["status"] == "error"
+    assert result["reason"] == "jira_ticket_credentials_rejected"
+    assert "classic (unscoped)" in result["message"]
+    assert "JIRA_TICKET_EMAIL" in result["message"]
+    assert EMAIL not in result["message"] and TOKEN not in result["message"]
+    assert len(session.calls) == 1
+
+
+@pytest.mark.parametrize(
+    ("response", "hint"),
+    [
+        (_FakeResponse(status_code=404), "JIRA_TICKET_PROJECT_KEY"),
+        (_permissions(browse=False), "Browse Projects"),
+        (_permissions(create=False), "Create Issues"),
+        (_permissions(create="true"), "valid project permission result"),
+        (_FakeResponse(text="not JSON"), "non-JSON connection check response"),
+    ],
+)
+def test_probe_rejects_denied_or_malformed_permissions(session, response, hint) -> None:
+    session.queue = [_FakeResponse(payload={"accountId": "private-id"}), response]
+
+    result = json.loads(jira_ticket.jira_ticket_check_connection())
+
+    assert result["status"] == "error"
+    assert hint in result["message"]
+    assert len(session.calls) == 2
+
+
+@pytest.mark.parametrize(
+    ("variable", "value"),
+    [
+        ("JIRA_TICKET_SITE", "https://example.com"),
+        ("JIRA_TICKET_PROJECT_KEY", "bad/key"),
+    ],
+)
+def test_probe_rejects_invalid_configuration(
+    session, monkeypatch, variable, value
+) -> None:
+    monkeypatch.setenv(variable, value)
+
+    result = json.loads(jira_ticket.jira_ticket_check_connection())
+
+    assert result["status"] == "error"
+    assert variable in result["message"]
+    assert not session.calls
 
 
 def test_module_uses_the_public_requests_facade() -> None:

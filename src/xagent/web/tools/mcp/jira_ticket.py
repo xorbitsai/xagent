@@ -9,9 +9,10 @@ search and read other reporters' tickets. This server offers exactly one tool,
 ``jira_ticket_create``, and fixes the site and project in the connection
 configuration, so the worst a visitor can do is file a ticket in that project.
 
-There is deliberately no read, search, get, update, comment, transition or
-delete tool, and no argument selects a project, site or URL. Attachments are
-only ever uploaded to the issue the same call just created.
+There is deliberately no agent tool to read, search, update, comment,
+transition or delete tickets, and no argument selects a project, site or
+URL. Attachments are only ever uploaded to the issue the same call just
+created. The separate connection probe reads account and permission metadata.
 
 Attachments are read only from directories named in
 ``XAGENT_JIRA_FILE_ALLOWED_DIRS``. The shared helper treats an unset or blank
@@ -41,10 +42,13 @@ import logging
 import os
 import re
 import socket
+import sys
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlencode
 
 from mcp.server.fastmcp import FastMCP
+from mcp.types import ToolAnnotations
 from urllib3.exceptions import ConnectTimeoutError, MaxRetryError, NewConnectionError
 
 from ....core.utils import public_requests as requests
@@ -53,6 +57,7 @@ from ....core.utils.security import (
     redact_sensitive_text,
     reject_private_network_host,
 )
+from ...connector_probes import JIRA_TICKET_PROBE_ARG
 from ...utils.graphql_errors import truncate_error_text
 from .jira_attachment import (
     UPLOAD_ALLOWED_DIRS_ENV_VAR,
@@ -65,6 +70,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("jira-ticket-mcp")
 
 mcp = FastMCP("jira-ticket-mcp")
+probe_mcp = FastMCP("jira-ticket-connection-probe")
 
 # The public_requests facade's Session pins every connection to the address it
 # validated as public, honours only the operator-trusted egress proxy, ignores
@@ -85,6 +91,7 @@ _ISSUE_KEY_PATTERN = re.compile(r"\A[A-Z][A-Z0-9_]*-[0-9]+\Z")
 _EMAIL_PATTERN = re.compile(r"\A[^@\s:]+@[^@\s:]+\Z")
 
 CREATE_TIMEOUT_SECONDS = 30
+PROBE_REQUEST_TIMEOUT_SECONDS = 10
 DEFAULT_ISSUE_TYPE = "Task"
 # Jira's own limit for the summary field.
 MAX_SUMMARY_CHARS = 255
@@ -343,6 +350,81 @@ def _send(
             response=response
         )
     return response
+
+
+_PROBE_HTTP_REASONS = {
+    401: "jira_ticket_credentials_rejected",
+    403: "jira_ticket_project_permission_required",
+    404: "jira_ticket_site_or_project_not_found",
+}
+
+
+def _probe_error(message: str, reason: str) -> str:
+    return json.dumps({"status": "error", "message": message, "reason": reason})
+
+
+def _probe_response(site: str, path: str) -> Any:
+    response = _send(site, "GET", path, timeout=PROBE_REQUEST_TIMEOUT_SECONDS)
+    try:
+        return response.json()
+    except ValueError:
+        raise RuntimeError(
+            "Jira returned a non-JSON connection check response."
+        ) from None
+
+
+@probe_mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
+def jira_ticket_check_connection() -> str:
+    """Check credentials and ticket creation permission for the configured project."""
+    try:
+        project_key = _project_key()
+        site = _base_url()
+        # mypermissions also serves anonymous callers. Require an authenticated
+        # account before interpreting any project permission as a valid grant.
+        account = _probe_response(site, "/rest/api/3/myself")
+        account_id = account.get("accountId") if isinstance(account, dict) else None
+        if not isinstance(account_id, str) or not account_id:
+            return _probe_error(
+                "Jira did not identify an authenticated account. Check that "
+                "JIRA_TICKET_API_TOKEN is a classic (unscoped) Atlassian API token "
+                "created by the JIRA_TICKET_EMAIL account.",
+                "jira_ticket_credentials_rejected",
+            )
+
+        required = ("BROWSE_PROJECTS", "CREATE_ISSUES")
+        query = urlencode(
+            {"projectKey": project_key, "permissions": ",".join(required)}
+        )
+        payload = _probe_response(site, f"/rest/api/3/mypermissions?{query}")
+        permissions = payload.get("permissions") if isinstance(payload, dict) else None
+        if not isinstance(permissions, dict):
+            return _error("Jira did not return a valid project permission result.")
+        for key in required:
+            permission = permissions.get(key)
+            allowed = (
+                permission.get("havePermission")
+                if isinstance(permission, dict)
+                else None
+            )
+            if allowed is False:
+                return _probe_error(
+                    "Jira denied the project permission check. Check "
+                    "JIRA_TICKET_PROJECT_KEY and the account's Browse Projects and "
+                    "Create Issues permissions on this project.",
+                    "jira_ticket_project_permission_required",
+                )
+            if allowed is not True:
+                return _error("Jira did not return a valid project permission result.")
+        return _success()
+    except ValueError as exc:
+        return _probe_error(_safe_text(exc), "jira_ticket_invalid_configuration")
+    except (RuntimeError, requests.RequestException) as exc:
+        cause = exc.__cause__
+        if isinstance(cause, requests.HTTPError) and cause.response is not None:
+            reason = _PROBE_HTTP_REASONS.get(cause.response.status_code)
+            if reason is not None:
+                return _probe_error(_safe_text(exc), reason)
+        return _error(_safe_text(exc))
 
 
 def _validated_labels(labels: list[str] | None) -> list[str]:
@@ -645,4 +727,5 @@ def jira_ticket_create(
 
 
 if __name__ == "__main__":
-    mcp.run(transport="stdio")
+    server = probe_mcp if sys.argv[1:] == [JIRA_TICKET_PROBE_ARG] else mcp
+    server.run(transport="stdio")

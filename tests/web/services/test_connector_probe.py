@@ -37,7 +37,11 @@ from xagent.web.api.mcp import (
     _ensure_catalog_mcp_oauth_server,
 )
 from xagent.web.builtin_mcp_registry import seed_builtin_oauth_and_public_mcp_apps
-from xagent.web.connector_probes import ConnectorProbe
+from xagent.web.connector_probes import (
+    JIRA_TICKET_PROBE_ARG,
+    ConnectorProbe,
+    get_connector_probe,
+)
 from xagent.web.models.database import Base
 from xagent.web.models.mcp import MCPServer, UserMCPServer
 from xagent.web.models.public_mcp import PublicMCPApp
@@ -52,6 +56,7 @@ from xagent.web.services.connector_probe import (
     is_connector_probe_user,
     run_connector_probe,
 )
+from xagent.web.services.mcp_connector_session import list_connector_tools
 
 SECRET_TEXT = "Bad credentials for token ghp_secret at https://api.github.com/user"
 
@@ -231,6 +236,62 @@ async def test_declared_probe_passes_on_a_success_envelope(db_users, monkeypatch
     ((connections, _),) = loader.calls
     (connection,) = connections.values()
     assert connection["env"]["GITHUB_ACCESS_TOKEN"] == "gh-token"
+
+
+@pytest.mark.asyncio
+async def test_jira_ticket_probe_uses_a_separate_launch(db_users, monkeypatch):
+    db, user, _ = db_users
+    # The shipped app stays hidden pending validation with live credentials.
+    app = db.query(PublicMCPApp).filter_by(app_id="jira-ticket").one()
+    app.is_visible_in_connector = True
+    db.commit()
+    server, _ = _ensure_catalog_app_server(db, "jira-ticket")
+    credentials = {
+        "JIRA_TICKET_SITE": "acme",
+        "JIRA_TICKET_EMAIL": "monitor@example.test",
+        "JIRA_TICKET_API_TOKEN": "jira-token",
+        "JIRA_TICKET_PROJECT_KEY": "SUP",
+    }
+    _link_without_owning(
+        db, user, server, env=encrypt_env_dict(credentials), env_source="own"
+    )
+    adapter = _Adapter(
+        "jira_ticket_check_connection", _text_result('{"status": "success"}')
+    )
+    loader = _Loader(adapter)
+    monkeypatch.setattr(LOADER, loader)
+
+    result = await run_connector_probe(db, user=user, server_id=server.id)
+    await list_connector_tools(db, user=user, server_id=server.id, name_prefix="mcp_")
+
+    assert result.outcome is ConnectorProbeOutcome.OK
+    assert adapter.calls == [{}]
+    ((probe_connections, _), (regular_connections, _)) = loader.calls
+    probe = probe_connections[server.name]
+    regular = regular_connections[server.name]
+    assert regular["args"] == ["-m", "xagent.web.tools.mcp.jira_ticket"]
+    assert probe["args"] == [*regular["args"], JIRA_TICKET_PROBE_ARG]
+    assert all(probe["env"][key] == value for key, value in credentials.items())
+
+
+@pytest.mark.parametrize(
+    ("reason", "expected"),
+    [
+        ("jira_ticket_credentials_rejected", "jira_ticket_credentials_rejected"),
+        (SECRET_TEXT, "status_not_success"),
+    ],
+)
+def test_jira_ticket_probe_exposes_only_declared_failure_reasons(reason, expected):
+    probe = get_connector_probe("jira-ticket")
+    assert probe is not None
+    raw = _text_result(
+        json.dumps({"status": "error", "reason": reason, "message": SECRET_TEXT})
+    )
+
+    assert evaluate_probe_result(raw, probe) == (
+        ConnectorProbeOutcome.PROBE_ASSERTION_FAILED,
+        expected,
+    )
 
 
 @pytest.mark.asyncio

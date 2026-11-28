@@ -332,6 +332,7 @@ async def _run(
         server_id=server_id,
         name_prefix="probe_",
         refuse_sandboxed=True,
+        probe_mode=True,
         mcp_runtime_authorization_policy=mcp_runtime_authorization_policy,
         mcp_actor_stdio_connection_adapter=mcp_actor_stdio_connection_adapter,
         mcp_actor_execution_identity=mcp_actor_execution_identity,
@@ -365,6 +366,7 @@ async def _run_actor_stdio(
         app_id=app_id,
         name_prefix="probe_",
         refuse_sandboxed=True,
+        probe_mode=True,
         mcp_runtime_authorization_policy=mcp_runtime_authorization_policy,
         mcp_actor_stdio_connection_adapter=mcp_actor_stdio_connection_adapter,
         mcp_actor_execution_identity=mcp_actor_execution_identity,
@@ -443,7 +445,12 @@ def evaluate_probe_result(
         return ConnectorProbeOutcome.PROBE_ASSERTION_FAILED, "not_a_json_object"
     if "status" in payload:
         if payload["status"] != "success":
-            return ConnectorProbeOutcome.PROBE_ASSERTION_FAILED, "status_not_success"
+            reason = payload.get("reason")
+            return ConnectorProbeOutcome.PROBE_ASSERTION_FAILED, (
+                reason
+                if isinstance(reason, str) and reason in probe.failure_reasons
+                else "status_not_success"
+            )
     elif not probe.expect_keys:
         return ConnectorProbeOutcome.PROBE_ASSERTION_FAILED, "no_status"
     if any(key not in payload for key in probe.expect_keys):

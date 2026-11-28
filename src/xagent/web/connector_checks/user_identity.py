@@ -90,6 +90,7 @@ class UserIdentityAdapter:
             server_id=target.ref,
             name_prefix=_NAME_PREFIX,
             refuse_sandboxed=purpose is SessionPurpose.CALL_TOOLS,
+            probe_mode=purpose is SessionPurpose.CALL_TOOLS,
         )
 
     def resolve_fixture(self, key: str) -> FixtureValue | None:

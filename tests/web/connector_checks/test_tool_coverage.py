@@ -78,6 +78,9 @@ def _registered_tools(module_name: str) -> set[str]:
         # The low-level Server modules (linkedin) expose the handler directly.
         tools = asyncio.run(module.list_tools())
     registered = {tool.name for tool in tools}
+    # Jira Ticket runs its diagnostics in a separate probe-only launch.
+    if module_name == "xagent.web.tools.mcp.jira_ticket":
+        registered |= {tool.name for tool in asyncio.run(module.probe_mcp.list_tools())}
     # zoom offers its meeting-write tool only when a deployment switch is on;
     # an exemption has to cover it whether or not this process sees it.
     register_gated = getattr(module, "_register_meeting_write_tools", None)

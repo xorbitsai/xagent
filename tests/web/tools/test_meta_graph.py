@@ -426,6 +426,35 @@ def test_proxy_upstream_graph_error_keeps_the_graph_error_body(
     assert "403" in str(caught.value)
 
 
+@pytest.mark.parametrize("redirect_status", [301, 302, 303, 307, 308])
+def test_proxy_rejects_unfollowed_provider_redirect(
+    monkeypatch, composio_env, redirect_status
+):
+    calls = _capture_proxy(monkeypatch, _proxy_response("", status=redirect_status))
+
+    token = composio_proxy.begin_request_count()
+    try:
+        with pytest.raises(
+            meta_graph.GraphAPIError,
+            match="the request was redirected and the redirect not followed",
+        ) as caught:
+            meta_graph.graph_request("GET", "/me")
+    finally:
+        accepted = composio_proxy.end_request_count(token)
+
+    assert not isinstance(caught.value, meta_graph.ComposioProxyError)
+    assert len(calls) == accepted == 1
+
+
+@pytest.mark.parametrize("status, data", [(300, {"data": ["choice"]}), (304, None)])
+def test_proxy_returns_data_for_other_3xx_responses(
+    monkeypatch, composio_env, status, data
+):
+    _capture_proxy(monkeypatch, _proxy_response(data, status=status))
+
+    assert meta_graph.graph_request("GET", "/me") == (data if data is not None else {})
+
+
 @pytest.mark.parametrize("http_status", [401, 404, 429, 500])
 def test_proxy_composio_failure_is_distinct_and_redacted(
     monkeypatch, composio_env, http_status

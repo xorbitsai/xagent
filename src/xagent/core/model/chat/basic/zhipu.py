@@ -22,15 +22,17 @@ from ..types import ChunkType, StreamChunk
 from .base import BaseLLM
 
 ZhipuAiClient: "type[_ZhipuAiClient] | None"
+ZaiAPIStatusError: "type[_ZaiAPIStatusError] | None"
 try:
     from zai import ZhipuAiClient as _ZhipuAiClient
-    from zai.core import APIStatusError as ZaiAPIStatusError
+    from zai.core import APIStatusError as _ZaiAPIStatusError
 except ImportError:
     # Fallback for when zai SDK is not available
     ZhipuAiClient = None
-    ZaiAPIStatusError = None  # type: ignore[assignment]
+    ZaiAPIStatusError = None
 else:
     ZhipuAiClient = _ZhipuAiClient
+    ZaiAPIStatusError = _ZaiAPIStatusError
 
 logger = logging.getLogger(__name__)
 

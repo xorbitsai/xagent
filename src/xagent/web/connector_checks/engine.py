@@ -58,11 +58,10 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import logging
-import math
 import time
 from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from typing import Any
 
 from ...config import get_connector_smoke_write_apps
@@ -81,7 +80,6 @@ from .fixtures import FixtureMissing, resolve_fixtures
 from .identity import (
     ConnectorTarget,
     IdentityAdapter,
-    IdentitySetupError,
     SessionPurpose,
 )
 from .registry import connector_checks_for
@@ -94,6 +92,13 @@ from .results import (
     RunResult,
     SessionRow,
     classify_session,
+)
+from .run_support import (
+    ResolverFailed,
+    RunDeadline,
+    SafeResolver,
+    enumerate_targets,
+    validate_timeout,
 )
 from .writes import (
     PreparedWrite,
@@ -154,48 +159,6 @@ class _ConnectorPlan:
         return self.target.connector
 
 
-class _ResolverFailed(Exception):
-    """The adapter's fixture resolver raised; carries nothing from the error."""
-
-
-class _SafeResolver:
-    """Wraps the adapter's resolver so a raise becomes ``_ResolverFailed``."""
-
-    def __init__(self, adapter: IdentityAdapter) -> None:
-        self._adapter = adapter
-
-    def resolve_fixture(self, key: str) -> Any:
-        try:
-            return self._adapter.resolve_fixture(key)
-        except FixtureMissing:
-            # A missing key all the same; reported under the requested key,
-            # which is a validated code, never under one the adapter chose.
-            raise FixtureMissing(key) from None
-        except Exception as error:
-            logger.warning("Resolving fixture %s raised %s", key, type(error).__name__)
-            raise _ResolverFailed() from None
-
-
-class _Clock:
-    """The run's deadline, and whether it has cut anything."""
-
-    def __init__(self, total_timeout: float) -> None:
-        self._started = time.monotonic()
-        self._deadline = self._started + total_timeout
-        self.cut = False
-
-    def elapsed(self) -> timedelta:
-        return timedelta(seconds=time.monotonic() - self._started)
-
-    def remaining(self) -> float:
-        return self._deadline - time.monotonic()
-
-    def expired(self) -> bool:
-        if not self.cut and self.remaining() <= 0:
-            self.cut = True
-        return self.cut
-
-
 async def run_checks(
     adapter: IdentityAdapter,
     *,
@@ -222,10 +185,10 @@ async def run_checks(
     raises as ``write_policy:exception``.
     """
     started_at = datetime.now(timezone.utc)
-    _require_finite_positive(total_timeout)
+    validate_timeout(total_timeout)
     if check_timeout is not None:
-        _require_finite_positive(check_timeout)
-    clock = _Clock(total_timeout)
+        validate_timeout(check_timeout)
+    clock = RunDeadline(total_timeout)
     if isinstance(connectors, str) or isinstance(checks, str):
         raise TypeError("a selector is a collection of names, not one string")
     if not IDENTITY_PATTERN.fullmatch(adapter.label):
@@ -250,17 +213,9 @@ async def run_checks(
             failure=failure,
         )
 
-    try:
-        targets = list(adapter.enumerate_targets())
-    except IdentitySetupError as error:
-        return finish((), error.code)
-    except Exception as error:
-        logger.warning("Enumerating connectors raised %s", type(error).__name__)
-        return finish((), "enumeration:exception")
-    if not targets:
-        return finish((), "enumeration:no_connectors")
-    if len({target.connector for target in targets}) != len(targets):
-        return finish((), "enumeration:duplicate_connector")
+    targets, failure = enumerate_targets(adapter, logger)
+    if failure is not None:
+        return finish((), failure)
 
     try:
         plans = _plan(
@@ -272,7 +227,7 @@ async def run_checks(
             write_apps=write_apps,
             run_id=run_id,
         )
-    except _ResolverFailed:
+    except ResolverFailed:
         return finish((), "fixtures:exception")
     except WritePolicyFailed:
         return finish((), "write_policy:exception")
@@ -347,7 +302,7 @@ def _plan(
                 if isinstance(check, ReadCheck)
             },
             writes=prepare_writes(
-                plan.checks, plan.target, adapter, _SafeResolver(adapter), run_id
+                plan.checks, plan.target, adapter, SafeResolver(adapter, logger), run_id
             )
             if plan.writes_enabled
             else {},
@@ -364,17 +319,10 @@ def _raise_if_cancelled() -> None:
         raise asyncio.CancelledError
 
 
-def _require_finite_positive(timeout: float) -> None:
-    # A bool is an int; NaN breaks the event loop's timer ordering, and
-    # infinity never expires.
-    if isinstance(timeout, bool) or not math.isfinite(timeout) or timeout <= 0:
-        raise ValueError("a timeout must be a finite number of seconds above 0")
-
-
 def _prepare(check: ReadCheck, adapter: IdentityAdapter) -> _Prepared:
     """``check`` with its fixtures resolved; only an unresolved key is a
-    skip, and a resolver that raises is ``_ResolverFailed``."""
-    resolver = _SafeResolver(adapter)
+    skip, and a resolver that raises is ``ResolverFailed``."""
+    resolver = SafeResolver(adapter, logger)
     try:
         arguments = resolve_fixtures(dict(check.arguments), resolver)
         assertions = resolve_expected(check.assertions, resolver)
@@ -387,7 +335,7 @@ async def _run_connector(
     adapter: IdentityAdapter,
     plan: _ConnectorPlan,
     *,
-    clock: _Clock,
+    clock: RunDeadline,
     check_timeout: float,
 ) -> list[SessionRow | CheckRow]:
     connector = plan.connector
@@ -477,7 +425,7 @@ async def _run_read(
     prepared: _Prepared,
     tools: Any,
     *,
-    clock: _Clock,
+    clock: RunDeadline,
     check_timeout: float,
 ) -> CheckRow:
     check = prepared.check

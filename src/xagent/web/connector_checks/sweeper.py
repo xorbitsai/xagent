@@ -47,21 +47,17 @@ deleted, failed, kept and unparsed. It carries no name, id or value.
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
-import math
 import re
 import time
 from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from importlib import resources
 from typing import Any
 
 from ...config import get_connector_smoke_write_apps
 from ..services.connector_probe import find_tool, probe_call_timeout_seconds
 from .assertions import at_path, resolve_expected, value_at
-from .codes import APP_ID_PATTERN, is_code
 from .declarations import (
     DECLARATION_FORMAT_VERSION,
     RUN_SCOPED_PREFIX,
@@ -76,19 +72,29 @@ from .fixtures import FixtureMissing, resolve_fixtures
 from .identity import (
     ConnectorTarget,
     IdentityAdapter,
-    IdentitySetupError,
     SessionPurpose,
     WritePolicy,
 )
 from .registry import connector_checks_for
 from .results import (
     ENVIRONMENT_PATTERN,
-    FAIL_CLASSES,
     IDENTITY_PATTERN,
-    SKIP_CLASSES,
     FailureClass,
     Outcome,
     classify_session,
+    format_timestamp,
+    load_document_schema,
+    validate_connector,
+    validate_nonnegative_int,
+    validate_outcome,
+    validate_run_header,
+)
+from .run_support import (
+    ResolverFailed,
+    RunDeadline,
+    SafeResolver,
+    enumerate_targets,
+    validate_timeout,
 )
 from .writes import (
     Step,
@@ -140,21 +146,12 @@ class SweepRow:
     duration_ms: int = 0
 
     def __post_init__(self) -> None:
-        if not APP_ID_PATTERN.fullmatch(self.connector):
-            raise ValueError(f"invalid connector: {self.connector!r}")
-        if self.reason is not None and not is_code(self.reason):
-            raise ValueError("a reason must be a code")
-        valid = {
-            Outcome.PASS: self.failure_class is None,
-            Outcome.FAIL: self.failure_class in FAIL_CLASSES,
-            Outcome.SKIP: self.failure_class in SKIP_CLASSES,
-        }.get(self.outcome, False)
-        if not valid:
-            raise ValueError(f"{self.outcome} cannot carry {self.failure_class}")
+        validate_connector(self.connector, label="connector")
+        validate_outcome(
+            self.outcome, self.failure_class, self.reason, row_kind="sweep"
+        )
         for name in ("found", "deleted", "failed", "kept", "unparsed", "duration_ms"):
-            value = getattr(self, name)
-            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-                raise ValueError(f"{name} must be a non-negative integer")
+            validate_nonnegative_int(name, getattr(self, name))
 
     def to_json(self) -> dict[str, Any]:
         return {
@@ -187,24 +184,16 @@ class SweepResult:
     failure: str | None = None
 
     def __post_init__(self) -> None:
-        if not IDENTITY_PATTERN.fullmatch(self.identity):
-            raise ValueError(f"invalid identity label: {self.identity!r}")
-        if self.environment is not None and not ENVIRONMENT_PATTERN.fullmatch(
-            self.environment
-        ):
-            raise ValueError(f"invalid environment label: {self.environment!r}")
-        for moment in (self.started_at, self.finished_at):
-            if moment.utcoffset() is None:
-                raise ValueError("sweep times must be timezone-aware")
-        if self.finished_at < self.started_at:
-            raise ValueError("a sweep cannot finish before it starts")
-        if self.failure is not None:
-            if not is_code(self.failure):
-                raise ValueError("a sweep failure must be a code")
-            if self.complete or self.rows:
-                raise ValueError(
-                    "a sweep that failed to set up is incomplete and empty"
-                )
+        validate_run_header(
+            self.identity,
+            self.environment,
+            self.started_at,
+            self.finished_at,
+            complete=self.complete,
+            has_rows=bool(self.rows),
+            failure=self.failure,
+            document="sweep",
+        )
         connectors = [row.connector for row in self.rows]
         if len(set(connectors)) != len(connectors):
             raise ValueError("two rows for one connector")
@@ -216,8 +205,8 @@ class SweepResult:
             "declaration_format_version": DECLARATION_FORMAT_VERSION,
             "identity": self.identity,
             "environment": self.environment,
-            "started_at": _timestamp(self.started_at),
-            "finished_at": _timestamp(self.finished_at),
+            "started_at": format_timestamp(self.started_at),
+            "finished_at": format_timestamp(self.finished_at),
             "complete": self.complete,
             "failure": self.failure,
             "older_than_seconds": int(SWEEP_AFTER.total_seconds()),
@@ -228,13 +217,7 @@ class SweepResult:
 
 def load_sweep_schema() -> dict[str, Any]:
     """The JSON Schema every sweep document validates against."""
-    text = (
-        resources.files(__package__)
-        .joinpath("sweep.schema.json")
-        .read_text(encoding="utf-8")
-    )
-    schema: dict[str, Any] = json.loads(text)
-    return schema
+    return load_document_schema("sweep.schema.json")
 
 
 @dataclass(frozen=True)
@@ -264,23 +247,6 @@ class _Counts:
     unparsed: int = 0
 
 
-class _ResolverFailed(Exception):
-    """The adapter's fixture resolver raised; carries nothing from the error."""
-
-
-class _Deadline:
-    def __init__(self, total_timeout: float) -> None:
-        self._started = time.monotonic()
-        self._deadline = self._started + total_timeout
-        self.cut = False
-
-    def elapsed(self) -> timedelta:
-        return timedelta(seconds=time.monotonic() - self._started)
-
-    def remaining(self) -> float:
-        return self._deadline - time.monotonic()
-
-
 async def run_sweep(
     adapter: IdentityAdapter,
     *,
@@ -303,10 +269,8 @@ async def run_sweep(
     """
     started_at = now()
     for timeout in (total_timeout, call_timeout):
-        if timeout is not None and (
-            isinstance(timeout, bool) or not math.isfinite(timeout) or timeout <= 0
-        ):
-            raise ValueError("a timeout must be a finite number of seconds above 0")
+        if timeout is not None:
+            validate_timeout(timeout)
     if isinstance(connectors, str):
         raise TypeError("a selector is a collection of names, not one string")
     if not IDENTITY_PATTERN.fullmatch(adapter.label):
@@ -314,7 +278,7 @@ async def run_sweep(
     if environment is not None and not ENVIRONMENT_PATTERN.fullmatch(environment):
         raise ValueError("invalid environment label")
     timeout = float(call_timeout or probe_call_timeout_seconds())
-    deadline = _Deadline(total_timeout)
+    deadline = RunDeadline(total_timeout)
 
     def finish(rows: Sequence[SweepRow], failure: str | None) -> SweepResult:
         return SweepResult(
@@ -327,20 +291,13 @@ async def run_sweep(
             failure=failure,
         )
 
-    try:
-        targets = list(adapter.enumerate_targets())
-    except IdentitySetupError as error:
-        return finish((), error.code)
-    except Exception as error:
-        logger.warning("Enumerating connectors raised %s", type(error).__name__)
-        return finish((), "enumeration:exception")
-    if not targets:
-        return finish((), "enumeration:no_connectors")
-    if len({target.connector for target in targets}) != len(targets):
-        return finish((), "enumeration:duplicate_connector")
+    targets, failure = enumerate_targets(adapter, logger)
+    if failure is not None:
+        return finish((), failure)
+
     try:
         plans = _plan(adapter, targets, declarations, connectors)
-    except _ResolverFailed:
+    except ResolverFailed:
         return finish((), "fixtures:exception")
     except WritePolicyFailed:
         return finish((), "write_policy:exception")
@@ -418,7 +375,7 @@ def _prepare(
     if refusal is not None:
         return _Plan(target, sweep, True, refusal)
 
-    resolver = _SafeResolver(adapter)
+    resolver = SafeResolver(adapter, logger)
     try:
         tenant = resolve_fixtures(sweep.tenant_pin.expected, resolver)
         steps = {
@@ -431,24 +388,7 @@ def _prepare(
     return _Plan(target, sweep, True, None, steps, tenant)
 
 
-class _SafeResolver:
-    """The adapter's resolver; a raise other than ``FixtureMissing`` is
-    ``_ResolverFailed``, which carries nothing from the error."""
-
-    def __init__(self, adapter: IdentityAdapter) -> None:
-        self._adapter = adapter
-
-    def resolve_fixture(self, key: str) -> Any:
-        try:
-            return self._adapter.resolve_fixture(key)
-        except FixtureMissing:
-            raise FixtureMissing(key) from None
-        except Exception as error:
-            logger.warning("Resolving fixture %s raised %s", key, type(error).__name__)
-            raise _ResolverFailed() from None
-
-
-def _step(step: ToolStep, resolver: _SafeResolver) -> Step:
+def _step(step: ToolStep, resolver: SafeResolver) -> Step:
     return Step(
         step.tool,
         resolve_fixtures(dict(step.arguments), resolver),
@@ -460,7 +400,7 @@ def _step(step: ToolStep, resolver: _SafeResolver) -> Step:
 async def _sweep_connector(
     adapter: IdentityAdapter,
     plan: _Plan,
-    deadline: _Deadline,
+    deadline: RunDeadline,
     timeout: float,
     now: datetime,
 ) -> SweepRow:
@@ -699,7 +639,3 @@ def _item_id(step: Step, item: Any) -> tuple[str, ...] | None:
         else str(value)
         for value in found
     )
-
-
-def _timestamp(moment: datetime) -> str:
-    return moment.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")

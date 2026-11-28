@@ -1,4 +1,5 @@
 import json
+import time
 from unittest.mock import Mock
 
 import pytest
@@ -1387,7 +1388,53 @@ def test_get_channel_history_reports_actionable_error_when_not_a_member(monkeypa
     assert mock_request.call_count == 1
 
 
-def test_get_channel_history_no_policy_not_a_member_message_is_unchanged(monkeypatch):
+@pytest.mark.parametrize("with_policy", [False, True])
+@pytest.mark.parametrize("error_code", ["not_in_channel", "channel_not_found"])
+def test_get_channel_history_dm_advice(monkeypatch, with_policy, error_code):
+    channel = "D0123456789"
+    if with_policy:
+        monkeypatch.setenv(
+            slack._CHANNEL_ACCESS_POLICY_ENV_VAR,
+            json.dumps(
+                {
+                    "version": 2,
+                    "channel_ids": [channel],
+                    "expires_at": time.time() + 300,
+                    "capabilities": ["read"],
+                }
+            ),
+        )
+    else:
+        monkeypatch.delenv(slack._CHANNEL_ACCESS_POLICY_ENV_VAR, raising=False)
+    request = Mock(return_value=MockResponse({"ok": False, "error": error_code}))
+    monkeypatch.setattr(slack.requests, "request", request)
+
+    result = json.loads(slack.slack_get_channel_history(channel))
+
+    assert result["status"] == "error"
+    assert "the bot cannot access this direct message" in result["message"]
+    assert "/invite" not in result["message"]
+    assert "slack_join_channel" not in result["message"]
+    request.assert_called_once()
+
+
+def test_get_channel_history_explains_invisible_private_channel(monkeypatch):
+    request = Mock(return_value=MockResponse({"ok": True, "channels": []}))
+    monkeypatch.setattr(slack.requests, "request", request)
+
+    result = json.loads(slack.slack_get_channel_history("#private-planning"))
+
+    assert result["status"] == "error"
+    assert "private channel" in result["message"]
+    assert "/invite" in result["message"]
+    assert "before the bot can see it" in result["message"]
+    request.assert_called_once()
+
+
+@pytest.mark.parametrize("channel", ["C0123456789", "G0123456789"])
+def test_get_channel_history_no_policy_not_a_member_message_is_unchanged(
+    monkeypatch, channel
+):
     """Pins the exact no-policy advice text, so an edit made for the policy
     variant cannot change it unnoticed."""
     monkeypatch.delenv(slack._CHANNEL_ACCESS_POLICY_ENV_VAR, raising=False)
@@ -1396,7 +1443,7 @@ def test_get_channel_history_no_policy_not_a_member_message_is_unchanged(monkeyp
     )
     monkeypatch.setattr(slack.requests, "request", mock_request)
 
-    result = json.loads(slack.slack_get_channel_history("C0123456789"))
+    result = json.loads(slack.slack_get_channel_history(channel))
 
     assert result["message"] == (
         "not_in_channel: the bot cannot access this channel — because the "

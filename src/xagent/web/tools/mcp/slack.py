@@ -227,7 +227,9 @@ def _resolve_channel_id(channel: str) -> str:
     raise ValueError(
         f"Could not resolve channel '{channel}' to an id — use slack_list_channels "
         "or slack_list_direct_messages to look it up, or pass the channel id "
-        "directly."
+        "directly. A private channel the bot is not in stays invisible to "
+        "conversations.list; a member of it needs to run "
+        "`/invite @<this app's bot name>` before the bot can see it."
     )
 
 
@@ -586,6 +588,19 @@ def _request_requiring_membership(
             # not_in_channel is unambiguous per Slack's own docs — no need
             # to hedge.
             cause = "because the bot isn't a member of it"
+        request_data = params if params is not None else (json_data or {})
+        channel = request_data.get("channel") or request_data.get("channel_id")
+        if (
+            isinstance(channel, str)
+            and channel.startswith("D")
+            and _SLACK_ID_PATTERN.fullmatch(channel)
+        ):
+            raise _SlackNotAMemberError(
+                f"{e.code}: the bot cannot access this direct message. "
+                "A bot can only access direct messages it is already part of. "
+                "Ask the user to share the relevant messages in a conversation "
+                "the bot can access."
+            ) from None
         if _runtime_policy_installed():
             # slack_join_channel is not offered under a policy (see
             # _drop_tools_the_policy_forbids), so only a member can add it.

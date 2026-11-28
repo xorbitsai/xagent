@@ -53,10 +53,12 @@ interface AutoCandidate {
   target_model: Model;
 }
 
+type AutoMode = "routing" | "sequential_failover";
+
 interface AutoConfig {
   configured: boolean;
-  mode: "routing" | "sequential_failover";
-  fallback_model_id?: number;
+  mode: AutoMode;
+  fallback_model_id?: number | null;
   auto_model?: Model;
   candidates: AutoCandidate[];
 }
@@ -149,11 +151,10 @@ export function AutoModelConfigCard({
   const [profiles, setProfiles] = useState<RouterProfile[]>([]);
   const [selectedIds, setSelectedIds] = useState<string[]>([]);
   const [bindings, setBindings] = useState<Record<string, string>>({});
-  const [fallbackId, setFallbackId] = useState<string>("");
-  const [mode, setMode] = useState<"routing" | "sequential_failover">(
-    "routing",
-  );
+  const [preferredFallbackId, setFallbackId] = useState<string>("");
+  const [mode, setMode] = useState<AutoMode>("routing");
   const [setAsDefault, setSetAsDefault] = useState(false);
+  const sequential = mode === "sequential_failover";
 
   const availableModels = useMemo(
     () =>
@@ -178,6 +179,12 @@ export function AutoModelConfigCard({
         .filter((model): model is Model => Boolean(model)),
     [availableModels, selectedIds],
   );
+
+  const fallbackId = selectedModels.some(
+    (model) => String(model.id) === preferredFallbackId,
+  )
+    ? preferredFallbackId
+    : String(selectedModels[0]?.id ?? "");
 
   const hydrateForm = (
     nextConfig: AutoConfig,
@@ -282,20 +289,18 @@ export function AutoModelConfigCard({
   };
 
   const duplicateProfiles = useMemo(() => {
-    if (mode === "sequential_failover") return new Set<string>();
-    const counts = Object.values(bindings).reduce<Record<string, number>>(
-      (acc, value) => {
-        if (value) acc[value] = (acc[value] || 0) + 1;
-        return acc;
-      },
-      {},
-    );
+    if (sequential) return new Set<string>();
+    const counts: Record<string, number> = {};
+    for (const model of selectedModels) {
+      const profile = bindings[String(model.id)];
+      if (profile) counts[profile] = (counts[profile] || 0) + 1;
+    }
     return new Set(
       Object.entries(counts)
         .filter(([, count]) => count > 1)
         .map(([id]) => id),
     );
-  }, [bindings, mode]);
+  }, [bindings, selectedModels, sequential]);
 
   // A saved binding can name a profile that a newer xrouter-llm release
   // dropped, or, in routing mode, one whose image, audio or video inputs no
@@ -315,18 +320,23 @@ export function AutoModelConfigCard({
     if (!binding) return null;
     const profile = profilesById.get(binding);
     if (!profile) return "unknownProfile";
-    if (mode === "routing" && !modalitiesMatch(model, profile)) {
+    if (!sequential && !modalitiesMatch(model, profile)) {
       return "modalityMismatch";
     }
     return null;
   };
 
   const moveCandidate = (index: number, offset: -1 | 1) => {
+    const candidate = selectedModels[index];
+    const neighbor = selectedModels[index + offset];
+    if (!candidate || !neighbor) return;
+
     setSelectedIds((current) => {
-      const target = index + offset;
-      if (target < 0 || target >= current.length) return current;
+      const from = current.indexOf(String(candidate.id));
+      const to = current.indexOf(String(neighbor.id));
+      if (from < 0 || to < 0) return current;
       const next = [...current];
-      [next[index], next[target]] = [next[target], next[index]];
+      [next[from], next[to]] = [next[to], next[from]];
       return next;
     });
   };
@@ -338,7 +348,7 @@ export function AutoModelConfigCard({
         Boolean(bindings[String(model.id)]) && bindingIssue(model) === null,
     ) &&
     duplicateProfiles.size === 0 &&
-    (mode === "sequential_failover" || Boolean(fallbackId));
+    (sequential || Boolean(fallbackId));
 
   const save = async () => {
     if (!canSave) return;
@@ -351,8 +361,7 @@ export function AutoModelConfigCard({
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
             mode,
-            fallback_model_id:
-              mode === "routing" ? Number(fallbackId) : null,
+            fallback_model_id: sequential ? null : Number(fallbackId),
             set_as_default: setAsDefault,
             candidates: selectedModels.map((model) => ({
               target_model_id: model.id,
@@ -460,9 +469,7 @@ export function AutoModelConfigCard({
               <Label>{t("models.auto.mode")}</Label>
               <Select
                 value={mode}
-                onValueChange={(value) =>
-                  setMode(value as "routing" | "sequential_failover")
-                }
+                onValueChange={(value) => setMode(value as AutoMode)}
               >
                 <SelectTrigger>
                   <SelectValue />
@@ -478,9 +485,9 @@ export function AutoModelConfigCard({
               </Select>
               <p className="text-xs text-muted-foreground">
                 {t(
-                  mode === "routing"
-                    ? "models.auto.modeRoutingHelp"
-                    : "models.auto.modeSequentialHelp",
+                  sequential
+                    ? "models.auto.modeSequentialHelp"
+                    : "models.auto.modeRoutingHelp",
                 )}
               </p>
             </div>
@@ -518,7 +525,7 @@ export function AutoModelConfigCard({
                       className="grid gap-2 rounded-lg border p-3 md:grid-cols-[1fr_1.4fr] md:items-center"
                     >
                       <div className="flex items-center gap-2">
-                        {mode === "sequential_failover" && (
+                        {sequential && (
                           <div className="flex shrink-0 gap-1">
                             <Button
                               type="button"
@@ -526,7 +533,9 @@ export function AutoModelConfigCard({
                               size="icon"
                               className="h-7 w-7"
                               disabled={index === 0}
-                              aria-label={t("models.auto.moveUp")}
+                              aria-label={t("models.auto.moveUp", {
+                                name: model.model_name,
+                              })}
                               onClick={() => moveCandidate(index, -1)}
                             >
                               <ChevronUp className="h-3.5 w-3.5" />
@@ -537,7 +546,9 @@ export function AutoModelConfigCard({
                               size="icon"
                               className="h-7 w-7"
                               disabled={index === selectedModels.length - 1}
-                              aria-label={t("models.auto.moveDown")}
+                              aria-label={t("models.auto.moveDown", {
+                                name: model.model_name,
+                              })}
                               onClick={() => moveCandidate(index, 1)}
                             >
                               <ChevronDown className="h-3.5 w-3.5" />
@@ -546,7 +557,7 @@ export function AutoModelConfigCard({
                         )}
                         <div>
                           <div className="text-sm font-medium">
-                            {mode === "sequential_failover" && `${index + 1}. `}
+                            {sequential && `${index + 1}. `}
                             {model.model_name}
                           </div>
                           <div className="break-all text-xs text-muted-foreground">
@@ -607,7 +618,7 @@ export function AutoModelConfigCard({
               </div>
             )}
 
-            {mode === "routing" && (
+            {!sequential && (
               <div className="space-y-2">
                 <Label>{t("models.auto.fallback")}</Label>
                 <Select

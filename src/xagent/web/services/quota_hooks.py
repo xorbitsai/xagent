@@ -199,7 +199,8 @@ def set_standalone_gate_hook(
     is decided here, at registration, from the hook's required positional
     parameters: three or exactly two. A hook whose signature leaves it
     ambiguous (``*args``, a defaulted third parameter, no readable signature)
-    is refused with a ``TypeError``; wrap it in a plain function.
+    is refused with a ``TypeError`` and leaves the previous hook installed.
+    Wrap it in a plain function or pass ``None`` to remove the previous hook.
 
     Return ``None`` to allow the work, or a reason to refuse it: a message
     ``str`` or a structured mapping (e.g. ``{"code", "metric", "message"}``)

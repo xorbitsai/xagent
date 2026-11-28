@@ -319,6 +319,15 @@ def test_a_gate_of_ambiguous_shape_is_rejected_at_registration(hook):
     assert quota_hooks.get_standalone_gate() is None
 
 
+def test_a_refused_gate_replacement_keeps_the_previous_hook(gate):
+    with pytest.raises(TypeError, match="standalone gate hook"):
+        quota_hooks.set_standalone_gate_hook(lambda user_id: None)
+
+    assert quota_hooks.get_standalone_gate_hook() is gate
+    check_standalone_gate(7, "kb_search", model_ids=())
+    assert gate.calls == [(7, "kb_search")]
+
+
 @pytest.mark.parametrize(
     "check",
     [

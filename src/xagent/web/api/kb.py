@@ -5165,7 +5165,8 @@ async def search(
     model_pin = ModelResolutionPin(enabled=gated)
     search_model_ids: tuple[str, ...] = ()
     if gated:
-        search_model_ids = model_pin.run(
+        search_model_ids = await asyncio.to_thread(
+            model_pin.run,
             resolve_search_model_ids,
             safe_collection,
             config=config,

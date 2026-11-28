@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING, Any, Mapping, Optional, Type
 
 from pydantic import BaseModel
 
-from ....agent.result import normalize_tool_failure_code
+from ....agent.result import normalize_tool_failure_code, tool_result_succeeded
 from ...tool_result_spill import (
     SPILL_RESERVED_RESULT_KEY,
     SpillRunBudget,
@@ -323,6 +323,19 @@ class OutputFilteredToolWrapper(AbstractBaseTool):
         if not isinstance(filtered, dict) or not isinstance(spilled, dict):
             return filtered
 
+        if not tool_result_succeeded(spilled):
+            # Failure markers are top-level metadata, even when they follow
+            # the payload in insertion order. Keep a false MCP is_error flag
+            # distinct from the adapter's success=False verdict.
+            for key in ("success", "is_error"):
+                flag = spilled.get(key)
+                if isinstance(flag, bool):
+                    filtered[key] = flag
+            if tool_result_succeeded(filtered):
+                # The only remaining failure signal was status. Restore the
+                # canonical marker without copying an unfiltered tool value.
+                filtered["status"] = "error"
+
         if tool_result_waits_for_user(spilled):
             filtered["status"] = WAITING_FOR_USER_STATUS
             for key in ("interaction_id", "message_type"):
@@ -339,17 +352,10 @@ class OutputFilteredToolWrapper(AbstractBaseTool):
             return filtered
 
         if is_classified_tool_failure(spilled):
-            # ``success``/``is_error`` were matched by identity above, so
-            # they are literally ``False``/``True``; the two caller-supplied
-            # classification values are re-checked before bypassing the
-            # filter. Only ``"error"`` can reach this branch for ``status``:
-            # both producers of the ``success=False``/``is_error=True`` pair
-            # hardcode it (agent_tool._classified_failure,
-            # mcp_adapter._run_unavailable), and a waiting result is handled
-            # above. Exact plain-string match keeps a ``str`` subclass from
-            # writing itself back unfiltered.
-            filtered["success"] = spilled["success"]
-            filtered["is_error"] = spilled["is_error"]
+            # The booleans are already restored. Re-check the remaining
+            # classification values before bypassing the filter. Exact
+            # plain-string match keeps a str subclass from writing itself
+            # back unfiltered as status.
             status = spilled.get("status")
             if type(status) is str and status == "error":
                 filtered["status"] = status

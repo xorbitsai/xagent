@@ -6,6 +6,7 @@ from typing import Any
 
 import pytest
 
+from xagent.core.agent.result import tool_result_succeeded
 from xagent.core.tools.adapters.vibe.output_filter_wrapper import (
     OutputFilteredToolWrapper,
 )
@@ -138,6 +139,66 @@ async def test_waiting_control_envelope_survives_field_filtering() -> None:
     )
     assert result["interactions"][1]["field"] == "second-routing-field"
     assert result["interactions"][1]["default"] is False
+
+
+@pytest.mark.parametrize(
+    ("max_fields", "markers", "succeeded", "retained"),
+    [
+        (
+            1,
+            {"is_error": False, "success": False},
+            False,
+            {"is_error": False, "success": False},
+        ),
+        (
+            3,
+            {"is_error": False, "success": False},
+            False,
+            {"is_error": False, "success": False},
+        ),
+        (2, {"is_error": True}, False, {"is_error": True}),
+        (1, {"status": "ERROR"}, False, {"status": "error"}),
+        (1, {"success": True}, True, {}),
+    ],
+)
+@pytest.mark.asyncio
+async def test_tool_result_verdict_survives_field_filtering(
+    max_fields: int,
+    markers: dict[str, Any],
+    succeeded: bool,
+    retained: dict[str, Any],
+) -> None:
+    raw_result = {
+        "content": [{"type": "text", "text": "Tool output"}],
+        "structured_content": None,
+        **markers,
+        "extra_payload": "This field should be dropped by the field cap.",
+    }
+
+    class ResultTool:
+        name = "result-tool"
+
+        async def run_json_async(self, args: dict[str, Any]) -> dict[str, Any]:
+            return raw_result
+
+    wrapper = OutputFilteredToolWrapper(
+        target_tool=ResultTool(),
+        max_chars=1_000,
+        max_fields=max_fields,
+        max_recursion=5,
+    )
+
+    result = await wrapper.run_json_async({})
+
+    assert tool_result_succeeded(raw_result) is succeeded
+    assert tool_result_succeeded(result) is succeeded
+    for key, value in retained.items():
+        assert result[key] == value
+    if "is_error" in markers and not succeeded:
+        assert result["is_error"] is markers["is_error"]
+    if "is_error" not in markers:
+        assert "is_error" not in result
+    assert "extra_payload" not in result
 
 
 @pytest.mark.asyncio

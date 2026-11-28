@@ -501,8 +501,11 @@ def _validate_write(app_id: str, check: WriteCheck) -> None:
         raise DeclarationError(
             f"{where}: an expected verdict is needed for exactly {sorted(write_tools)}"
         )
-    allowed = set(get_args(ExpectedVerdict))
-    if any(verdict not in allowed for verdict in verdicts.values()):
+    allowed = get_args(ExpectedVerdict)
+    if any(
+        not isinstance(verdict, str) or verdict not in allowed
+        for verdict in verdicts.values()
+    ):
         raise DeclarationError(f"{where}: unknown expected verdict")
 
 
@@ -736,6 +739,8 @@ def _validate_call(
     _validate_json_value(where, arguments)
     if payload not in get_args(PayloadSource):
         raise DeclarationError(f"{where}: unknown payload source {payload!r}")
+    if not isinstance(assertions, tuple):
+        raise DeclarationError(f"{where}: assertions must be a tuple")
     for assertion in assertions:
         _validate_assertion(where, assertion)
     if any(isinstance(item, L3Envelope) for item in assertions):
@@ -822,6 +827,8 @@ def _refuse_references(
 
 
 def _validate_assertion(where: str, assertion: Assertion) -> None:
+    if not isinstance(assertion, Assertion):
+        raise DeclarationError(f"{where}: unknown assertion {type(assertion).__name__}")
     if isinstance(assertion, StatusSuccess):
         return
     if isinstance(assertion, L3Envelope):
@@ -837,6 +844,10 @@ def _validate_assertion(where: str, assertion: Assertion) -> None:
         if assertion.type not in get_args(JsonType):
             raise DeclarationError(f"{where}: unknown JSON type {assertion.type!r}")
     elif isinstance(assertion, Length):
+        if type(assertion.min) is not int or (
+            assertion.max is not None and type(assertion.max) is not int
+        ):
+            raise DeclarationError(f"{where}: length bounds must be integers")
         if assertion.min < 0 or (
             assertion.max is not None and assertion.max < assertion.min
         ):
@@ -849,11 +860,11 @@ def _validate_assertion(where: str, assertion: Assertion) -> None:
             value, (str, bool, int, float, FixtureRef, RunScopedName, CreatedRef)
         ):
             raise DeclarationError(f"{where}: Equals takes a scalar value")
-    else:
-        raise DeclarationError(f"{where}: unknown assertion {type(assertion).__name__}")
 
 
 def _validate_keys(where: str, keys: tuple[str, ...], *, allow_empty: bool) -> None:
+    if not isinstance(keys, tuple):
+        raise DeclarationError(f"{where}: keys must be a tuple of strings")
     if (not keys and not allow_empty) or not all(
         isinstance(key, str) and key for key in keys
     ):

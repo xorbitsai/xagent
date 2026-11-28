@@ -9,6 +9,7 @@ from typing import Any
 from urllib.parse import urlsplit
 
 from mcp.server.fastmcp import FastMCP
+from mcp.types import ToolAnnotations
 
 from ....config import get_tool_max_output_length
 from ....core.tools.core.web_content import get_trusted_proxy_url
@@ -791,7 +792,7 @@ def _category_summary(category: dict[str, Any], _depth: int = 0) -> dict[str, An
     }
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
 def magento_list_products(
     sku_like: str = "", status: int | None = None, limit: int = 25, page: int = 1
 ) -> str:
@@ -827,7 +828,7 @@ def magento_list_products(
         return _error(str(e))
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
 def magento_get_product(sku: str) -> str:
     """
     Get a Magento product by SKU (Magento's REST API identifies products by
@@ -950,7 +951,7 @@ def magento_update_product(
         return _error(str(e))
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
 def magento_list_orders(
     status: str = "", increment_id: str = "", limit: int = 25, page: int = 1
 ) -> str:
@@ -991,7 +992,7 @@ def magento_list_orders(
         return _error(str(e))
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
 def magento_get_order(order_id: int) -> str:
     """
     Get a Magento order by its numeric entity id (from magento_list_orders;
@@ -1062,7 +1063,7 @@ def magento_add_order_comment(
         return _error(str(e))
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
 def magento_list_customers(email_like: str = "", limit: int = 25, page: int = 1) -> str:
     """
     Search/list customer accounts.
@@ -1090,7 +1091,7 @@ def magento_list_customers(email_like: str = "", limit: int = 25, page: int = 1)
         return _error(str(e))
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
 def magento_get_customer(customer_id: int) -> str:
     """
     Get a Magento customer by numeric id.
@@ -1105,7 +1106,7 @@ def magento_get_customer(customer_id: int) -> str:
         return _error(str(e))
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
 def magento_get_category_tree(
     root_category_id: int | None = None, depth: int | None = None
 ) -> str:
@@ -1127,7 +1128,7 @@ def magento_get_category_tree(
         return _error(str(e))
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
 def magento_get_category(category_id: int) -> str:
     """
     Get one category's own fields (id, name, active/position). Magento's

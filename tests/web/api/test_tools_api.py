@@ -109,11 +109,10 @@ def test_music_tool_requires_music_model() -> None:
 
 
 @pytest.mark.asyncio
-async def test_available_tools_route_surfaces_the_withheld_edit_image(
+async def test_available_tools_route_reports_media_model_capabilities(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # The helper's unit test cannot catch the wiring being dropped, and every
-    # other route test configures zero image models, which short-circuits it.
+    from xagent.core.tools.adapters.vibe.vision_tool import create_vision_tools
     from xagent.web.api.tools import get_available_tools
 
     class Config:
@@ -122,6 +121,9 @@ async def test_available_tools_route_surfaces_the_withheld_edit_image(
 
         def get_vision_model(self):
             return None
+
+        def get_vision_models(self):
+            return {"selectable-vision": object()}
 
         def get_image_models(self):
             return {"img": SimpleNamespace(abilities=["generate"])}
@@ -147,9 +149,17 @@ async def test_available_tools_route_surfaces_the_withheld_edit_image(
         def close(self) -> None:
             return None
 
-    async def create_all_tools(_config, apply_user_override_filter: bool = True):
+    async def create_workspace(_config):
+        return None
+
+    async def create_all_tools(config, apply_user_override_filter: bool = True):
         # Capability gating already withheld edit_image.
-        return []
+        return await create_vision_tools(config)
+
+    monkeypatch.setattr(
+        "xagent.core.tools.adapters.vibe.factory.ToolFactory.create_workspace_async",
+        create_workspace,
+    )
 
     class Query:
         def all(self) -> list[object]:
@@ -176,6 +186,10 @@ async def test_available_tools_route_surfaces_the_withheld_edit_image(
     assert rows["edit_image"]["enabled"] is False
     assert rows["edit_image"]["status"] == "missing_capability"
     assert "editing support" in rows["edit_image"]["status_reason"]
+    for name in ("understand_media", "detect_objects"):
+        assert rows[name]["enabled"] is True
+        assert rows[name]["status"] == "available"
+        assert "selectable-vision" in rows[name]["description"]
 
 
 class _AvailableToolsRouteHarness:
@@ -203,6 +217,10 @@ class _AvailableToolsRouteHarness:
             def get_vision_model(self):
                 harness.events.append("vision")
                 return None
+
+            def get_vision_models(self):
+                harness.events.append("vision_models")
+                return {}
 
             def get_image_models(self):
                 harness.events.append("image")
@@ -348,6 +366,7 @@ async def test_available_tools_cleanup_failure_follows_complete_route_body(
         "factory",
         "sandbox_release",
         "vision",
+        "vision_models",
         "image",
         "video",
         "asr",
@@ -862,6 +881,10 @@ class TestToolsAvailableAPI:
         monkeypatch.setattr(
             "xagent.web.tools.config.WebToolConfig.get_vision_model",
             lambda self: None,
+        )
+        monkeypatch.setattr(
+            "xagent.web.tools.config.WebToolConfig.get_vision_models",
+            lambda self: {},
         )
 
         set_user_tool_overrides_hook(

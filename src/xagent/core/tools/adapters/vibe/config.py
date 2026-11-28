@@ -336,6 +336,10 @@ class BaseToolConfig(ABC):
         """Get vision model."""
         pass
 
+    def get_vision_models(self) -> Dict[str, Any]:
+        """Return the selectable vision models for this tool configuration."""
+        return {}
+
     @abstractmethod
     def get_image_models(self) -> Dict[str, Any]:
         """Get image models."""

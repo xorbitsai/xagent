@@ -4,6 +4,7 @@ Framework wrapper around the pure vision core
 """
 
 import asyncio
+import json
 import logging
 import os
 from pathlib import Path
@@ -41,34 +42,65 @@ class VisionTool:
 
     def __init__(
         self,
-        vision_model: BaseLLM,
+        vision_model: BaseLLM | None,
         workspace: Optional[TaskWorkspace] = None,
+        *,
+        vision_models: dict[str, BaseLLM] | None = None,
     ):
         """
         Initialize with a vision-enabled LLM model.
 
         Args:
-            vision_model: LLM model with vision capabilities
+            vision_model: Default LLM with vision capabilities
             workspace: Optional workspace for resolving local image paths
+            vision_models: Permitted alternatives keyed by model ID
         """
         self.vision_model = vision_model
         self.workspace = workspace
+        self._vision_models = dict(vision_models or {})
+        self._default_id = getattr(vision_model, "model_id", None)
+        self.core = (
+            self._create_core(vision_model) if vision_model is not None else None
+        )
 
-        # Determine output directory
-        output_dir = str(workspace.output_dir) if workspace else "./output"
-
-        # Create core instance
+    def _create_core(self, model: BaseLLM) -> VisionCore:
+        workspace = self.workspace
         private_staging_roots = (
             (workspace.external_upload_staging_root(host_private=True),)
             if isinstance(workspace, TaskWorkspace)
             else ()
         )
-        self.core = VisionCore(
-            vision_model,
-            output_directory=output_dir,
+        return VisionCore(
+            model,
+            output_directory=str(workspace.output_dir) if workspace else None,
             workspace_root=workspace.workspace_dir if workspace else None,
             allowed_local_media_roots=private_staging_roots,
         )
+
+    def _select_core(self, model_id: str | None) -> VisionCore:
+        if model_id is None or (model_id and model_id == self._default_id):
+            if self.core is not None:
+                return self.core
+            raise ValueError("No default vision model is configured. Specify model_id.")
+        model = self._vision_models.get(model_id)
+        if model is None:
+            raise ValueError("The requested vision model is unavailable for this task.")
+        return self._create_core(model)
+
+    def _model_selection_hint(self) -> str:
+        model_ids = set(self._vision_models)
+        if isinstance(self._default_id, str) and self._default_id:
+            model_ids.add(self._default_id)
+        requirement = (
+            "Omit model_id to use the configured default vision model."
+            if self.core is not None
+            else "No default vision model is configured. Supply model_id."
+        )
+        if model_ids:
+            requirement += (
+                " Selectable model IDs are " + json.dumps(sorted(model_ids)) + "."
+            )
+        return requirement
 
     def _stage_media_path_sync(self, media_path: str) -> Path:
         if self.workspace is None:
@@ -126,13 +158,17 @@ class VisionTool:
                 "Media is unavailable or outside the task workspace"
             ) from None
         staged_sources[str(safe_path)] = media_path
-        if isinstance(self.workspace, TaskWorkspace):
-            self.core.add_allowed_local_media_root(
-                self.workspace.external_upload_staging_root(host_private=True)
-            )
         if not safe_path.is_file():
             raise FileNotFoundError(f"Media file not found: {media_path}")
         return str(safe_path)
+
+    def _allow_staged_media(
+        self, core: VisionCore, staged_sources: dict[str, str]
+    ) -> None:
+        if staged_sources and isinstance(self.workspace, TaskWorkspace):
+            core.add_allowed_local_media_root(
+                self.workspace.external_upload_staging_root(host_private=True)
+            )
 
     async def _resolve_media(
         self,
@@ -222,16 +258,19 @@ class VisionTool:
         max_frames: Optional[int] = None,
         temperature: Optional[float] = None,
         max_tokens: Optional[int] = None,
+        model_id: str | None = None,
     ) -> UnderstandMediaResult:
         """Analyze images, videos, or mixed media with one public tool."""
         staged_sources: dict[str, str] = {}
         resolution_warnings: list[str] = []
         try:
+            core = self._select_core(model_id)
             normalized_media = self._normalize_media(media)
             resolved_media = await self._resolve_media(
                 normalized_media, staged_sources, resolution_warnings
             )
-            result = await self.core.understand_media(
+            self._allow_staged_media(core, staged_sources)
+            result = await core.understand_media(
                 resolved_media,
                 question,
                 start_time,
@@ -255,6 +294,7 @@ class VisionTool:
         question: str,
         temperature: Optional[float] = None,
         max_tokens: Optional[int] = None,
+        model_id: str | None = None,
     ) -> UnderstandImagesResult:
         """
         Analyze images and answer questions about their content.
@@ -273,6 +313,7 @@ class VisionTool:
             question=question,
             temperature=temperature,
             max_tokens=max_tokens,
+            model_id=model_id,
         )
 
     async def describe_images(
@@ -281,6 +322,7 @@ class VisionTool:
         detail_level: str = "normal",
         temperature: Optional[float] = None,
         max_tokens: Optional[int] = None,
+        model_id: str | None = None,
     ) -> UnderstandImagesResult:
         """
         Generate descriptions for images.
@@ -297,11 +339,13 @@ class VisionTool:
         staged_sources: dict[str, str] = {}
         resolution_warnings: list[str] = []
         try:
+            core = self._select_core(model_id)
             normalized_images = self._normalize_images(images)
             resolved_images = await self._resolve_media(
                 normalized_images, staged_sources, resolution_warnings
             )
-            result = await self.core.describe_images(
+            self._allow_staged_media(core, staged_sources)
+            result = await core.describe_images(
                 resolved_images, detail_level, temperature, max_tokens
             )
             result.warnings = [*resolution_warnings, *result.warnings]
@@ -322,6 +366,7 @@ class VisionTool:
         confidence_threshold: float = 0.5,
         temperature: Optional[float] = None,
         max_tokens: Optional[int] = None,
+        model_id: str | None = None,
     ) -> DetectObjectsResult:
         """
         Detect objects in images with optional marking capability.
@@ -341,6 +386,7 @@ class VisionTool:
         staged_sources: dict[str, str] = {}
         resolution_warnings: list[str] = []
         try:
+            core = self._select_core(model_id)
             normalized_images = self._normalize_images(images)
             resolved_images = await self._resolve_media(
                 normalized_images, staged_sources, resolution_warnings
@@ -354,10 +400,11 @@ class VisionTool:
             return DetectObjectsResult(success=False, error=str(e))
         result: DetectObjectsResult | None = None
         try:
+            self._allow_staged_media(core, staged_sources)
             # Execute within auto_register context when marking
             if mark_objects and self.workspace:
                 with self.workspace.auto_register_files():
-                    result = await self.core.detect_objects(
+                    result = await core.detect_objects(
                         resolved_images,
                         task,
                         mark_objects,
@@ -367,7 +414,7 @@ class VisionTool:
                         max_tokens,
                     )
             else:
-                result = await self.core.detect_objects(
+                result = await core.detect_objects(
                     resolved_images,
                     task,
                     mark_objects,
@@ -466,7 +513,9 @@ filename, and read other text or code with read_file. A bare file_id carries no
 filename: take the name from the same task's get_file_info or from the file
 listing that gave you the id, and if neither resolves it, skip the id rather than
 probing it here.
-                """.strip(),
+                """.strip()
+                + "\n\n"
+                + self._model_selection_hint(),
             ),
             VisionFunctionTool(
                 self.detect_objects,
@@ -535,7 +584,9 @@ Perfect for:
 - Creating annotated images for documentation
 - Security monitoring
 - Debugging computer vision systems
-                """.strip(),
+                """.strip()
+                + "\n\n"
+                + self._model_selection_hint(),
             ),
         ]
 
@@ -642,6 +693,8 @@ def get_default_vision_model() -> Optional[BaseLLM]:
 def get_vision_tool(
     vision_model: Optional[BaseLLM] = None,
     workspace: Optional[TaskWorkspace] = None,
+    *,
+    vision_models: dict[str, BaseLLM] | None = None,
 ) -> list:
     """
     Create vision tools with a vision-enabled LLM model.
@@ -649,18 +702,19 @@ def get_vision_tool(
     Args:
         vision_model: LLM model with vision capabilities. If None, uses default vision model.
         workspace: Optional workspace for resolving local image paths
+        vision_models: Permitted alternatives keyed by model ID
 
     Returns:
         List of tool instances for vision capabilities
     """
-    if vision_model is None:
+    if vision_model is None and not vision_models:
         vision_model = get_default_vision_model()
 
-    if vision_model is None:
+    if vision_model is None and not vision_models:
         logger.warning("No vision model available for vision tool")
         return []
 
-    tool_instance = VisionTool(vision_model, workspace)
+    tool_instance = VisionTool(vision_model, workspace, vision_models=vision_models)
     return tool_instance.get_tools()
 
 
@@ -676,13 +730,16 @@ if TYPE_CHECKING:
 async def create_vision_tools(config: "BaseToolConfig") -> List[Any]:
     """Create vision understanding tools."""
     vision_model = config.get_vision_model()
-    if not vision_model:
+    vision_models = config.get_vision_models()
+    if not vision_model and not vision_models:
         return []
 
     workspace = await ToolFactory.create_workspace_async(config)
 
     try:
-        return get_vision_tool(vision_model=vision_model, workspace=workspace)
+        return get_vision_tool(
+            vision_model=vision_model, workspace=workspace, vision_models=vision_models
+        )
     except Exception as e:
         logger.warning(f"Failed to create vision tools: {e}")
         return []

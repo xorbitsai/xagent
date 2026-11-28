@@ -533,6 +533,7 @@ class _ToolFactoryRuntimeSnapshot:
     tool_overrides: dict[str, Any] = field(default_factory=dict)
     tool_allowlist: list[str] | None = None
     vision_model: Any | None = None
+    vision_models: dict[str, Any] = field(default_factory=dict)
     image_models: dict[str, Any] = field(default_factory=dict)
     image_generate_model: Any | None = None
     image_edit_model: Any | None = None
@@ -558,6 +559,7 @@ class _RetainedFactoryModelState:
     load_video: bool
     load_audio: bool
     vision_model: Any | None
+    vision_models: Mapping[str, Any]
     image_models: Mapping[str, Any]
     image_generate_model: Any | None
     image_edit_model: Any | None
@@ -574,6 +576,7 @@ class _RetainedFactoryModelState:
 
     def __post_init__(self) -> None:
         for field_name in (
+            "vision_models",
             "image_models",
             "video_models",
             "asr_models",
@@ -598,6 +601,7 @@ class _RetainedFactoryModelState:
             load_video=plan.load_video,
             load_audio=plan.load_audio,
             vision_model=snapshot.vision_model if plan.load_vision else None,
+            vision_models=snapshot.vision_models if plan.load_vision else {},
             image_models=snapshot.image_models if plan.load_image else {},
             image_generate_model=(
                 snapshot.image_generate_model if plan.load_image else None
@@ -1805,6 +1809,7 @@ def _load_tool_factory_runtime_snapshot(
     custom_api_configs: list[dict[str, Any]] = []
     runtime_policy = policy_snapshot or _ToolRuntimePolicySnapshot()
     vision_model: Any | None = None
+    vision_models: dict[str, Any] = {}
     image_models: dict[str, Any] = {}
     image_generate_model: Any | None = None
     image_edit_model: Any | None = None
@@ -1975,6 +1980,11 @@ def _load_tool_factory_runtime_snapshot(
         )
 
     if plan.load_vision:
+        vision_models = load_snapshot_input(
+            "vision:models",
+            lambda db: model_service.get_vision_models(db, plan.user_id),
+            {},
+        )
         vision_model = load_snapshot_input(
             "vision",
             lambda db: model_service.get_default_vision_model(plan.user_id, db=db),
@@ -2036,6 +2046,7 @@ def _load_tool_factory_runtime_snapshot(
         tool_overrides=runtime_policy.tool_overrides,
         tool_allowlist=runtime_policy.tool_allowlist,
         vision_model=vision_model,
+        vision_models=vision_models,
         image_models=image_models,
         image_generate_model=image_generate_model,
         image_edit_model=image_edit_model,
@@ -2413,6 +2424,7 @@ class WebToolConfig(BaseToolConfig):
 
         # Cache for loaded configurations
         self._cached_vision_config: Optional[Any] = None
+        self._cached_vision_configs: Optional[Dict[str, Any]] = None
         self._cached_image_configs: Optional[Dict[str, Any]] = None
         self._cached_video_configs: Optional[Dict[str, Any]] = None
         self._cached_image_generate_model: Optional[Any] = None
@@ -2618,14 +2630,31 @@ class WebToolConfig(BaseToolConfig):
 
     def get_vision_model(self) -> Optional[Any]:
         """Get vision model, prioritizing explicitly provided model over database."""
-        if hasattr(self, "_explicit_vision_model") and self._explicit_vision_model:
+        if self._explicit_vision_model is not None:
             return self._explicit_vision_model
-
-        return self._get_factory_model_value(
+        model = self._get_factory_model_value(
             load_flag="load_vision",
             field_name="vision_model",
             cache_name="_cached_vision_config",
             loader=self._load_vision_model,
+        )
+        if _media_model_permitted(
+            getattr(model, "model_id", None),
+            self._excluded_model_ids,
+            self._allowed_model_ids,
+        ):
+            return model
+        return None
+
+    def get_vision_models(self) -> Dict[str, Any]:
+        """Return the task's permitted selectable vision models."""
+        if self._explicit_vision_model is not None:
+            return {}
+        return self._get_factory_model_mapping(
+            load_flag="load_vision",
+            field_name="vision_models",
+            cache_name="_cached_vision_configs",
+            loader=self._load_vision_models,
         )
 
     def get_image_models(self) -> Dict[str, Any]:
@@ -3500,7 +3529,7 @@ class WebToolConfig(BaseToolConfig):
                 else bool(includes_custom_api())
             ),
             load_vision=(
-                wants_category("vision") and not bool(self._explicit_vision_model)
+                wants_category("vision") and self._explicit_vision_model is None
             ),
             load_image=wants_category("image"),
             load_video=wants_category("video"),
@@ -3912,6 +3941,11 @@ class WebToolConfig(BaseToolConfig):
             logger = logging.getLogger(__name__)
             logger.warning(f"Failed to load vision model: {e}")
             return None
+
+    def _load_vision_models(self) -> Dict[str, Any]:
+        from ..services.model_service import get_vision_models
+
+        return get_vision_models(self.db, self._user_id)
 
     def _load_image_models(self) -> Dict[str, Any]:
         """Load image models from database via model service."""

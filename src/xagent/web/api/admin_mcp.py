@@ -1,3 +1,4 @@
+import re
 from copy import deepcopy
 from typing import Any, Dict, List, Optional
 from uuid import uuid4
@@ -104,6 +105,25 @@ class OAuthProviderResponse(OAuthProviderBase):
     id: int
 
 
+# A catalog app_id is printed verbatim in smoke-check output and log lines.
+# An id containing a newline or other control character can forge extra
+# output lines (issue #3270).  Restrict to lowercase letters, digits, ``-``
+# and ``_`` at write time so existing rows and responses are unaffected.
+_APP_ID_PATTERN = re.compile(r"^[a-z0-9_-]+\Z")
+
+
+def _validate_app_id(value: Optional[str]) -> Optional[str]:
+    """Reject an app_id that contains anything other than [a-z0-9_-]."""
+    if value is None:
+        return value
+    if not isinstance(value, str) or not _APP_ID_PATTERN.match(value):
+        raise ValueError(
+            "app_id must contain only lowercase letters, digits, "
+            "'-' and '_' (e.g. 'outlook', 'google-drive')"
+        )
+    return value
+
+
 class PublicMCPAppBase(BaseModel):
     app_id: str
     name: str
@@ -124,6 +144,8 @@ class PublicMCPAppCreate(PublicMCPAppBase):
     _check_read_only_tools = field_validator("launch_config")(
         _validate_launch_config_read_only_tools
     )
+
+    _validate_app_id = field_validator("app_id")(_validate_app_id)
 
     # Validator lives on the write model only, not PublicMCPAppBase — otherwise
     # PublicMCPAppResponse would inherit it and re-run on response serialization,
@@ -167,6 +189,7 @@ class PublicMCPAppResponse(PublicMCPAppBase):
 
 
 class PublicMCPAppUpdate(BaseModel):
+    _validate_app_id = field_validator("app_id")(_validate_app_id)
     _check_read_only_tools = field_validator("launch_config")(
         _validate_launch_config_read_only_tools
     )

@@ -13,6 +13,7 @@ from datetime import datetime, timezone
 from typing import Any, Literal
 
 from mcp.server.fastmcp import FastMCP
+from mcp.types import ToolAnnotations
 
 from ....config import get_tool_max_output_length
 from ....core.utils import public_requests as requests
@@ -580,7 +581,7 @@ def _search(
     )
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
 def hubspot_search_contacts(
     query: str | None = None,
     filter_groups_json: str | None = None,
@@ -638,7 +639,7 @@ def hubspot_search_contacts(
         return _error(str(e))
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
 def hubspot_get_contact(contact_id: str) -> str:
     """
     Get a HubSpot contact by id, including associated company and deal ids.
@@ -697,7 +698,7 @@ def hubspot_update_contact(contact_id: str, properties_json: str) -> str:
         return _error(str(e))
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
 def hubspot_search_companies(
     query: str | None = None,
     filter_groups_json: str | None = None,
@@ -869,7 +870,7 @@ def _get_associated_deals(
     return payload
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
 def hubspot_get_contact_deals(
     contact_id: str, limit: int = 100, after: str | None = None
 ) -> str:
@@ -906,7 +907,7 @@ def hubspot_get_contact_deals(
         return _error(str(e))
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
 def hubspot_get_company_deals(
     company_id: str, limit: int = 100, after: str | None = None
 ) -> str:
@@ -992,7 +993,7 @@ def hubspot_update_deal(deal_id: str, properties_json: str) -> str:
         return _error(str(e))
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
 def hubspot_search_deals(
     query: str | None = None,
     filter_groups_json: str | None = None,
@@ -1064,7 +1065,7 @@ def _list_objects(
     )
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
 def hubspot_list_deals(
     limit: int = 100, after: str | None = None, properties: str | None = None
 ) -> str:
@@ -1103,7 +1104,7 @@ def hubspot_list_deals(
         return _error(str(e))
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
 def hubspot_list_companies(
     limit: int = 100, after: str | None = None, properties: str | None = None
 ) -> str:
@@ -1134,7 +1135,7 @@ def hubspot_list_companies(
         return _error(str(e))
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
 def hubspot_list_contacts(
     limit: int = 100, after: str | None = None, properties: str | None = None
 ) -> str:
@@ -1165,7 +1166,7 @@ def hubspot_list_contacts(
         return _error(str(e))
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
 def hubspot_get_contact_notes(
     contact_id: str, limit: int = 20, after: str | None = None
 ) -> str:
@@ -1292,7 +1293,7 @@ def _project_fields(items: list[Any], fields: tuple[str, ...]) -> list[dict[str,
     ]
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
 def hubspot_list_forms(limit: int = 20, after: str | None = None) -> str:
     """
     List HubSpot marketing forms: id, name, form type, created/updated
@@ -1320,7 +1321,7 @@ def hubspot_list_forms(limit: int = 20, after: str | None = None) -> str:
         return _error(str(e))
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
 def hubspot_get_form_submissions(
     form_id: str, limit: int = 20, after: str | None = None
 ) -> str:
@@ -1349,7 +1350,7 @@ def hubspot_get_form_submissions(
         return _error(str(e))
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
 def hubspot_get_analytics_report(
     report_type: str,
     start_date: str,
@@ -1405,7 +1406,7 @@ def hubspot_get_analytics_report(
         return _error(str(e))
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
 def hubspot_list_marketing_emails(limit: int = 20, after: str | None = None) -> str:
     """
     List HubSpot marketing emails: id, name, subject, state, publish
@@ -1439,7 +1440,7 @@ def hubspot_list_marketing_emails(limit: int = 20, after: str | None = None) -> 
         return _error(str(e))
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
 def hubspot_get_marketing_email_statistics(
     email_ids: str,
     start_date: str | None = None,
@@ -1497,7 +1498,7 @@ def hubspot_get_marketing_email_statistics(
         return _error(str(e))
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
 def hubspot_list_campaigns(limit: int = 20, after: str | None = None) -> str:
     """
     List HubSpot marketing campaigns, including id and properties (name,
@@ -1533,7 +1534,7 @@ def hubspot_list_campaigns(limit: int = 20, after: str | None = None) -> str:
         return _error(str(e))
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
 def hubspot_get_campaign_metrics(
     campaign_id: str,
     start_date: str | None = None,

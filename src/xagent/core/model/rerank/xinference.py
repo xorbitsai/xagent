@@ -117,7 +117,7 @@ class XinferenceRerank(BaseRerank):
 
     @staticmethod
     def list_available_models(
-        base_url: str, api_key: Optional[str] = None
+        base_url: str, api_key: Optional[str] = None, *, raise_on_error: bool = False
     ) -> List[Dict[str, Any]]:
         """Fetch available rerank models from a Xinference server.
 
@@ -129,6 +129,8 @@ class XinferenceRerank(BaseRerank):
         Args:
             base_url: Xinference server base URL.
             api_key: Optional API key for authentication.
+            raise_on_error: Propagate a failed list_models call instead of
+                returning an empty list.
 
         Returns:
             List of available rerank models, each shaped as
@@ -145,6 +147,8 @@ class XinferenceRerank(BaseRerank):
         try:
             models_dict = client.list_models()
         except Exception as exc:
+            if raise_on_error:
+                raise
             logger.error("Failed to fetch rerank models from Xinference: %s", exc)
             return []
         finally:

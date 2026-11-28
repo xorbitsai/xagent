@@ -2,7 +2,7 @@
 
 import inspect
 import logging
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Protocol
 
 from ...core.model.providers import (
     ENDPOINT_KIND_OFFICIAL,
@@ -53,16 +53,18 @@ async def fetch_openai_models(
 
 
 async def fetch_deepseek_models(
-    api_key: str, base_url: Optional[str] = None
+    api_key: str, base_url: Optional[str] = None, *, raise_on_error: bool = False
 ) -> List[Dict[str, Any]]:
     """Return DeepSeek v4 curated model list."""
     from ...core.model.chat.basic.deepseek import DeepSeekLLM
 
-    return await DeepSeekLLM.list_available_models(api_key, base_url)
+    return await DeepSeekLLM.list_available_models(
+        api_key, base_url, **_error_mode(raise_on_error)
+    )
 
 
 async def fetch_bedrock_models(
-    api_key: str, base_url: Optional[str] = None
+    api_key: str, base_url: Optional[str] = None, *, raise_on_error: bool = False
 ) -> List[Dict[str, Any]]:
     """Return no catalog and let users enter an invocation target directly.
 
@@ -71,7 +73,7 @@ async def fetch_bedrock_models(
     that the caller has ``InvokeModel`` permission. A denied list operation
     must therefore not become an admission gate for an otherwise valid target.
     """
-    _ = api_key, base_url
+    _ = api_key, base_url, raise_on_error
     return []
 
 
@@ -133,7 +135,7 @@ async def fetch_gemini_models(
 
 
 async def fetch_xinference_models(
-    api_key: str, base_url: Optional[str] = None
+    api_key: str, base_url: Optional[str] = None, *, raise_on_error: bool = False
 ) -> List[Dict[str, Any]]:
     """Fetch available models from Xinference using XinferenceLLM.list_available_models().
 
@@ -153,13 +155,14 @@ async def fetch_xinference_models(
 
 
 async def fetch_xinference_rerank_models(
-    api_key: str, base_url: Optional[str] = None
+    api_key: str, base_url: Optional[str] = None, *, raise_on_error: bool = False
 ) -> List[Dict[str, Any]]:
     """Fetch available rerank models from a Xinference server.
 
     Args:
         api_key: Xinference API key (optional)
         base_url: Xinference server base URL (required)
+        raise_on_error: Propagate a failed catalog read.
 
     Returns:
         List of available rerank models on the server, shaped as
@@ -170,11 +173,13 @@ async def fetch_xinference_rerank_models(
 
     from ...core.model.rerank.xinference import XinferenceRerank
 
-    return XinferenceRerank.list_available_models(base_url=base_url, api_key=api_key)
+    return XinferenceRerank.list_available_models(
+        base_url=base_url, api_key=api_key, **_error_mode(raise_on_error)
+    )
 
 
 async def fetch_xinference_video_models(
-    api_key: str, base_url: Optional[str] = None
+    api_key: str, base_url: Optional[str] = None, *, raise_on_error: bool = False
 ) -> List[Dict[str, Any]]:
     """Fetch available video models from a Xinference server."""
     if not base_url:
@@ -207,7 +212,7 @@ async def fetch_xinference_video_models(
 
 
 async def fetch_elevenlabs_models(
-    api_key: str, base_url: Optional[str] = None
+    api_key: str, base_url: Optional[str] = None, *, raise_on_error: bool = False
 ) -> List[Dict[str, Any]]:
     """Fetch available ElevenLabs speech models.
 
@@ -233,9 +238,12 @@ async def fetch_elevenlabs_models(
 
 
 async def fetch_elevenlabs_sound_effect_models(
-    api_key: str, base_url: Optional[str] = None
+    api_key: str, base_url: Optional[str] = None, *, raise_on_error: bool = False
 ) -> List[Dict[str, Any]]:
-    """Validate ElevenLabs access and return sound effect models."""
+    """List sound effect models with a documented fallback for missing user_read.
+
+    The permission fallback serves a curated catalog in both modes.
+    """
     from ...core.model.sound_effect.elevenlabs import ElevenLabsSoundEffectModel
 
     return await ElevenLabsSoundEffectModel.async_list_available_models(
@@ -245,9 +253,12 @@ async def fetch_elevenlabs_sound_effect_models(
 
 
 async def fetch_elevenlabs_music_models(
-    api_key: str, base_url: Optional[str] = None
+    api_key: str, base_url: Optional[str] = None, *, raise_on_error: bool = False
 ) -> List[Dict[str, Any]]:
-    """Discover ElevenLabs music models with SDK/documented fallbacks."""
+    """List music models with SDK/documented fallbacks for missing user_read.
+
+    The permission fallback serves a curated catalog in both modes.
+    """
     from ...core.model.music.elevenlabs import ElevenLabsMusicModel
 
     return await ElevenLabsMusicModel.async_list_available_models(
@@ -257,7 +268,7 @@ async def fetch_elevenlabs_music_models(
 
 
 async def fetch_dashscope_embedding_models(
-    api_key: str, base_url: Optional[str] = None
+    api_key: str, base_url: Optional[str] = None, *, raise_on_error: bool = False
 ) -> List[Dict[str, Any]]:
     """Return curated DashScope text embedding models.
 
@@ -267,7 +278,7 @@ async def fetch_dashscope_embedding_models(
     to the UI. ``DashScopeEmbedding`` imposes no model enumeration, so the
     list is maintained here.
     """
-    _ = api_key, base_url
+    _ = api_key, base_url, raise_on_error
 
     return [
         {
@@ -280,7 +291,7 @@ async def fetch_dashscope_embedding_models(
 
 
 async def fetch_dashscope_rerank_models(
-    api_key: str, base_url: Optional[str] = None
+    api_key: str, base_url: Optional[str] = None, *, raise_on_error: bool = False
 ) -> List[Dict[str, Any]]:
     """Return curated DashScope rerank models.
 
@@ -291,7 +302,7 @@ async def fetch_dashscope_rerank_models(
     ``xagent.core.model.rerank.dashscope``; we expose them as a static curated
     list so the UI can preselect a known-good model.
     """
-    _ = api_key, base_url
+    _ = api_key, base_url, raise_on_error
 
     from ...core.model.rerank.dashscope import NEW_FORMAT_MODELS, OLD_FORMAT_MODELS
 
@@ -308,10 +319,10 @@ async def fetch_dashscope_rerank_models(
 
 
 async def fetch_alibaba_coding_plan_models(
-    api_key: str, base_url: Optional[str] = None
+    api_key: str, base_url: Optional[str] = None, *, raise_on_error: bool = False
 ) -> List[Dict[str, Any]]:
     """Return curated Alibaba Bailian coding plan models."""
-    _ = api_key, base_url
+    _ = api_key, base_url, raise_on_error
     return _static_model_list(
         curated_models_for_provider("alibaba-coding-plan"),
         owned_by="alibaba-coding-plan",
@@ -319,10 +330,10 @@ async def fetch_alibaba_coding_plan_models(
 
 
 async def fetch_alibaba_coding_plan_cn_models(
-    api_key: str, base_url: Optional[str] = None
+    api_key: str, base_url: Optional[str] = None, *, raise_on_error: bool = False
 ) -> List[Dict[str, Any]]:
     """Return curated Alibaba Bailian coding plan models (China)."""
-    _ = api_key, base_url
+    _ = api_key, base_url, raise_on_error
     return _static_model_list(
         curated_models_for_provider("alibaba-coding-plan-cn"),
         owned_by="alibaba-coding-plan-cn",
@@ -330,10 +341,10 @@ async def fetch_alibaba_coding_plan_cn_models(
 
 
 async def fetch_minimax_coding_plan_models(
-    api_key: str, base_url: Optional[str] = None
+    api_key: str, base_url: Optional[str] = None, *, raise_on_error: bool = False
 ) -> List[Dict[str, Any]]:
     """Return curated MiniMax coding plan models (minimax.io)."""
-    _ = api_key, base_url
+    _ = api_key, base_url, raise_on_error
     return _static_model_list(
         curated_models_for_provider("minimax-coding-plan"),
         owned_by="minimax-coding-plan",
@@ -341,10 +352,10 @@ async def fetch_minimax_coding_plan_models(
 
 
 async def fetch_minimax_cn_coding_plan_models(
-    api_key: str, base_url: Optional[str] = None
+    api_key: str, base_url: Optional[str] = None, *, raise_on_error: bool = False
 ) -> List[Dict[str, Any]]:
     """Return curated MiniMax coding plan models (minimaxi.com)."""
-    _ = api_key, base_url
+    _ = api_key, base_url, raise_on_error
     return _static_model_list(
         curated_models_for_provider("minimax-cn-coding-plan"),
         owned_by="minimax-cn-coding-plan",
@@ -364,11 +375,14 @@ async def _fetch_openai_compatible_video_models(
     *,
     owned_by: str,
     default_base_url: str,
+    raise_on_error: bool = False,
 ) -> List[Dict[str, Any]]:
     if not api_key or not base_url:
         return []
 
-    provider_models = await fetch_openai_models(api_key, base_url)
+    provider_models = await fetch_openai_models(
+        api_key, base_url, **_error_mode(raise_on_error)
+    )
     dynamic_models: List[Dict[str, Any]] = []
     for model in provider_models:
         model_id = str(model.get("id") or "")
@@ -389,10 +403,10 @@ async def _fetch_openai_compatible_video_models(
 
 
 async def fetch_volcengine_ark_video_models(
-    api_key: str, base_url: Optional[str] = None
+    api_key: str, base_url: Optional[str] = None, *, raise_on_error: bool = False
 ) -> List[Dict[str, Any]]:
     """Fetch Volcengine Ark video models from the live model list endpoint."""
-    from xagent.core.model.video.ark import ARK_DOMESTIC_BASE_URL
+    from ...core.model.video.ark import ARK_DOMESTIC_BASE_URL
 
     resolved_base_url = base_url or ARK_DOMESTIC_BASE_URL
     return await _fetch_openai_compatible_video_models(
@@ -400,14 +414,15 @@ async def fetch_volcengine_ark_video_models(
         resolved_base_url,
         owned_by="volcengine-ark",
         default_base_url=ARK_DOMESTIC_BASE_URL,
+        raise_on_error=raise_on_error,
     )
 
 
 async def fetch_byteplus_ark_video_models(
-    api_key: str, base_url: Optional[str] = None
+    api_key: str, base_url: Optional[str] = None, *, raise_on_error: bool = False
 ) -> List[Dict[str, Any]]:
     """Fetch BytePlus Ark video models from the live model list endpoint."""
-    from xagent.core.model.video.ark import ARK_BYTEPLUS_BASE_URL
+    from ...core.model.video.ark import ARK_BYTEPLUS_BASE_URL
 
     resolved_base_url = base_url or ARK_BYTEPLUS_BASE_URL
     return await _fetch_openai_compatible_video_models(
@@ -415,11 +430,21 @@ async def fetch_byteplus_ark_video_models(
         resolved_base_url,
         owned_by="byteplus-ark",
         default_base_url=ARK_BYTEPLUS_BASE_URL,
+        raise_on_error=raise_on_error,
     )
 
 
-# Provider registry mapping provider names to their fetch functions
-PROVIDER_FETCHERS: Dict[str, Any] = {
+class _CatalogFetcher(Protocol):
+    async def __call__(
+        self,
+        api_key: str,
+        base_url: Optional[str] = None,
+        *,
+        raise_on_error: bool = False,
+    ) -> List[Dict[str, Any]]: ...
+
+
+_BUILTIN_PROVIDER_FETCHERS: Dict[str, _CatalogFetcher] = {
     "bedrock": fetch_bedrock_models,
     "openai": fetch_openai_models,
     "openai-compatible": fetch_openai_models,
@@ -453,6 +478,10 @@ PROVIDER_FETCHERS: Dict[str, Any] = {
 }
 
 
+# External registrations can still use the legacy two-argument signature.
+PROVIDER_FETCHERS: Dict[str, Any] = dict(_BUILTIN_PROVIDER_FETCHERS)
+
+
 async def fetch_models_from_provider(
     provider: str,
     api_key: str,
@@ -466,14 +495,13 @@ async def fetch_models_from_provider(
         provider: Provider name (openai, zhipu, claude, etc.)
         api_key: API key for the provider
         base_url: Custom base URL (optional)
-        raise_on_error: Callers that must tell a failed read from an empty
-            catalog set this: fetchers that would otherwise answer a rate
-            limit, 5xx, timeout, connection or permission failure with an
-            empty list raise it instead. It reaches only fetchers that accept
-            it: the Volcengine/BytePlus Ark video fetchers and the Xinference
-            rerank fetcher do not, so those failures still come back as an
-            empty list there, and an unknown provider is an empty list in
-            either mode. The default keeps each fetcher's existing behavior.
+        raise_on_error: Distinguish a failed read from a successfully empty
+            catalog. Built-in readers raise live read failures in this mode.
+            Curated catalogs and the ElevenLabs music/sound-effect permission
+            fallback still return their model lists. Strict mode is best
+            effort for external entries using the legacy two-argument
+            signature. Unknown providers return an empty list in either mode.
+            The default preserves each reader's existing behavior.
 
     Returns:
         List of available models

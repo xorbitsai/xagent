@@ -2,6 +2,11 @@
 
 from __future__ import annotations
 
+import sys
+from inspect import Parameter, signature
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, Mock
+
 import pytest
 
 from xagent.core.model.asr.elevenlabs import ElevenLabsASR
@@ -15,6 +20,7 @@ from xagent.web.services.model_list_service import (
     fetch_elevenlabs_models,
     fetch_elevenlabs_music_models,
     fetch_elevenlabs_sound_effect_models,
+    fetch_models_from_provider,
     fetch_openai_models,
 )
 
@@ -166,3 +172,149 @@ async def test_fetch_elevenlabs_sound_effect_models_is_separate(
             "abilities": ["generate"],
         }
     ]
+
+
+@pytest.mark.parametrize("provider", sorted(PROVIDER_FETCHERS))
+def test_builtin_fetcher_accepts_strict_mode(provider: str) -> None:
+    parameters = signature(PROVIDER_FETCHERS[provider]).parameters
+    strict = parameters.get("raise_on_error")
+    assert strict is not None
+    assert strict.kind == Parameter.KEYWORD_ONLY
+    assert strict.default is False
+
+
+@pytest.mark.parametrize(
+    "provider", ["volcengine-ark", "byteplus-ark", "ark", "ark-video"]
+)
+async def test_ark_catalog_distinguishes_failure_from_empty(
+    provider: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    failure = TimeoutError("offline catalog timeout")
+    client = AsyncMock()
+    client.models.list.side_effect = failure
+    monkeypatch.setattr(
+        "xagent.core.model.chat.basic.openai.create_owned_async_sdk_client",
+        Mock(return_value=client),
+    )
+    args = (provider, "test-key", "https://provider.example/v1")
+
+    assert await fetch_models_from_provider(*args) == []
+    with pytest.raises(TimeoutError) as exc_info:
+        await fetch_models_from_provider(*args, raise_on_error=True)
+    assert exc_info.value is failure
+
+    client.models.list.side_effect = None
+    client.models.list.return_value = SimpleNamespace(data=[])
+    assert await fetch_models_from_provider(*args, raise_on_error=True) == []
+    assert client.models.list.await_count == client.close.await_count == 3
+
+
+async def test_xinference_rerank_catalog_distinguishes_failure_from_empty(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    failure = RuntimeError("offline catalog failure")
+    client = Mock()
+    client.list_models.side_effect = failure
+    monkeypatch.setattr(
+        "xagent.core.model.public_xinference.PublicXinferenceClient",
+        Mock(return_value=client),
+    )
+    args = ("xinference-rerank", "test-key", "https://provider.example")
+
+    assert await fetch_models_from_provider(*args) == []
+    with pytest.raises(RuntimeError) as exc_info:
+        await fetch_models_from_provider(*args, raise_on_error=True)
+    assert exc_info.value is failure
+
+    client.list_models.side_effect = None
+    client.list_models.return_value = {}
+    assert await fetch_models_from_provider(*args, raise_on_error=True) == []
+    assert client.list_models.call_count == client.close.call_count == 3
+
+
+@pytest.mark.parametrize("raise_on_error", [False, True])
+async def test_xinference_rerank_preserves_client_setup_errors(
+    monkeypatch: pytest.MonkeyPatch, raise_on_error: bool
+) -> None:
+    failure = ImportError("Xinference SDK unavailable")
+    monkeypatch.setattr(
+        "xagent.core.model.public_xinference.PublicXinferenceClient",
+        Mock(side_effect=failure),
+    )
+    with pytest.raises(ImportError) as exc_info:
+        await fetch_models_from_provider(
+            "xinference-rerank",
+            "test-key",
+            "https://provider.example",
+            raise_on_error=raise_on_error,
+        )
+    assert exc_info.value is failure
+
+
+@pytest.mark.parametrize("raise_on_error", [False, True])
+async def test_xinference_rerank_preserves_missing_sdk_error(
+    monkeypatch: pytest.MonkeyPatch, raise_on_error: bool
+) -> None:
+    monkeypatch.setitem(sys.modules, "xagent.core.model.public_xinference", None)
+    with pytest.raises(ModuleNotFoundError, match="public_xinference"):
+        await fetch_models_from_provider(
+            "xinference-rerank",
+            "test-key",
+            "https://provider.example",
+            raise_on_error=raise_on_error,
+        )
+
+
+async def test_curated_catalog_ignores_strict_mode() -> None:
+    args = ("dashscope-embedding", "test-key", "https://provider.example")
+    default_catalog = await fetch_models_from_provider(*args)
+    assert default_catalog
+    assert (
+        await fetch_models_from_provider(*args, raise_on_error=True) == default_catalog
+    )
+    assert (
+        await fetch_models_from_provider(
+            "unregistered-provider", "test-key", raise_on_error=True
+        )
+        == []
+    )
+
+
+async def test_strict_mode_accepts_legacy_external_fetcher(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    expected = [{"id": "external-model"}]
+
+    async def legacy_fetcher(api_key: str, base_url: str) -> list[dict[str, str]]:
+        assert api_key == "test-key"
+        assert base_url == "https://provider.example"
+        return expected
+
+    monkeypatch.setitem(PROVIDER_FETCHERS, "external-test", legacy_fetcher)
+    assert (
+        await fetch_models_from_provider(
+            "external-test", "test-key", "https://provider.example", raise_on_error=True
+        )
+        == expected
+    )
+
+
+async def test_strict_mode_forwards_keyword_without_retrying_body_type_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    failure = TypeError("fetcher failed internally")
+    calls: list[bool] = []
+
+    async def strict_fetcher(
+        api_key: str, base_url: str, *, raise_on_error: bool = False
+    ) -> list[dict[str, str]]:
+        calls.append(raise_on_error)
+        raise failure
+
+    monkeypatch.setitem(PROVIDER_FETCHERS, "external-test", strict_fetcher)
+    with pytest.raises(TypeError) as exc_info:
+        await fetch_models_from_provider(
+            "external-test", "test-key", "https://provider.example", raise_on_error=True
+        )
+    assert exc_info.value is failure
+    assert calls == [True]

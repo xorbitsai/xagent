@@ -617,11 +617,12 @@ def get_default_vision_model() -> Optional[BaseLLM]:
     claude_key = os.getenv("ANTHROPIC_API_KEY") or os.getenv("CLAUDE_API_KEY")
     if claude_key:
         try:
-            from xagent.core.model.chat.basic.claude import ClaudeLLM
-
-            model_name = os.getenv(
-                "CLAUDE_VISION_MODEL_NAME", "claude-3-5-sonnet-20241022"
+            from xagent.core.model.chat.basic.claude import (
+                DEFAULT_CLAUDE_MODEL,
+                ClaudeLLM,
             )
+
+            model_name = os.getenv("CLAUDE_VISION_MODEL_NAME", DEFAULT_CLAUDE_MODEL)
             base_url = os.getenv("CLAUDE_BASE_URL")
 
             return attach_chat_retry_wrapper(

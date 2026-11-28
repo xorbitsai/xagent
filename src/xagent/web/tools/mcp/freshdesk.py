@@ -705,7 +705,19 @@ def freshdesk_search_tickets(query: str, page: int = 1) -> str:
     the expression at 512 characters.
 
     Queryable fields include agent_id, group_id, priority, status, tag,
-    type, created_at, updated_at, due_by and custom fields.
+    type, due_by, fr_due_by, created_at, updated_at and closed_at. You
+    cannot search subject or description text. Ticket updates take a few
+    minutes to appear in search results.
+
+    For custom fields, use the field's key exactly as a ticket's
+    custom_fields or freshdesk_list_ticket_fields gives it, e.g.
+    cf_jira_key:'PROJ-123'. Zero results from a custom-field query do not
+    rule out a match: the query can miss a field that was created recently
+    or moved to Freshdesk's new infrastructure. For a single-line text
+    field, retry with custom_string:'PROJ-123' before reporting no match.
+    It matches the value in any single-line text custom field, so check
+    each result's custom_fields to confirm the intended field has that
+    value.
 
     page: 1-based page number. Freshdesk fixes this endpoint at 30 results
     per page and refuses pages beyond 10, so at most 300 tickets are

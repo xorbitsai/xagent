@@ -712,6 +712,28 @@ def test_search_tickets_wraps_the_expression_in_double_quotes(
     assert recorder.call["url"].endswith("/api/v2/search/tickets")
 
 
+def test_search_tickets_preserves_custom_string_query(
+    monkeypatch: pytest.MonkeyPatch, configured_env: None
+):
+    recorder = _install(monkeypatch, _json_response({"results": [], "total": 0}))
+
+    freshdesk.freshdesk_search_tickets("custom_string:'PROJ-123'")
+
+    assert recorder.call["params"]["query"] == "\"custom_string:'PROJ-123'\""
+
+
+async def test_search_tickets_description_explains_custom_field_fallback():
+    tools = {tool.name: tool for tool in await freshdesk.mcp.list_tools()}
+
+    description = " ".join(tools["freshdesk_search_tickets"].description.split())
+    assert "Zero results from a custom-field query do not rule out a match" in (
+        description
+    )
+    assert "custom_string:'PROJ-123'" in description
+    assert "any single-line text custom field" in description
+    assert "check each result's custom_fields" in description
+
+
 def test_search_tickets_returns_total_and_results(
     monkeypatch: pytest.MonkeyPatch, configured_env: None
 ):

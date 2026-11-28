@@ -9,6 +9,8 @@ import {
 import React, { createContext, useContext } from "react"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 
+import { resolveTranslation, type TranslationKey } from "@/i18n/translations"
+
 import type { Model } from "./models"
 import { AutoModelConfigCard } from "./auto-model-config-card"
 
@@ -20,7 +22,12 @@ vi.mock("@/components/ui/sonner", () => ({
 }))
 vi.mock("@/components/ui/multi-select", () => ({ MultiSelect: () => null }))
 vi.mock("@/contexts/i18n-context", () => ({
-  useI18n: () => ({ t: (key: string) => key }),
+  useI18n: () => ({
+    t: (key: TranslationKey, vars?: { name: string }) =>
+      key === "models.auto.moveUp" || key === "models.auto.moveDown"
+        ? resolveTranslation("en", key, vars)
+        : key,
+  }),
 }))
 // Radix Select needs pointer APIs jsdom lacks; render each item as a button so
 // a row can be rebound.
@@ -279,6 +286,7 @@ describe("AutoModelConfigCard with a profile whose inputs differ from the model"
     const request = apiRequestMock.mock.calls[2][1] as RequestInit
     expect(JSON.parse(String(request.body))).toMatchObject({
       mode: "routing",
+      fallback_model_id: 4,
       candidates: [
         { target_model_id: 3, routing_model_id: "openai/gpt-5.5-vision" },
         { target_model_id: 4, routing_model_id: "openai/gpt-5.5-mini" },
@@ -307,5 +315,103 @@ describe("AutoModelConfigCard with a profile whose inputs differ from the model"
       within(row("1. vision-model")).getByTestId("select-trigger"),
     ).not.toHaveClass("border-destructive")
     expect(screen.getByText("models.auto.save")).toBeEnabled()
+  })
+})
+
+
+describe("AutoModelConfigCard with an inactive saved candidate", () => {
+  const inactive: Model = {
+    ...base,
+    id: 3,
+    model_id: "inactive",
+    model_name: "inactive-model",
+    is_active: false,
+  }
+  const profiles = [
+    { id: "openai/gpt-5.5", input_modalities: ["text"] },
+    { id: "openai/gpt-5.5-mini", input_modalities: ["text"] },
+  ]
+  const savedConfig = {
+    configured: true,
+    mode: "sequential_failover",
+    fallback_model_id: null,
+    candidates: [
+      { routing_model_id: profiles[0].id, target_model_id: stale.id, target_model: stale },
+      { routing_model_id: profiles[0].id, target_model_id: inactive.id, target_model: inactive },
+      { routing_model_id: profiles[1].id, target_model_id: healthy.id, target_model: healthy },
+    ],
+  }
+
+  beforeEach(() => {
+    apiRequestMock.mockReset()
+    apiRequestMock
+      .mockResolvedValueOnce(jsonResponse(savedConfig))
+      .mockResolvedValueOnce(jsonResponse(profiles))
+      .mockResolvedValueOnce(jsonResponse({ ...savedConfig, auto_model: healthy }))
+  })
+
+  async function openConfig() {
+    render(
+      <AutoModelConfigCard
+        models={[stale, inactive, healthy]}
+        onSuccess={vi.fn().mockResolvedValue(undefined)}
+      />,
+    )
+    await waitFor(() => expect(screen.getByText("models.auto.edit")).toBeEnabled())
+    fireEvent.click(screen.getByText("models.auto.edit"))
+  }
+
+  async function saveConfig() {
+    fireEvent.click(screen.getByText("models.auto.save"))
+    await waitFor(() => expect(apiRequestMock).toHaveBeenCalledTimes(3))
+    const request = apiRequestMock.mock.calls[2][1] as RequestInit
+    return JSON.parse(String(request.body))
+  }
+
+  it("moves visible candidates in either direction and saves the displayed order", async () => {
+    await openConfig()
+
+    expect(row("1. stale-model")).toBeInTheDocument()
+    expect(row("2. healthy-model")).toBeInTheDocument()
+    const moveUp = screen.getByRole("button", { name: "Move healthy-model up" })
+    const moveDown = screen.getByRole("button", { name: "Move healthy-model down" })
+    expect(screen.getByRole("button", { name: "Move stale-model up" })).toBeDisabled()
+    expect(moveDown).toBeDisabled()
+
+    fireEvent.click(moveUp)
+    expect(row("1. healthy-model")).toBeInTheDocument()
+    expect(row("2. stale-model")).toBeInTheDocument()
+    expect(moveUp).toBeDisabled()
+    expect(moveDown).toBeEnabled()
+    expect(screen.getByRole("button", { name: "Move stale-model down" })).toBeDisabled()
+
+    fireEvent.click(moveDown)
+    expect(row("1. stale-model")).toBeInTheDocument()
+    expect(row("2. healthy-model")).toBeInTheDocument()
+    fireEvent.click(moveUp)
+
+    expect(await saveConfig()).toMatchObject({
+      mode: "sequential_failover",
+      fallback_model_id: null,
+      candidates: [
+        { target_model_id: healthy.id, routing_model_id: profiles[1].id },
+        { target_model_id: stale.id, routing_model_id: profiles[0].id },
+      ],
+    })
+  })
+
+  it("defaults to the first visible candidate when switching to routing", async () => {
+    await openConfig()
+    fireEvent.click(screen.getByRole("button", { name: "models.auto.modeRouting" }))
+
+    expect(screen.getByText("models.auto.save")).toBeEnabled()
+    expect(await saveConfig()).toMatchObject({
+      mode: "routing",
+      fallback_model_id: stale.id,
+      candidates: [
+        { target_model_id: stale.id, routing_model_id: profiles[0].id },
+        { target_model_id: healthy.id, routing_model_id: profiles[1].id },
+      ],
+    })
   })
 })

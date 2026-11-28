@@ -90,8 +90,8 @@ from .results import (
     validate_run_header,
 )
 from .run_support import (
-    RunDeadline,
     ResolverFailed,
+    RunDeadline,
     SafeResolver,
     enumerate_targets,
     validate_timeout,

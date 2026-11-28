@@ -37,6 +37,7 @@ def configurable_tool_category(tool_name: str) -> str:
         "zhipu_web_search",
         "exa_web_search",
         "brave_web_search",
+        "keenable_web_search",
     }:
         return ToolCategory.WEB_TOOLS.value
     if tool_name == "sql_query":

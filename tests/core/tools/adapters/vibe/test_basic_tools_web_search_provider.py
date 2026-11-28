@@ -201,6 +201,7 @@ _ALL_SEARCH_CREDENTIALS = {
     "exa_web_search": {"api_key": "exa-key"},
     "web_search": {"api_key": "google-key", "cse_id": "google-cse-id"},
     "brave_web_search": {"api_key": "brave-key"},
+    "keenable_web_search": {"api_key": "keenable-key"},
 }
 
 
@@ -269,3 +270,37 @@ async def test_empty_provider_value_means_auto(monkeypatch):
         await _search_tool_class(_ALL_SEARCH_CREDENTIALS, "  ", monkeypatch)
         == "ZhipuWebSearchTool"
     )
+
+
+@pytest.mark.asyncio
+async def test_explicit_keenable_provider_works_without_a_key(monkeypatch):
+    monkeypatch.delenv("KEENABLE_API_KEY", raising=False)
+    assert await _search_tool_class({}, "keenable", monkeypatch) == (
+        "KeenableWebSearchTool"
+    )
+
+
+@pytest.mark.asyncio
+async def test_explicit_keenable_provider_ignores_other_keys(monkeypatch):
+    assert (
+        await _search_tool_class(_ALL_SEARCH_CREDENTIALS, "keenable", monkeypatch)
+        == "KeenableWebSearchTool"
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "present,expected",
+    [
+        ([], None),
+        (["keenable_web_search"], "KeenableWebSearchTool"),
+        (["brave_web_search", "keenable_web_search"], "BraveWebSearchTool"),
+        (["web_search", "keenable_web_search"], "WebSearchTool"),
+    ],
+)
+async def test_auto_order_keeps_keenable_last_and_needs_a_key(
+    monkeypatch, present, expected
+):
+    monkeypatch.delenv("KEENABLE_API_KEY", raising=False)
+    credentials = {k: _ALL_SEARCH_CREDENTIALS[k] for k in present}
+    assert await _search_tool_class(credentials, None, monkeypatch) == expected

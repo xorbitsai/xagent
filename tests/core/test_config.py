@@ -1127,6 +1127,10 @@ class TestGetWebSearchProvider:
         monkeypatch.setenv(WEB_SEARCH_PROVIDER, "Brave")
         assert get_web_search_provider() == "brave"
 
+    def test_keenable_web_search_provider(self, monkeypatch):
+        monkeypatch.setenv(WEB_SEARCH_PROVIDER, " Keenable ")
+        assert get_web_search_provider() == "keenable"
+
     def test_empty_web_search_provider_means_auto(self, monkeypatch):
         monkeypatch.setenv(WEB_SEARCH_PROVIDER, "  ")
         assert get_web_search_provider() == "auto"

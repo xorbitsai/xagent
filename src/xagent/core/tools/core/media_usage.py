@@ -261,6 +261,7 @@ WEB_SEARCH_MODEL_IDS: dict[str, str] = {
     "exa": "platform/web-search-exa",
     "google": "platform/web-search-google",
     "brave": "platform/web-search-brave",
+    "keenable": "platform/web-search-keenable",
 }
 
 

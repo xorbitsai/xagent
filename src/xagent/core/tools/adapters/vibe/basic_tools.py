@@ -32,7 +32,9 @@ async def create_web_tools(config: "BaseToolConfig") -> List[Any]:
             logger.warning("Skipping %s: stored credential is unreadable", tool_name)
             return [None for _ in fields]
 
-    # Web search tool preference in auto mode: Zhipu -> Tavily -> Exa -> Google -> Brave -> none
+    # Web search tool preference in auto mode: Zhipu -> Tavily -> Exa -> Google -> Brave -> Keenable -> none.
+    # Keenable works without a key, but auto only picks it when a key is set,
+    # so a deployment without any search key keeps having no search tool.
     zhipu_api_key, zhipu_base_url = credentials(
         "zhipu_web_search", "api_key", "base_url"
     )
@@ -40,6 +42,7 @@ async def create_web_tools(config: "BaseToolConfig") -> List[Any]:
     google_api_key, google_cse_id = credentials("web_search", "api_key", "cse_id")
     (exa_api_key,) = credentials("exa_web_search", "api_key")
     (brave_api_key,) = credentials("brave_web_search", "api_key")
+    (keenable_api_key,) = credentials("keenable_web_search", "api_key")
     provider = get_web_search_provider()
 
     if provider in ("auto", "zhipu") and zhipu_api_key:
@@ -62,6 +65,10 @@ async def create_web_tools(config: "BaseToolConfig") -> List[Any]:
         from .brave_web_search import BraveWebSearchTool
 
         tools.append(BraveWebSearchTool(api_key=brave_api_key))
+    elif provider == "keenable" or (provider == "auto" and keenable_api_key):
+        from .keenable_web_search import KeenableWebSearchTool
+
+        tools.append(KeenableWebSearchTool(api_key=keenable_api_key))
 
     from .fetch_web_content import FetchWebContentTool
 

@@ -332,6 +332,21 @@ class _SlackNotAMemberError(_SlackActionableError):
     """
 
 
+class _SlackRateLimitError(_SlackActionableError):
+    """Slack returned HTTP 429 and the connector has no retry left."""
+
+    def __init__(self, method: str, retry_after: int | None) -> None:
+        wait = (
+            f" Retry-After: {retry_after} seconds." if retry_after is not None else ""
+        )
+        super().__init__(
+            f"Slack rate limited {method} (HTTP 429).{wait} "
+            "Do not call Slack tools again right away. "
+            "Tell the user that Slack asked you to wait and share any results "
+            "already collected."
+        )
+
+
 def _request(
     method: str,
     path: str,
@@ -341,16 +356,15 @@ def _request(
 ) -> dict[str, Any]:
     """Call a Slack Web API method.
 
-    Slack always answers with HTTP 200, even on failure — success/failure is
-    only signalled by the body's "ok" boolean plus an "error" code, so error
-    detection here is on that field, not on raise_for_status().
+    Slack reports application errors in HTTP 200 responses through the body's
+    "ok" boolean and "error" code. HTTP failures are also checked.
 
     Write calls pass json_data rather than params: message text can exceed
     URL length limits, and query strings are commonly logged in plaintext by
     proxies/load balancers, which would leak message content.
 
-    Rate limiting is the one non-200 case worth special handling: on a 429
-    with a small Retry-After, wait once and retry instead of failing.
+    A 429 with a small Retry-After gets one retry. A terminal 429 becomes
+    an actionable error that tells callers to wait.
     """
     for attempt in (0, 1):
         # Re-read immediately before every network attempt. A policy can
@@ -377,15 +391,22 @@ def _request(
         # Never consume a response received after the grant expired while the
         # request was in flight, including a 429 that would otherwise sleep.
         _channel_access_policy()
-        if response.status_code == 429 and attempt == 0:
-            try:
-                retry_after = int(response.headers.get("Retry-After", "0"))
-            except ValueError:
-                retry_after = 0
-            if 0 < retry_after <= MAX_RETRY_AFTER_SECONDS:
-                time.sleep(retry_after)
-                continue
-        break
+        if response.status_code != 429:
+            break
+        try:
+            retry_after = int(response.headers.get("Retry-After", ""))
+        except ValueError:
+            retry_after = None
+        if retry_after is not None and retry_after < 0:
+            retry_after = None
+        if (
+            attempt == 0
+            and retry_after is not None
+            and 0 < retry_after <= MAX_RETRY_AFTER_SECONDS
+        ):
+            time.sleep(retry_after)
+            continue
+        raise _SlackRateLimitError(path, retry_after)
     response.raise_for_status()
     payload: dict[str, Any] = response.json()
     if not payload.get("ok"):
@@ -1173,15 +1194,9 @@ def slack_search_messages(
 
         threads_scanned = 0
         thread_replies_truncated = False
-        # An actionable error from the history scan (not a member, missing
-        # scope) describes a channel-wide or connection-wide bot state, not
-        # something specific to whichever page hit it — every
-        # conversations.replies call below would fail the exact same way,
-        # so skip the (up to MAX_SEARCH_THREADS) doomed calls entirely
-        # rather than re-discovering the same failure per thread. Checked
-        # on the common _SlackActionableError base, not one specific
-        # subclass, so this covers missing_scope the same way it covers
-        # not-a-member.
+        # Stop after an actionable history error. A membership or scope
+        # problem can affect the whole search, and a rate limit asks callers
+        # to wait before making further requests.
         if include_thread_replies and not isinstance(scan_error, _SlackActionableError):
             for parent in threaded_parents:
                 if threads_scanned >= MAX_SEARCH_THREADS or len(matches) >= max_matches:
@@ -1214,21 +1229,12 @@ def slack_search_messages(
                     # gap distinct from threads never attempted at all
                     # (below) — it must still flag truncated even though
                     # threads_scanned already counts the attempt for budget
-                    # purposes. An actionable not-a-member or missing-scope
-                    # message always wins over a later transient one (rate
-                    # limit, etc.) or over the history-pagination failure
-                    # above, so a membership problem is never masked by an
-                    # unrelated failure elsewhere in this same call.
+                    # purposes. An actionable error takes precedence over
+                    # an unrelated history or thread failure.
                     scan_error = _prefer_actionable_error(scan_error, thread_exc)
                     if isinstance(thread_exc, _SlackActionableError):
-                        # Discovered mid-loop rather than up front (the
-                        # earlier history scan succeeded, so the guard
-                        # above this loop didn't catch it) — but not a
-                        # member / missing scope are both channel-wide or
-                        # connection-wide bot states, not specific to this
-                        # thread, so every remaining parent would fail
-                        # identically. Stop instead of repeating the same
-                        # doomed call up to MAX_SEARCH_THREADS times.
+                        # Return the matches collected before the failure
+                        # and stop scanning further threads.
                         break
                     continue
                 # A thread with over 200 replies is only partially scanned —

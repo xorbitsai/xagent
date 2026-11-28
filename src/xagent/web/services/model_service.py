@@ -796,6 +796,31 @@ def get_vision_model(db: Session, user_id: Optional[int] = None) -> Optional[Bas
         return None
 
 
+def get_vision_models(db: Session, user_id: Optional[int] = None) -> dict[str, BaseLLM]:
+    """Build the active vision-capable chat models visible to the caller."""
+    from ...core.model.providers import ROUTER_PROVIDER
+    from .llm_utils import _create_llm_instance
+
+    candidates = (
+        db.query(DBModel)
+        .filter(DBModel.category == "llm", DBModel.is_active.is_(True))
+        .all()
+    )
+    rows = rank_name_matched_models(db, candidates, user_id)
+    models: dict[str, BaseLLM] = {}
+    for row in rows:
+        if row.model_provider == ROUTER_PROVIDER or "vision" not in (
+            row.abilities or []
+        ):
+            continue
+        model_id = str(row.model_id)
+        try:
+            models[model_id] = _create_llm_instance(row)
+        except Exception:
+            logger.warning("Failed to initialize selectable vision model %s", model_id)
+    return models
+
+
 def _add_image_model_with_id(
     models_dict: dict[str, Any], instance: Any, db_model: DBModel
 ) -> None:

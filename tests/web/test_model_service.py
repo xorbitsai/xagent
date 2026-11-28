@@ -34,6 +34,7 @@ from xagent.web.services.model_service import (
     get_sound_effect_models,
     get_tts_models,
     get_vision_model,
+    get_vision_models,
     set_model_visibility_hook,
     set_visible_user_ids_hook,
 )
@@ -1256,3 +1257,46 @@ class TestModelVisibilityHook:
 
         assert result is not None
         assert result.model_id == gpt.model_id
+
+
+def test_vision_catalog_uses_visible_active_vision_models(
+    db_session, regular_user, admin_user, monkeypatch
+):
+    monkeypatch.setattr(
+        "xagent.web.services.model_service._get_visible_user_ids",
+        lambda _db, _user_id: [admin_user.id],
+    )
+    for model_id, owner, shared, abilities, active in (
+        ("own", regular_user, False, ["vision"], True),
+        ("shared", admin_user, True, ["vision"], True),
+        ("private", admin_user, False, ["vision"], True),
+        ("text-only", regular_user, False, ["chat"], True),
+        ("inactive", regular_user, False, ["vision"], False),
+    ):
+        row = Model(
+            model_id=model_id,
+            model_name=model_id,
+            model_provider="openai",
+            api_key="test-key",
+            base_url="https://example.test/v1",
+            category="llm",
+            abilities=abilities,
+            is_active=active,
+        )
+        db_session.add(row)
+        db_session.flush()
+        db_session.add(
+            UserModel(
+                user_id=owner.id,
+                model_id=row.id,
+                is_owner=True,
+                is_shared=shared,
+            )
+        )
+    db_session.commit()
+
+    with patch(
+        "xagent.web.services.llm_utils._create_llm_instance", return_value=object()
+    ):
+        assert set(get_vision_models(db_session, regular_user.id)) == {"own", "shared"}
+        assert set(get_vision_models(db_session)) == {"shared"}

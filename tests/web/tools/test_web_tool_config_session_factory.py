@@ -63,6 +63,7 @@ _FACTORY_MODEL_VALUE_FIELDS = (
     "music_model",
 )
 _FACTORY_MODEL_MAPPING_FIELDS = (
+    "vision_models",
     "image_models",
     "video_models",
     "asr_models",
@@ -1452,6 +1453,7 @@ async def test_handoff_retains_loaded_model_values_without_database_fallback():
         "load_video",
         "load_audio",
         "vision_model",
+        "vision_models",
         "image_models",
         "image_generate_model",
         "image_edit_model",
@@ -1468,6 +1470,7 @@ async def test_handoff_retains_loaded_model_values_without_database_fallback():
     }
     mapping_proxy_type = type(MappingProxyType({}))
     for name in (
+        "vision_models",
         "image_models",
         "video_models",
         "asr_models",
@@ -2242,6 +2245,7 @@ async def test_factory_prepare_snapshots_selected_sync_factory_inputs(
 
     model_values = {
         "get_default_vision_model": object(),
+        "get_vision_models": {"vision": object()},
         "get_image_models": {"image": object()},
         "get_default_image_generate_model": object(),
         "get_default_image_edit_model": object(),
@@ -2306,6 +2310,7 @@ async def test_factory_prepare_snapshots_selected_sync_factory_inputs(
     )
     assert cfg.get_music_model() is model_values["get_default_music_model"]
     mapping_getters = (
+        (cfg.get_vision_models, "get_vision_models"),
         (cfg.get_image_models, "get_image_models"),
         (cfg.get_video_models, "get_video_models"),
         (cfg.get_asr_models, "get_asr_models"),
@@ -2981,6 +2986,7 @@ async def test_default_model_prefetch_returns_every_pool_checkout(
     event.listen(engine, "checkin", record_checkin)  # codespell:ignore checkin
 
     collection_getters = (
+        "get_vision_models",
         "get_image_models",
         "get_video_models",
         "get_asr_models",
@@ -3826,3 +3832,32 @@ def test_a_default_inside_the_allow_list_is_kept_without_loading_a_mapping(
 
     assert cfg.get_video_model() is default
     assert loads == []
+
+
+def test_vision_catalog_and_default_use_task_model_constraints():
+    from dataclasses import replace
+
+    snapshot, _ = _factory_model_snapshot("vision-policy")
+    available = _MediaModel("permitted", ("vision",))
+    blocked = _MediaModel("blocked-default", ("vision",))
+    unlisted = _MediaModel("unlisted", ("vision",))
+    cfg = WebToolConfig(
+        db=object(),
+        request=None,
+        user_id=1,
+        excluded_model_ids=frozenset({blocked.model_id}),
+        allowed_model_ids=frozenset({available.model_id, blocked.model_id}),
+    )
+    cfg._factory_runtime_snapshot = replace(
+        snapshot,
+        vision_model=blocked,
+        vision_models={
+            model.model_id: model for model in (blocked, available, unlisted)
+        },
+    )
+    assert cfg.get_vision_model() is None
+    assert cfg.get_vision_models() == {available.model_id: available}
+
+    cfg.handoff_factory_runtime()
+    assert cfg.get_vision_model() is None
+    assert cfg.get_vision_models() == {available.model_id: available}

@@ -408,7 +408,7 @@ async def get_available_tools(
                 )
             return "other"
 
-        vision_model = tool_config.get_vision_model()
+        vision_model = tool_config.get_vision_model() or tool_config.get_vision_models()
         image_models = tool_config.get_image_models()
         video_models = tool_config.get_video_models()
         asr_models = tool_config.get_asr_models()

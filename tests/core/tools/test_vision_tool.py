@@ -2634,3 +2634,82 @@ class TestDrawBoundingBoxes:
             finally:
                 if os.path.exists(temp_image_path):
                     os.unlink(temp_image_path)
+
+
+@pytest.mark.asyncio
+async def test_vision_tool_selects_model_per_call(mock_vision_model, mock_workspace):
+    alternative = Mock(spec=BaseLLM)
+    alternative.model_id = "allowed-alternative"
+    alternative.has_ability.return_value = True
+    alternative.vision_chat = AsyncMock(return_value="alternative response")
+    mock_vision_model.model_id = "configured-default"
+    tool = VisionTool(
+        mock_vision_model,
+        mock_workspace,
+        vision_models={alternative.model_id: alternative},
+    )
+    understand = next(
+        item for item in tool.get_tools() if item.name == "understand_media"
+    )
+    assert alternative.model_id in understand.description
+    assert "model_id" in understand.args_type().model_fields
+    args = {"media": "https://example.test/image.png", "question": "What's here?"}
+
+    selected = await understand.run_json_async(
+        {**args, "model_id": alternative.model_id}
+    )
+    with patch.object(tool, "_resolve_media", new_callable=AsyncMock) as resolve:
+        invalid = await understand.run_json_async({**args, "model_id": "private-model"})
+        resolve.assert_not_awaited()
+    default = await understand.run_json_async(args)
+
+    assert selected["success"] and selected["answer"] == "alternative response"
+    assert not invalid["success"] and "unavailable" in invalid["error"]
+    assert default["success"]
+    alternative.vision_chat.assert_awaited_once()
+    mock_vision_model.vision_chat.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_vision_tool_can_run_without_default(mock_vision_model, mock_workspace):
+    model_id = "selectable-model"
+    tools = get_vision_tool(
+        workspace=mock_workspace, vision_models={model_id: mock_vision_model}
+    )
+    understand = next(tool for tool in tools if tool.name == "understand_media")
+    assert "Supply model_id" in understand.description
+    args = {"media": "https://example.test/image.png", "question": "What's here?"}
+
+    missing = await understand.run_json_async(args)
+    assert not missing["success"] and "Specify model_id" in missing["error"]
+    mock_vision_model.vision_chat.assert_not_awaited()
+
+    selected = await understand.run_json_async({**args, "model_id": model_id})
+    assert selected["success"]
+    mock_vision_model.vision_chat.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_detect_objects_uses_selected_model(
+    mock_vision_model, mock_vision_model_with_detection
+):
+    model_id = "detection-model"
+    tools = get_vision_tool(
+        vision_model=mock_vision_model,
+        vision_models={model_id: mock_vision_model_with_detection},
+    )
+    detect = next(tool for tool in tools if tool.name == "detect_objects")
+    result = await detect.run_json_async(
+        {
+            "images": "data:image/jpeg;base64,ZmFrZV9pbWFnZV9kYXRh",
+            "task": "Find objects",
+            "model_id": model_id,
+        }
+    )
+    assert result["success"]
+    assert [detection["class"] for detection in result["detections"]] == [
+        "person",
+        "car",
+    ]
+    mock_vision_model.vision_chat.assert_not_awaited()
+    mock_vision_model_with_detection.vision_chat.assert_awaited_once()

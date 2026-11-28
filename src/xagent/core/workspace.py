@@ -2235,6 +2235,11 @@ class TaskWorkspace:
     def _ensure_directories(self) -> None:
         """Ensure task directories inherit writable sandbox-group access."""
         self.workspace_dir.parent.mkdir(parents=True, exist_ok=True)
+        if os.name == "nt":
+            # The sandbox group layout depends on POSIX directory descriptors
+            # and setgid inheritance. Windows uses the regular workspace tree.
+            self._ensure_legacy_directories()
+            return
         parent = self.workspace_dir.parent.resolve()
         uploads_root = get_uploads_dir().expanduser().resolve()
         parent_is_managed = parent == uploads_root or parent.is_relative_to(

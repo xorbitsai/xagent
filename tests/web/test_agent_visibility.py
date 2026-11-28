@@ -452,10 +452,18 @@ def test_store_rejects_unknown_visibility_value(db, team_of_admin_and_member):
 
 
 def test_non_admin_cannot_downgrade_admins_only_agent(db, team_of_admin_and_member):
-    """#9: the visibility guard rejects a non-admin changing (downgrading) an
-    agent that is currently admins-only, even when the agent is handed in
-    pre-fetched (the endpoint's reuse path). Members normally 404 at the
-    ownership layer; this asserts the guard itself is the second line."""
+    """#9: a non-admin cannot change (downgrade) an agent that is currently
+    admins-only.
+
+    The store checks ownership first, inside the query that locks the agent
+    row, even when the caller hands in a pre-fetched agent (the endpoint's
+    reuse path): a member who cannot manage the agent gets ``None`` and
+    nothing is written. The visibility guard is the second line and is
+    asserted on its own."""
+    from sqlalchemy import func, select
+
+    from xagent.web.models.agent import Agent
+    from xagent.web.models.agent_version import AgentVersion
     from xagent.web.services.agent_store import (
         AgentStore,
         _assert_can_set_visibility,
@@ -475,8 +483,9 @@ def test_non_admin_cannot_downgrade_admins_only_agent(db, team_of_admin_and_memb
     # Guard rejects a downgrade attempt with a non-admin scope.
     with pytest.raises(PermissionError):
         _assert_can_set_visibility(non_admin_scope, "team", agent.visibility)
-    # And through the store when the owned agent is passed in explicitly.
-    with pytest.raises(PermissionError):
+    # Through the store, with the agent passed in explicitly, the ownership
+    # check in the locking query refuses first: nothing is written.
+    assert (
         store.update_agent_fields(
             int(member.id),
             int(agent.id),
@@ -484,6 +493,25 @@ def test_non_admin_cannot_downgrade_admins_only_agent(db, team_of_admin_and_memb
             team_scope=non_admin_scope,
             agent=agent,
         )
+        is None
+    )
+    db.rollback()
+    assert (
+        db.execute(
+            select(Agent.__table__.c.visibility).where(
+                Agent.__table__.c.id == int(agent.id)
+            )
+        ).scalar_one()
+        == "admins"
+    )
+    assert (
+        db.execute(
+            select(func.count(AgentVersion.id)).where(
+                AgentVersion.agent_id == int(agent.id)
+            )
+        ).scalar_one()
+        == 0
+    )
 
 
 def test_non_admin_cannot_demote_teammates_team_agent(db, two_users_one_team_via_scope):

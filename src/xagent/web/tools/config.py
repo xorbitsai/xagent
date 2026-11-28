@@ -140,6 +140,9 @@ OAUTH_TOKEN_RESOLVER_FAILURE_CODE = "oauth_token_resolver_failed"
 OAUTH_TOKEN_RESOLVER_FAILURE_MESSAGE = "OAuth token resolver failed"
 UNAVAILABLE_MCP_MESSAGE = "MCP server is unavailable."
 UNAVAILABLE_MCP_CREDENTIAL_MESSAGE = "MCP server credentials are unavailable."
+UNAVAILABLE_MCP_OAUTH_REFRESH_MESSAGE = (
+    "MCP OAuth authorization server did not respond."
+)
 # The user's only grant is a provider-level one this app no longer accepts
 # (APPS_REQUIRING_APP_SCOPED_OAUTH_GRANT); connecting the app itself fixes it.
 UNAVAILABLE_MCP_APP_SCOPED_GRANT_MESSAGE = (
@@ -174,6 +177,7 @@ MCP_UNAVAILABLE_REASONS = frozenset(
         "oauth_token_required",
         OAUTH_TOKEN_RESOLVER_FAILURE_CODE,
         "runtime_connection_failed",
+        "token_refresh_unavailable",
         "token_refresh_failed",
         CLIENT_REJECTED_REASON,
     }
@@ -6109,9 +6113,17 @@ class WebToolConfig(BaseToolConfig):
                         return self._build_unavailable_mcp_config(
                             server=server,
                             reason=reason,
-                            message=UNAVAILABLE_MCP_CREDENTIAL_MESSAGE,
+                            message=(
+                                UNAVAILABLE_MCP_OAUTH_REFRESH_MESSAGE
+                                if reason == "token_refresh_unavailable"
+                                else UNAVAILABLE_MCP_CREDENTIAL_MESSAGE
+                            ),
                             diagnostic=diagnostic,
-                            failure_code="oauth_token_required",
+                            failure_code=(
+                                None
+                                if reason == "token_refresh_unavailable"
+                                else "oauth_token_required"
+                            ),
                         )
                     if actor_remote_oauth:
                         # Actor catalog execution trusts only its selected bearer.

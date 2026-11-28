@@ -1596,8 +1596,9 @@ async def _refresh_mcp_oauth_grant(
     same refresh token is answered this way twice, at least
     ``MCP_OAUTH_INVALID_GRANT_RETIRE_SECONDS`` apart and within
     ``MCP_OAUTH_INVALID_GRANT_MARKER_TTL_SECONDS``. The whole request is
-    bounded by ``MCP_OAUTH_REFRESH_DEADLINE_SECONDS``. 5xx, network errors
-    and every other code stay transient.
+    bounded by ``MCP_OAUTH_REFRESH_DEADLINE_SECONDS``. Timeouts, transport
+    errors and 5xx answers raise ``token_refresh_unavailable`` and leave the
+    grant untouched.
     """
     data = {
         "grant_type": "refresh_token",
@@ -1647,14 +1648,23 @@ async def _refresh_mcp_oauth_grant(
                         resolve_dns_for_url_policy=False,
                         **request_kwargs,
                     )
+            if response.is_server_error:
+                raise MCPOAuthRuntimeError(
+                    "token_refresh_unavailable",
+                    "MCP OAuth authorization server did not respond",
+                )
             payload = response.json()
     except TimeoutError as exc:
         raise MCPOAuthRuntimeError(
-            "token_refresh_failed", "MCP OAuth refresh timed out"
+            "token_refresh_unavailable", "MCP OAuth refresh timed out"
         ) from exc
     except (MCPOAuthDiscoveryError, httpx.HTTPError, ValueError) as exc:
+        transport_error = isinstance(exc, httpx.TransportError) or (
+            isinstance(exc, MCPOAuthDiscoveryError)
+            and isinstance(exc.__cause__, httpx.TransportError)
+        )
         raise MCPOAuthRuntimeError(
-            "token_refresh_failed",
+            "token_refresh_unavailable" if transport_error else "token_refresh_failed",
             oauth_exception_message(exc, "MCP OAuth refresh failed"),
         ) from exc
 
@@ -1924,6 +1934,19 @@ def _invalid_grant_marker_age_seconds(
     if marked_at.tzinfo is None:
         marked_at = marked_at.replace(tzinfo=timezone.utc)
     return (_utc_now() - marked_at).total_seconds()
+
+
+def mcp_oauth_grant_has_invalid_grant_marker(grant: Any) -> bool:
+    """Whether the grant's current refresh token has an unexpired rejection marker."""
+    refresh_token = getattr(grant, "refresh_token", None)
+    metadata = getattr(grant, "metadata_json", None)
+    if not isinstance(refresh_token, str) or not isinstance(metadata, dict):
+        return False
+    token_digest = hashlib.sha256(refresh_token.encode("utf-8")).hexdigest()
+    marked_for_seconds = _invalid_grant_marker_age_seconds(metadata, token_digest)
+    return marked_for_seconds is not None and (
+        0 <= marked_for_seconds < MCP_OAUTH_INVALID_GRANT_MARKER_TTL_SECONDS
+    )
 
 
 def _utc_now() -> datetime:

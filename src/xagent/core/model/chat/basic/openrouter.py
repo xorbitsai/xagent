@@ -587,6 +587,8 @@ class OpenRouterLLM(OpenAILLM):
         ``thinking`` between enabled and disabled, each adjustment at most
         once per call (see ``_next_compat_adjustment``).
         """
+        # The retry state must reflect the choice actually sent to the provider.
+        tool_choice = self.compatible_tool_choice(tool_choice)
         if self._uses_deepseek_tool_protocol:
             tool_choice = _force_single_required_deepseek_tool(tools, tool_choice)
         response = await self._run_chat_with_compat_retry(
@@ -645,7 +647,7 @@ class OpenRouterLLM(OpenAILLM):
             temperature=temperature,
             max_tokens=max_tokens,
             tools=tools,
-            tool_choice=tool_choice,
+            tool_choice=self.compatible_tool_choice(tool_choice),
             response_format=response_format,
             thinking=thinking,
             output_config=output_config,
@@ -946,7 +948,7 @@ class OpenRouterLLM(OpenAILLM):
             temperature=temperature,
             max_tokens=max_tokens,
             tools=tools,
-            tool_choice=tool_choice,
+            tool_choice=self.compatible_tool_choice(tool_choice),
             response_format=response_format,
             thinking=thinking,
             output_config=output_config,

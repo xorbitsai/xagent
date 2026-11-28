@@ -179,6 +179,35 @@ async def test_router_normalizes_tool_choice_after_resolving_model(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_resolved_router_exposes_openrouter_tool_choice_capability(monkeypatch):
+    model_id = "anthropic/claude-opus-5.5"
+    downstream = OpenRouterLLM(model_name=model_id, api_key="test-key")
+    router = RouterLLM(
+        downstream_resolver=lambda _model_id: downstream,
+        candidate_models=(model_id,),
+    )
+
+    async def select_model(_prompt: str, **_kwargs: Any) -> str:
+        return model_id
+
+    monkeypatch.setattr(router, "_select_model", select_model)
+    monkeypatch.setattr(router, "_profile_context_window", lambda _model_id: None)
+    monkeypatch.setattr(router, "_profile_input_modalities", lambda _model_id: ())
+    messages = [{"role": "user", "content": "hi"}]
+    seen = []
+
+    async def chat(_messages, *, tool_choice, **_kwargs):
+        seen.append(tool_choice)
+        return "ok"
+
+    monkeypatch.setattr(downstream, "chat", chat)
+    prepared = await router.prepare_for_call(messages)
+    assert not prepared.supports_forced_tool_choice
+    assert await prepared.chat(messages, tool_choice="required") == "ok"
+    assert seen == ["auto"]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("candidate_models", "expected_abilities", "expected_thinking"),
     [

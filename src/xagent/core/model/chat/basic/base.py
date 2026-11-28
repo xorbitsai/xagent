@@ -5,6 +5,7 @@ from abc import ABC, abstractmethod
 from typing import Any, AsyncIterator, List
 
 from ..types import ChunkType, StreamChunk
+from .tool_choice import supports_forced_tool_choice
 
 
 def compatible_tool_choice_for_llm(
@@ -12,9 +13,9 @@ def compatible_tool_choice_for_llm(
 ) -> str | dict[str, Any] | None:
     """Return the strongest tool choice supported by an arbitrary LLM object."""
 
-    if getattr(llm, "supports_forced_tool_choice", True):
-        return tool_choice
     if tool_choice is None or tool_choice in ("auto", "none"):
+        return tool_choice
+    if getattr(llm, "supports_forced_tool_choice", True):
         return tool_choice
     return "auto"
 
@@ -103,11 +104,11 @@ class BaseLLM(ABC):
 
         Tool calling and forced tool selection are separate capabilities: a
         model can accept tool schemas with ``tool_choice=auto`` while rejecting
-        ``required`` or a named tool. Most providers support both, so the
-        default preserves their existing behavior. Wrappers that do not use
-        the generic retry delegator must explicitly forward this property.
+        ``required`` or a named tool. Detect this restriction through known
+        model identifiers or the ``auto_tool_choice_only`` ability. Wrappers
+        must forward the capability of the model handling the call.
         """
-        return True
+        return supports_forced_tool_choice(self.abilities, self.model_name)
 
     def compatible_tool_choice(
         self, tool_choice: str | dict[str, Any] | None

@@ -7,6 +7,7 @@ from os import environ
 from typing import Any
 
 from mcp.server.fastmcp import FastMCP
+from mcp.types import ToolAnnotations
 
 from ....config import get_tool_max_output_length
 from ....core.utils import public_requests as requests
@@ -19,6 +20,8 @@ logger = logging.getLogger("mixpanel-mcp")
 
 
 mcp = FastMCP("mixpanel-mcp")
+
+READ_ONLY = ToolAnnotations(readOnlyHint=True)
 
 DEFAULT_TIMEOUT_SECONDS = 30
 MAX_LIMIT = 100
@@ -455,7 +458,7 @@ def _request(
         ) from exc
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY)
 def mixpanel_list_event_names(event_type: str = "general", limit: int = 50) -> str:
     """
     List event names tracked in this project, ordered by volume.
@@ -477,7 +480,7 @@ def mixpanel_list_event_names(event_type: str = "general", limit: int = 50) -> s
         return _error(str(e))
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY)
 def mixpanel_get_top_events(event_type: str = "general", limit: int = 50) -> str:
     """
     Get the top events in this project with their volume and change vs. the
@@ -499,7 +502,7 @@ def mixpanel_get_top_events(event_type: str = "general", limit: int = 50) -> str
         return _error(str(e))
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY)
 def mixpanel_get_event_properties(event: str, limit: int = 10) -> str:
     """
     Get the top property names tracked on a given event, with their volume.
@@ -520,7 +523,7 @@ def mixpanel_get_event_properties(event: str, limit: int = 10) -> str:
         return _error(str(e))
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY)
 def mixpanel_query_user_activity(
     identifier: str,
     event: str,
@@ -629,7 +632,7 @@ def mixpanel_query_user_activity(
         return _error(str(e))
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY)
 def mixpanel_query_segmentation(
     event: str,
     from_date: str,
@@ -672,7 +675,7 @@ def mixpanel_query_segmentation(
         return _error(str(e))
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY)
 def mixpanel_query_retention(
     from_date: str,
     to_date: str,
@@ -726,7 +729,7 @@ def mixpanel_query_retention(
         return _error(str(e))
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY)
 def mixpanel_list_funnels() -> str:
     """
     List saved funnels in this project -- funnel_id and name. Use the
@@ -740,7 +743,7 @@ def mixpanel_list_funnels() -> str:
         return _error(str(e))
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY)
 def mixpanel_query_funnel(
     funnel_id: int, from_date: str, to_date: str, unit: str = "day"
 ) -> str:
@@ -770,7 +773,7 @@ def mixpanel_query_funnel(
         return _error(str(e))
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY)
 def mixpanel_query_engage(
     where: str = "", output_properties: str = "", session_id: str = "", page: int = 0
 ) -> str:
@@ -817,7 +820,7 @@ def mixpanel_query_engage(
         return _error(message, **details)
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY)
 def mixpanel_list_annotations(from_date: str, to_date: str) -> str:
     """
     List annotations (notes marking a point in time, e.g. a deploy or
@@ -866,7 +869,7 @@ def mixpanel_create_annotation(date: str, description: str) -> str:
         return _error(str(e))
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY)
 def mixpanel_export_events(
     from_date: str, to_date: str, event: str = "", where: str = ""
 ) -> str:

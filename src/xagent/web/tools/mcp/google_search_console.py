@@ -6,6 +6,7 @@ import re
 from typing import Any, Callable
 
 from mcp.server.fastmcp import FastMCP
+from mcp.types import ToolAnnotations
 
 from ....config import get_tool_max_output_length
 from ....core.utils import public_requests as requests
@@ -19,6 +20,8 @@ logger = logging.getLogger("google-search-console-mcp")
 
 
 mcp = FastMCP("google-search-console-mcp")
+
+READ_ONLY = ToolAnnotations(readOnlyHint=True)
 
 WEBMASTERS_API_BASE_URL = "https://www.googleapis.com/webmasters/v3"
 SEARCH_CONSOLE_API_BASE_URL = "https://searchconsole.googleapis.com/v1"
@@ -280,7 +283,7 @@ def _validate_date(label: str, value: str) -> None:
         raise ValueError(f"{label} must be a valid calendar date") from None
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY)
 def google_search_console_list_sites() -> str:
     """
     List the sites (URL-prefix or domain properties) the connected account
@@ -320,7 +323,7 @@ def google_search_console_list_sites() -> str:
         return _error(str(e))
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY)
 def google_search_console_list_sitemaps(site_url: str) -> str:
     """
     List the sitemaps submitted for a site, including their status and
@@ -357,7 +360,7 @@ def google_search_console_list_sitemaps(site_url: str) -> str:
         return _error(str(e))
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY)
 def google_search_console_query_search_analytics(
     site_url: str,
     start_date: str,
@@ -489,7 +492,7 @@ def google_search_console_query_search_analytics(
         return _error(str(e))
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY)
 def google_search_console_inspect_url(
     site_url: str, inspection_url: str, language_code: str = "en-US"
 ) -> str:

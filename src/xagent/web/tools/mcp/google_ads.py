@@ -5,6 +5,7 @@ import re
 from typing import Any
 
 from mcp.server.fastmcp import FastMCP
+from mcp.types import ToolAnnotations
 
 from ....core.utils import public_requests as requests
 
@@ -13,6 +14,8 @@ logger = logging.getLogger("google-ads-mcp")
 
 
 mcp = FastMCP("google-ads-mcp")
+
+READ_ONLY = ToolAnnotations(readOnlyHint=True)
 
 GOOGLE_ADS_BASE_URL = "https://googleads.googleapis.com/v23"
 DEFAULT_TIMEOUT_SECONDS = 30
@@ -147,7 +150,7 @@ def _request(
     return response.json()
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY)
 def google_ads_list_accessible_customers() -> str:
     """
     List the Google Ads customer IDs accessible to the connected account.
@@ -167,7 +170,7 @@ def google_ads_list_accessible_customers() -> str:
         return _error(str(e))
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY)
 def google_ads_search(
     customer_id: str, query: str, login_customer_id: str | None = None
 ) -> str:

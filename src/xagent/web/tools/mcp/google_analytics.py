@@ -6,6 +6,7 @@ from datetime import date
 from typing import Any
 
 from mcp.server.fastmcp import FastMCP
+from mcp.types import ToolAnnotations
 
 from ....config import get_tool_max_output_length
 from ....core.utils import public_requests as requests
@@ -15,6 +16,8 @@ logger = logging.getLogger("google-analytics-mcp")
 
 
 mcp = FastMCP("google-analytics-mcp")
+
+READ_ONLY = ToolAnnotations(readOnlyHint=True)
 
 DATA_API_BASE_URL = "https://analyticsdata.googleapis.com/v1beta"
 ADMIN_API_BASE_URL = "https://analyticsadmin.googleapis.com/v1beta"
@@ -246,7 +249,7 @@ def _date_ranges_overlap(a: dict[str, Any], b: dict[str, Any]) -> bool:
     return False
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY)
 def google_analytics_list_properties() -> str:
     """
     List the GA4 accounts and properties accessible to the connected account.
@@ -326,7 +329,7 @@ def _project_metadata_entries(entries: list[Any], search: str) -> list[dict[str,
     return projected
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY)
 def google_analytics_get_metadata(property_id: str, search: str = "") -> str:
     """
     List the dimension and metric names available to query for a GA4 property
@@ -356,7 +359,7 @@ def google_analytics_get_metadata(property_id: str, search: str = "") -> str:
         return _error(str(e))
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY)
 def google_analytics_run_report(
     property_id: str,
     metrics: list[str],

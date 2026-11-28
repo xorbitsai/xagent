@@ -13195,7 +13195,7 @@ describe("opens the first gate and the session check from one place each", () =>
   // Comments go first: prose may name these actions.
   const code = (file: string) => readFileSync(file, "utf8").replace(/\/\*[\s\S]*?\*\//g, "").replace(/\/\/[^\n]*/g, "")
   const callers = (pattern: RegExp) => productionSources(root)
-    .map(file => ({ file: path.relative(root, file), calls: Array.from(code(file).matchAll(pattern)).length }))
+    .map(file => ({ file: path.relative(root, file).split(path.sep).join("/"), calls: Array.from(code(file).matchAll(pattern)).length }))
     .filter(({ calls }) => calls > 0)
 
   it("calls openFirstGate once, from the app context", () => {

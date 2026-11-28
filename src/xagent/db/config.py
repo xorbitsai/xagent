@@ -16,8 +16,10 @@ def create_alembic_config(engine: Engine) -> Any:
     cfg.set_main_option("version_path_separator", "os")
     cfg.set_main_option("output_encoding", "utf-8")
 
-    # Database URL from engine
-    cfg.set_main_option("sqlalchemy.url", str(engine.url))
+    # Preserve credentials for Alembic's standalone connection path and
+    # escape literal percent signs for ConfigParser interpolation.
+    database_url = engine.url.render_as_string(hide_password=False)
+    cfg.set_main_option("sqlalchemy.url", database_url.replace("%", "%%"))
 
     # Logging configuration
     cfg.set_main_option("keys", "root,sqlalchemy,alembic")

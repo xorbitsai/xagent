@@ -2509,6 +2509,41 @@ class TestTaskRuntimeHookConfig:
         assert get_task_runtime_hook_queue_timeout_seconds() == 30
 
 
+@pytest.mark.parametrize(
+    ("operation", "env_var", "default"),
+    [
+        (
+            "on_task_created",
+            "XAGENT_TASK_RUNTIME_HOOK_ON_TASK_CREATED_TIMEOUT_SECONDS",
+            30,
+        ),
+        ("build_runtime", "XAGENT_TASK_RUNTIME_HOOK_BUILD_RUNTIME_TIMEOUT_SECONDS", 10),
+        (
+            "public_metadata",
+            "XAGENT_TASK_RUNTIME_HOOK_PUBLIC_METADATA_TIMEOUT_SECONDS",
+            10,
+        ),
+        (
+            "on_task_deleted",
+            "XAGENT_TASK_RUNTIME_HOOK_ON_TASK_DELETED_TIMEOUT_SECONDS",
+            30,
+        ),
+    ],
+)
+def test_task_runtime_hook_execution_timeout(monkeypatch, operation, env_var, default):
+    from xagent.config import get_task_runtime_hook_execution_timeout_seconds
+
+    monkeypatch.delenv(env_var, raising=False)
+    assert get_task_runtime_hook_execution_timeout_seconds(operation) == default
+
+    monkeypatch.setenv(env_var, "1.25")
+    assert get_task_runtime_hook_execution_timeout_seconds(operation) == 1.25
+
+    for value in ("0", "-1", "abc", "nan", "inf", " "):
+        monkeypatch.setenv(env_var, value)
+        assert get_task_runtime_hook_execution_timeout_seconds(operation) == default
+
+
 class TestLocalBrowserConfig:
     def test_defaults(self, monkeypatch):
         for name in (

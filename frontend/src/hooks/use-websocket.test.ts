@@ -1627,6 +1627,7 @@ describe("useWebSocket normalized connections", () => {
       message: "create lazily",
       context: { timezone: expect.any(String) },
       client_message_id: "session-turn-1",
+      input_mode: "text",
     })
 
     act(() => socket.receive({
@@ -3578,12 +3579,14 @@ describe("useWebSocket normalized connections", () => {
         expect(socket.send).toHaveBeenCalledTimes(1)
         const raw = socket.send.mock.calls[0][0] as string
         const timezone = resolveReportedTimezone()
-        // The frame a send without a source has always produced, key order included.
+        // The frame a send without a source has always produced, key order
+        // included; a Session connection also marks how the message was entered.
         const unchanged: Record<string, unknown> = {
           type: "chat",
           message: "continue",
           client_message_id: clientMessageId,
           ...(requestId ? { request_id: requestId } : {}),
+          ...(mode === "omit" ? { input_mode: "text" } : {}),
           ...(timezone ? { context: { timezone } } : {}),
           ...(mode === "required" ? { task_id: 7 } : {}),
         }
@@ -3613,6 +3616,167 @@ describe("useWebSocket normalized connections", () => {
       expect(frame).toMatchObject({ file_ids: [fileId], source_task_id: 101 })
       act(() => socket.receive({ type: "message_accepted", client_message_id: "msg-both" }))
       await delivery
+    })
+  })
+
+  describe("chat frames mark how the message was entered", () => {
+    type Shape = {
+      name: string
+      args: Parameters<ReturnType<typeof useWebSocket>["sendChatMessage"]>
+    }
+    const SHAPES: Shape[] = [
+      { name: "plain", args: ["hi", undefined, false, "m-1"] },
+      { name: "with a request id", args: ["hi", undefined, false, "m-1", "request-1"] },
+      { name: "with a source", args: ["hi", undefined, false, "m-1", undefined, undefined, 101] },
+      { name: "a new turn", args: ["hi", undefined, false, "m-1", undefined, undefined, undefined, "new_turn"] },
+      { name: "a send now", args: ["hi", undefined, false, "m-1", undefined, undefined, undefined, "send_now"] },
+      { name: "spoken", args: ["hi", undefined, false, "m-1", undefined, undefined, undefined, undefined, "voice"] },
+    ]
+
+    const openConnection = async (mode: "omit" | "required") => {
+      const hook = mode === "omit"
+        ? renderHook(() => useWebSocket({ connection: sessionConnection() }))
+        : renderHook(() => useWebSocket({ url: "ws://localhost", taskId: 7 }))
+      await waitFor(() => expect(MockWebSocket.instances).toHaveLength(1))
+      const socket = MockWebSocket.instances[0]
+      if (mode === "omit") socket.protocol = "xagent-session-v1"
+      act(() => socket.open())
+      return { ...hook, socket }
+    }
+
+    // Shapes the visitor-credential connection refuses before any frame goes out.
+    const refusedOnRequired = new Set(["with a source", "a new turn", "a send now"])
+
+    it.each(SHAPES.flatMap((shape) => (["omit", "required"] as const).map((mode) => [shape.name, mode, shape] as const)))(
+      "input_mode rides every session frame shape: %s on a %s connection",
+      async (_name, mode, shape) => {
+        const { result, socket } = await openConnection(mode)
+        const delivery = result.current.sendChatMessage(...shape.args)
+
+        if (mode === "required" && refusedOnRequired.has(shape.name)) {
+          await expect(delivery).rejects.toMatchObject({ disposition: "not_sent" })
+          expect(socket.send).not.toHaveBeenCalled()
+          return
+        }
+        const raw = socket.send.mock.calls[0][0] as string
+        const frame = JSON.parse(raw) as Record<string, unknown>
+        expect("input_mode" in frame).toBe(mode === "omit")
+        if (mode === "omit") expect(frame.input_mode).toBe(shape.name === "spoken" ? "voice" : "text")
+        else expect(raw).not.toContain("input_mode")
+        act(() => socket.receive({ type: "message_accepted", client_message_id: "m-1" }))
+        await delivery
+      },
+    )
+
+    it.each(["text", "voice"] as const)("a resend keeps the input mode: %s", async (value) => {
+      const { result, socket } = await openConnection("omit")
+      const args: Shape["args"] = value === "voice"
+        ? ["hi", undefined, false, "m-resend", undefined, undefined, undefined, undefined, "voice"]
+        : ["hi", undefined, false, "m-resend"]
+
+      const first = result.current.sendChatMessage(...args)
+      act(() => socket.receive({
+        type: "message_rejected",
+        client_message_id: "m-resend",
+        error_code: "message_attachment_unavailable",
+      }))
+      await expect(first).rejects.toThrow()
+      const second = result.current.sendChatMessage(...args)
+
+      const [firstFrame, secondFrame] = socket.send.mock.calls.map((call) => JSON.parse(call[0] as string))
+      expect(firstFrame.input_mode).toBe(value)
+      expect(secondFrame.input_mode).toBe(firstFrame.input_mode)
+      act(() => socket.receive({ type: "message_accepted", client_message_id: "m-resend" }))
+      await second
+    })
+
+    describe("a frame that only the input marker pushes over the size limit", () => {
+      const LIMIT = 64 * 1024
+      const bytes = (text: string) => new TextEncoder().encode(text).byteLength
+      // A message of `fill` repeated until the frame, carrying `mode` marker or not,
+      // is exactly `target` bytes. `fill` is "a" (1 byte) or "é" (2 bytes).
+      const messageFor = (fill: string, target: number, marker: string | null) => {
+        const frame = (message: string) => JSON.stringify({
+          type: "chat",
+          message,
+          client_message_id: "m-big",
+          ...(marker ? { input_mode: marker } : {}),
+          context: { timezone: resolveReportedTimezone() },
+        })
+        const base = bytes(frame(""))
+        const gap = target - base
+        const unit = bytes(fill)
+        // Odd gaps cannot be filled with 2-byte characters alone: pad with one "a".
+        const message = fill.repeat(Math.floor(gap / unit)) + "a".repeat(gap % unit)
+        expect(bytes(frame(message))).toBe(target)
+        return message
+      }
+      const send = async (message: string, mode: "omit" | "required", voice: boolean) => {
+        const { result, socket } = await openConnection(mode)
+        const args: Shape["args"] = voice
+          ? [message, undefined, false, "m-big", undefined, undefined, undefined, undefined, "voice"]
+          : [message, undefined, false, "m-big"]
+        const delivery = result.current.sendChatMessage(...args)
+        const raw = socket.send.mock.calls[0][0] as string
+        act(() => socket.receive({ type: "message_accepted", client_message_id: "m-big" }))
+        await delivery
+        return raw
+      }
+
+      it.each(["text", "voice"] as const)("keeps the marker on a frame at the limit: %s", async (marker) => {
+        const voice = marker === "voice"
+        // Exactly at the limit with the marker: sent with it.
+        const atLimit = messageFor("a", LIMIT, marker)
+        const kept = await send(atLimit, "omit", voice)
+        expect(bytes(kept)).toBe(LIMIT)
+        expect(JSON.parse(kept).input_mode).toBe(marker)
+      })
+
+      it.each(["text", "voice"] as const)("drops the marker of a frame one byte over: %s", async (marker) => {
+        const voice = marker === "voice"
+        const message = messageFor("a", LIMIT + 1, marker)
+        const raw = await send(message, "omit", voice)
+        const frame = JSON.parse(raw) as Record<string, unknown>
+        expect("input_mode" in frame).toBe(false)
+        expect(Object.keys(frame)).toEqual(["type", "message", "client_message_id", "context"])
+        expect(bytes(raw)).toBeLessThanOrEqual(LIMIT)
+      })
+
+      it.each(["text", "voice"] as const)("counts UTF-8 bytes, not characters: %s", async (marker) => {
+        const voice = marker === "voice"
+        const message = messageFor("é", LIMIT + 1, marker)
+        // Fewer characters than bytes: a length check would let the frame through.
+        expect(message.length).toBeLessThan(LIMIT)
+        const raw = await send(message, "omit", voice)
+        expect(raw).not.toContain("input_mode")
+        expect(bytes(raw)).toBeLessThanOrEqual(LIMIT)
+      })
+
+      it.each(["text", "voice"] as const)("keeps the marker when the frame is over without it too: %s", async (marker) => {
+        const voice = marker === "voice"
+        const unmarkedAlready = messageFor("a", LIMIT + 1, null)
+        const raw = await send(unmarkedAlready, "omit", voice)
+        expect(JSON.parse(raw).input_mode).toBe(marker)
+        expect(bytes(raw)).toBeGreaterThan(LIMIT)
+      })
+
+      it.each(["text", "voice"] as const)("leaves a short message with the marker: %s", async (marker) => {
+        const raw = await send("short", "omit", marker === "voice")
+        expect(JSON.parse(raw).input_mode).toBe(marker)
+      })
+
+      it("sends a visitor-connection frame exactly as serialized", async () => {
+        const message = messageFor("a", LIMIT + 1, "text")
+        const raw = await send(message, "required", false)
+        expect(raw).not.toContain("input_mode")
+        expect(raw).toBe(JSON.stringify({
+          type: "chat",
+          message,
+          client_message_id: "m-big",
+          context: { timezone: resolveReportedTimezone() },
+          task_id: 7,
+        }))
+      })
     })
   })
 

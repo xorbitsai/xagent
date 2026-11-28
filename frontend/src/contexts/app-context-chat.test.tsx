@@ -6532,6 +6532,34 @@ describe("AppProvider websocket message routing", () => {
       ])
     })
 
+    it("passes a spoken send to the chat frame with the voice marker as the ninth argument", async () => {
+      mount("session")
+
+      expect(await send({ clientMessageId: "spoken", inputMode: "voice" })).toBe("ok")
+
+      expect(sendChatMessageMock.mock.calls).toEqual([
+        ["continue", undefined, undefined, "spoken", undefined, undefined, undefined, undefined, "voice"],
+      ])
+    })
+
+    it.each([
+      ["a new-turn declaration", { delivery: "new_turn" }],
+      ["a send-now declaration", { delivery: "send_now" }],
+      ["a conversation source", { sourceTaskId: 101 }],
+    ] as const)("a spoken send refuses %s", async (_label, extra) => {
+      mount("session")
+      announce(NEW_TURN_CAPABILITIES)
+
+      const outcome = await send({ clientMessageId: "spoken-both", inputMode: "voice", ...extra })
+
+      expect(outcome).toBeInstanceOf(MessageDeliveryError)
+      expect(outcome).toMatchObject({
+        message: "A spoken message cannot carry a delivery declaration or a source.",
+        disposition: "not_sent",
+      })
+      expect(sendChatMessageMock).not.toHaveBeenCalled()
+    })
+
     it("passes a declaration together with uploaded files", async () => {
       const transport = makeSessionTransport()
       const fileId = "0b1e5c9e-3f1a-4a63-9b0e-6c1d2f3a4b5c"
@@ -6775,6 +6803,33 @@ describe("AppProvider websocket message routing", () => {
       expect(sendChatMessageMock.mock.calls.map((call) => [call[3], call[6]])).toEqual([
         ["resent-source", 101],
         ["resent-source", 101],
+      ])
+    })
+
+    it("resends a spoken send with the voice marker on the new connection", async () => {
+      sendChatMessageMock.mockRejectedValueOnce(
+        new MessageDeliveryError("lost", "outcome_unknown", { connectionLost: true }),
+      )
+      const sessionTree = (identity: string) => (
+        <AppProvider token="token" transport={makeSessionTransport(makeSessionConnection(identity))}>
+          <SessionControlsProbe />
+        </AppProvider>
+      )
+      const { rerender } = render(sessionTree("session-one"))
+      act(() => webSocketOptions.current?.onConnect?.())
+      expect(screen.getByTestId("session-conversation-state").textContent).toBe("unbound")
+      const outcome = getSessionControls()
+        .sendMessage("hello", { clientMessageId: "resent-spoken", inputMode: "voice" })
+        .then(() => "ok", (error: Error) => error)
+      await act(async () => {})
+
+      rerender(sessionTree("session-two"))
+      act(() => webSocketOptions.current?.onConnect?.())
+      await act(async () => { expect(await outcome).toBe("ok") })
+
+      expect(sendChatMessageMock.mock.calls.map((call) => [call[3], call[8]])).toEqual([
+        ["resent-spoken", "voice"],
+        ["resent-spoken", "voice"],
       ])
     })
   })

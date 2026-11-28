@@ -45,6 +45,8 @@ from pathlib import Path
 from typing import Any
 
 from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp.exceptions import ToolError
+from mcp.types import ToolAnnotations
 from urllib3.exceptions import ConnectTimeoutError, MaxRetryError, NewConnectionError
 
 from ....core.utils import public_requests as requests
@@ -98,10 +100,6 @@ MAX_ERROR_MESSAGE_CHARS = 800
 
 def _success(**payload: Any) -> str:
     return json.dumps({"status": "success", **payload}, ensure_ascii=False)
-
-
-def _error(message: str) -> str:
-    return json.dumps({"status": "error", "message": message}, ensure_ascii=False)
 
 
 def _env(name: str) -> str:
@@ -528,7 +526,15 @@ def _outcome_unknown(exc: Exception) -> bool:
     return isinstance(status, int) and status >= 500
 
 
-@mcp.tool()
+def _unknown_create_result(detail: str | Exception) -> str:
+    # Keep the MCP error flag clear so an uncertain create still blocks an
+    # identical write in this turn. Put the advice before the bounded detail.
+    message = f"{_OUTCOME_UNKNOWN_ADVICE}. Detail: {_safe_text(detail)}"
+    logger.error("Error creating Jira ticket: %s", message)
+    return json.dumps({"status": "error", "message": message}, ensure_ascii=False)
+
+
+@mcp.tool(annotations=ToolAnnotations(destructiveHint=False, idempotentHint=False))
 def jira_ticket_create(
     summary: str,
     description: str,
@@ -606,27 +612,21 @@ def jira_ticket_create(
         except Exception as exc:
             if not _outcome_unknown(exc):
                 raise
-            # The advice goes first and the detail is truncated once, so a long
-            # underlying message cannot cut the advice off.
-            safe_message = f"{_OUTCOME_UNKNOWN_ADVICE}. Detail: {_safe_text(exc)}"
-            logger.error("Error creating Jira ticket: %s", safe_message)
-            return _error(safe_message)
-        try:
-            created = response.json()
-        except ValueError:
-            raise RuntimeError(
-                f"Jira returned a non-JSON response to the create request. "
-                f"{_OUTCOME_UNKNOWN_ADVICE}"
-            ) from None
-        key = created.get("key") if isinstance(created, dict) else None
-        if not isinstance(key, str) or not _ISSUE_KEY_PATTERN.match(key):
-            raise RuntimeError(
-                f"Jira did not return a usable issue key. {_OUTCOME_UNKNOWN_ADVICE}"
-            )
+            return _unknown_create_result(exc)
     except Exception as exc:
         safe_message = _safe_text(exc)
         logger.error("Error creating Jira ticket: %s", safe_message)
-        return _error(safe_message)
+        raise ToolError(safe_message) from None
+
+    try:
+        created = response.json()
+    except (ValueError, RecursionError):
+        return _unknown_create_result(
+            "Jira returned an unreadable JSON response to the create request."
+        )
+    key = created.get("key") if isinstance(created, dict) else None
+    if not isinstance(key, str) or not _ISSUE_KEY_PATTERN.match(key):
+        return _unknown_create_result("Jira did not return a usable issue key.")
 
     attachments: list[dict[str, Any]] = []
     failed: list[dict[str, Any]] = []

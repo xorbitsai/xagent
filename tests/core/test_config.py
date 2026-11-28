@@ -1287,6 +1287,13 @@ class TestFileStorageConfig:
 
         assert get_file_materialize_dir() == Path("/custom/materialized")
 
+    def test_file_materialize_dir_expands_home(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.setenv("USERPROFILE", str(tmp_path))
+        monkeypatch.setenv(FILE_MATERIALIZE_DIR, "~/materialized")
+
+        assert get_file_materialize_dir() == tmp_path / "materialized"
+
     def test_preview_tmp_dir_default(self, monkeypatch):
         monkeypatch.delenv(PREVIEW_TMP_DIR, raising=False)
 

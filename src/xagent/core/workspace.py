@@ -2032,7 +2032,7 @@ class TaskWorkspace:
         roots = [
             self.base_dir.resolve(),
             self.workspace_dir.resolve(),
-            get_file_materialize_dir().expanduser().resolve(),
+            get_file_materialize_dir().resolve(),
             *self.allowed_external_dirs,
         ]
         return any(resolved == root or resolved.is_relative_to(root) for root in roots)

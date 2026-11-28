@@ -3772,7 +3772,7 @@ def get_file_materialize_dir() -> Path:
     """Get the local directory used for temporary durable-file materialization."""
     env_value = os.getenv(FILE_MATERIALIZE_DIR)
     if env_value:
-        return Path(env_value)
+        return Path(env_value).expanduser()
 
     return Path(tempfile.gettempdir()) / "xagent-materialized"
 

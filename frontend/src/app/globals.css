@@ -481,8 +481,11 @@ body .hover\:\text-\[\#E6EDF3\]:hover {
   justify-content: center;
 }
 
-/* Ensure TabsTrigger button is visible */
-button[data-radix-collection-item] {
+/* Ensure TabsTrigger button is visible. Radio group items are collection items
+   too, so only tab triggers match. :where() keeps the specificity at (0,1,1) so
+   Tailwind state utilities such as data-[state=active]:border-primary still
+   override this rule. */
+button[data-radix-collection-item]:where([role="tab"]) {
   display: inline-flex;
   align-items: center;
   justify-content: center;

@@ -12,6 +12,17 @@ describe("public MCP completion", () => {
     expect(close).toHaveBeenCalledOnce()
     expect(screen.getByText("Authorization completed")).toBeTruthy()
   })
+  it("shows a neutral notice when the authorization link was already used", () => {
+    window.history.replaceState({}, "", "/auth/mcp-complete?mcp_oauth_error=state_already_consumed&mcp_oauth_error_message=secret")
+    const close = vi.spyOn(window, "close").mockImplementation(() => {})
+    render(<McpCompletePage />)
+    expect(close).toHaveBeenCalledOnce()
+    expect(screen.getByRole("heading", { name: "Authorization link already used" })).toBeTruthy()
+    expect(screen.getByText(/check the connection status in the original window/i)).toBeTruthy()
+    expect(screen.queryByText("Authorization not completed")).toBeNull()
+    expect(screen.queryByText("Authorization completed")).toBeNull()
+    expect(screen.queryByText("secret")).toBeNull()
+  })
   it("never renders provider errors or treats cancellation as success", () => {
     window.history.replaceState({}, "", "/auth/mcp-complete?mcp_oauth_error=authorization_failed&mcp_oauth_error_message=secret")
     vi.spyOn(window, "close").mockImplementation(() => {})

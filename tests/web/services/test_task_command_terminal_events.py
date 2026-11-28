@@ -66,10 +66,10 @@ def db_session(request: pytest.FixtureRequest, tmp_path):
         admin_engine = create_engine(raw_url)
         with admin_engine.begin() as connection:
             connection.execute(CreateSchema(isolated_schema))
-        db_url = str(
-            make_url(raw_url).update_query_dict(
-                {"options": f"-csearch_path={isolated_schema}"}
-            )
+        db_url = (
+            make_url(raw_url)
+            .update_query_dict({"options": f"-csearch_path={isolated_schema}"})
+            .render_as_string(hide_password=False)
         )
     else:
         db_url = f"sqlite:///{tmp_path / 'terminal-task-events.db'}"
@@ -930,7 +930,7 @@ async def test_cancellation_after_commit_survives_a_fresh_database_session(
     with pytest.raises(asyncio.CancelledError):
         await persistence
 
-    db_url = str(get_engine().url)
+    db_url = get_engine().url.render_as_string(hide_password=False)
     db_session.close()
     get_engine().dispose()
     init_db(db_url=db_url)

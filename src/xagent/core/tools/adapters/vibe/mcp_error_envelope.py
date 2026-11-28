@@ -22,10 +22,9 @@ their own, so the adapter marks the result ``success: False`` instead, which
 The adapter applies this only to a tool whose wire annotations declare that a
 repeat adds no effect: ``readOnlyHint: true`` (with ``destructiveHint`` not
 true) or ``idempotentHint: true``. A write can return the envelope after its
-request went out: ``freshdesk_create_ticket``, an unannotated write, does so
-when the read times out after the POST, and ``deputy_create_resource``, a
-declared non-idempotent write, does too. ReAct reads a failed call as one
-whose write provably did not happen. In flash mode a failed result also
+request went out: ``freshdesk_create_ticket`` does so when the read times out
+after the POST. ReAct reads a failed call as one whose write provably did not
+happen. In flash mode a failed result also
 reopens the normal tools, so the model could write again, and the same-turn
 duplicate-write guard covers only declared non-idempotent tools. An
 undeclared tool is treated as a write, so its envelope stays a success.

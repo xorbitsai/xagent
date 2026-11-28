@@ -814,9 +814,8 @@ def test_create_ticket_requires_a_requester_identifier(
     the three fields that would satisfy it instead of relaying a 400.
     """
     recorder = _install(monkeypatch)
-    result = _payload(freshdesk.freshdesk_create_ticket(subject="s", description="d"))
-    assert result["status"] == "error"
-    assert "requester" in result["message"]
+    with pytest.raises(RuntimeError, match="requester"):
+        freshdesk.freshdesk_create_ticket(subject="s", description="d")
     assert recorder.calls == []
 
 
@@ -828,13 +827,10 @@ def test_create_ticket_rejects_values_below_or_outside_the_vendor_range(
     so an LLM reaches for it. Naming the legal values beats "Validation failed".
     """
     recorder = _install(monkeypatch)
-    result = _payload(
+    with pytest.raises(RuntimeError, match=field):
         freshdesk.freshdesk_create_ticket(
             subject="s", description="d", email="a@b.c", **{field: value}
         )
-    )
-    assert result["status"] == "error"
-    assert field in result["message"]
     assert recorder.calls == []
 
 
@@ -873,22 +869,10 @@ def test_create_ticket_rejects_blank_subject_or_description(
     monkeypatch: pytest.MonkeyPatch, configured_env: None, blank: str
 ):
     recorder = _install(monkeypatch)
-    assert (
-        _payload(
-            freshdesk.freshdesk_create_ticket(
-                subject=blank, description="d", email="a@b.c"
-            )
-        )["status"]
-        == "error"
-    )
-    assert (
-        _payload(
-            freshdesk.freshdesk_create_ticket(
-                subject="s", description=blank, email="a@b.c"
-            )
-        )["status"]
-        == "error"
-    )
+    with pytest.raises(RuntimeError, match="subject"):
+        freshdesk.freshdesk_create_ticket(subject=blank, description="d", email="a@b.c")
+    with pytest.raises(RuntimeError, match="description"):
+        freshdesk.freshdesk_create_ticket(subject="s", description=blank, email="a@b.c")
     assert recorder.calls == []
 
 
@@ -1066,10 +1050,10 @@ def test_reply_and_note_reject_an_empty_body(
     monkeypatch: pytest.MonkeyPatch, configured_env: None, blank: str
 ):
     recorder = _install(monkeypatch)
-    assert _payload(freshdesk.freshdesk_reply_to_ticket(8, blank))["status"] == "error"
-    assert (
-        _payload(freshdesk.freshdesk_add_note_to_ticket(8, blank))["status"] == "error"
-    )
+    with pytest.raises(RuntimeError, match="body"):
+        freshdesk.freshdesk_reply_to_ticket(8, blank)
+    with pytest.raises(RuntimeError, match="body"):
+        freshdesk.freshdesk_add_note_to_ticket(8, blank)
     assert recorder.calls == []
 
 
@@ -1346,9 +1330,8 @@ def test_phone_only_create_requires_a_name(
     attribute is mandatory." Without the local guard this always 400s.
     """
     recorder = _install(monkeypatch)
-    result = _payload(freshdesk.freshdesk_create_ticket("s", "d", phone="+15551234567"))
-    assert result["status"] == "error"
-    assert "name" in result["message"]
+    with pytest.raises(RuntimeError, match="name"):
+        freshdesk.freshdesk_create_ticket("s", "d", phone="+15551234567")
     assert recorder.calls == []
 
     recorder = _install(monkeypatch, _json_response({"id": 1}))
@@ -1501,11 +1484,8 @@ def test_body_ids_are_validated_like_path_ids(
     validation every path-embedded id gets: requester_id=0 was forwarded.
     """
     recorder = _install(monkeypatch)
-    result = _payload(
+    with pytest.raises(RuntimeError, match=field):
         freshdesk.freshdesk_create_ticket("s", "d", email="a@b.c", **{field: 0})
-    )
-    assert result["status"] == "error"
-    assert field in result["message"]
     assert recorder.calls == []
 
 

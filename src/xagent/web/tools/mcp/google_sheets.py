@@ -7,6 +7,7 @@ from typing import Any
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build  # type: ignore[import-not-found]
 from mcp.server.fastmcp import FastMCP
+from mcp.types import ToolAnnotations
 
 from .utils import (
     GoogleFileKind,
@@ -99,7 +100,7 @@ def _spreadsheet_error(
     )
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
 def google_sheets_get_spreadsheet(spreadsheet_id: str) -> str:
     """
     Get metadata for a Google Sheets spreadsheet by id or full URL: its title
@@ -232,7 +233,7 @@ def google_sheets_create_spreadsheet(
     )
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
 def google_sheets_read_range(
     spreadsheet_id: str, range_name: str, max_rows: int = 1000
 ) -> str:

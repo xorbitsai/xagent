@@ -9,6 +9,7 @@ from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build  # type: ignore[import-not-found]
 from googleapiclient.http import MediaIoBaseUpload  # type: ignore[import-not-found]
 from mcp.server.fastmcp import FastMCP
+from mcp.types import ToolAnnotations
 
 from .utils import (
     GoogleFileKind,
@@ -149,7 +150,7 @@ def _document_end_index(document: dict[str, Any]) -> int:
     return int(content[-1].get("endIndex", 2))
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
 def google_docs_get_document(document_id: str) -> str:
     """
     Read a Google Doc by document id or full document URL.

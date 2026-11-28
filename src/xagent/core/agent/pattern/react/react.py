@@ -185,6 +185,7 @@ from ...runtime import (
     LLMCallPreempted,
     PatternRuntime,
     ToolCallInterrupted,
+    llm_end_metadata,
     prepare_llm_for_context,
     resolve_compact_llm,
     resolved_llm_metadata,
@@ -1571,13 +1572,13 @@ class ReActPattern(AgentPattern):
                 reject_mixed_control_calls=protocol_retry_performed,
                 allowed_tool_names=frozenset(self._schema_tool_names(tool_schemas)),
             )
-            end_metadata: dict[str, Any] = dict(llm_metadata)
-            if requires_protocol_retry:
-                end_metadata.update(
-                    success=False,
-                    phase="discarded_invalid_tool_protocol",
-                )
             if not response_already_traced:
+                end_metadata = llm_end_metadata(call_llm, llm_metadata)
+                if requires_protocol_retry:
+                    end_metadata.update(
+                        success=False,
+                        phase="discarded_invalid_tool_protocol",
+                    )
                 await runtime.on_llm_end(
                     context=context,
                     response=response,
@@ -2664,7 +2665,7 @@ class ReActPattern(AgentPattern):
             reject_mixed_control_calls=(recovery_reason == "unavailable_tool_call"),
             allowed_tool_names=frozenset(self._schema_tool_names(tools)),
         )
-        end_metadata = dict(metadata)
+        end_metadata = llm_end_metadata(llm, metadata)
         if (
             retry_is_invalid
             and recovery_reason == "structured_final_answer_required"
@@ -6482,7 +6483,7 @@ class ReActPattern(AgentPattern):
         await runtime.on_llm_end(
             context=context,
             response=response,
-            metadata=llm_metadata,
+            metadata=llm_end_metadata(call_llm, llm_metadata),
         )
         self.last_response = response
         self.repeated_tool_decision = None

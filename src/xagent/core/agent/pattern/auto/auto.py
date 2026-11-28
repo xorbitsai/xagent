@@ -40,6 +40,7 @@ from ...language import (
 from ...runtime import (
     LLMCallInterrupted,
     PatternRuntime,
+    llm_end_metadata,
     prepare_llm_for_context,
     resolve_compact_llm,
     resolved_llm_metadata,
@@ -977,7 +978,9 @@ class AutoPattern(AgentPattern):
                 )
                 raise
             await runtime.on_llm_end(
-                context=context, response=response, metadata=metadata
+                context=context,
+                response=response,
+                metadata=llm_end_metadata(call_llm, metadata),
             )
             function_payloads = iter_tool_function_payloads(response)
             if skill_loading_available and len(function_payloads) != 1:

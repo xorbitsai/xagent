@@ -404,6 +404,15 @@ def resolved_llm_metadata(llm: Any) -> dict[str, Any]:
     return metadata
 
 
+def llm_end_metadata(llm: Any, start_metadata: dict[str, Any]) -> dict[str, Any]:
+    """Use the model that served the call, which can change during failover."""
+    metadata = dict(start_metadata)
+    metadata.pop("selected_model", None)
+    metadata.pop("context_window", None)
+    metadata.update(resolved_llm_metadata(llm))
+    return metadata
+
+
 def _budget_cannot_help(exc: Exception) -> bool:
     """True when asking again with a smaller output budget is pointless.
 

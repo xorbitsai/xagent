@@ -6,6 +6,7 @@ catalog, with the MCP loader replaced by a fake whose tools are scripted.
 
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import pytest
@@ -32,8 +33,9 @@ from xagent.web.connector_checks.identity import (
     SessionPurpose,
 )
 from xagent.web.connector_checks.user_identity import UserIdentityAdapter
-from xagent.web.models.mcp import MCPServer
+from xagent.web.models.mcp import MCPServer, UserMCPServer
 from xagent.web.models.public_mcp import PublicMCPApp
+from xagent.web.models.user_oauth import UserOAuth
 from xagent.web.services.mcp_connector_session import (
     ConnectorToolsOutcome,
     ConnectorToolsResult,
@@ -171,6 +173,95 @@ async def test_no_connected_connector_is_a_run_failure(db_users):
     result = await run_checks(UserIdentityAdapter(db, "monitor"))
 
     assert result.failure == "enumeration:no_connectors"
+
+
+@pytest.mark.parametrize("credential_state", ["cleared", "expired"])
+async def test_a_stale_oauth_grant_fails_without_starting_the_connector(
+    db_users, monkeypatch, credential_state
+):
+    db, user, _ = db_users
+    server = _connect_github(db, user)
+    grant = db.query(UserOAuth).filter_by(user_id=user.id, provider="github").one()
+    if credential_state == "cleared":
+        grant.access_token = ""
+    else:
+        grant.expires_at = datetime.now(timezone.utc) - timedelta(minutes=1)
+        grant.refresh_token = None
+    db.commit()
+    loader = _Loader()
+    monkeypatch.setattr(LOADER, loader)
+    adapter = UserIdentityAdapter(db, "monitor")
+
+    (target,) = adapter.enumerate_targets()
+    listing = await adapter.open_session(target, purpose=SessionPurpose.LIST_ONLY)
+    result = await run_checks(adapter)
+
+    assert target.app_id == "github"
+    assert listing.outcome is ConnectorToolsOutcome.NOT_CONNECTED
+    assert listing.server_id == server.id
+    assert result.failure is None
+    assert rows(result)[0] == (
+        "github",
+        None,
+        "fail",
+        "not_connected",
+        "needs_reconnect",
+    )
+    assert loader.calls == []
+
+
+async def test_a_healthy_connector_does_not_hide_a_reconnect_failure(
+    db_users, monkeypatch
+):
+    db, user, _ = db_users
+    _connect_github(db, user)
+    grant = db.query(UserOAuth).filter_by(user_id=user.id, provider="github").one()
+    grant.access_token = ""
+    db.commit()
+    _connect_catalog_stripe(db, user)
+    loader = _Loader(_stripe_ok())
+    monkeypatch.setattr(LOADER, loader)
+
+    result = await run_checks(UserIdentityAdapter(db, "monitor"))
+
+    session_rows = [row for row in rows(result) if row[1] is None]
+    assert session_rows == [
+        ("github", None, "fail", "not_connected", "needs_reconnect"),
+        ("stripe", None, "pass", None, None),
+    ]
+    assert len(loader.calls) == 1
+
+
+@pytest.mark.parametrize("excluded", ["hidden", "inactive", "no_personal_grant"])
+def test_an_ineligible_oauth_connection_is_not_a_target(db_users, excluded):
+    db, user, other_user = db_users
+    server = _connect_github(
+        db, user, token=None if excluded == "no_personal_grant" else "gh-token"
+    )
+    if excluded == "no_personal_grant":
+        # A credential owned by someone else must not seed the user's targets.
+        db.add(
+            UserOAuth(
+                user_id=other_user.id,
+                provider="github",
+                provider_user_id="2",
+                access_token="",
+            )
+        )
+    else:
+        grant = db.query(UserOAuth).filter_by(user_id=user.id, provider="github").one()
+        grant.access_token = ""
+        if excluded == "hidden":
+            db.query(PublicMCPApp).filter_by(
+                app_id="github"
+            ).one().is_visible_in_connector = False
+        else:
+            db.query(UserMCPServer).filter_by(
+                user_id=user.id, mcpserver_id=server.id
+            ).one().is_active = False
+    db.commit()
+
+    assert UserIdentityAdapter(db, "monitor").enumerate_targets() == []
 
 
 async def test_a_custom_server_is_not_a_target(db_users, monkeypatch):

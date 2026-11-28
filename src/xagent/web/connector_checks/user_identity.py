@@ -1,4 +1,4 @@
-"""The ``user`` identity: one local user's connected catalog connectors.
+"""The ``user`` identity: one local user's catalog connections.
 
 It exists so the engine and its CLI (``cli.py``) can be verified locally and
 on stage. The V2 workflow does not schedule it: the web identity's scheduled
@@ -14,10 +14,12 @@ The targets are the catalog apps the Connectors page shows the user as
 connected (``GET /api/mcp/apps``, the listing V1's L2/L3 smoke reads), each
 with the server row that page selects for it. As in V1, an app hidden from
 the catalog (``is_visible_in_connector`` false) is not a target even while
-connected. A catalog app that needs reconnecting (a builtin OAuth token that
-was cleared or expired with no refresh token, or an ``mcp_oauth`` association
-without an active grant) is not shown as connected either, so it is not a
-target and the run does not report it (#3635). A selected row that is not the catalog's own
+connected. An active builtin OAuth catalog row with a cleared, expired
+without refresh, or app-scope-ineligible personal grant is also a target
+and reports ``not_connected`` without starting a connector. An ``mcp_oauth``
+association alone does not establish
+that consent ever completed, so an association without an active grant is
+not a target. A selected row that is not the catalog's own
 (``connector_probe.owns_catalog_identity``: a user-owned row under a catalog
 id, or a catalog row whose launch has drifted) is offered with the skip
 reason ``not_catalog_identity`` and never started, as the probe route
@@ -37,8 +39,10 @@ from typing import Any
 
 from sqlalchemy import func
 
+from ..models.mcp import MCPServer, UserMCPServer
 from ..services.connector_probe import is_connector_probe_user, owns_catalog_identity
 from ..services.mcp_connector_session import (
+    ConnectorToolsOutcome,
     ConnectorToolsResult,
     find_visible_server,
     list_connector_tools,
@@ -71,11 +75,7 @@ class UserIdentityAdapter:
             raise IdentitySetupError("identity", "user_not_found")
         if not is_connector_probe_user(user):
             raise IdentitySetupError("identity", "user_not_allowed")
-        connected = _connected_catalog_apps(self._db, user)
-        targets = [
-            self._target(user, app_id, server_id)
-            for app_id, server_id in sorted(connected.items())
-        ]
+        targets = self._catalog_targets(user)
         self._user = user
         return targets
 
@@ -84,6 +84,8 @@ class UserIdentityAdapter:
     ) -> ConnectorToolsResult:
         if self._user is None:
             raise RuntimeError("enumerate_targets must run before a session opens")
+        if isinstance(target.ref, ConnectorToolsResult):
+            return target.ref
         return await list_connector_tools(
             self._db,
             user=self._user,
@@ -94,6 +96,68 @@ class UserIdentityAdapter:
 
     def resolve_fixture(self, key: str) -> FixtureValue | None:
         return None
+
+    def _catalog_targets(self, user: Any) -> list[ConnectorTarget]:
+        from ..api.mcp import list_mcp_apps
+
+        targets: dict[str, ConnectorTarget] = {}
+        disconnected_oauth_apps: set[str] = set()
+        for app in list_mcp_apps(location="remote", current_user=user, db=self._db):
+            app_id = app.get("id")
+            if not isinstance(app_id, str) or not app_id:
+                continue
+            server_id = app.get("server_id")
+            if app.get("is_connected") is True and type(server_id) is int:
+                targets[app_id] = self._target(user, app_id, server_id)
+            elif app.get("auth_type") == "builtin_oauth":
+                disconnected_oauth_apps.add(app_id)
+
+        disconnected_oauth_apps.difference_update(targets)
+        if disconnected_oauth_apps:
+            targets.update(self._reconnect_targets(user, disconnected_oauth_apps))
+        return [targets[app_id] for app_id in sorted(targets)]
+
+    def _reconnect_targets(
+        self, user: Any, app_ids: set[str]
+    ) -> dict[str, ConnectorTarget]:
+        from ..api.mcp import builtin_oauth_reconnect_candidates
+
+        user_id = int(user.id)
+        oauth_servers = (
+            self._db.query(MCPServer)
+            .join(UserMCPServer, UserMCPServer.mcpserver_id == MCPServer.id)
+            .filter(
+                UserMCPServer.user_id == user_id,
+                UserMCPServer.is_active.is_(True),
+                MCPServer.transport == "oauth",
+            )
+            .order_by(MCPServer.id)
+            .all()
+        )
+        targets: dict[str, ConnectorTarget] = {}
+        for app_id, server in builtin_oauth_reconnect_candidates(
+            self._db, user_id, oauth_servers
+        ):
+            if app_id not in app_ids or app_id in targets:
+                continue
+            visible = find_visible_server(
+                self._db,
+                user_id=user_id,
+                server_id=int(server.id),
+                connector_team_id=None,
+            )
+            if visible is None or not _is_catalog_row(self._db, visible, app_id):
+                continue
+            targets[app_id] = ConnectorTarget(
+                app_id,
+                ref=ConnectorToolsResult(
+                    outcome=ConnectorToolsOutcome.NOT_CONNECTED,
+                    server_id=int(visible.id),
+                    server_name=str(visible.name),
+                    reason="needs_reconnect",
+                ),
+            )
+        return targets
 
     def _target(self, user: Any, app_id: str, server_id: int) -> ConnectorTarget:
         server = find_visible_server(
@@ -116,22 +180,6 @@ def _find_user(db: Any, name: str) -> Any | None:
     if user is None:
         user = db.query(User).filter(func.lower(User.email) == name.lower()).first()
     return user
-
-
-def _connected_catalog_apps(db: Any, user: Any) -> dict[str, int]:
-    """Each catalog app the Connectors page shows ``user`` as connected, with
-    the server row it selects (V1's L2 ``select_targets`` reads the same)."""
-    from ..api.mcp import list_mcp_apps
-
-    apps = list_mcp_apps(location="remote", current_user=user, db=db)
-    return {
-        app["id"]: app["server_id"]
-        for app in apps
-        if isinstance(app.get("id"), str)
-        and app["id"]
-        and app.get("is_connected") is True
-        and type(app.get("server_id")) is int
-    }
 
 
 def _is_catalog_row(db: Any, server: Any, app_id: str) -> bool:

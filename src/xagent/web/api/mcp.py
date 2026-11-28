@@ -3194,7 +3194,7 @@ def _custom_api_to_mcp_response(
 
 
 def _oauth_account_summaries(
-    db: Session, user_id: int
+    db: Session, user_id: int, *, include_expired: bool = False
 ) -> dict[str, tuple[Optional[str], str, int]]:
     """Per-provider ``(email, connection_status, account_id)`` for the user's
     OAuth grants.
@@ -3203,7 +3203,9 @@ def _oauth_account_summaries(
     when the selected row has an access token and "needs_reconnect" when the
     row exists but its token was cleared (for example by a scope migration).
     It deliberately does not predict refreshability or resolver-hook output.
-    No entry means no persisted personal grant exists.
+    No entry means no persisted personal grant exists. The smoke adapter
+    opts into also treating an expired token without a refresh token as a
+    reconnect, since the user cannot use that grant until signing in again.
 
     ``email`` is nullable on ``UserOAuth`` (some providers never return one,
     or it was never backfilled) -- a grant missing it is still a grant, so
@@ -3247,12 +3249,10 @@ def _oauth_account_summaries(
         existing = summaries.get(provider)
         if existing is not None and existing[2] >= account_id:
             continue
-        email = (
-            str(oauth.email)
-            if oauth.email and _oauth_account_can_connect(oauth)
-            else None
-        )
-        status = "connected" if oauth.access_token else "needs_reconnect"
+        can_connect = _oauth_account_can_connect(oauth)
+        email = str(oauth.email) if oauth.email and can_connect else None
+        has_credential = can_connect if include_expired else bool(oauth.access_token)
+        status = "connected" if has_credential else "needs_reconnect"
         summaries[provider] = (email, status, account_id)
     return summaries
 
@@ -3323,6 +3323,21 @@ def _enrich_oauth_server_info(
         connected_account = None
 
     return app_id, provider, connected_account, connection_status
+
+
+def builtin_oauth_reconnect_candidates(
+    db: Session, user_id: int, servers: Sequence[MCPServer]
+) -> list[tuple[str, MCPServer]]:
+    """Project the selected personal OAuth credential for each candidate row."""
+    if not servers:
+        return []
+    accounts = _oauth_account_summaries(db, user_id, include_expired=True)
+    candidates = []
+    for server in servers:
+        app_id, _, _, status = _enrich_oauth_server_info(db, server, accounts)
+        if app_id and status == "needs_reconnect":
+            candidates.append((app_id, server))
+    return candidates
 
 
 def _app_lookup_keys(*values: object) -> list[str]:

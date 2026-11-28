@@ -613,6 +613,14 @@ _EXTERNAL_MEDIA_FILE_REF_REQUIRED = (
 _EXTERNAL_MEDIA_EXCLUSIVE_SOURCE = "Provide exactly one of image_url or file_path."
 
 
+class _DurableUploadFileNotFoundError(FileNotFoundError):
+    """A durable-upload FileRef could not be staged; carries the field name."""
+
+    def __init__(self, field_name: str) -> None:
+        super().__init__(field_name)
+        self.field_name = field_name
+
+
 class _ExternalMediaPreparationError(ValueError):
     """A public-safe external-media preparation failure."""
 
@@ -640,6 +648,13 @@ _DURABLE_UPLOAD_NOT_FOUND = "file_id not found or not accessible."
 def _durable_upload_note(fields: tuple[str, ...], *, own_file_id: bool) -> str:
     """The description sentence for a tool that accepts a durable FileRef."""
     if not own_file_id:
+        if len(fields) > 1:
+            joined = " or ".join(fields)
+            return (
+                " A registered file_id (or file:<id>) may be supplied for "
+                f"{joined}; it will be staged in the current task workspace "
+                "before this connector runs."
+            )
         return _DURABLE_UPLOAD_NOTE
     return (
         " A registered workspace file (file:<id>) may be supplied for "
@@ -650,12 +665,32 @@ def _durable_upload_note(fields: tuple[str, ...], *, own_file_id: bool) -> str:
 
 
 def _durable_upload_not_found_message(
-    fields: tuple[str, ...], *, own_file_id: bool
+    fields: tuple[str, ...],
+    *,
+    own_file_id: bool,
+    failed_field: str | None = None,
 ) -> str:
-    """The error for a FileRef that could not be staged; the tool is not called."""
+    """The error for a FileRef that could not be staged; the tool is not called.
+
+    When ``failed_field`` is set and the tool has more than one upload field,
+    the message names that field so the model can fix the right argument.
+    Single-field tools keep today's text.
+    """
     if not own_file_id:
+        if failed_field is not None and len(fields) > 1:
+            return (
+                f"file_id not found or not accessible for {failed_field}. "
+                "The tool was not called and nothing was changed."
+            )
         return _DURABLE_UPLOAD_NOT_FOUND
     names = " or ".join(fields)
+    if failed_field is not None and len(fields) > 1:
+        return (
+            f"{failed_field}: the registered workspace file (file:<id>) was not "
+            "found or is not accessible, so the tool was not called and nothing "
+            f"was changed. This is about the file passed as {failed_field}, not "
+            "the file_id argument."
+        )
     return (
         f"{names}: the registered workspace file (file:<id>) was not found or "
         "is not accessible, so the tool was not called and nothing was "
@@ -3461,7 +3496,10 @@ class MCPToolAdapter(AbstractBaseTool):
                 file_id = _file_ref_value(prepared.get(field_name))
                 if file_id is None:
                     continue
-                staged_path = await self._stage_external_upload_file(file_id)
+                try:
+                    staged_path = await self._stage_external_upload_file(file_id)
+                except FileNotFoundError:
+                    raise _DurableUploadFileNotFoundError(field_name) from None
                 prepared[field_name] = str(staged_path)
                 staged.append(staged_path)
                 staged_sources[str(staged_path)] = f"file:{file_id}"
@@ -3760,6 +3798,13 @@ class MCPToolAdapter(AbstractBaseTool):
                     staged_uploads,
                     staged_upload_sources,
                 ) = await self._stage_external_upload_args(tool_args)
+            except _DurableUploadFileNotFoundError as exc:
+                message = _durable_upload_not_found_message(
+                    self._durable_upload_fields,
+                    own_file_id=self._durable_upload_own_file_id,
+                    failed_field=exc.field_name,
+                )
+                return {"content": [{"text": message}], "is_error": True}
             except FileNotFoundError:
                 message = _durable_upload_not_found_message(
                     self._durable_upload_fields,

@@ -23,11 +23,10 @@ import re
 import socket
 from typing import Any
 
-from urllib3.exceptions import ConnectTimeoutError, MaxRetryError, NewConnectionError
-from urllib3.exceptions import ProxyError as Urllib3ProxyError
-
 from mcp.server.fastmcp import FastMCP
 from mcp.types import ToolAnnotations
+from urllib3.exceptions import ConnectTimeoutError, MaxRetryError, NewConnectionError
+from urllib3.exceptions import ProxyError as Urllib3ProxyError
 
 from ....config import get_tool_max_output_length
 from ....core.tools.core.web_content import get_trusted_proxy_url

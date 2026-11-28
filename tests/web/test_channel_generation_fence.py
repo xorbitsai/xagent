@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 from types import SimpleNamespace
 from typing import Any
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
@@ -20,6 +21,7 @@ from xagent.web.channels.slack import bot as slack_bot
 from xagent.web.channels.telegram import bot as telegram_bot
 from xagent.web.services import generation
 from xagent.web.services.channel_runtime import ChannelConfigSnapshot
+from xagent.web.services.release_hold import ReleaseHold
 
 
 def _snapshot(items: tuple[tuple[str, str], ...]) -> ChannelConfigSnapshot:
@@ -268,3 +270,38 @@ async def test_dormant_manager_skips_shared_result_recovery(monkeypatch, kind) -
     finally:
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", KINDS)
+@pytest.mark.parametrize("finishing_before_start", [True, False])
+async def test_finish_only_channel_manager_exits_without_polling(
+    monkeypatch, kind, finishing_before_start
+) -> None:
+    monkeypatch.setenv(generation.GENERATION_ENV, "blue")
+    manager, started, mod = _arm(monkeypatch, kind)
+    monkeypatch.setattr(mod, "get_shared_task_execution_enabled", lambda: True)
+    hold = ReleaseHold()
+    monkeypatch.setattr(mod, "release_hold", hold)
+    read = Mock(return_value="blue")
+    monkeypatch.setattr(generation, "serving_generation", read)
+    wait = AsyncMock(side_effect=AssertionError("finish-only must not poll"))
+    monkeypatch.setattr(mod, "wait_tick", wait)
+
+    if finishing_before_start:
+        hold.begin_finishing()
+    else:
+        # Finish-only can start after the manager enters the sync iteration.
+        sync = manager._sync_bots_async
+
+        async def finish_during_sync() -> bool:
+            hold.begin_finishing()
+            return await sync()
+
+        monkeypatch.setattr(manager, "_sync_bots_async", finish_during_sync)
+
+    await asyncio.wait_for(manager.start(), timeout=5)
+
+    wait.assert_not_called()
+    read.assert_not_called()
+    assert started == []

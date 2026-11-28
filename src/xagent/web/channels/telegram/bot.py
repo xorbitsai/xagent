@@ -3229,8 +3229,12 @@ class TelegramChannelManager:
         if not get_channel_ingress_enabled():
             logger.info("Telegram channel ingress disabled on this host")
             return
-        while get_channel_ingress_enabled():
+        while get_channel_ingress_enabled() and not release_hold.finishing:
             serving = await self._sync_bots_async()
+            # Finish-only may start while the sync awaits. The channel
+            # manager can exit permanently once the hold enters that state.
+            if release_hold.finishing:
+                return
             # With generations on, a sync that found this process not serving
             # must be retried until serving is confirmed, even when shared
             # execution is off (which otherwise ends the loop after one sync).

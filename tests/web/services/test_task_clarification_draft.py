@@ -21,7 +21,7 @@ from __future__ import annotations
 import logging
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, get_args
 
 import pytest
 from pydantic import ValidationError
@@ -53,6 +53,7 @@ from xagent.web.services.task_clarification_draft import (
     CLARIFICATION_REQUEST_TTL,
     ClarificationResolution,
     FailClosed,
+    FailClosedReason,
     NotApplicable,
     Publishable,
     build_clarification_payload,
@@ -1692,3 +1693,22 @@ def test_cross_run_anchor_mismatch_degrades_downstream_in_the_staging_primitive(
     finally:
         db.close()
         engine.dispose()
+
+
+_DISCARDING = {"unfenced_lease", "ownership_changed", "attempt_mismatch"}
+_SETTLING = {
+    "missing_draft",
+    "draft_status_mismatch",
+    "missing_event_id",
+    "invalid_event_id",
+}
+
+
+@pytest.mark.parametrize("reason", sorted(_DISCARDING | _SETTLING))
+def test_fail_closed_discards_settlement_by_reason(reason: str) -> None:
+    assert FailClosed(reason).discards_settlement is (reason in _DISCARDING)
+
+
+def test_fail_closed_reasons_split_into_exactly_two_classes() -> None:
+    assert set(get_args(FailClosedReason)) == _DISCARDING | _SETTLING
+    assert _DISCARDING & _SETTLING == set()

@@ -65,7 +65,6 @@ from xagent.web.services.task_interaction_close import (
 )
 from xagent.web.services.task_interaction_staging import (
     InteractionAnchor,
-    InteractionSlotTaken,
     stage_interaction_request,
 )
 
@@ -1080,10 +1079,11 @@ def test_only_resume_task_returns_from_a_branch_on_the_active_interaction_read()
 
 
 # --------------------------------------------------------------------------
-# Statement-count pin for the marker gate: on every deployment today (the
-# protocol marker is NULL for every task -- see active_interaction_id_sync's
-# own docstring), the marker gate short-circuits before the row lookup, so
-# this reader issues exactly one statement and returns ActiveInteractionAbsent
+# Statement-count pin for the marker gate: under the default rollout mode
+# (where the protocol marker is NULL for every task -- see
+# active_interaction_id_sync's own docstring), the marker gate
+# short-circuits before the row lookup, so this reader issues exactly one
+# statement and returns ActiveInteractionAbsent
 # rather than paying for the uncached catalog inspection plus the two-table
 # join below it. This test covers only that success path: the marker read
 # itself can raise (see
@@ -1305,11 +1305,9 @@ def _stage_a_replacement_question_the_way_a_resumed_agent_would(
     """Put a second question on the same run into the active slot, the way
     a resumed agent's own ``stage_interaction_request`` call does.
 
-    The first question has to be reclaimable for that INSERT to land at
-    all -- ``uq_task_interaction_active_slot`` allows one active row per
-    task -- so its deadline is moved into the past first, standing in for
-    the time that elapses while a resumed agent works. The second call
-    then takes ``_reclaim_stale_slot_stmt``'s expired-row branch on its
+    The first question's deadline is moved into the past first, standing
+    in for the time that elapses while a resumed agent works, so the second
+    call takes ``_reclaim_stale_slot_stmt``'s expired-row branch on its
     own; nothing here reclaims by hand. Returns ``(first_id, second_id)``.
     """
     first = _stage(db, task_id=task_id, run_id=run_id, anchor_id=anchor_id, key="q1")
@@ -1367,9 +1365,9 @@ def test_close_leaves_a_question_staged_after_the_injection_alone(db) -> None:
 
 
 def test_close_lets_a_second_question_on_the_same_run_become_active(db) -> None:
-    """Deleting the close call must turn this red: without it, the second
-    stage attempt collides with the first question's still-active slot and
-    raises InteractionSlotTaken instead of ever becoming the active row."""
+    """Deleting the close call must turn this red: without it, the first
+    question is retired by the second one as ``run_superseded`` instead of
+    being recorded as answered through the legacy chat path."""
     task_id = seed_task_with_run(db, run_id="run-a", marker=1)
     anchor_id = make_trace_event(db, task_id=task_id)
 
@@ -1396,23 +1394,29 @@ def test_close_lets_a_second_question_on_the_same_run_become_active(db) -> None:
     )
     assert active.id == second.staged_db_id
     assert active.request_idempotency_key == "q2"
+    assert (
+        row_state(db, first.staged_db_id).terminal_reason
+        == "answered_via_legacy_resume"
+    )
 
 
-def test_without_the_close_call_a_second_question_cannot_become_active(db) -> None:
-    """The 'delete the close call' mutation, run for real: with no close in
-    between, the first question's active row is still fresh (not expired,
-    same run), so the second stage attempt's INSERT collides with the
-    unique active-slot constraint and raises InteractionSlotTaken -- the
-    first question remains the only active row."""
+def test_without_the_close_call_the_next_question_retires_the_first(db) -> None:
+    """With no close in between, the first question's row is still active
+    and unexpired on the same run; publishing the second retires it, and
+    the second becomes the active row. This is the reclaim's job, not the
+    close's: only the close records the row as answered through chat."""
     task_id = seed_task_with_run(db, run_id="run-a", marker=1)
     anchor_id = make_trace_event(db, task_id=task_id)
 
     first = _stage(db, task_id=task_id, run_id="run-a", anchor_id=anchor_id, key="q1")
     db.commit()
 
-    with pytest.raises(InteractionSlotTaken):
-        _stage(db, task_id=task_id, run_id="run-a", anchor_id=anchor_id, key="q2")
-    db.rollback()
+    second = _stage(db, task_id=task_id, run_id="run-a", anchor_id=anchor_id, key="q2")
+    db.commit()
+
+    assert second.created is True
+    assert row_state(db, first.staged_db_id).status == "terminated"
+    assert row_state(db, first.staged_db_id).terminal_reason == "run_superseded"
 
     active = (
         db.query(TaskInteractionRequest)
@@ -1422,5 +1426,5 @@ def test_without_the_close_call_a_second_question_cannot_become_active(db) -> No
         )
         .one()
     )
-    assert active.id == first.staged_db_id
-    assert active.request_idempotency_key == "q1"
+    assert active.id == second.staged_db_id
+    assert active.request_idempotency_key == "q2"

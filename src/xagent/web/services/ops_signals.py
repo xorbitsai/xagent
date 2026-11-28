@@ -101,10 +101,10 @@ INTERACTION_LEGACY_RESUME_CLOSE_ROWCOUNT_ANOMALY = (
 # it runs the same guard sequence regardless of caller.
 #
 # What "stays lit" costs, operationally: resolve_publishable_clarification
-# has no production callers today, so this signal cannot currently be set
-# or cleared outside of tests. The scenario below is what would happen once
-# a caller is wired up, not something observed in production: the clearing
-# point is the publishable path only, so on a deployment where every round
+# is called only from the finalizers' native publication, which the rollout
+# policy keeps off by default, so with it off this signal is never set or
+# cleared outside of tests. With it on, the clearing point is the
+# publishable path only, so on a deployment where every round
 # ends short of publishing, nothing ever clears this signal once it has
 # fired -- the first occurrence latches it for the lifetime of the process.
 # active_degradations() feeds the unauthenticated /health response

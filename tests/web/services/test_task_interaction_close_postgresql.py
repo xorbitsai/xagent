@@ -225,11 +225,10 @@ def _stage_a_replacement_question_the_way_a_resumed_agent_would(
     """Put a second question on the same run into the active slot, the way
     a resumed agent's own ``stage_interaction_request`` call does.
 
-    ``uq_task_interaction_active_slot`` allows one active row per task, so
-    the first question's deadline is moved into the past first, standing
-    in for the time that elapses while a resumed agent works. The second
-    call then takes ``_reclaim_stale_slot_stmt``'s expired-row branch on
-    its own. Returns ``(first_id, second_id)``.
+    The first question's deadline is moved into the past first, standing
+    in for the time that elapses while a resumed agent works, so the second
+    call takes ``_reclaim_stale_slot_stmt``'s expired-row branch on its
+    own. Returns ``(first_id, second_id)``.
     """
     now = datetime.now(timezone.utc)
     anchor_id = make_trace_event(db, task_id=task_id)

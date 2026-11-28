@@ -1,38 +1,23 @@
-"""Zero-production-caller gate for ``task_interaction_service.create`` and
-``respond``.
+"""Call-site gates for ``task_interaction_service.create`` and ``respond``.
 
-Replaces the two-name gate this file's predecessor enforced, keeping both
-names under watch. The predecessor named its retirement condition as "the
-change that routes the existing resume coordinator through this module's
-compatibility seam" -- the change meant to give ``respond()`` its first
-production caller. That compatibility seam has since landed: it reads
-through ``task_interaction_close.active_interaction_id_sync``, which
-imports ``_active_native_row_criteria`` from this module (``websocket.py``
-itself no longer imports it directly). It does not,
-though, give ``respond()`` a caller -- the seam only reads that filter
-predicate, it never calls ``respond()`` -- so this gate's retirement
-condition is still open. Zero production code anywhere in this package
-calls either name, and this gate is what keeps that true until the change
-that wires a caller retires the name it wires.
-
-``create()``'s production call body -- the write that actually calls
-``stage_interaction_request`` -- arrives with the change that wires
-interaction creation end-to-end and fills in that primitive's caller
-obligations. Retiring this gate is that change's job, not this one's: the
-change that deletes this file must add whatever replacement guard it needs,
-the same way this file replaced its own predecessor.
+``respond()`` has zero production callers, and the gate below keeps that
+true until a change wires one. ``create()`` is called only from the two
+modules that hold the finalizers settling a waiting run
+(``task_execution`` and ``managed_task_lease``);
+``test_create_is_called_only_from_the_finalizer_modules`` asserts that set
+by equality, so a red result there is fixed by putting the call back, not
+by widening the set.
 
 AST-based, module-qualified matching -- not a bare-name or substring scan.
 ``create`` is an ordinary English verb already used as a method name
 elsewhere in this codebase (``docker_client.containers.create(...)``); a
 scanner that flagged every call named ``create`` would be red on day one.
-This gate only counts a call when the callee name is resolved -- through an
-import binding recorded in the same module -- to one of the gated names,
-``task_interaction_service.create`` or ``respond``.
+These gates only count a call when the callee name is resolved -- through
+an import binding recorded in the same module -- to one of the scanned
+names, ``task_interaction_service.create`` or ``respond``.
 
 Known blind spots, not fixed here because closing them is out of scope for a
-static AST scan of one package tree (identical to the predecessor gate's own
-list, for the identical reasons):
+static AST scan of one package tree (they apply to both gates):
 
 (a) Dynamic access: ``importlib.import_module(...)`` plus ``getattr(...)``
     matches none of the node shapes below.
@@ -70,7 +55,10 @@ from xagent.web.services import (  # noqa: F401 -- negative control import
     task_interaction_service as service,
 )
 
-GATED_NAMES = frozenset({"create", "respond"})
+# Every name the scanner below can resolve, used by its positive controls.
+SCANNED_NAMES = frozenset({"create", "respond"})
+# The names no production module may call.
+GATED_NAMES = frozenset({"respond"})
 SERVICE_MODULE = "task_interaction_service"
 
 
@@ -88,11 +76,11 @@ def _dotted_prefix(node: ast.expr) -> str | None:
     return None
 
 
-def _production_uses(source: str) -> set[str]:
-    """Gated names this module actually calls through a binding to
+def _production_uses(source: str, names: frozenset[str]) -> set[str]:
+    """Names in ``names`` this module actually calls through a binding to
     ``task_interaction_service``, resolved in two passes: first collect
-    every import binding this module makes to the service module or to its
-    gated names directly, then walk every call and count it only if its
+    every import binding this module makes to the service module or to
+    those names directly, then walk every call and count it only if its
     callee resolves through one of those bindings.
     """
     tree = ast.parse(source)
@@ -114,7 +102,7 @@ def _production_uses(source: str) -> set[str]:
                 for alias in node.names:
                     if alias.name == "*":
                         star_imported = True
-                    elif alias.name in GATED_NAMES:
+                    elif alias.name in names:
                         direct_bindings[alias.asname or alias.name] = alias.name
             else:
                 for alias in node.names:
@@ -140,9 +128,9 @@ def _production_uses(source: str) -> set[str]:
         if isinstance(func, ast.Name):
             if func.id in direct_bindings:
                 found.add(direct_bindings[func.id])
-            elif star_imported and func.id in GATED_NAMES:
+            elif star_imported and func.id in names:
                 found.add(func.id)
-        elif isinstance(func, ast.Attribute) and func.attr in GATED_NAMES:
+        elif isinstance(func, ast.Attribute) and func.attr in names:
             if isinstance(func.value, ast.Name) and func.value.id in module_bindings:
                 found.add(func.attr)
             else:
@@ -169,7 +157,7 @@ def _production_modules() -> list[Path]:
 # --------------------------------------------------------------------------
 
 
-def test_no_production_module_calls_create_or_respond() -> None:
+def test_no_production_module_calls_respond() -> None:
     offenders: dict[str, set[str]] = {}
     for path in _production_modules():
         try:
@@ -178,10 +166,20 @@ def test_no_production_module_calls_create_or_respond() -> None:
             raise RuntimeError(
                 f"{path}: not valid UTF-8, cannot be AST-scanned by this gate"
             ) from exc
-        uses = _production_uses(source)
+        uses = _production_uses(source, GATED_NAMES)
         if uses:
             offenders[str(path)] = uses
     assert offenders == {}, offenders
+
+
+def test_create_is_called_only_from_the_finalizer_modules() -> None:
+    callers = {
+        path.stem
+        for path in _production_modules()
+        if "create"
+        in _production_uses(path.read_text(encoding="utf-8"), frozenset({"create"}))
+    }
+    assert callers == {"task_execution", "managed_task_lease"}
 
 
 # --------------------------------------------------------------------------
@@ -199,7 +197,7 @@ def test_detects_direct_call_after_from_import() -> None:
             return create(db, **kwargs)
         """
     )
-    assert _production_uses(source) == {"create"}
+    assert _production_uses(source, SCANNED_NAMES) == {"create"}
 
 
 def test_detects_aliased_direct_call() -> None:
@@ -211,7 +209,7 @@ def test_detects_aliased_direct_call() -> None:
             return make(db, **kwargs)
         """
     )
-    assert _production_uses(source) == {"create"}
+    assert _production_uses(source, SCANNED_NAMES) == {"create"}
 
 
 def test_detects_module_attribute_call() -> None:
@@ -223,7 +221,7 @@ def test_detects_module_attribute_call() -> None:
             return task_interaction_service.create(db, **kwargs)
         """
     )
-    assert _production_uses(source) == {"create"}
+    assert _production_uses(source, SCANNED_NAMES) == {"create"}
 
 
 def test_detects_aliased_module_attribute_call() -> None:
@@ -235,7 +233,7 @@ def test_detects_aliased_module_attribute_call() -> None:
             return svc.create(db, **kwargs)
         """
     )
-    assert _production_uses(source) == {"create"}
+    assert _production_uses(source, SCANNED_NAMES) == {"create"}
 
 
 def test_detects_star_import_call() -> None:
@@ -247,7 +245,7 @@ def test_detects_star_import_call() -> None:
             return create(db, **kwargs)
         """
     )
-    assert _production_uses(source) == {"create"}
+    assert _production_uses(source, SCANNED_NAMES) == {"create"}
 
 
 # --------------------------------------------------------------------------
@@ -268,7 +266,7 @@ def test_bare_module_import_alone_is_not_flagged() -> None:
     binding trips the gate."""
 
     source = "from xagent.web.services import task_interaction_service\n"
-    assert _production_uses(source) == set()
+    assert _production_uses(source, SCANNED_NAMES) == set()
 
 
 def test_importing_unrelated_name_is_not_flagged() -> None:
@@ -280,15 +278,14 @@ def test_importing_unrelated_name_is_not_flagged() -> None:
             return InteractionPrincipal(**kwargs)
         """
     )
-    assert _production_uses(source) == set()
+    assert _production_uses(source, SCANNED_NAMES) == set()
 
 
 def test_detects_a_production_call_to_respond() -> None:
-    """``respond()`` is under this gate for the same reason ``create()``
-    is: it has no production caller, and the change that gives it one is
-    the change that takes it out of here. This is the positive control for
-    that half of the gate -- a hypothetical production call must be
-    detected, or the gate would be watching a name it cannot see."""
+    """``respond()`` is under the zero-caller gate: it has no production
+    caller. This is the positive control for that gate -- a hypothetical
+    production call must be detected, or the gate would be watching a name
+    it cannot see."""
 
     source = textwrap.dedent(
         """
@@ -298,7 +295,7 @@ def test_detects_a_production_call_to_respond() -> None:
             return respond(**kwargs)
         """
     )
-    assert _production_uses(source) == {"respond"}
+    assert _production_uses(source, SCANNED_NAMES) == {"respond"}
 
 
 def test_same_named_call_on_an_unrelated_object_is_not_flagged() -> None:
@@ -312,7 +309,7 @@ def test_same_named_call_on_an_unrelated_object_is_not_flagged() -> None:
             docker_client.containers.create(image="x")
         """
     )
-    assert _production_uses(source) == set()
+    assert _production_uses(source, SCANNED_NAMES) == set()
 
 
 def test_test_module_consumers_are_not_flagged() -> None:
@@ -333,7 +330,7 @@ def test_service_module_itself_is_excluded_from_the_scan_set() -> None:
 
 
 # --------------------------------------------------------------------------
-# Forward-verification: adding a real production caller of ``create`` must
+# Forward-verification: adding a real production caller of ``respond`` must
 # turn this gate red, not just its unit-level ``_production_uses`` checks
 # above. ``_production_modules`` walks ``xagent.__path__`` rather than a
 # hardcoded root, so pointing that at a scratch directory for the duration
@@ -352,11 +349,11 @@ def test_gate_turns_red_when_a_production_caller_is_added(
     planted.write_text(
         textwrap.dedent(
             """
-            from xagent.web.services.task_interaction_service import create
+            from xagent.web.services.task_interaction_service import respond
 
 
-            def handler(db, **kwargs):
-                return create(db, **kwargs)
+            def handler(**kwargs):
+                return respond(**kwargs)
             """
         ),
         encoding="utf-8",
@@ -364,7 +361,7 @@ def test_gate_turns_red_when_a_production_caller_is_added(
 
     offenders: dict[str, set[str]] = {}
     for path in _production_modules():
-        uses = _production_uses(path.read_text(encoding="utf-8"))
+        uses = _production_uses(path.read_text(encoding="utf-8"), GATED_NAMES)
         if uses:
             offenders[str(path)] = uses
-    assert offenders == {str(planted): {"create"}}
+    assert offenders == {str(planted): {"respond"}}

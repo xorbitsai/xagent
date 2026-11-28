@@ -45,9 +45,12 @@ short transaction only after the message write has already committed --
 the close is a best-effort step that follows the message write, not part
 of it. If that separate transaction fails, both call sites only log the
 failure; they do not retry, raise, or register a degradation signal. That
-is a deliberate choice, not a gap: a stale marker degrades to the legacy
-fallback question by design -- the same guarantee documented in the marker
-comment on ``Task.interaction_protocol_version`` (``models/task.py``) -- so
+is a deliberate choice, not a gap: the row stays active, so the read surface
+keeps showing that question until the next chat message closes it or the
+run's next published question retires it (``_reclaim_stale_slot_stmt``). A
+marker left with no active row falls back to the transcript question, the
+guarantee documented in the marker comment on
+``Task.interaction_protocol_version`` (``models/task.py``). So
 there is nothing left to protect by escalating. Both WebSocket call sites
 handle the failure of the delivery marker write immediately beside each
 close call (``mark_user_message_delivery_sync``) the identical log-only
@@ -65,9 +68,9 @@ transaction that writes the resumed input and closes the interaction row
 together. A crash between those two commits leaves the interaction row
 ``active`` and the marker still set to ``1`` even though the injected
 message already answered the question. That window is benign for the same
-reason as the reader fallback documented above: a reader keys off
-``status`` first, so a stale active row here just makes it fall back to
-asking the legacy question again.
+reason as the best-effort close documented
+above: the question stays on display until the next chat message closes the
+row or the run's next published question retires it.
 
 The replay ``AgentRunner.inject_user_message`` short-circuits on a
 repeated turn id is not a window of that same benign family. A replay
@@ -121,14 +124,17 @@ the close runs, which an unbound statement would retire as though the
 injected message had answered it. Reading the id at close time instead of
 before the injection leaves that window exactly as wide as it is with no
 key at all -- the value has to be the one observed before the message
-went in.
+went in. A row published after that read is out of this statement's reach, and
+re-reading here to catch it would reopen the window above. The run's next
+published question retires such a row (``_reclaim_stale_slot_stmt``).
 
 Every rowcount the close statement below produces is classified the same
 way, at the one place the classification happens
 (``_classify_close_rowcount``): exactly one row closed is the expected
-case and logs at info; zero rows is the overwhelmingly common case today
-(no production writer has inserted into ``task_interaction_requests``
-yet) and logs at debug, carrying with it a short description of why
+case and logs at info; zero rows is the common case, and the only one
+under the default rollout mode (the finalizers insert into
+``task_interaction_requests`` only when the rollout policy allows native
+publication), and logs at debug, carrying with it a short description of why
 nothing matched (``_unmatched_close_row``) -- "nothing was ever there"
 and "something was there and is no longer this run's live question" are
 the same rowcount and different situations; more than one row is
@@ -398,10 +404,13 @@ def active_interaction_id_sync(task_id: int) -> ActiveInteractionRead:
     message, and under a NULL marker it now costs one primary-key lookup
     instead of an uncached catalog inspection plus a two-table join.
 
-    That gate decides every call today: the only statements in ``src/``
-    that write the column are this module's two clears, and both of them
-    write ``NULL``, so the marker is NULL for every task and this branch
-    returns ``ActiveInteractionAbsent()`` before anything below it runs.
+    Under the default rollout mode that gate decides every call. Besides
+    this module's two clears, which write ``NULL``, the only statements in
+    ``src/`` that write the column are the three finalizers' native
+    publication, which writes ``1`` and runs only when the rollout policy
+    allows native publication. So under the default mode the marker is
+    NULL for every task and this branch returns ``ActiveInteractionAbsent()``
+    before anything below it runs.
 
     This is also the resume command seam's reader (the refusal gate in
     ``resume_task``, for a resume whose payload cannot prove it answered the
@@ -543,9 +552,10 @@ def close_legacy_resume_interaction(
     the marker only when no active row for this ``(task_id, run_id)``
     pair remains once the close above has had its turn. That covers the
     case this function is normally in (the close retired the one live
-    row, so nothing is left and the marker goes) and today's 100% case
-    (this run never staged a row at all, so nothing was ever there and
-    the marker still goes, since the table has no production writer yet),
+    row, so nothing is left and the marker goes) and the only case under
+    the default rollout mode (this run never staged a row at all, so
+    nothing was ever there and the marker still goes, since the finalizers
+    stage rows only when the rollout policy allows native publication),
     while refusing the case that used to lose a question: the
     pre-injection read came back ``None`` -- or came back with an id the
     close did not match -- while a live row is in fact still sitting

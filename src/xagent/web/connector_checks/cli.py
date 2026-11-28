@@ -63,7 +63,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.sweep and args.check:
         parser.error("--check does not apply to --sweep")
     logging.basicConfig(level=logging.WARNING, stream=sys.stderr)
-    with _stdout_to_stderr():
+    with redirect_stdout_to_stderr():
         result = asyncio.run(_run(args))
     print(json.dumps(result.to_document()), flush=True)
     failed = any(row.outcome is Outcome.FAIL for row in result.rows)
@@ -86,14 +86,14 @@ async def _run(args: argparse.Namespace) -> RunResult | SweepResult:
         )
 
     try:
-        with _database() as db:
+        with open_smoke_database() as db:
             adapter = UserIdentityAdapter(db, args.user)
             try:
                 if args.sweep:
                     return await run_sweep(
                         adapter,
                         environment=args.environment,
-                        connectors=_flatten(args.connector),
+                        connectors=flatten_selectors(args.connector),
                         call_timeout=args.check_timeout,
                         total_timeout=args.total_timeout
                         or DEFAULT_SWEEP_TIMEOUT_SECONDS,
@@ -101,8 +101,8 @@ async def _run(args: argparse.Namespace) -> RunResult | SweepResult:
                 return await run_checks(
                     adapter,
                     environment=args.environment,
-                    connectors=_flatten(args.connector),
-                    checks=_flatten(args.check),
+                    connectors=flatten_selectors(args.connector),
+                    checks=flatten_selectors(args.check),
                     check_timeout=args.check_timeout,
                     total_timeout=args.total_timeout or DEFAULT_TOTAL_TIMEOUT_SECONDS,
                 )
@@ -117,7 +117,7 @@ async def _run(args: argparse.Namespace) -> RunResult | SweepResult:
 
 
 @contextlib.contextmanager
-def _database() -> Iterator[Any]:
+def open_smoke_database() -> Iterator[Any]:
     """A session on the service's database, connected before it is yielded.
     It never migrates or seeds: container startup owns that."""
     from ..models.database import configure_db, get_engine, get_session_local
@@ -136,9 +136,13 @@ def _database() -> Iterator[Any]:
 
 
 @contextlib.contextmanager
-def _stdout_to_stderr() -> Iterator[None]:
+def redirect_stdout_to_stderr() -> Iterator[None]:
     """Point file descriptor 1 and ``sys.stdout`` at stderr until the block
-    exits, so only the document reaches stdout."""
+    exits, so only the document reaches stdout.
+
+    Use this process-wide context from a standalone CLI before printing the
+    result document.
+    """
     sys.stdout.flush()
     saved = os.dup(1)
     os.dup2(2, 1)
@@ -169,7 +173,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--connector",
         action="append",
-        type=_selector_names,
+        type=parse_selector_names,
         metavar="LABEL",
         help="run only these connectors, by their label in the result; "
         "repeatable or comma-separated",
@@ -177,7 +181,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--check",
         action="append",
-        type=_selector_names,
+        type=parse_selector_names,
         metavar="CHECK_ID",
         help="run only these checks, by id (slack.l3_probe); repeatable or "
         "comma-separated",
@@ -189,12 +193,12 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--check-timeout",
-        type=_seconds,
+        type=parse_timeout_seconds,
         help="each tool call's bound in seconds; defaults to the L3 probe call's",
     )
     parser.add_argument(
         "--total-timeout",
-        type=_seconds,
+        type=parse_timeout_seconds,
         help="the run's budget in seconds, counted from before the connectors "
         "are enumerated; only connector sessions and tool calls are cut short "
         f"(default: {DEFAULT_TOTAL_TIMEOUT_SECONDS:g}, or "
@@ -209,14 +213,15 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _flatten(values: Iterable[frozenset[str]] | None) -> frozenset[str] | None:
+def flatten_selectors(values: Iterable[frozenset[str]] | None) -> frozenset[str] | None:
     """One set from a repeatable selector; None when it was not given."""
     if values is None:
         return None
     return frozenset(name for names in values for name in names)
 
 
-def _selector_names(value: str) -> frozenset[str]:
+def parse_selector_names(value: str) -> frozenset[str]:
+    """Parse one comma-separated connector or check selector for argparse."""
     names = frozenset(item.strip() for item in value.split(",") if item.strip())
     if not names:
         raise argparse.ArgumentTypeError("must name at least one")
@@ -229,7 +234,8 @@ def _environment(value: str) -> str:
     return value
 
 
-def _seconds(value: str) -> float:
+def parse_timeout_seconds(value: str) -> float:
+    """Parse a positive, finite timeout in seconds for argparse."""
     try:
         seconds = float(value)
     except ValueError:

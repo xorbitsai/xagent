@@ -101,7 +101,7 @@ class UserIdentityAdapter:
         )
         # A row a task would not see is offered as it is: its listing is
         # not_found, and nothing starts.
-        if server is not None and not _is_catalog_row(self._db, server, app_id):
+        if server is not None and not is_catalog_row(self._db, server, app_id):
             return ConnectorTarget(app_id, skip_reason=NOT_CATALOG_IDENTITY)
         return ConnectorTarget(app_id, ref=server_id)
 
@@ -134,7 +134,7 @@ def _connected_catalog_apps(db: Any, user: Any) -> dict[str, int]:
     }
 
 
-def _is_catalog_row(db: Any, server: Any, app_id: str) -> bool:
+def is_catalog_row(db: Any, server: Any, app_id: str) -> bool:
     """Whether ``server`` is catalog app ``app_id``'s own row, by the probe
     route's rule."""
     from ..mcp_apps import get_app_for_mcp_server

@@ -87,6 +87,32 @@ class TurnUsage:
     by_model: tuple[TurnModelUsage, ...]
 
 
+def turn_usage_payload(usage: TurnUsage) -> dict[str, Any]:
+    """Serialize one run's usage as the JSON stored on its answer row.
+
+    Display data, not a billing record: it carries what the run observed, as
+    ``TurnUsage`` does. The keys mirror ``TurnUsage`` field for field, with
+    each model entry keeping its ``model_id``. It copies fields and never
+    raises; callers check for ``None`` before calling.
+    """
+    return {
+        "input_tokens": usage.input_tokens,
+        "output_tokens": usage.output_tokens,
+        "llm_calls": usage.llm_calls,
+        "tool_calls": usage.tool_calls,
+        "tool_errors": usage.tool_errors,
+        "by_model": [
+            {
+                "model_id": m.model_id,
+                "model_name": m.model_name,
+                "input_tokens": m.input_tokens,
+                "output_tokens": m.output_tokens,
+            }
+            for m in usage.by_model
+        ],
+    }
+
+
 _UNSETTLED_ANSWER_STATUSES = frozenset({"paused", "waiting_for_user"})
 
 

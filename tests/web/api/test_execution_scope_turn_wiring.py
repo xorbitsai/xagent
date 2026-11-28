@@ -1078,6 +1078,7 @@ async def test_resume_db_lifecycle_runs_in_short_session_workers() -> None:
         report: SettlementReport | None = None,
         turn_id: str | None = None,
         classify_unknown_tool_effect: bool = False,
+        run_usage: Any = None,
     ) -> None:
         assert acquired_lease is lease
         assert error_message is None

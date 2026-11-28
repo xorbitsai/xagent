@@ -166,6 +166,7 @@ from .task_settlement_report import RecordedInterruption, SettlementReport
 from .task_setup_snapshot import load_task_setup_snapshot_sync
 from .turn_settlement import (
     TurnFacts,
+    TurnUsage,
     bind_settlement_turn,
     report_turn_settled,
     settled_outcome,
@@ -2071,6 +2072,7 @@ def settle_task_lease_isolated(
     classify_unknown_tool_effect: bool = False,
     interruption: InterruptionReason | None = None,
     report: SettlementReport | None = None,
+    run_usage: TurnUsage | None = None,
 ) -> bool:
     """Settle exactly one run/runner lease in one worker-owned Session.
 
@@ -2112,6 +2114,10 @@ def settle_task_lease_isolated(
     is recorded in ``task_auto_recovery``. ``report``, when supplied,
     also receives the recorded reason of a committed pause.
 
+    ``run_usage`` is the usage of the run being settled; when given, the
+    failure row written for it stores that usage in its ``message_metadata``.
+    Callers settling a run they do not hold the usage of leave it ``None``.
+
     ``turn_id`` is the accepted current turn whose client-safe failure
     projection is written. It is never inferred from the task's original
     configuration because a later turn may own this settlement.
@@ -2135,6 +2141,7 @@ def settle_task_lease_isolated(
             classify_unknown_tool_effect=classify_unknown_tool_effect,
             interruption=interruption,
             report=report,
+            run_usage=run_usage,
             attempt=attempt,
         ),
         site="settlement",
@@ -2153,6 +2160,7 @@ def _settle_task_lease_attempt(
     classify_unknown_tool_effect: bool,
     interruption: InterruptionReason | None,
     report: SettlementReport | None,
+    run_usage: TurnUsage | None = None,
     attempt: CommitAttempt | None = None,
 ) -> bool:
     """One transaction of ``settle_task_lease_isolated``.
@@ -2162,7 +2170,10 @@ def _settle_task_lease_attempt(
     for the retry driver.
     """
     from ..models.database import get_session_local
-    from .chat_history_service import persist_assistant_message_no_commit
+    from .chat_history_service import (
+        persist_assistant_message_no_commit,
+        run_usage_message_metadata,
+    )
     from .task_execution_controller import task_control_snapshot
     from .workforce_runtime import sync_workforce_run_status
 
@@ -2272,6 +2283,7 @@ def _settle_task_lease_attempt(
                             content=client_error_message,
                             message_type=client_message_type,
                             turn_id=history_turn_id,
+                            message_metadata=run_usage_message_metadata(run_usage),
                         )
                     from .task_execution_event_writer import stage_result_fact_no_commit
 
@@ -3171,6 +3183,7 @@ def _schedule_bg(
                                 ),
                                 interruption=settlement_interruption,
                                 report=report,
+                                run_usage=facts.usage,
                             )
                         )
                     )

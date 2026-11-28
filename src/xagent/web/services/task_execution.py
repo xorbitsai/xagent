@@ -143,6 +143,7 @@ from .task_lease_service import (
 from .task_settlement_report import RecordedInterruption, SettlementReport
 from .turn_settlement import (
     TurnFacts,
+    TurnUsage,
     bind_settlement_turn,
     report_turn_settled,
     settled_outcome,
@@ -2220,10 +2221,18 @@ def _finalize_task_execution_result_isolated(
     prepared_outputs: _PreparedTaskFileOutputs | None = None,
     turn_id: str | None = None,
     input_message_id: int | None = None,
+    run_usage: TurnUsage | None = None,
 ) -> _TaskExecutionFinalization:
-    """Persist one task result in a worker-owned, ownership-fenced session."""
+    """Persist one task result in a worker-owned, ownership-fenced session.
+
+    ``run_usage`` is the usage of the run that produced ``result``; when given,
+    the answer row stores it in its ``message_metadata``.
+    """
     from ..models.chat_message import TaskChatMessage
-    from .chat_history_service import persist_assistant_message_no_commit
+    from .chat_history_service import (
+        persist_assistant_message_no_commit,
+        run_usage_message_metadata,
+    )
 
     if prepared_outputs is None:
         resolved_output_user_id = task_user_id
@@ -2591,6 +2600,7 @@ def _finalize_task_execution_result_isolated(
                     ),
                     turn_id=turn_id,
                     content_is_reconciled=True,
+                    message_metadata=run_usage_message_metadata(run_usage),
                 )
                 if (
                     assistant_message is not None
@@ -3014,6 +3024,7 @@ async def execute_task_background(
                     ),
                     turn_id=history_turn_id,
                     input_message_id=before_message_id,
+                    run_usage=(turn_facts.usage if turn_facts is not None else None),
                 )
             )
         )
@@ -3467,11 +3478,19 @@ def _finalize_resumed_task(
     result: Dict[str, Any],
     task_lease: TaskLease,
     prepared_outputs: _PreparedTaskFileOutputs,
+    run_usage: TurnUsage | None = None,
 ) -> dict[str, Any]:
-    """Persist one fenced resumed result in a single worker transaction."""
+    """Persist one fenced resumed result in a single worker transaction.
+
+    ``run_usage`` is the usage of the resumed run that produced ``result``;
+    when given, the answer or failure row stores it in its ``message_metadata``.
+    """
     from ..models.agent import Agent
     from ..models.chat_message import TaskChatMessage
-    from .chat_history_service import persist_assistant_message_no_commit
+    from .chat_history_service import (
+        persist_assistant_message_no_commit,
+        run_usage_message_metadata,
+    )
     from .task_orchestrator import sync_trigger_run_status
 
     finalized: dict[str, Any] = {
@@ -3641,6 +3660,7 @@ def _finalize_resumed_task(
                 message_type=ASSISTANT_RESPONSE_MESSAGE_TYPE,
                 turn_id=result_turn_id,
                 content_is_reconciled=True,
+                message_metadata=run_usage_message_metadata(run_usage),
             )
             orm_task = cast(Any, task)
             orm_task.output = output
@@ -3656,6 +3676,7 @@ def _finalize_resumed_task(
                     message_type=TASK_FAILURE_MESSAGE_TYPE,
                     turn_id=result_turn_id,
                     content_is_reconciled=True,
+                    message_metadata=run_usage_message_metadata(run_usage),
                 )
             orm_task = cast(Any, task)
             orm_task.output = None
@@ -3805,11 +3826,14 @@ def _settle_resumed_task_lease(
     interruption: InterruptionReason | None = None,
     report: SettlementReport | None = None,
     classify_unknown_tool_effect: bool = False,
+    run_usage: TurnUsage | None = None,
 ) -> bool:
     """Delegate resume cleanup to the shared run/runner-fenced lifecycle.
 
     ``classify_unknown_tool_effect`` is for a resumed run that raised, as
-    for a new run (see ``settle_task_lease_isolated``).
+    for a new run (see ``settle_task_lease_isolated``). ``run_usage`` is the
+    usage of the resumed run being cleaned up; it is stored on the failure
+    row the settlement writes.
     """
     from .assistant_history_safety import CLIENT_SAFE_FAILURE_MESSAGE_TYPE
     from .external_task_cancel import EXTERNAL_TURN_INTERRUPTED_MESSAGE
@@ -3824,6 +3848,7 @@ def _settle_resumed_task_lease(
             client_message_type=CLIENT_SAFE_FAILURE_MESSAGE_TYPE,
             turn_id=turn_id,
             report=report,
+            run_usage=run_usage,
         )
     return settle_task_lease_isolated(
         lease,
@@ -3832,6 +3857,7 @@ def _settle_resumed_task_lease(
         classify_unknown_tool_effect=classify_unknown_tool_effect,
         interruption=interruption,
         report=report,
+        run_usage=run_usage,
     )
 
 
@@ -4808,6 +4834,7 @@ async def execute_resume_background(
                         result=result,
                         task_lease=lease,
                         prepared_outputs=outputs_for_finalizer,
+                        run_usage=facts.usage,
                     )
                 )
             )
@@ -5341,6 +5368,7 @@ async def execute_resume_background(
                                         settlement_classifies_unknown_tool_effect
                                     ),
                                     report=settlement_report,
+                                    run_usage=facts.usage,
                                 )
                             )
                         # Returned, not raised: no retention to record, even

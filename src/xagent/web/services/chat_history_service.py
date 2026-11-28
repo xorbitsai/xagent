@@ -46,6 +46,7 @@ from .task_execution_event_writer import (
     stage_delivery_fact_no_commit,
 )
 from .task_retention import touch_task_last_activity
+from .turn_settlement import TurnUsage, turn_usage_payload
 
 logger = logging.getLogger(__name__)
 
@@ -54,6 +55,10 @@ DELIVERY_DISPATCHED = "dispatched"
 DELIVERY_COMPLETED = "completed"
 DELIVERY_FAILED = "failed"
 DELIVERY_OUTCOME_UNKNOWN = "outcome_unknown"
+
+# ``message_metadata`` key on an assistant answer row holding the usage of the
+# run that produced the answer (see ``turn_settlement.turn_usage_payload``).
+ASSISTANT_RUN_USAGE_METADATA_KEY = "run_usage"
 
 QUESTION_MESSAGE_TYPE = "question"
 SUPERSEDED_MESSAGE_TYPE = "question_superseded"
@@ -775,6 +780,19 @@ def persist_assistant_message(
         turn_id=turn_id,
         source_event_id=source_event_id,
     )
+
+
+def run_usage_message_metadata(
+    run_usage: TurnUsage | None,
+) -> Dict[str, Any] | None:
+    """The ``message_metadata`` of an answer row written by a run with usage.
+
+    ``None`` when the run recorded no usage: the row then carries no metadata,
+    exactly as a row written without this argument.
+    """
+    if run_usage is None:
+        return None
+    return {ASSISTANT_RUN_USAGE_METADATA_KEY: turn_usage_payload(run_usage)}
 
 
 def persist_assistant_message_no_commit(

@@ -26,7 +26,10 @@ from xagent.core.agent.trace import (
 from xagent.web.models.chat_message import TaskChatMessage
 from xagent.web.models.task import Task, TaskStatus, TraceEvent
 from xagent.web.models.task_execution_event import TaskExecutionEvent
-from xagent.web.services.chat_history_service import persist_user_message_no_commit
+from xagent.web.services.chat_history_service import (
+    persist_assistant_message_no_commit,
+    persist_user_message_no_commit,
+)
 from xagent.web.services.managed_task_lease import finalize_managed_task_lease_result
 from xagent.web.services.task_execution_controller import (
     TaskControlState,
@@ -1105,3 +1108,45 @@ async def test_stream_deltas_publish_without_durable_writes(
     with factory() as db:
         assert [row.kind for row in facts(db, task_id)] == ["final_answer_end"]
         assert facts(db, task_id)[0].payload["data"]["content"] == "hello world"
+
+
+def test_v2_answer_event_conflicts_on_different_run_usage(canonical):
+    from xagent.web.services.task_execution_event_store import ExecutionEventConflict
+
+    factory, task_id = canonical
+
+    def usage(tokens):
+        return {"run_usage": {"input_tokens": tokens, "output_tokens": 1}}
+
+    with factory() as db:
+        user_id = db.get(Task, task_id).user_id
+        persist_assistant_message_no_commit(
+            db,
+            task_id,
+            user_id,
+            "answer",
+            source_event_id="answer-1",
+            message_metadata=usage(10),
+        )
+        db.commit()
+
+    with factory() as db:
+        # The same fact again is idempotent.
+        persist_assistant_message_no_commit(
+            db,
+            task_id,
+            user_id,
+            "answer",
+            source_event_id="answer-1",
+            message_metadata=usage(10),
+        )
+        db.rollback()
+        with pytest.raises(ExecutionEventConflict):
+            persist_assistant_message_no_commit(
+                db,
+                task_id,
+                user_id,
+                "answer",
+                source_event_id="answer-1",
+                message_metadata=usage(11),
+            )

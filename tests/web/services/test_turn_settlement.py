@@ -17,7 +17,7 @@ from typing import Any, Awaitable, Callable, cast
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 import pytest
-from sqlalchemy import event, update
+from sqlalchemy import event, select, update
 from sqlalchemy.orm import Session
 
 from tests.web.services.test_task_execution_event_writer import (
@@ -33,6 +33,7 @@ from xagent.core.agent import (
     PatternResult,
 )
 from xagent.core.agent.interruption import InterruptionReason
+from xagent.web.models.chat_message import TaskChatMessage
 from xagent.web.models.task import Task, TaskStatus
 from xagent.web.services import (
     agent_service_manager,
@@ -1171,8 +1172,12 @@ async def _drive_resume(
     preacquired_prior_status: TaskStatus | None = None,
     finalize_side_effect: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
     during_resume: Callable[[], None] | None = None,
+    lease: TaskLease | None = None,
+    task_owner_user_id: int = 1,
 ) -> type[BaseException] | None:
     from xagent.web.services.task_execution import execute_resume_background
+
+    resume_lease = lease if lease is not None else _resume_lease()
 
     heartbeat_stop = asyncio.Event()
 
@@ -1259,14 +1264,14 @@ async def _drive_resume(
             stack.enter_context(active)
         try:
             await execute_resume_background(
-                task_id=42,
+                task_id=resume_lease.task_id,
                 agent_service=service,
-                task_owner_user_id=1,
+                task_owner_user_id=task_owner_user_id,
                 delivery_turn_id=delivery_turn_id,
                 delivery_already_dispatched=True,
-                expected_run_id="run-a",
+                expected_run_id=resume_lease.run_id,
                 resolved_execution_scope=None,
-                preacquired_lease=_resume_lease(),
+                preacquired_lease=resume_lease,
                 preacquired_heartbeat_stop=heartbeat_stop,
                 preacquired_heartbeat_task=heartbeat_task,
                 trusted_task_source=trusted_task_source,
@@ -2324,3 +2329,186 @@ def test_turn_usage_payload_mirrors_turn_usage_field_for_field() -> None:
             },
         ],
     }
+
+
+# ---------------------------------------------------------------------------
+# The usage a run reports is also stored on the answer row it wrote.
+# ---------------------------------------------------------------------------
+
+RUN_USAGE = TurnUsage(
+    input_tokens=17,
+    output_tokens=6,
+    llm_calls=2,
+    tool_calls=0,
+    tool_errors=0,
+    by_model=(
+        TurnModelUsage("7", "model-a", 12, 4),
+        TurnModelUsage("9", "model-b", 5, 2),
+    ),
+)
+
+
+def _metered_manager(outcome: dict[str, Any] | BaseException) -> Any:
+    """The real manager over an agent that spends tokens on two models."""
+    from xagent.core.model.chat.token_context import add_token_usage
+    from xagent.web.services.agent_service_manager import AgentServiceManager
+
+    service = MagicMock()
+    service.workspace = None
+
+    async def execute(**_kwargs: Any) -> dict[str, Any]:
+        add_token_usage(
+            input_tokens=12,
+            output_tokens=4,
+            model="model-a",
+            model_id="7",
+            call_type="chat",
+        )
+        add_token_usage(
+            input_tokens=5,
+            output_tokens=2,
+            model="model-b",
+            model_id="9",
+            call_type="chat",
+        )
+        if isinstance(outcome, BaseException):
+            raise outcome
+        return dict(outcome)
+
+    service.execute_task = execute
+    manager = AgentServiceManager()
+    manager.get_agent_for_task = AsyncMock(return_value=service)  # type: ignore[method-assign]
+    return manager
+
+
+def _answer_rows(canonical: Any) -> list[TaskChatMessage]:
+    factory, tid = canonical
+    with factory() as db:
+        rows = list(
+            db.scalars(
+                select(TaskChatMessage)
+                .where(
+                    TaskChatMessage.task_id == tid,
+                    TaskChatMessage.role == "assistant",
+                )
+                .order_by(TaskChatMessage.id)
+            )
+        )
+        db.expunge_all()
+    return rows
+
+
+async def _drive_resume_on_db(
+    monkeypatch: pytest.MonkeyPatch,
+    canonical: Any,
+    outcome: dict[str, Any] | BaseException,
+    *,
+    final_status: TaskStatus = TaskStatus.COMPLETED,
+    trusted_task_source: str | None = "sdk",
+) -> None:
+    """A resumed run whose finalizer and cleanup settlement are the real ones."""
+    from xagent.web.services import task_execution
+
+    factory, tid = canonical
+    with factory() as db:
+        task = db.get(Task, tid)
+        task.source = trusted_task_source
+        owner = task.user_id
+        db.commit()
+        lease = acquire_task_lease(db, tid, new_run=True)
+    await _drive_resume(
+        monkeypatch,
+        outcome,
+        final_status=final_status,
+        trusted_task_source=trusted_task_source,
+        lease=lease,
+        task_owner_user_id=owner,
+        extra_patches=(
+            patch("xagent.web.tracking.task_tracker.TaskTracker", new=_SinkTracker),
+            patch(
+                "xagent.web.services.task_execution._finalize_resumed_task",
+                wraps=task_execution._finalize_resumed_task,
+            ),
+            patch(
+                "xagent.web.services.task_execution._settle_resumed_task_lease",
+                wraps=task_execution._settle_resumed_task_lease,
+            ),
+        ),
+    )
+
+
+RUN_USAGE_PATHS = {
+    "new_run": ("schedule", {"success": True, "output": "4"}, "sdk"),
+    "new_run_failure": (
+        "schedule",
+        {"success": False, "output": "", "error": "model refused"},
+        "sdk",
+    ),
+    "orchestrator_failure": ("schedule", RuntimeError("agent failed"), "sdk"),
+    "resumed_run": ("resume", RESUME_OK, "sdk"),
+    "resumed_failure": (
+        "resume",
+        {"success": False, "output": "", "status": "failed", "error": "refused"},
+        "sdk",
+    ),
+    "resumed_cleanup_failure": ("resume", RuntimeError("agent failed"), "sdk"),
+    "resumed_interrupted_external": (
+        "resume",
+        asyncio.CancelledError(),
+        "external",
+    ),
+}
+
+
+@pytest.mark.usefixtures("_clear_bg_manager")
+@pytest.mark.parametrize("path", list(RUN_USAGE_PATHS))
+async def test_finalize_records_run_usage_on_answer(
+    canonical, monkeypatch, path
+) -> None:
+    kind, outcome, source = RUN_USAGE_PATHS[path]
+    received = _capture()
+
+    if kind == "schedule":
+        await _schedule_turn(canonical, _metered_manager(outcome), task_source=source)
+    else:
+        await _drive_resume_on_db(
+            monkeypatch,
+            canonical,
+            outcome,
+            final_status=(
+                TaskStatus.FAILED if path == "resumed_failure" else TaskStatus.COMPLETED
+            ),
+            trusted_task_source=source,
+        )
+
+    assert len(received) == 1
+    settlement = received[0]
+    assert settlement.usage is not None
+    rows = _answer_rows(canonical)
+    assert len(rows) == 1
+    assert rows[0].message_metadata == {
+        "run_usage": turn_usage_payload(settlement.usage)
+    }
+    if path == "resumed_interrupted_external":
+        # The branch of the resume cleanup written for the external visitor.
+        from xagent.web.services.assistant_history_safety import (
+            CLIENT_SAFE_FAILURE_MESSAGE_TYPE,
+        )
+        from xagent.web.services.external_task_cancel import (
+            EXTERNAL_TURN_INTERRUPTED_MESSAGE,
+        )
+
+        assert rows[0].message_type == CLIENT_SAFE_FAILURE_MESSAGE_TYPE
+        assert rows[0].content == EXTERNAL_TURN_INTERRUPTED_MESSAGE
+
+
+@pytest.mark.usefixtures("_clear_bg_manager")
+async def test_finalize_without_usage_keeps_metadata_null(canonical) -> None:
+    received = _capture()
+
+    await _schedule_turn(canonical, _result_manager({"success": True, "output": "4"}))
+
+    assert [s.usage for s in received] == [None]
+    rows = _answer_rows(canonical)
+    assert len(rows) == 1
+    assert rows[0].message_metadata is None

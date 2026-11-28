@@ -26,24 +26,28 @@ app id (stamped with an app id or not) is not a catalog app the page shows as
 connected, so it is not a target.
 
 Each connector starts as the user's own task would start it: no actor policy
-and no team (``mcp_connector_session.list_connector_tools``). No fixture has
-a value yet: the server-side source comes with #3284, so a check that needs
-one is ``skip``/``fixture_missing``.
+and no team (``mcp_connector_session.list_connector_tools``). Fixture values
+come from the server-side JSON file named by
+``XAGENT_CONNECTOR_SMOKE_USER_FIXTURES``, if configured. A read check whose
+key has no value is ``skip``/``fixture_missing``.
 """
 
 from __future__ import annotations
 
+import json
+from functools import cached_property
 from typing import Any
 
 from sqlalchemy import func
 
+from ...config import get_connector_smoke_user_fixtures_path
 from ..services.connector_probe import is_connector_probe_user, owns_catalog_identity
 from ..services.mcp_connector_session import (
     ConnectorToolsResult,
     find_visible_server,
     list_connector_tools,
 )
-from .fixtures import FixtureValue
+from .fixtures import FixtureRef, FixtureValue, is_fixture_value
 from .identity import ConnectorTarget, IdentitySetupError, SessionPurpose
 
 USER_IDENTITY_LABEL = "user"
@@ -93,7 +97,32 @@ class UserIdentityAdapter:
         )
 
     def resolve_fixture(self, key: str) -> FixtureValue | None:
-        return None
+        return self._fixtures.get(key)
+
+    @cached_property
+    def _fixtures(self) -> dict[str, FixtureValue]:
+        """Load one snapshot, only when a selected check needs a fixture."""
+        try:
+            path = get_connector_smoke_user_fixtures_path()
+            if path is None:
+                return {}
+            with path.open(encoding="utf-8") as source:
+                document = json.load(source)
+        except (OSError, ValueError, RuntimeError):
+            raise ValueError("cannot read the user fixture file") from None
+
+        if not isinstance(document, dict):
+            raise ValueError("the user fixture file must contain a JSON object")
+        fixtures: dict[str, FixtureValue] = {}
+        for key, value in document.items():
+            try:
+                ref = FixtureRef(key)
+            except ValueError:
+                raise ValueError("the user fixture file has an invalid key") from None
+            if not is_fixture_value(value):
+                raise ValueError("the user fixture file has a non-scalar value")
+            fixtures[ref.key] = value
+        return fixtures
 
     def _target(self, user: Any, app_id: str, server_id: int) -> ConnectorTarget:
         server = find_visible_server(

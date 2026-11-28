@@ -21,10 +21,12 @@ import jsonschema
 import pytest
 
 from tests.web.services.test_connector_probe import (
+    _Adapter,
     _connect_catalog_stripe,
     _github_ok,
     _Loader,
     _stripe_ok,
+    _text_result,
 )
 from tests.web.services.test_mcp_connector_session import (
     LOADER,
@@ -362,6 +364,93 @@ def test_a_sweep_that_cannot_open_the_database_prints_a_sweep_failure(
 
 
 # --- the real adapter ------------------------------------------------------
+
+
+def test_user_fixture_reaches_the_tool_and_assertion_but_not_stdout(
+    db_users, probe_users, monkeypatch, capfd, tmp_path
+):
+    db, user, _ = db_users
+    _connect_github(db, user)
+    repo = "fixture-private-org/fixture-private-repo"
+    path = tmp_path / "private-fixture-source.json"
+    path.write_text(json.dumps({"github.read_repo": repo}), encoding="utf-8")
+    monkeypatch.setenv("XAGENT_CONNECTOR_SMOKE_USER_FIXTURES", str(path))
+    repository = _Adapter(
+        "github_get_repository",
+        _text_result(
+            json.dumps(
+                {
+                    "status": "success",
+                    "repository": {
+                        "full_name": repo,
+                        "private": True,
+                        "default_branch": "main",
+                        "html_url": f"https://github.com/{repo}",
+                    },
+                }
+            )
+        ),
+    )
+    monkeypatch.setattr(LOADER, _Loader(repository))
+    _with_database(monkeypatch, db)
+
+    code = cli.main(
+        ["--user", "monitor", "--check", "github.read_repository,github.read_issue"]
+    )
+
+    out, _ = capfd.readouterr()
+    document = _document(out)
+    assert code == 0
+    assert document["complete"] is True
+    assert repository.calls == [{"repo": repo}]
+    assert [
+        (row["check"], row["outcome"], row.get("failure_class"), row.get("reason"))
+        for row in document["rows"]
+    ] == [
+        (None, "pass", None, None),
+        ("github.read_repository", "pass", None, None),
+        ("github.read_issue", "skip", "fixture_missing", "github.issue_number"),
+    ]
+    assert repo not in out
+    assert path.name not in out
+
+
+@pytest.mark.parametrize(
+    "contents",
+    [
+        None,
+        '{"private-fixture-body":',
+        '["private-fixture-body"]',
+        '{"github.login": {"id": "private-fixture-body"}}',
+        '{"github.login": null}',
+        '{"github.login": 1e999}',
+        '{"private-fixture-body": "monitor"}',
+    ],
+)
+def test_broken_user_fixture_source_fails_without_exposing_it(
+    db_users, probe_users, monkeypatch, capfd, caplog, tmp_path, contents
+):
+    db, user, _ = db_users
+    _connect_github(db, user)
+    path = tmp_path / "private-fixture-source.json"
+    if contents is not None:
+        path.write_text(contents, encoding="utf-8")
+    monkeypatch.setenv("XAGENT_CONNECTOR_SMOKE_USER_FIXTURES", str(path))
+    loader = _Loader(_github_ok())
+    monkeypatch.setattr(LOADER, loader)
+    _with_database(monkeypatch, db)
+
+    code = cli.main(["--user", "monitor", "--check", "github.current_user"])
+
+    out, err = capfd.readouterr()
+    document = _document(out)
+    assert code == 1
+    assert document["failure"] == "fixtures:exception"
+    assert document["rows"] == []
+    assert loader.calls == []
+    for output in (out, err, caplog.text):
+        assert path.name not in output
+        assert "private-fixture-body" not in output
 
 
 def test_a_user_outside_the_probe_users_is_refused_before_a_connector_starts(

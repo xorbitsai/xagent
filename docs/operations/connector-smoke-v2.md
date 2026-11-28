@@ -179,6 +179,25 @@ A path is a tuple of object keys and list indexes into the payload; `()` is the 
 
 A fixture key is `<namespace>.<name>`, at most 80 characters: the namespace is kebab-case, by convention the app id of the connector or tenant family that owns the value, and the name is one or more dot-separated snake_case parts (`google-docs.document_id`, `jira.seed.project_key`). The identity adapter resolves keys from server-side configuration, per environment and identity (`fixtures.FixtureResolver`). An unresolved key reports a read check as `skip` with `fixture_missing` and the key as the row's `reason`; a write check or a sweep is refused as `fail` with `tenant_mismatch` and the key, and only after the write policy has answered for its tools (see [Running write checks](#running-write-checks)). Errors and results name the key, never its value. The document, Google, GitHub, Jira and Microsoft 365 connectors' read checks use these keys; the probe route does not take fixtures yet (#3284).
 
+For a local or stage `--user` run, set `XAGENT_CONNECTOR_SMOKE_USER_FIXTURES`
+in the runner's environment to the path of a UTF-8 JSON file for that
+account and deployment. The file is a JSON object that maps fixture keys to
+identifiers. Values may be strings, integers, finite floats or booleans.
+Keep credentials out of the file. For example:
+
+```json
+{
+  "github.read_repo": "example-org/smoke-test",
+  "github.issue_number": 1
+}
+```
+
+The user adapter loads the file once when a selected check first needs a
+fixture. An unset setting or an omitted key leaves the affected check at
+`skip`/`fixture_missing`. An unreadable file or invalid contents cause
+`fixtures:exception` when a check needs the source. The result document on
+stdout omits the file path and fixture values.
+
 ### Today's L3 probes
 
 A connector that has not adopted V2 keeps `web/connector_probes.py` as its single source (`registry.connector_checks_for`):

@@ -14,6 +14,7 @@ request went out, so an undeclared or additive write stays a success.
 import json
 import re
 from contextlib import asynccontextmanager
+from importlib import import_module
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -37,6 +38,8 @@ from xagent.core.tools.adapters.vibe.mcp_error_envelope import (
     is_error_envelope,
     speaks_error_envelope,
 )
+from xagent.core.tools.core.mcp.tools import load_mcp_tools, raw_annotations_for
+from xagent.web.tools.mcp import chartmogul
 
 _ERROR = json.dumps({"status": "error", "message": "Vendor rejected the token"})
 
@@ -172,6 +175,48 @@ def test_every_catalog_launched_module_is_classified():
     assert not ERROR_ENVELOPE_SERVER_MODULES & passes_vendor_text_through
 
 
+# Undeclared writes in the analytics connectors covered by this annotation pass.
+# A new tool must declare read-only or be explicitly classified here as a write.
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("module", "unannotated_writes"),
+    [
+        (
+            "chartmogul",
+            {
+                "chartmogul_create_contact",
+                "chartmogul_create_customer",
+                "chartmogul_create_opportunity",
+                "chartmogul_delete_contact",
+                "chartmogul_delete_customer",
+                "chartmogul_delete_opportunity",
+                "chartmogul_update_contact",
+                "chartmogul_update_customer",
+                "chartmogul_update_opportunity",
+            },
+        ),
+        ("google_ads", set()),
+        ("google_analytics", set()),
+        ("google_search_console", set()),
+        ("mixpanel", {"mixpanel_create_annotation"}),
+        ("posthog", {"posthog_create_annotation"}),
+    ],
+)
+async def test_analytics_connector_tool_annotations(module, unannotated_writes):
+    server = import_module(f"{IN_REPO_SERVER_PACKAGE}.{module}").mcp
+    tools = await server.list_tools()
+
+    assert tools
+    assert {tool.name for tool in tools if tool.annotations is None} == (
+        unannotated_writes
+    )
+    for tool in tools:
+        if tool.name not in unannotated_writes:
+            assert tool.annotations is not None, tool.name
+            assert tool.annotations.readOnlyHint is True, tool.name
+            assert tool.annotations.destructiveHint is not True, tool.name
+
+
 # --- What counts as the envelope ---------------------------------------------
 
 
@@ -259,7 +304,9 @@ def _server_returning(payload: str, annotations: dict | None = None) -> FastMCP:
     return server
 
 
-async def _adapter(monkeypatch, server: FastMCP, connection, **kwargs):
+async def _adapter(
+    monkeypatch, server: FastMCP, connection, *, tool_name=None, **kwargs
+):
     @asynccontextmanager
     async def _session(_connection):
         async with create_connected_server_and_client_session(
@@ -268,7 +315,12 @@ async def _adapter(monkeypatch, server: FastMCP, connection, **kwargs):
             yield session
 
     monkeypatch.setattr(mcp_adapter_module, "create_session", _session)
-    (mcp_tool,) = await server.list_tools()
+    async with _session(connection) as session:
+        tools = await load_mcp_tools(session)
+    (mcp_tool,) = [
+        tool for tool in tools if tool_name is None or tool.name == tool_name
+    ]
+    kwargs.setdefault("raw_annotations", raw_annotations_for(mcp_tool))
     return MCPToolAdapter(
         mcp_tool=mcp_tool,
         connection=connection,
@@ -297,6 +349,40 @@ async def test_in_repo_error_envelope_is_a_failed_tool_call(monkeypatch):
     # reads the server's own message.
     assert result["is_error"] is False
     assert result["content"][0]["text"] == _ERROR
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("tool_name", "arguments", "succeeded"),
+    [
+        ("chartmogul_list_customers", {}, False),
+        (
+            "chartmogul_create_customer",
+            {"data": {"data_source_uuid": "ds_test", "external_id": "customer-test"}},
+            True,
+        ),
+    ],
+)
+async def test_chartmogul_error_envelope_uses_wire_annotations(
+    monkeypatch, tool_name, arguments, succeeded
+):
+    def request_times_out(*args, **kwargs):
+        raise TimeoutError("ChartMogul request timed out")
+
+    monkeypatch.setattr(chartmogul, "_request", request_times_out)
+    adapter = await _adapter(
+        monkeypatch,
+        chartmogul.mcp,
+        _in_repo("chartmogul"),
+        source_server="chartmogul",
+        tool_name=tool_name,
+    )
+
+    result = await adapter.run_json_async(arguments)
+
+    assert result["is_error"] is False
+    assert json.loads(result["content"][0]["text"])["status"] == "error"
+    assert tool_result_succeeded(result) is succeeded
 
 
 @pytest.mark.asyncio

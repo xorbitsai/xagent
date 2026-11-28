@@ -8,6 +8,7 @@ from urllib.parse import quote, urlsplit
 
 from mcp.server.fastmcp import FastMCP
 from mcp.server.fastmcp.exceptions import ToolError
+from mcp.types import ToolAnnotations
 
 from ....core.tools.core.web_content import get_trusted_proxy_url
 from ....core.utils import public_requests as requests
@@ -24,6 +25,8 @@ logger = logging.getLogger("posthog-mcp")
 
 
 mcp = FastMCP("posthog-mcp")
+
+READ_ONLY = ToolAnnotations(readOnlyHint=True)
 
 DEFAULT_TIMEOUT_SECONDS = 30
 MAX_LIMIT = 100
@@ -433,7 +436,7 @@ def _paginated_results(
     return page, truncated, next_offset
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY)
 def posthog_get_current_user() -> str:
     """
     Get the profile of the PostHog account this connector's Personal API key
@@ -456,7 +459,7 @@ def posthog_get_current_user() -> str:
         return _error(str(e))
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY)
 def posthog_list_organizations(limit: int = 50, offset: int = 0) -> str:
     """
     List organizations this account can see — id, name.
@@ -483,7 +486,7 @@ def posthog_list_organizations(limit: int = 50, offset: int = 0) -> str:
         return _error(str(e))
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY)
 def posthog_list_projects(
     organization_id: str = "@current", limit: int = 50, offset: int = 0
 ) -> str:
@@ -513,7 +516,7 @@ def posthog_list_projects(
         return _error(str(e))
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY)
 def posthog_query(
     hogql_query: str, project_id: str = "@current", name: str = "", limit: int = 50
 ) -> str:
@@ -574,7 +577,7 @@ def posthog_query(
         raise ToolError(_query_error_message(e)) from e
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY)
 def posthog_list_persons(
     project_id: str = "@current", search: str = "", limit: int = 50, offset: int = 0
 ) -> str:
@@ -606,7 +609,7 @@ def posthog_list_persons(
         return _error(str(e))
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY)
 def posthog_get_person(person_id: str, project_id: str = "@current") -> str:
     """
     Get one person's full details (distinct_ids, properties, last seen).
@@ -627,7 +630,7 @@ def posthog_get_person(person_id: str, project_id: str = "@current") -> str:
         return _error(str(e))
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY)
 def posthog_list_insights(
     project_id: str = "@current", search: str = "", limit: int = 50, offset: int = 0
 ) -> str:
@@ -662,7 +665,7 @@ def posthog_list_insights(
         return _error(str(e))
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY)
 def posthog_get_insight(insight_id: str, project_id: str = "@current") -> str:
     """
     Get one saved insight's full definition and cached result.
@@ -682,7 +685,7 @@ def posthog_get_insight(insight_id: str, project_id: str = "@current") -> str:
         return _error(str(e))
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY)
 def posthog_list_feature_flags(
     project_id: str = "@current", limit: int = 50, offset: int = 0
 ) -> str:
@@ -712,7 +715,7 @@ def posthog_list_feature_flags(
         return _error(str(e))
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY)
 def posthog_list_dashboards(
     project_id: str = "@current", limit: int = 50, offset: int = 0
 ) -> str:
@@ -740,7 +743,7 @@ def posthog_list_dashboards(
         return _error(str(e))
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY)
 def posthog_list_annotations(
     project_id: str = "@current", search: str = "", limit: int = 50, offset: int = 0
 ) -> str:

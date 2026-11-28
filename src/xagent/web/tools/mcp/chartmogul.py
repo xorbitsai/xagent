@@ -7,6 +7,7 @@ from decimal import Decimal
 from typing import Any, Literal, get_args
 
 from mcp.server.fastmcp import FastMCP
+from mcp.types import ToolAnnotations
 
 from ....config import get_tool_max_output_length
 from ....core.utils import public_requests as requests
@@ -19,6 +20,8 @@ logger = logging.getLogger("chartmogul-mcp")
 
 
 mcp = FastMCP("chartmogul-mcp")
+
+READ_ONLY = ToolAnnotations(readOnlyHint=True)
 
 # ChartMogul's REST API (dev.chartmogul.com) authenticates every request with
 # HTTP Basic Auth: the account's API key as the username, empty password --
@@ -385,7 +388,7 @@ def _validated_list_result(result: Any, endpoint: str) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY)
 def chartmogul_list_customers(
     data_source_uuid: str | None = None,
     external_id: str | None = None,
@@ -461,7 +464,7 @@ def chartmogul_create_customer(data: dict[str, Any]) -> str:
         return _error(str(e))
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY)
 def chartmogul_get_customer(uuid: str) -> str:
     """
     Get one customer by uuid (GET /customers/{uuid}).
@@ -526,7 +529,7 @@ def chartmogul_delete_customer(uuid: str) -> str:
 # ---------------------------------------------------------------------------
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY)
 def chartmogul_list_contacts(
     email: str | None = None,
     customer_uuid: str | None = None,
@@ -601,7 +604,7 @@ def chartmogul_create_contact(customer_uuid: str, data: dict[str, Any]) -> str:
         return _error(str(e))
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY)
 def chartmogul_get_contact(uuid: str) -> str:
     """
     Get one contact by uuid (GET /contacts/{uuid}).
@@ -658,7 +661,7 @@ def chartmogul_delete_contact(uuid: str) -> str:
 # ---------------------------------------------------------------------------
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY)
 def chartmogul_list_opportunities(
     customer_uuid: str | None = None,
     owner: str | None = None,
@@ -737,7 +740,7 @@ def chartmogul_create_opportunity(data: dict[str, Any]) -> str:
         return _error(str(e))
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY)
 def chartmogul_get_opportunity(uuid: str) -> str:
     """
     Get one sales opportunity by uuid (GET /opportunities/{uuid}).
@@ -807,7 +810,7 @@ def chartmogul_delete_opportunity(uuid: str) -> str:
 # ---------------------------------------------------------------------------
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY)
 def chartmogul_get_metrics(
     metric: MetricName,
     start_date: str,

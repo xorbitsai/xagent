@@ -118,6 +118,7 @@ _PUBLIC_MCP_UNAVAILABLE_REASONS = frozenset(
         "sandbox_list_tools",
         "sandbox_tool_wrap",
         "session_start",
+        "token_refresh_unavailable",
         "token_refresh_failed",
     }
 )

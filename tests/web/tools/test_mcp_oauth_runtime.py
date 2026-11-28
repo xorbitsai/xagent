@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import logging
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 from urllib.parse import parse_qs
 
 import httpx
@@ -18,6 +19,10 @@ from xagent.web.models.mcp import MCPServer, UserMCPServer
 from xagent.web.models.mcp_oauth import MCPOAuthClient, MCPOAuthGrant
 from xagent.web.models.user import User
 from xagent.web.services import mcp_oauth as mcp_oauth_service
+from xagent.web.services.mcp_connector_session import (
+    ConnectorToolsOutcome,
+    list_connector_tools,
+)
 from xagent.web.services.mcp_runtime import (
     connection_with_bearer_authorization,
     connection_without_authorization,
@@ -169,7 +174,13 @@ def _assert_unavailable_runtime_config(
     assert config["config"]["reason"] == diagnostic["code"]
     assert config["config"]["server_id"] == server.id
     assert config["config"]["diagnostic"] == diagnostic
-    assert config["config"]["failure_code"] == "oauth_token_required"
+    if diagnostic["code"] == "token_refresh_unavailable":
+        assert "failure_code" not in config["config"]
+        assert config["config"]["message"] == (
+            "MCP OAuth authorization server did not respond."
+        )
+    else:
+        assert config["config"]["failure_code"] == "oauth_token_required"
     assert config["user_id"] == str(server.user_mcpservers[0].user_id)
     assert "allow_users" not in config
     assert "runtime_input_schema" not in config
@@ -190,6 +201,38 @@ def _mock_token_endpoint(monkeypatch, handler) -> None:
 
     monkeypatch.setattr(mcp_oauth_service, "validate_oauth_http_url", skip_url_policy)
     monkeypatch.setattr(mcp_oauth_service.httpx, "AsyncClient", async_client_factory)
+
+
+@pytest.mark.parametrize(
+    ("marker_token", "age_seconds", "expected"),
+    [
+        ("current-token", 1, True),
+        (
+            "current-token",
+            mcp_oauth_service.MCP_OAUTH_INVALID_GRANT_MARKER_TTL_SECONDS,
+            False,
+        ),
+        ("old-token", 1, False),
+        (None, 1, False),
+    ],
+)
+def test_current_refresh_token_invalid_grant_marker(
+    monkeypatch, marker_token, age_seconds, expected
+):
+    now = datetime.now(timezone.utc)
+    monkeypatch.setattr(mcp_oauth_service, "_utc_now", lambda: now)
+    metadata = (
+        {
+            "invalid_grant_at": (now - timedelta(seconds=age_seconds)).isoformat(),
+            "invalid_grant_token_sha256": hashlib.sha256(
+                marker_token.encode("utf-8")
+            ).hexdigest(),
+        }
+        if marker_token is not None
+        else {}
+    )
+    grant = SimpleNamespace(refresh_token="current-token", metadata_json=metadata)
+    assert mcp_oauth_service.mcp_oauth_grant_has_invalid_grant_marker(grant) is expected
 
 
 def test_effective_mcp_oauth_resource_prefers_selector_verbatim(db_session):
@@ -1176,9 +1219,10 @@ async def test_mcp_oauth_runtime_refresh_deadline_is_transient(
     configs, cfg = await _load_configs(db, user)
 
     diagnostics = cfg.get_mcp_oauth_diagnostics()
-    assert diagnostics[0]["code"] == "token_refresh_failed"
+    assert diagnostics[0]["code"] == "token_refresh_unavailable"
     assert diagnostics[0]["message"] == "MCP OAuth refresh timed out"
     assert len(configs) == 1
+    _assert_unavailable_runtime_config(configs[0], server, diagnostics[0])
     db.refresh(grant)
     assert grant.status == "active"
     assert decrypt_value(grant.access_token) == "expired-access-token"
@@ -1269,9 +1313,11 @@ async def test_mcp_oauth_runtime_does_not_store_marker_keys_from_a_token_payload
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("status_code", [400, 401])
 async def test_mcp_oauth_runtime_keeps_the_first_strike_timestamp(
     db_session,
     monkeypatch,
+    status_code,
 ):
     db, user, _ = db_session
     server = _add_mcp_oauth_server(db, user)
@@ -1288,7 +1334,7 @@ async def test_mcp_oauth_runtime_keeps_the_first_strike_timestamp(
 
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(
-            400,
+            status_code,
             json={"error": "invalid_grant", "error_description": "OAuth grant revoked"},
         )
 
@@ -1302,6 +1348,7 @@ async def test_mcp_oauth_runtime_keeps_the_first_strike_timestamp(
     db.refresh(grant)
     first_marker = dict(grant.metadata_json)
     assert "invalid_grant_at" in first_marker
+    assert mcp_oauth_service.mcp_oauth_grant_has_invalid_grant_marker(grant)
     assert grant.revoked_at is None
 
     clock["now"] = started_at + timedelta(seconds=30)
@@ -1688,9 +1735,11 @@ async def test_mcp_oauth_runtime_keeps_a_grant_a_concurrent_refresh_rotated(
 
 
 @pytest.mark.asyncio
-async def test_mcp_oauth_runtime_keeps_a_grant_on_a_5xx_invalid_grant_answer(
+@pytest.mark.parametrize("json_body", [True, False])
+async def test_mcp_oauth_runtime_treats_5xx_as_unavailable(
     db_session,
     monkeypatch,
+    json_body,
 ):
     db, user, _ = db_session
     server = _add_mcp_oauth_server(db, user)
@@ -1703,27 +1752,21 @@ async def test_mcp_oauth_runtime_keeps_a_grant_on_a_5xx_invalid_grant_answer(
         refresh_token="refresh-token-123",
         expires_at=datetime.now(timezone.utc) - timedelta(minutes=1),
     )
-    real_async_client = httpx.AsyncClient
 
     def handler(request: httpx.Request) -> httpx.Response:
+        if not json_body:
+            return httpx.Response(502, text="Bad gateway")
         return httpx.Response(
             500,
             json={"error": "invalid_grant", "error_description": "OAuth grant revoked"},
         )
 
-    def async_client_factory(*args, **kwargs):
-        return real_async_client(transport=httpx.MockTransport(handler))
-
-    async def skip_url_policy(*args, **kwargs):
-        return None
-
-    monkeypatch.setattr(mcp_oauth_service, "validate_oauth_http_url", skip_url_policy)
-    monkeypatch.setattr(mcp_oauth_service.httpx, "AsyncClient", async_client_factory)
+    _mock_token_endpoint(monkeypatch, handler)
 
     configs, cfg = await _load_configs(db, user)
 
     diagnostics = cfg.get_mcp_oauth_diagnostics()
-    assert diagnostics[0]["code"] == "token_refresh_failed"
+    assert diagnostics[0]["code"] == "token_refresh_unavailable"
     assert len(configs) == 1
     _assert_unavailable_runtime_config(configs[0], server, diagnostics[0])
     db.refresh(grant)
@@ -1733,11 +1776,28 @@ async def test_mcp_oauth_runtime_keeps_a_grant_on_a_5xx_invalid_grant_answer(
     assert "invalid_grant_at" not in metadata
     assert "invalid_grant_token_sha256" not in metadata
 
+    result = await list_connector_tools(
+        db, user=user, server_id=server.id, name_prefix="mcp_"
+    )
+    assert result.outcome is ConnectorToolsOutcome.FAILED_TO_START
+    assert result.reason == "token_refresh_unavailable"
+    assert result.diagnostic == diagnostics[0]
+
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("exception_type", "message"),
+    [
+        (httpx.ConnectError, "OAuth request failed"),
+        (httpx.RemoteProtocolError, "OAuth endpoint response could not be read"),
+        (httpx.ReadTimeout, "OAuth request timed out"),
+    ],
+)
 async def test_mcp_oauth_runtime_refresh_sanitizes_transport_exception(
     db_session,
     monkeypatch,
+    exception_type,
+    message,
 ):
     db, user, _ = db_session
     server = _add_mcp_oauth_server(db, user)
@@ -1750,25 +1810,17 @@ async def test_mcp_oauth_runtime_refresh_sanitizes_transport_exception(
         refresh_token="refresh-token-123",
         expires_at=datetime.now(timezone.utc) - timedelta(minutes=1),
     )
-    real_async_client = httpx.AsyncClient
 
     def handler(request: httpx.Request) -> httpx.Response:
-        raise httpx.ConnectError("raw refresh transport detail with secret-token")
+        raise exception_type("raw refresh transport detail with secret-token")
 
-    def async_client_factory(*args, **kwargs):
-        return real_async_client(transport=httpx.MockTransport(handler))
-
-    async def skip_url_policy(*args, **kwargs):
-        return None
-
-    monkeypatch.setattr(mcp_oauth_service, "validate_oauth_http_url", skip_url_policy)
-    monkeypatch.setattr(mcp_oauth_service.httpx, "AsyncClient", async_client_factory)
+    _mock_token_endpoint(monkeypatch, handler)
 
     configs, cfg = await _load_configs(db, user)
 
     diagnostics = cfg.get_mcp_oauth_diagnostics()
-    assert diagnostics[0]["code"] == "token_refresh_failed"
-    assert diagnostics[0]["message"] == "OAuth request failed"
+    assert diagnostics[0]["code"] == "token_refresh_unavailable"
+    assert diagnostics[0]["message"] == message
     assert "secret-token" not in str(diagnostics[0])
     assert len(configs) == 1
     _assert_unavailable_runtime_config(configs[0], server, diagnostics[0])

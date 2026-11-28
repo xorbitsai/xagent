@@ -80,11 +80,63 @@ def test_stage_path_uses_host_private_copy_and_cleanup(workspace):
     source.write_text("changed", encoding="utf-8")
 
     assert staged.read_text(encoding="utf-8") == "original"
-    assert stat.S_IMODE(staged.stat().st_mode) == 0o600
     assert not staged.is_relative_to(workspace.workspace_dir)
-    assert stat.S_IMODE(staged.parents[1].stat().st_mode) == 0o700
+    if os.name != "nt":
+        assert stat.S_IMODE(staged.stat().st_mode) == 0o600
+        assert stat.S_IMODE(staged.parents[1].stat().st_mode) == 0o700
     workspace.discard_staged_external_upload(staged)
     assert not staged.exists()
+
+
+def test_stage_path_uses_sandbox_visible_binary_copy_and_cleanup(workspace):
+    source = workspace.output_dir / "report.bin"
+    payload = b"\x00\xff\r\n\x1a"
+    source.write_bytes(payload)
+
+    staged = workspace.stage_path_for_external_upload(
+        "output/report.bin", max_bytes=len(payload)
+    )
+
+    assert staged.is_relative_to(workspace.external_upload_staging_root())
+    assert staged.read_bytes() == payload
+    workspace.discard_staged_external_upload(staged)
+    assert not staged.parent.exists()
+    assert source.read_bytes() == payload
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows reparse points")
+def test_windows_upload_staging_rejects_junction_in_staging_root(workspace, tmp_path):
+    from _winapi import CreateJunction
+
+    redirected = tmp_path / "redirected"
+    redirected.mkdir()
+    CreateJunction(str(redirected), str(workspace.internal_temp_dir))
+    source = workspace.output_dir / "report.bin"
+    source.write_bytes(b"attachment")
+
+    with pytest.raises(ExternalUploadStagingError, match="staging area"):
+        workspace.stage_path_for_external_upload("output/report.bin")
+
+    assert list(redirected.iterdir()) == []
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows reparse points")
+def test_windows_upload_staging_rejects_registered_file_under_junction(
+    workspace, tmp_path, monkeypatch
+):
+    from _winapi import CreateJunction
+
+    source_dir = tmp_path / "source"
+    source_dir.mkdir()
+    (source_dir / "report.bin").write_bytes(b"attachment")
+    junction = workspace.input_dir / "linked"
+    CreateJunction(str(source_dir), str(junction))
+    monkeypatch.setattr(
+        workspace, "resolve_file_id_detached", lambda _: junction / "report.bin"
+    )
+
+    with pytest.raises(FileNotFoundError, match="File not found"):
+        workspace.stage_file_for_external_upload("file-id")
 
 
 def test_stage_path_accepts_authorized_external_symlink(tmp_path):

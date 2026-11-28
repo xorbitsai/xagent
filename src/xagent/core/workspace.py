@@ -38,6 +38,7 @@ from ..config import (
     get_uploads_dir,
     in_sandbox_tool_runner,
 )
+from . import _windows_nofollow
 from .execution_scope import validate_scope_component
 from .file_ref import (
     SANDBOX_FILE_ID_PREFIX,
@@ -482,6 +483,11 @@ class TaskWorkspace:
     def _open_regular_file_nofollow(source: Path, selector: str) -> int:
         """Open an absolute file without following any path component."""
         absolute = source.absolute()
+        if os.name == "nt":
+            try:
+                return _windows_nofollow.open_readonly(absolute)
+            except OSError as exc:
+                raise FileNotFoundError(f"File not found: {selector}") from exc
         directory_flags = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0)
         current_fd = os.open(os.path.sep, directory_flags)
         try:
@@ -525,19 +531,28 @@ class TaskWorkspace:
         source_fd = self._open_regular_file_nofollow(source, selector)
         staging_dir: Path | None = None
         try:
-            staging_root = self.external_upload_staging_root(host_private=host_private)
-            staging_dir = staging_root / uuid4().hex
-            target = staging_dir / source.name
             source_size = os.fstat(source_fd).st_size
             if max_bytes is not None and source_size > max_bytes:
                 raise ExternalUploadSizeLimitError(
                     f"File exceeds maximum staging size of {max_bytes} bytes: "
                     f"{selector}"
                 )
-            staging_dir.mkdir(parents=True, exist_ok=False)
+            staging_root = self.external_upload_staging_root(host_private=host_private)
+            new_dir = staging_root / uuid4().hex
+            if os.name == "nt":
+                _windows_nofollow.create_directory(new_dir)
+            else:
+                new_dir.mkdir(exist_ok=False)
+            staging_dir = new_dir
+            target = staging_dir / source.name
             with os.fdopen(source_fd, "rb", closefd=True) as source_file:
                 source_fd = -1
-                with target.open("xb") as target_file:
+                target_file = (
+                    os.fdopen(_windows_nofollow.create_file(target), "wb")
+                    if os.name == "nt"
+                    else target.open("xb")
+                )
+                with target_file:
                     copied = 0
                     while chunk := source_file.read(1024 * 1024):
                         copied += len(chunk)
@@ -547,7 +562,8 @@ class TaskWorkspace:
                                 f"{max_bytes} bytes: {selector}"
                             )
                         target_file.write(chunk)
-            os.chmod(target, 0o600)
+            if os.name != "nt":
+                os.chmod(target, 0o600)
         except BaseException:
             if staging_dir is not None:
                 shutil.rmtree(staging_dir, ignore_errors=True)
@@ -664,6 +680,20 @@ class TaskWorkspace:
                     self, shutil.rmtree, staging_root, ignore_errors=True
                 )
                 return staging_root
+
+        if os.name == "nt":
+            # Keep the lexical workspace path so the native open can reject
+            # directory reparse points in the task's staging tree.
+            staging_root = self.temp_dir.absolute()
+            try:
+                for component in _SANDBOX_EXTERNAL_UPLOAD_STAGING_PARTS:
+                    staging_root /= component
+                    _windows_nofollow.create_directory(staging_root, exist_ok=True)
+            except OSError as exc:
+                raise ExternalUploadStagingError(
+                    "task upload staging area is unavailable"
+                ) from exc
+            return staging_root
 
         parent_root = self.temp_dir.resolve(strict=True)
         flags = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0)
@@ -2235,6 +2265,11 @@ class TaskWorkspace:
     def _ensure_directories(self) -> None:
         """Ensure task directories inherit writable sandbox-group access."""
         self.workspace_dir.parent.mkdir(parents=True, exist_ok=True)
+        if os.name == "nt":
+            # The sandbox group layout depends on POSIX directory descriptors
+            # and setgid inheritance. Windows uses the regular workspace tree.
+            self._ensure_legacy_directories()
+            return
         parent = self.workspace_dir.parent.resolve()
         uploads_root = get_uploads_dir().expanduser().resolve()
         parent_is_managed = parent == uploads_root or parent.is_relative_to(

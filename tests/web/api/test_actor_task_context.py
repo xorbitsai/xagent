@@ -18,6 +18,7 @@ from xagent.web.services.agent_service_manager import (
     AgentServiceManager,
     _build_tool_selection_spec_for_task,
     _spec_wants_mcp,
+    _task_model_override_excluded_categories,
 )
 from xagent.web.services.channel_runtime import ChannelTaskMode
 from xagent.web.services.mcp_runtime import (
@@ -658,6 +659,58 @@ def test_explicit_mcp_exclusion_suppresses_the_actor_add_back() -> None:
     )
     assert _spec_wants_mcp(unexcluded)
     assert unexcluded.includes_mcp()
+
+
+def test_excluded_binding_authorized_category_withholds_ssh_from_task_spec() -> None:
+    """The override's exclusion set reaches the categories a binding grants.
+
+    ``ssh`` is never in ``tool_categories``, so removing a name from that list
+    could not take it away; the exclusion set has to reach the spec's
+    binding-authorized predicate for the dispatch and name gates to drop it.
+    """
+    snapshot = apply_task_model_override(
+        _snapshot(
+            agent_config={
+                "knowledge_bases": [],
+                "skills": [],
+                "tool_categories": ["basic_tools", "file"],
+            },
+        ),
+        TaskModelOverride(
+            llm=MagicMock(spec=BaseLLM),
+            excluded_tool_categories=frozenset({"ssh"}),
+        ),
+    )
+    # The list itself is untouched: it never held the excluded name.
+    assert snapshot.agent_config["tool_categories"] == ["basic_tools", "file"]
+
+    spec = _build_tool_selection_spec_for_task(
+        snapshot.agent_config,
+        None,
+        task_id=42,
+        excluded_tool_categories=_task_model_override_excluded_categories(snapshot),
+    )
+    assert spec.excluded_binding_authorized == frozenset({"ssh"})
+    assert spec.includes_binding_authorized() is False
+    assert spec.includes_category("ssh") is False
+    assert ToolRegistry._should_run_creator(frozenset({"ssh"}), spec, None) is False
+
+    # Negative controls: an override naming only ordinary categories, and no
+    # override at all, both leave the binding's dispatch alone.
+    assert (
+        _task_model_override_excluded_categories(_snapshot(agent_config=None))
+        == frozenset()
+    )
+    for excluded in (frozenset({"mcp", "web_tools"}), frozenset()):
+        other = _build_tool_selection_spec_for_task(
+            snapshot.agent_config,
+            None,
+            task_id=42,
+            excluded_tool_categories=excluded,
+        )
+        assert other.excluded_binding_authorized == frozenset()
+        assert other.includes_binding_authorized() is True
+        assert ToolRegistry._should_run_creator(frozenset({"ssh"}), other, None) is True
 
 
 @pytest.mark.asyncio

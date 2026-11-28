@@ -206,7 +206,7 @@ def test_request_does_not_retry_on_large_retry_after(monkeypatch):
     monkeypatch.setattr(slack.requests, "request", mock_request)
     monkeypatch.setattr(slack.time, "sleep", sleep)
 
-    with pytest.raises(requests.HTTPError):
+    with pytest.raises(RuntimeError, match=r"conversations\.list.*Retry-After.*120"):
         slack._request("GET", "conversations.list")
 
     assert mock_request.call_count == 1
@@ -1665,6 +1665,93 @@ def test_list_direct_messages_reports_error_payload(monkeypatch):
 # ---------------------------------------------------------------------------
 # slack_search_messages
 # ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("retry_after", ["120", None])
+def test_search_messages_reports_a_rate_limited_first_history_page(
+    monkeypatch, retry_after
+):
+    headers = {} if retry_after is None else {"Retry-After": retry_after}
+    request = Mock(return_value=MockResponse(status_code=429, headers=headers))
+    sleep = Mock()
+    monkeypatch.setattr(slack.requests, "request", request)
+    monkeypatch.setattr(slack.time, "sleep", sleep)
+
+    result = json.loads(slack.slack_search_messages("C0123456789", "deploy"))
+
+    assert result["status"] == "error"
+    message = result["message"]
+    assert "conversations.history" in message
+    assert "Do not call Slack tools again right away" in message
+    assert "Client Error" not in message
+    if retry_after is None:
+        assert "Retry-After" not in message
+    else:
+        assert f"Retry-After: {retry_after} seconds" in message
+    request.assert_called_once()
+    sleep.assert_not_called()
+
+
+def test_search_messages_reports_the_second_rate_limit_after_one_retry(monkeypatch):
+    request = Mock(
+        side_effect=[
+            MockResponse(status_code=429, headers={"Retry-After": "2"}),
+            MockResponse(status_code=429, headers={"Retry-After": "3"}),
+        ]
+    )
+    sleep = Mock()
+    monkeypatch.setattr(slack.requests, "request", request)
+    monkeypatch.setattr(slack.time, "sleep", sleep)
+
+    result = json.loads(slack.slack_search_messages("C0123456789", "deploy"))
+
+    assert result["status"] == "error"
+    assert "conversations.history" in result["message"]
+    assert "Retry-After: 3 seconds" in result["message"]
+    assert request.call_count == 2
+    sleep.assert_called_once_with(2)
+
+
+def test_search_messages_stops_at_rate_limited_thread_and_keeps_matches(monkeypatch):
+    request = Mock(
+        side_effect=[
+            MockResponse(
+                {
+                    "ok": True,
+                    "messages": [
+                        {"ts": f"1.{index}", "text": "kickoff", "reply_count": 1}
+                        for index in range(1, 4)
+                    ],
+                }
+            ),
+            MockResponse(
+                {
+                    "ok": True,
+                    "messages": [
+                        {"ts": "1.1", "text": "kickoff"},
+                        {"ts": "1.4", "user": "U2", "text": "deploy finished"},
+                    ],
+                }
+            ),
+            MockResponse(status_code=429, headers={"Retry-After": "90"}),
+        ]
+    )
+    monkeypatch.setattr(slack.requests, "request", request)
+
+    result = json.loads(slack.slack_search_messages("C0123456789", "deploy"))
+
+    assert result["status"] == "success"
+    assert result["truncated"] is True
+    assert "conversations.replies" in result["error"]
+    assert "Retry-After: 90 seconds" in result["error"]
+    assert result["matches"] == [
+        {"ts": "1.4", "user": "U2", "text": "deploy finished", "thread_ts": "1.1"}
+    ]
+    assert [call.kwargs["params"].get("ts") for call in request.call_args_list] == [
+        None,
+        "1.1",
+        "1.2",
+    ]
 
 
 def test_search_messages_matches_channel_history(monkeypatch):

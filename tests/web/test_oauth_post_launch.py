@@ -7,12 +7,15 @@ from datetime import timedelta
 from unittest.mock import Mock
 from urllib.parse import parse_qs, urlsplit
 
+import httpx
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
 
+from scripts.connector_smoke import l1
+from scripts.connector_smoke.client import SmokeClient
 from xagent.web.api import auth
 from xagent.web.auth_sessions import user_session_claims
 from xagent.web.models.database import Base
@@ -176,6 +179,61 @@ def test_provider_errors_are_not_reported_as_a_successful_json_url(launch):
     )
     assert response.status_code >= 400
     assert response.headers["cache-control"] == "no-store"
+
+
+@pytest.mark.parametrize(
+    "client_id", ["example-client", ""], ids=["configured", "missing"]
+)
+def test_oauth_launch_satisfies_l1_smoke_contract(launch, monkeypatch, client_id):
+    client, db, _, provider, token = launch
+    origin = "https://callback.example:8443"
+    provider.redirect_uri = f"{origin}/api/auth/custom/callback"
+    monkeypatch.delenv("CUSTOM_CLIENT_ID", raising=False)
+    provider.client_id = client_id
+    db.commit()
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        assert request.url.host == "testserver"
+        response = client.request(
+            request.method,
+            str(request.url),
+            content=request.content,
+            headers={**request.headers, "Authorization": f"Bearer {token}"},
+            follow_redirects=False,
+        )
+
+        return httpx.Response(
+            response.status_code, headers=response.headers, content=response.content
+        )
+
+    with SmokeClient(
+        "http://testserver", origin=origin, transport=httpx.MockTransport(handle)
+    ) as smoke:
+        start = smoke.start_launch("custom")
+        callback = l1.check_callback_origin(
+            "custom",
+            status_code=start.status_code,
+            payload=start.payload,
+            expected_origin=origin,
+        )
+        assert callback.ok, callback.reason
+
+        redeem = smoke.redeem_launch("custom", start.payload["authorization_url"])
+        authorize = l1.check_authorize_redirect(
+            "custom",
+            status_code=redeem.status_code,
+            location=redeem.location,
+            body=redeem.body,
+            expected_origin=origin,
+        )
+    if client_id:
+        assert authorize.ok, authorize.reason
+        url = urlsplit(redeem.location or "")
+        assert url.netloc == "provider.example"
+        assert parse_qs(url.query)["client_id"] == [client_id]
+    else:
+        assert not authorize.ok
+        assert "OAuth provider not configured" in authorize.reason
 
 
 def test_launch_ticket_is_single_use_after_rollback_and_for_other_clients(launch):

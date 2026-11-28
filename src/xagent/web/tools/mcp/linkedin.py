@@ -22,6 +22,9 @@ USERINFO_URL = "https://api.linkedin.com/v2/userinfo"
 IMAGES_URL = "https://api.linkedin.com/rest/images"
 _UPLOAD_ALLOWED_DIRS_ENV_VAR = "XAGENT_LINKEDIN_IMAGE_ALLOWED_DIRS"
 
+DEFAULT_TIMEOUT_SECONDS = 30
+UPLOAD_TIMEOUT_SECONDS = 120
+
 
 def _post_urn_from_header(post_id: str) -> str:
     if post_id.startswith("urn:li:"):
@@ -51,7 +54,9 @@ def _sanitize_post_text(text: str) -> str:
 
 
 def _get_author_urn(headers: dict, proxies: dict | None) -> str:
-    r = requests.get(USERINFO_URL, headers=headers, proxies=proxies)
+    r = requests.get(
+        USERINFO_URL, headers=headers, proxies=proxies, timeout=DEFAULT_TIMEOUT_SECONDS
+    )
     r.raise_for_status()
     sub = r.json().get("sub", "")
     return f"urn:li:person:{sub}"
@@ -101,6 +106,7 @@ def _upload_image(
         headers=headers,
         json=initialize_body,
         proxies=proxies,
+        timeout=DEFAULT_TIMEOUT_SECONDS,
     )
     init_response.raise_for_status()
 
@@ -121,6 +127,7 @@ def _upload_image(
             headers=upload_headers,
             data=image_file,
             proxies=proxies,
+            timeout=UPLOAD_TIMEOUT_SECONDS,
         )
     upload_response.raise_for_status()
     return image_urn
@@ -232,7 +239,12 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         proxy = get_trusted_proxy_url()
         proxies = {"http": proxy, "https": proxy} if proxy else None
         if name == "get_profile":
-            r = requests.get(USERINFO_URL, headers=headers, proxies=proxies)
+            r = requests.get(
+                USERINFO_URL,
+                headers=headers,
+                proxies=proxies,
+                timeout=DEFAULT_TIMEOUT_SECONDS,
+            )
             r.raise_for_status()
             return [TextContent(type="text", text=r.text)]
 
@@ -255,6 +267,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 headers=headers,
                 json=body,
                 proxies=proxies,
+                timeout=DEFAULT_TIMEOUT_SECONDS,
             )
             r2.raise_for_status()
             post_id = r2.headers.get("x-restli-id", "")
@@ -285,6 +298,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 headers=headers,
                 json=body,
                 proxies=proxies,
+                timeout=DEFAULT_TIMEOUT_SECONDS,
             )
             r2.raise_for_status()
             post_id = r2.headers.get("x-restli-id", "")
@@ -302,6 +316,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 f"https://api.linkedin.com/rest/posts/{encoded_urn}",
                 headers=headers,
                 proxies=proxies,
+                timeout=DEFAULT_TIMEOUT_SECONDS,
             )
             r.raise_for_status()
             return [
@@ -311,7 +326,12 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         elif name == "create_comment":
             post_urn = arguments.get("post_urn")
             text = _sanitize_post_text(str(arguments.get("text") or ""))
-            r = requests.get(USERINFO_URL, headers=headers, proxies=proxies)
+            r = requests.get(
+                USERINFO_URL,
+                headers=headers,
+                proxies=proxies,
+                timeout=DEFAULT_TIMEOUT_SECONDS,
+            )
             r.raise_for_status()
             sub = r.json().get("sub", "")
             actor_urn = f"urn:li:person:{sub}"
@@ -323,6 +343,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 headers=headers,
                 json=body,
                 proxies=proxies,
+                timeout=DEFAULT_TIMEOUT_SECONDS,
             )
             r2.raise_for_status()
             comment_id = r2.headers.get("x-restli-id", "")

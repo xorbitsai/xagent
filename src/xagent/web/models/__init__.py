@@ -2,6 +2,7 @@ from .actor_mcp_connection import ActorMCPServerConnection
 from .actor_oauth_flow import ActorOAuthFlowState
 from .agent import Agent
 from .agent_api_key import AgentApiKey
+from .agent_version import AgentVersion
 from .api_idempotency_key import ApiIdempotencyKey
 from .auto_model import AutoModelCandidate, AutoModelConfig
 from .background_job import BackgroundJob, BackgroundJobStatus, BackgroundJobType
@@ -117,6 +118,7 @@ __all__ = [
     "SystemSetting",
     "Agent",
     "AgentApiKey",
+    "AgentVersion",
     "AutoModelConfig",
     "AutoModelCandidate",
     "BackgroundJob",

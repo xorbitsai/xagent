@@ -97,6 +97,12 @@ def get_event_type_mapping(event: TraceEvent) -> str:
         return "llm_call_failed"
     elif (
         scope == TraceScope.ACTION
+        and action == TraceAction.ERROR
+        and category == TraceCategory.LLM_CAPACITY
+    ):
+        return "llm_capacity_refusal"
+    elif (
+        scope == TraceScope.ACTION
         and action == TraceAction.START
         and category == TraceCategory.TOOL
     ):

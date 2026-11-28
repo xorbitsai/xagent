@@ -14,7 +14,7 @@ from ...public_http import (
     create_public_model_async_client,
 )
 from ..error import retry_on
-from ..exceptions import LLMRetryableError, LLMTimeoutError
+from ..exceptions import LLMCapacityError, LLMRetryableError, LLMTimeoutError
 from ..stream_deadline import await_before_deadline
 from ..timeout_config import TimeoutConfig
 from ..token_context import add_token_usage, extract_cached_input_tokens
@@ -24,13 +24,30 @@ from .base import BaseLLM
 ZhipuAiClient: "type[_ZhipuAiClient] | None"
 try:
     from zai import ZhipuAiClient as _ZhipuAiClient
+    from zai.core import APIStatusError as ZaiAPIStatusError
 except ImportError:
     # Fallback for when zai SDK is not available
     ZhipuAiClient = None
+    ZaiAPIStatusError = None  # type: ignore[assignment]
 else:
     ZhipuAiClient = _ZhipuAiClient
 
 logger = logging.getLogger(__name__)
+
+
+def _is_capacity_refusal(error: Exception) -> bool:
+    if ZaiAPIStatusError is None or not isinstance(error, ZaiAPIStatusError):
+        return False
+    if error.status_code != 429:
+        return False
+    try:
+        payload = error.response.json()
+    except (ValueError, httpx.ResponseNotRead):
+        return False
+    detail = payload.get("error") if isinstance(payload, dict) else None
+    # 1305 is temporary provider overload. Other 429s include concurrency,
+    # account quotas and caller-specific rate limits.
+    return isinstance(detail, dict) and detail.get("code") in (1305, "1305")
 
 
 def _close_stream_response(stream: Any) -> None:
@@ -425,6 +442,8 @@ class ZhipuLLM(BaseLLM):
             return content
 
         except Exception as e:
+            if _is_capacity_refusal(e):
+                raise LLMCapacityError() from e
             # Handle any errors
             logger.error("Zhipu API exception details:")
             logger.error(f"  - Exception type: {type(e).__name__}")
@@ -830,6 +849,8 @@ class ZhipuLLM(BaseLLM):
             raise LLMRetryableError("Streaming timeout exceeded")
 
         except Exception as e:
+            if _is_capacity_refusal(e):
+                raise LLMCapacityError() from e
             # Streaming swallowed every provider failure into an ERROR chunk,
             # so the shared RetryWrapper never saw one and the zai SDK's own
             # budget (three retries) was the only cover a streaming call had.
@@ -1126,6 +1147,8 @@ class ZhipuLLM(BaseLLM):
             return content
 
         except Exception as e:
+            if _is_capacity_refusal(e):
+                raise LLMCapacityError() from e
             # Handle any errors
             logger.error("Zhipu Vision API exception details:")
             logger.error(f"  - Exception type: {type(e).__name__}")

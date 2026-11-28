@@ -16,6 +16,7 @@ from ...providers import is_placeholder_api_key
 from ...public_http import public_model_http_client_options
 from ..error import is_context_length_error
 from ..exceptions import (
+    LLMCapacityError,
     LLMContextLengthError,
     LLMEmptyContentError,
     LLMInvalidResponseError,
@@ -29,6 +30,26 @@ from ..types import ChunkType, StreamChunk
 from .base import BaseLLM
 
 logger = logging.getLogger(__name__)
+
+
+def _is_capacity_refusal(error: Exception) -> bool:
+    if not isinstance(error, genai_errors.ServerError):
+        return False
+    if error.code != 503 or error.status != "UNAVAILABLE":
+        return False
+    # UNAVAILABLE also covers service incidents. Gemini describes demand
+    # spikes in the structured message and uses 429 for ordinary quotas.
+    if not isinstance(error.message, str):
+        return False
+    message = error.message.lower()
+    return any(
+        marker in message
+        for marker in (
+            "model is overloaded",
+            "experiencing high demand",
+            "model capacity",
+        )
+    )
 
 
 def _contains_refs_or_defs(obj: Any) -> bool:
@@ -742,6 +763,8 @@ class GeminiLLM(BaseLLM):
             return content
 
         except Exception as e:
+            if _is_capacity_refusal(e):
+                raise LLMCapacityError() from e
             logger.error("Gemini SDK API error: %s", redact_sensitive_text(str(e)))
 
             if is_context_length_error(e):
@@ -1079,6 +1102,8 @@ class GeminiLLM(BaseLLM):
         except LLMTimeoutError:
             raise
         except Exception as e:
+            if _is_capacity_refusal(e):
+                raise LLMCapacityError() from e
             logger.error(
                 "Gemini SDK streaming error: %s", redact_sensitive_text(str(e))
             )

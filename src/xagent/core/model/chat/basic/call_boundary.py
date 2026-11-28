@@ -63,7 +63,12 @@ from typing import Any, List, NamedTuple
 import httpx
 
 from ..error import is_context_length_error, retry_on
-from ..exceptions import LLMContextLengthError, LLMToolProtocolError
+from ..exceptions import (
+    LLM_CAPACITY_MESSAGE,
+    LLMCapacityError,
+    LLMContextLengthError,
+    LLMToolProtocolError,
+)
 from ..types import ChunkType, StreamChunk
 from .base import BaseLLM
 
@@ -73,6 +78,7 @@ logger = logging.getLogger(__name__)
 CONTEXT_LENGTH = "context_length"
 CREDENTIAL_REJECTED = "credential_rejected"
 PROVIDER_QUOTA = "provider_quota"
+PROVIDER_CAPACITY = "provider_capacity"
 RATE_LIMITED = "rate_limited"
 TIMEOUT = "timeout"
 PROVIDER_UNAVAILABLE = "provider_unavailable"
@@ -90,6 +96,7 @@ PROVIDER_CALL_FAILURE_CODES = frozenset(
         CONTEXT_LENGTH,
         CREDENTIAL_REJECTED,
         PROVIDER_QUOTA,
+        PROVIDER_CAPACITY,
         RATE_LIMITED,
         TIMEOUT,
         PROVIDER_UNAVAILABLE,
@@ -113,6 +120,7 @@ PROVIDER_CALL_FAILURE_CODES = frozenset(
 BUDGET_INSENSITIVE_FAILURE_CODES = frozenset(
     {
         CREDENTIAL_REJECTED,
+        PROVIDER_CAPACITY,
         RATE_LIMITED,
         TIMEOUT,
         PROVIDER_UNAVAILABLE,
@@ -127,6 +135,7 @@ _SAFE_MESSAGES = {
     # recognizes the message as well as the type.
     CONTEXT_LENGTH: "Model provider call failed: context length exceeded.",
     CREDENTIAL_REJECTED: "Model provider call failed: the credential was rejected.",
+    PROVIDER_CAPACITY: LLM_CAPACITY_MESSAGE,
     PROVIDER_QUOTA: "Model provider call failed: the provider account has no quota left.",
     RATE_LIMITED: "Model provider call failed: rate limited by the provider.",
     TIMEOUT: "Model provider call failed: the request timed out.",
@@ -277,6 +286,8 @@ def classify_provider_failure(exc: BaseException) -> str:
     if is_context_length_error(exc):
         return CONTEXT_LENGTH
     causes = _chain(exc)
+    if any(isinstance(cause, LLMCapacityError) for cause in causes):
+        return PROVIDER_CAPACITY
     names = {type(cause).__name__ for cause in causes}
     statuses = {
         status for cause in causes if (status := _http_status(cause)) is not None

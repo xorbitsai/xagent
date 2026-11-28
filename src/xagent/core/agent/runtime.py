@@ -20,6 +20,7 @@ from ..agent.prompt_composition import (
 )
 from ..agent.result_card import RESULT_CARD_DISPLAY, RESULT_CARD_MESSAGE_TYPE
 from ..agent.trace import (
+    ACTION_LLM_CAPACITY_REFUSAL,
     TraceAction,
     TraceCategory,
     TraceEventType,
@@ -43,11 +44,14 @@ from ..inline_file_delivery import InlineFileDelivery, InlineFileStreamGuard
 from ..model.chat.basic.base import BaseLLM
 from ..model.chat.basic.call_boundary import (
     BUDGET_INSENSITIVE_FAILURE_CODES,
+    PROVIDER_CAPACITY,
     ProviderCallError,
 )
 from ..model.chat.cache_lifecycle import AgentCacheSession
 from ..model.chat.error import is_context_length_error, retry_on
 from ..model.chat.exceptions import (
+    LLM_CAPACITY_MESSAGE,
+    LLMCapacityError,
     LLMContextLengthError,
     LLMToolProtocolError,
     ModelProviderError,
@@ -2281,6 +2285,24 @@ class PatternRuntime:
         metadata: dict[str, Any] | None = None,
     ) -> None:
         event_metadata = metadata or {}
+        # Patterns report the outcome of a logical call here, after the
+        # adapter has spent its retry budget.
+        if isinstance(error, LLMCapacityError) or (
+            isinstance(error, ProviderCallError) and error.code == PROVIDER_CAPACITY
+        ):
+            await self._emit_trace_event(
+                ACTION_LLM_CAPACITY_REFUSAL,
+                task_id=str(event_metadata.get("task_id") or self._task_id(context)),
+                step_id=str(event_metadata.get("step_id") or self._step_id(context)),
+                data={
+                    **event_metadata,
+                    "error_type": PROVIDER_CAPACITY,
+                    "error": LLM_CAPACITY_MESSAGE,
+                    "error_message": LLM_CAPACITY_MESSAGE,
+                    "success": False,
+                },
+            )
+            return
         protocol_metadata: dict[str, Any] = {}
         if isinstance(error, LLMToolProtocolError):
             protocol_metadata = {
@@ -2830,7 +2852,8 @@ class PatternRuntime:
         # pass through unchanged.
         if (
             data
-            and getattr(event_type, "category", None) == TraceCategory.LLM
+            and getattr(event_type, "category", None)
+            in {TraceCategory.LLM, TraceCategory.LLM_CAPACITY}
             and getattr(self.tracer, "records_execution_events", False) is not True
         ):
             data = normalize_llm_trace_payload(data)

@@ -21,7 +21,9 @@ from openai import AsyncOpenAI
 from ....runtime_performance import run_in_thread_with_telemetry
 from ....utils.security import redact_sensitive_text
 from ...public_http import create_owned_async_sdk_client
+from ..error import retry_on
 from ..exceptions import (
+    LLMCapacityError,
     LLMEmptyContentError,
     LLMRetryableError,
     LLMTimeoutError,
@@ -308,7 +310,7 @@ def _guarded(extract: Callable[[], _T], default: _T) -> _T:
 
 def _model_provider_error(
     prefix: str, error: BaseException, *, retryable: bool = False
-) -> ModelProviderError:
+) -> ModelProviderError | LLMCapacityError:
     """The typed exception for a provider failure; never raises.
 
     Each field is extracted under its own guard, so one failing accessor
@@ -336,6 +338,29 @@ def _model_provider_error(
             lambda: _truncate_error_detail(str(error)),
             _guarded(lambda: _truncate_error_detail(repr(error)), type(error).__name__),
         )
+
+    def is_capacity_refusal() -> bool:
+        if not isinstance(error, openai.APIStatusError) or error.status_code not in {
+            429,
+            503,
+        }:
+            return False
+        payload = _openai_error_payload(error) or {}
+        code = _openai_error_code(error)
+        error_type = payload.get("type")
+        if code in ("insufficient_quota", "insufficient_balance") or error_type in (
+            "insufficient_quota",
+            "insufficient_balance",
+        ):
+            return False
+        message = payload.get("message") or error.message
+        return retry_on(error) and (
+            code in ("insufficient_capacity", "model_overloaded", "server_overloaded")
+            or (isinstance(message, str) and "on-demand capacity" in message.lower())
+        )
+
+    if _guarded(is_capacity_refusal, False):
+        return LLMCapacityError()
 
     status_code = _guarded(status_code_of, None)
     kind = _guarded(lambda: _provider_failure_kind(error, status_code), "unknown")

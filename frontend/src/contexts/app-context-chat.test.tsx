@@ -933,6 +933,25 @@ describe("AppProvider websocket message routing", () => {
     expect(screen.getByTestId("stream-recovery").textContent).toBe("")
   })
 
+  it("retains the provider capacity trace and its event id from the task stream", () => {
+    render(<AppProvider token="token"><SeedRunningTask /><StateProbe /></AppProvider>)
+    act(() => {
+      webSocketOptions.current?.onMessage?.({
+        type: "trace_event",
+        task_id: 1,
+        timestamp: "2026-05-27T05:00:00Z",
+        event_type: "llm_capacity_refusal",
+        event_id: "capacity-refusal-1",
+        step_id: "step-1",
+        data: { error_type: "provider_capacity" },
+      } as TestWebSocketMessage)
+    })
+    expect(JSON.parse(screen.getByTestId("staged-trace-events").textContent || "[]"))
+      .toEqual(["capacity-refusal-1"])
+    expect(JSON.parse(screen.getByTestId("trace-events").textContent || "[]"))
+      .toEqual([{ event_type: "llm_capacity_refusal" }])
+  })
+
   it("replayed interrupted empty answer keeps its tool steps", () => {
     render(<AppProvider token="token"><SeedRunningTask /><StateProbe /></AppProvider>)
     const send = (message: Record<string, unknown>) => act(() => {

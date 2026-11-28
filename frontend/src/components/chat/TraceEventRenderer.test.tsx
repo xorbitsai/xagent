@@ -1371,6 +1371,37 @@ describe("TraceEventRenderer", () => {
     expect(screen.getByText("chatPage.executionPlan.dagSectionOther:2")).toBeInTheDocument()
   })
 
+  it("renders one localized capacity refusal for the matching model call", () => {
+    const events = [
+      {
+        event_id: "step",
+        event_type: "dag_step_start",
+        step_id: "step",
+        timestamp: 1000,
+        data: { step_name: "Generate report" },
+      },
+      {
+        event_id: "llm-start",
+        event_type: "llm_call_start",
+        step_id: "step",
+        timestamp: 2000,
+        data: { model_name: "gpt-test" },
+      },
+      {
+        event_id: "capacity",
+        event_type: "llm_capacity_refusal",
+        step_id: "step",
+        timestamp: 3000,
+        data: { error: "raw provider text" },
+      },
+    ]
+    render(<TraceEventRenderer events={events} taskStatus="failed" />)
+    fireEvent.click(screen.getByRole("button", { name: "Generate report" }))
+    expect(screen.getByText("traceEventRenderer.llmCapacityRefusal")).toBeInTheDocument()
+    expect(screen.getByText("traceEventRenderer.llmCapacityRecovery")).toBeInTheDocument()
+    expect(screen.queryByText("raw provider text")).not.toBeInTheDocument()
+  })
+
   it("stops running process spinners when the parent task has failed", () => {
     const { container } = render(
       <TraceEventRenderer

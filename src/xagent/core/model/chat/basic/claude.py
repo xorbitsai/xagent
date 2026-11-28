@@ -8,12 +8,13 @@ from typing import TYPE_CHECKING, Any, AsyncIterator, Dict, List, Optional, Unio
 from json_repair import loads as repair_loads
 
 if TYPE_CHECKING:
-    from anthropic import Anthropic, AsyncAnthropic
+    from anthropic import Anthropic, APIStatusError, AsyncAnthropic
 else:
     try:
-        from anthropic import Anthropic, AsyncAnthropic  # type: ignore
+        from anthropic import Anthropic, APIStatusError, AsyncAnthropic  # type: ignore
     except ImportError:
         Anthropic = None  # type: ignore
+        APIStatusError = None  # type: ignore
         AsyncAnthropic = None  # type: ignore
 
 from ...public_http import (
@@ -21,7 +22,7 @@ from ...public_http import (
     create_public_model_async_client,
 )
 from ..error import is_retryable_http_status
-from ..exceptions import LLMRetryableError, LLMTimeoutError
+from ..exceptions import LLMCapacityError, LLMRetryableError, LLMTimeoutError
 from ..stream_deadline import await_before_deadline
 from ..timeout_config import TimeoutConfig
 from ..token_context import add_token_usage
@@ -784,6 +785,12 @@ class ClaudeLLM(BaseLLM):
             return content
 
         except Exception as e:
+            if (
+                APIStatusError is not None
+                and isinstance(e, APIStatusError)
+                and e.status_code == 529
+            ):
+                raise LLMCapacityError() from e
             logger.error(f"Claude API error: {str(e)}")
             # Re-raise LLMRetryableError as-is (will be caught by retry wrapper)
             # Wrap other errors in RuntimeError
@@ -794,7 +801,6 @@ class ClaudeLLM(BaseLLM):
                 # We can safely import these as _client exists implies SDK is installed
                 from anthropic import (
                     APIConnectionError,
-                    APIStatusError,
                     APITimeoutError,
                     RateLimitError,
                 )
@@ -802,7 +808,7 @@ class ClaudeLLM(BaseLLM):
                 if isinstance(e, (APITimeoutError, APIConnectionError, RateLimitError)):
                     raise LLMRetryableError(str(e)) from e
 
-                if isinstance(e, APIStatusError):
+                if APIStatusError is not None and isinstance(e, APIStatusError):
                     raise LLMRetryableError(str(e)) from e
 
             raise RuntimeError(f"Claude API error: {str(e)}") from e
@@ -1195,6 +1201,12 @@ class ClaudeLLM(BaseLLM):
             # Already logged where the deadline expired.
             raise
         except Exception as e:
+            if (
+                APIStatusError is not None
+                and isinstance(e, APIStatusError)
+                and e.status_code == 529
+            ):
+                raise LLMCapacityError() from e
             logger.error(f"Claude streaming API error: {str(e)}")
             # Re-raise LLMRetryableError for retry
             if isinstance(e, LLMRetryableError):
@@ -1204,7 +1216,6 @@ class ClaudeLLM(BaseLLM):
             if self._client:
                 from anthropic import (
                     APIConnectionError,
-                    APIStatusError,
                     APITimeoutError,
                     RateLimitError,
                 )
@@ -1213,15 +1224,14 @@ class ClaudeLLM(BaseLLM):
                     error_msg = f"Claude API retryable error: {str(e)}"
                     raise LLMRetryableError(error_msg) from e
 
-                if isinstance(e, APIStatusError):
+                if APIStatusError is not None and isinstance(e, APIStatusError):
                     # ``chat`` turns every APIStatusError into
                     # LLMRetryableError; streaming swallowed them into an
                     # ERROR chunk instead, so the shared RetryWrapper never
                     # saw one and the anthropic SDK's own budget was the only
                     # cover a streaming call had. That budget is now zero
                     # (see ``_ensure_client``), so transient statuses have to
-                    # raise -- a 529 Overloaded is exactly the capacity shape
-                    # this policy exists for. Permanent statuses keep the
+                    # raise. Permanent statuses keep the
                     # ERROR chunk: replaying them cannot help, and ``chat``'s
                     # blanket retry of 4xx is a separate defect, not one to
                     # copy here.

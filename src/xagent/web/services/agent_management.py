@@ -47,7 +47,12 @@ from ..services.agent_store import (
     invalidate_agent_cache,
 )
 from .agent_team_scope import get_agent_team_scope
-from .agent_versions import VERSIONED_FIELDS, ConfigActor, same_value
+from .agent_versions import (
+    VERSIONED_FIELDS,
+    ConfigActor,
+    model_slot_is_unset,
+    same_value,
+)
 from .api_keys import (
     AgentApiKeyService,
     AgentKeyMetadata,
@@ -1111,8 +1116,9 @@ _MAX_MODEL_PK = 2**31 - 1
 def unresolved_models(db: Session, agent: Agent, user_id: int) -> tuple[str, ...]:
     """Slots of *agent* whose model *user_id* cannot be confirmed to resolve.
 
-    A slot holding null, ``""``, integer 0 or ``false`` is unset: slot
-    resolution returns nothing for it without a query, so it is not listed.
+    A slot holding null, ``""``, integer 0 or ``false`` is unset
+    (:func:`model_slot_is_unset`): slot resolution returns nothing for it
+    without a query, so it is not listed.
     A slot holding a canonical integer id (an ``int``, not a ``bool``, from 1
     to 2**31 - 1) is listed unless the id is one of the models *user_id* can
     put in a slot. Any other stored value is listed: how slot resolution
@@ -1126,21 +1132,13 @@ def unresolved_models(db: Session, agent: Agent, user_id: int) -> tuple[str, ...
     if not isinstance(stored, dict):
         return ()
 
-    def is_unset(value: Any) -> bool:
-        return (
-            value is None
-            or value is False
-            or value == ""
-            or (type(value) is int and value == 0)
-        )
-
     def is_canonical(value: Any) -> bool:
         return type(value) is int and 1 <= value <= _MAX_MODEL_PK
 
     set_slots = {
         slot: stored[slot]
         for slot in AGENT_MODEL_KEYS
-        if slot in stored and not is_unset(stored[slot])
+        if slot in stored and not model_slot_is_unset(stored[slot])
     }
     ids = sorted({value for value in set_slots.values() if is_canonical(value)})
     assignable = (
@@ -1555,7 +1553,8 @@ class AgentManagementRuntime:
         to a model id is checked under the lock, after the length and name
         checks (:func:`_check_slot_models`); a refused slot raises
         :class:`ModelSlotsUnusableError` and nothing is written. If every such
-        slot is empty either way, nothing is merged.
+        slot is unset both as stored and as requested
+        (:func:`model_slot_is_unset`), nothing is merged.
 
         The commit releases the lock, so after a write the agent is read again
         with the visibility rule and team scope of the first read, and the
@@ -1604,8 +1603,9 @@ class AgentManagementRuntime:
             if changed_slots and _same_stored(
                 "models", agent, {**base, **changed_slots}
             ):
-                # Only slots that are empty either way, e.g. a stored ``0``
-                # cleared to ``None``: the runtime reads both as unset.
+                # Only slots that are unset either way (model_slot_is_unset),
+                # e.g. a stored ``0`` cleared to ``None``. A stored ``0.0``,
+                # ``[]`` or ``{}`` is not unset, so clearing it is written.
                 changed_slots = {}
             if changed_slots:
                 updates["models"] = {**base, **changed_slots}

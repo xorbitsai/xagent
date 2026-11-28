@@ -43,11 +43,12 @@ from xagent.web.services.agent_versions import (
     SessionBoundaryError,
     SystemWrite,
     apply_agent_change,
+    model_slot_is_unset,
     rewrite_agent_references,
 )
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
-WEB = ConfigActor.user(1, source="web")
+WEB = ConfigActor.user(1, entry_point="web")
 
 
 def _sqlite_sessions(path: Path) -> Iterator[sessionmaker[Session]]:
@@ -121,7 +122,7 @@ def _row_content(db: Session, agent_id: int) -> dict[str, Any]:
 
 def _save(db: Session, user_id: int, agent_id: int, updates: dict[str, Any]) -> Any:
     return AgentStore(db).update_agent_fields(
-        user_id, agent_id, updates, actor=ConfigActor.user(user_id, source="web")
+        user_id, agent_id, updates, actor=ConfigActor.user(user_id, entry_point="web")
     )
 
 
@@ -140,6 +141,21 @@ def test_versioned_field_constants() -> None:
 
 PCF_A = [{"name": "site", "max_length": 100, "description": None}]
 PCF_B = [{"name": "site", "max_length": 200, "description": None}]
+
+# Stored model slot values and whether each is unset (model_slot_is_unset).
+SLOT_VALUES_UNSET: list[tuple[Any, bool]] = [
+    (None, True),
+    (False, True),
+    ("", True),
+    (0, True),
+    (0.0, False),
+    ([], False),
+    ({}, False),
+    (True, False),
+    (1.0, False),
+    ("0", False),
+    (1, False),
+]
 
 # field -> (stored value, requested value, is it a new version?)
 CANONICAL_MATRIX: dict[str, list[tuple[Any, Any, bool]]] = {
@@ -172,6 +188,20 @@ CANONICAL_MATRIX: dict[str, list[tuple[Any, Any, bool]]] = {
         # Compared as JSON: ``True`` and ``1.0`` do not name model 1.
         ({"general": True}, {"general": 1}, True),
         ({"general": 1.0}, {"general": 1}, True),
+        # Clearing a slot, with ``None`` or by leaving it out, is a change
+        # only when the stored value is not unset (model_slot_is_unset).
+        ({"general": 0}, {"general": None}, False),
+        ({"general": 0}, {}, False),
+        ({"general": False}, {"general": None}, False),
+        ({"general": False}, {}, False),
+        ({"general": ""}, {"general": None}, False),
+        ({"general": ""}, {}, False),
+        ({"general": 0.0}, {"general": None}, True),
+        ({"general": 0.0}, {}, True),
+        ({"general": []}, {"general": None}, True),
+        ({"general": []}, {}, True),
+        ({"general": {}}, {"general": None}, True),
+        ({"general": {}}, {}, True),
     ],
     "knowledge_bases": [
         (None, [], False),
@@ -190,6 +220,30 @@ CANONICAL_MATRIX: dict[str, list[tuple[Any, Any, bool]]] = {
 
 def test_canonical_matrix_covers_every_versioned_field() -> None:
     assert set(CANONICAL_MATRIX) == set(VERSIONED_FIELDS)
+
+
+@pytest.mark.parametrize(
+    ("value", "unset"),
+    SLOT_VALUES_UNSET,
+    ids=[repr(value) for value, _ in SLOT_VALUES_UNSET],
+)
+def test_model_slot_unset_rule(value: Any, unset: bool) -> None:
+    assert model_slot_is_unset(value) is unset
+
+
+def test_models_matrix_follows_the_unset_rule() -> None:
+    """Every clear-a-slot row of the matrix expects a change exactly when the
+    stored value is not unset."""
+    clears = [
+        (stored["general"], new)
+        for stored, requested, new in CANONICAL_MATRIX["models"]
+        if isinstance(stored, dict)
+        and list(stored) == ["general"]
+        and requested in ({"general": None}, {})
+    ]
+    assert len(clears) == 12
+    for value, new in clears:
+        assert new is (not model_slot_is_unset(value)), value
 
 
 @pytest.mark.parametrize(

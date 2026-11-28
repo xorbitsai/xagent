@@ -139,7 +139,7 @@ class MigrationLoader:
                     existing_id,
                     {"instructions": instructions},
                     agent=existing,
-                    actor=ConfigActor.user(self.user_id, source="import"),
+                    actor=ConfigActor.user(self.user_id, entry_point="import"),
                 )
                 if updated is None:
                     logger.warning(

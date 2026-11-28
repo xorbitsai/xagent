@@ -1471,7 +1471,9 @@ class UpdateAgentTool(AbstractBaseTool):
                         self._user_id,
                         agent_id,
                         updates,
-                        actor=ConfigActor.user(self._user_id, source="builder_tool"),
+                        actor=ConfigActor.user(
+                            self._user_id, entry_point="builder_tool"
+                        ),
                     )
                 except UnsharedConnectorsError as exc:
                     missing = [

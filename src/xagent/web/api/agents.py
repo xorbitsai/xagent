@@ -828,7 +828,7 @@ async def create_agent(
                         user_id,
                         int(agent.id),
                         {"logo_url": logo_url},
-                        actor=ConfigActor.user(user_id, source="web"),
+                        actor=ConfigActor.user(user_id, entry_point="web"),
                     )
                     or agent
                 )
@@ -1265,7 +1265,7 @@ async def update_agent(
                     updates,
                     team_scope=team_scope,
                     agent=agent,
-                    actor=ConfigActor.user(user_id, source="web"),
+                    actor=ConfigActor.user(user_id, entry_point="web"),
                 )
             except IntegrityError as exc:
                 db.rollback()
@@ -1541,7 +1541,7 @@ async def enable_agent_share_link(
             int(current_user.id),
             agent_id,
             updates,
-            actor=ConfigActor.user(int(current_user.id), source="web"),
+            actor=ConfigActor.user(int(current_user.id), entry_point="web"),
         )
         if updated_agent is None:
             raise HTTPException(status_code=404, detail="Agent not found")
@@ -1572,7 +1572,7 @@ async def rotate_agent_share_link(
                 "share_token": _new_share_token(),
                 "share_updated_at": datetime.now(timezone.utc),
             },
-            actor=ConfigActor.user(int(current_user.id), source="web"),
+            actor=ConfigActor.user(int(current_user.id), entry_point="web"),
         )
         if agent is None:
             raise HTTPException(status_code=404, detail="Agent not found")
@@ -1605,7 +1605,7 @@ async def disable_agent_share_link(
                 "share_token": None,
                 "share_updated_at": datetime.now(timezone.utc),
             },
-            actor=ConfigActor.user(int(current_user.id), source="web"),
+            actor=ConfigActor.user(int(current_user.id), entry_point="web"),
         )
         if agent is None:
             raise HTTPException(status_code=404, detail="Agent not found")
@@ -1636,7 +1636,7 @@ async def get_agent_widget_key(
                 user_id,
                 agent_id,
                 {"widget_key": new_widget_key()},
-                actor=ConfigActor.user(user_id, source="web"),
+                actor=ConfigActor.user(user_id, entry_point="web"),
             )
             if agent is None:
                 raise HTTPException(status_code=404, detail="Agent not found")
@@ -1669,7 +1669,7 @@ async def rotate_agent_widget_key(
             user_id,
             agent_id,
             {"widget_key": new_widget_key()},
-            actor=ConfigActor.user(user_id, source="web"),
+            actor=ConfigActor.user(user_id, entry_point="web"),
         )
         if agent is None:
             raise HTTPException(status_code=404, detail="Agent not found")
@@ -1743,7 +1743,7 @@ async def upload_agent_logo(
             user_id,
             agent_id,
             {"logo_url": logo_url},
-            actor=ConfigActor.user(user_id, source="web"),
+            actor=ConfigActor.user(user_id, entry_point="web"),
         )
         if updated is None:
             # Deleted, or no longer manageable by this user, since the read

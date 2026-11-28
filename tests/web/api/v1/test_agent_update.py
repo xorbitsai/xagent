@@ -37,6 +37,7 @@ from xagent.web.services.agent_team_scope import (
     AgentTeamScope,
     set_agent_team_scope_hook,
 )
+from xagent.web.services.agent_versions import model_slot_is_unset
 from xagent.web.services.model_service import (
     set_model_visibility_hook,
     set_visible_user_ids_hook,
@@ -587,6 +588,17 @@ def test_update_log_line(caplog, body, fields):
     assert "SECRET" not in _logged_text(caplog)
 
 
+# Stored slot values cleared with null: (id, value, written?). A value that
+# is unset (model_slot_is_unset) is kept as stored; any other is written.
+_SLOT_CLEARS = [
+    ("int-zero", 0, False),
+    ("false", False, False),
+    ("blank", "", False),
+    ("float-zero", 0.0, True),
+    ("empty-list", [], True),
+    ("empty-dict", {}, True),
+]
+
 # (id, stored columns, request body) that update_agent_fields keeps as stored.
 _KEPT_AS_STORED = [
     (
@@ -594,7 +606,15 @@ _KEPT_AS_STORED = [
         {"instructions": "stored i"},
         {"instructions": "  stored i\n"},
     ),
-    ("cleared-empty-slot", {"models": {"general": 0}}, {"models": {"general": None}}),
+    *(
+        (
+            f"cleared-{name}-slot",
+            {"models": {"general": value}},
+            {"models": {"general": None}},
+        )
+        for name, value, written in _SLOT_CLEARS
+        if not written
+    ),
 ]
 
 
@@ -612,6 +632,7 @@ def test_a_value_kept_as_stored_is_not_written_or_logged(caplog, stored, body):
         resp = _patch(holder, agent_id, body)
 
     assert resp.status_code == 200, resp.text
+    assert resp.json()["unresolved_models"] == []
     assert _row(agent_id) == before
     cleared.assert_not_called()
     assert _update_records(caplog) == []
@@ -623,6 +644,54 @@ def test_a_value_kept_as_stored_is_not_written_or_logged(caplog, stored, body):
         )
     finally:
         db.close()
+
+
+@pytest.mark.parametrize(
+    "value",
+    [value for _, value, written in _SLOT_CLEARS if written],
+    ids=[name for name, _, written in _SLOT_CLEARS if written],
+)
+def test_clearing_a_listed_slot_writes_null(caplog, value):
+    holder = Holder()
+    agent_id = _seed(holder.user_id, models={"general": value})
+    before = client.get(f"/v1/agents/{agent_id}", headers=_bearer(holder.key))
+    assert before.json()["unresolved_models"] == ["general"]
+
+    with patch(CACHE_CLEAR) as cleared, caplog.at_level(logging.INFO):
+        resp = _patch(holder, agent_id, {"models": {"general": None}})
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["models"] == {"general": None}
+    assert resp.json()["unresolved_models"] == []
+    assert _row(agent_id)["models"] == {"general": None}
+    cleared.assert_called_once_with(holder.user_id, agent_id, None)
+    records = _update_records(caplog)
+    assert len(records) == 1
+    assert records[0].args == (
+        holder.prefix,
+        holder.user_id,
+        agent_id,
+        "models[general]",
+    )
+    db = _direct_db_session()
+    try:
+        versions = (
+            db.query(AgentVersion)
+            .filter(AgentVersion.agent_id == agent_id)
+            .order_by(AgentVersion.version_no)
+            .all()
+        )
+        assert [v.kind for v in versions] == ["initial", "save"]
+        assert versions[0].content["models"] == {"general": value}
+        assert versions[1].content["models"] == {"general": None}
+        assert versions[1].actor_kind == "api_key"
+    finally:
+        db.close()
+
+
+def test_slot_clear_table_follows_the_unset_rule():
+    for _, value, written in _SLOT_CLEARS:
+        assert model_slot_is_unset(value) is (not written), value
 
 
 def test_cancelled_update_still_logs(caplog):

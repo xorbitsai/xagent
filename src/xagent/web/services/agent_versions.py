@@ -69,8 +69,10 @@ VERSIONED_FIELDS: tuple[str, ...] = (
 # - instructions: ``None`` equals ``""``; compared without leading and
 #   trailing whitespace.
 # - execution_mode: compared as stored.
-# - models: ``None`` equals ``{}``; empty slots are dropped, because the
-#   runtime treats an empty slot like a missing one.
+# - models: ``None`` equals ``{}``; unset slots are dropped
+#   (``model_slot_is_unset``: ``None``, ``False``, ``""`` or the integer
+#   ``0``). Other values such as ``0.0``, ``[]`` or ``{}`` are kept, so
+#   clearing one of them with ``None`` is a change.
 # - skills: ``None`` equals ``[]``; order does not matter (membership test).
 # - knowledge_bases: ``None`` equals ``[]``; order matters (it is the order
 #   the prompt lists them in).
@@ -93,6 +95,25 @@ _EMPTY_VALUES: dict[str, Any] = {
 }
 EMPTY_EQUIVALENT: frozenset[str] = frozenset(_EMPTY_VALUES)
 ORDER_INSENSITIVE: frozenset[str] = frozenset({"skills", "tool_categories"})
+
+
+def model_slot_is_unset(value: Any) -> bool:
+    """Whether a stored model slot value means "no model": ``None``,
+    ``False``, ``""`` or the integer ``0``.
+
+    The canonical form of ``models`` and the ``unresolved_models``
+    diagnostic both use this rule. Any other value, ``0.0``, ``[]`` and
+    ``{}`` included, is a stored value: it is listed as needing a rewrite
+    with an integer id, and clearing it with ``None`` is a change. This is
+    the rule for stored values, not how a running task resolves a slot.
+    """
+    return (
+        value is None
+        or value is False
+        or value == ""
+        or (type(value) is int and value == 0)
+    )
+
 
 ACTOR_KINDS: frozenset[str] = frozenset(
     {"user", "api_key", "workspace_key", "system", "unspecified"}
@@ -118,32 +139,36 @@ class ConfigActor:
     user_id: int | None = None
     # Personal key prefix, or the id of a workspace key.
     key_prefix: str | None = None
-    # Entry point, e.g. ``web``, ``builder_tool``, ``v1``, ``import``.
-    source: str | None = None
+    # Entry point, e.g. ``web``, ``builder_tool``, ``v1``, ``import``. Stored in
+    # the ``actor_source`` column.
+    entry_point: str | None = None
 
     def __post_init__(self) -> None:
         if self.kind not in ACTOR_KINDS:
             raise ValueError(f"Unsupported actor kind: {self.kind}")
         if self.key_prefix is not None and len(self.key_prefix) > 32:
             raise ValueError("actor key_prefix is longer than 32 characters")
-        if self.source is not None and len(self.source) > 64:
-            raise ValueError("actor source is longer than 64 characters")
+        if self.entry_point is not None and len(self.entry_point) > 64:
+            raise ValueError("actor entry_point is longer than 64 characters")
 
     @classmethod
-    def user(cls, user_id: int, *, source: str) -> ConfigActor:
-        return cls(kind="user", user_id=int(user_id), source=source)
+    def user(cls, user_id: int, *, entry_point: str) -> ConfigActor:
+        return cls(kind="user", user_id=int(user_id), entry_point=entry_point)
 
     @classmethod
     def api_key(
-        cls, user_id: int, key_prefix: str, *, source: str = "v1"
+        cls, user_id: int, key_prefix: str, *, entry_point: str = "v1"
     ) -> ConfigActor:
         return cls(
-            kind="api_key", user_id=int(user_id), key_prefix=key_prefix, source=source
+            kind="api_key",
+            user_id=int(user_id),
+            key_prefix=key_prefix,
+            entry_point=entry_point,
         )
 
     @classmethod
-    def system(cls, source: str) -> ConfigActor:
-        return cls(kind="system", source=source)
+    def system(cls, entry_point: str) -> ConfigActor:
+        return cls(kind="system", entry_point=entry_point)
 
     @classmethod
     def unspecified(cls) -> ConfigActor:
@@ -233,7 +258,11 @@ def canonical_value(field: str, value: Any) -> Any:
     if field == "instructions" and isinstance(value, str):
         return value.strip()
     if field == "models" and isinstance(value, dict):
-        return {slot: model for slot, model in value.items() if model}
+        return {
+            slot: model
+            for slot, model in value.items()
+            if not model_slot_is_unset(model)
+        }
     if field in ORDER_INSENSITIVE and isinstance(value, list):
         return sorted(value, key=_sort_key)
     return value
@@ -318,7 +347,7 @@ def _insert_version(
             actor_kind=actor.kind,
             actor_user_id=actor.user_id,
             actor_key_prefix=actor.key_prefix,
-            actor_source=actor.source,
+            actor_source=actor.entry_point,
             content=content,
         )
     )

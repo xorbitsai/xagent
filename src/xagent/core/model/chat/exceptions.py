@@ -26,6 +26,19 @@ class LLMRetryableError(RuntimeError):
     pass
 
 
+LLM_CAPACITY_MESSAGE = (
+    "The model provider has reached its serving capacity. Try again in a moment "
+    "or switch to a different model."
+)
+
+
+class LLMCapacityError(LLMRetryableError):
+    """The provider could not serve the request because it is overloaded."""
+
+    def __init__(self) -> None:
+        super().__init__(LLM_CAPACITY_MESSAGE)
+
+
 class LLMToolProtocolError(LLMRetryableError):
     """Structured provider tool-protocol failure.
 

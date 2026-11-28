@@ -6,20 +6,30 @@ existing transient-fault retries keep working.
 """
 
 import time
+from contextlib import nullcontext
 from unittest.mock import AsyncMock
 
 import httpx
 import openai
 import pytest
+from anthropic import APIStatusError as ClaudeStatusError
+from google.genai import errors as genai_errors
 
 from xagent.core.model import ChatModelConfig
 from xagent.core.model.chat.basic.adapter import create_base_llm
 from xagent.core.model.chat.basic.azure_openai import AzureOpenAILLM
+from xagent.core.model.chat.basic.call_boundary import (
+    PROVIDER_CAPACITY,
+    ProviderCallError,
+    guard_llm_calls,
+)
 from xagent.core.model.chat.basic.claude import ClaudeLLM
+from xagent.core.model.chat.basic.gemini import GeminiLLM
 from xagent.core.model.chat.basic.openai import OpenAICompatibleLLM
 from xagent.core.model.chat.basic.zhipu import ZhipuLLM
 from xagent.core.model.chat.error import retry_on
-from xagent.core.retry.policy import RetryBudget
+from xagent.core.model.chat.exceptions import LLMCapacityError
+from xagent.core.retry.policy import RetryBudget, is_capacity_error, retry_after_seconds
 from xagent.core.retry.strategy import FixedDelay
 from xagent.core.retry.wrapper import RetryWrapper
 
@@ -35,7 +45,7 @@ def _sdk_error(cls, status: int, message: str) -> openai.APIStatusError:
 
 
 def _as_adapter_raises(error: BaseException, prefix: str) -> RuntimeError:
-    """Mirror how ``OpenAICompatibleLLM.chat`` re-raises a provider failure."""
+    """Simulate an older adapter or proxy with no typed capacity error."""
     wrapped = RuntimeError(f"{prefix}: {error}")
     wrapped.__cause__ = error
     return wrapped
@@ -324,7 +334,7 @@ class TestStreamingTransientFaultsStillReachTheWrapper:
         return chunks
 
     async def test_claude_streaming_5xx_raises_for_the_wrapper(self, mocker):
-        """A 529 Overloaded is exactly the capacity shape #2605 is about."""
+        """Generic server errors still reach the wrapper."""
         from anthropic import InternalServerError
 
         from xagent.core.model.chat.exceptions import LLMRetryableError
@@ -332,13 +342,13 @@ class TestStreamingTransientFaultsStillReachTheWrapper:
         llm = ClaudeLLM("claude-sonnet-4", base_url=None, api_key="k")
         client = mocker.AsyncMock()
         client.messages.create.side_effect = InternalServerError(
-            "Overloaded",
-            response=httpx.Response(529, request=REQUEST),
+            "Bad gateway",
+            response=httpx.Response(502, request=REQUEST),
             body=None,
         )
         llm._client = client
 
-        with pytest.raises(LLMRetryableError, match="Overloaded"):
+        with pytest.raises(LLMRetryableError, match="Bad gateway"):
             await self._drain(llm, [{"role": "user", "content": "hi"}])
 
     async def test_claude_streaming_permanent_status_keeps_the_error_chunk(
@@ -454,3 +464,90 @@ class TestProviderRetryVetoAndTransientStatuses:
         with pytest.raises(LLMRetryableError):
             async for _ in llm.stream_chat([{"role": "user", "content": "hi"}]):
                 pass
+
+
+@pytest.mark.parametrize("stream", [False, True], ids=["chat", "stream"])
+@pytest.mark.parametrize("provider", ["openai", "claude", "gemini", "zhipu"])
+@pytest.mark.parametrize("capacity", [True, False], ids=["capacity", "other"])
+async def test_sdk_classifies_capacity_without_treating_other_failures_as_capacity(
+    provider, stream, capacity, mocker
+):
+    headers = {"Retry-After": "3"}
+
+    def response(status, **kwargs):
+        return httpx.Response(status, request=REQUEST, headers=headers, **kwargs)
+
+    client = mocker.MagicMock()
+    if provider == "openai":
+        model = OpenAICompatibleLLM("gpt-4o", base_url=None, api_key="k")
+        error = openai.RateLimitError(
+            "vendor detail",
+            response=response(429),
+            body={
+                "code": "insufficient_capacity" if capacity else "insufficient_quota"
+            },
+        )
+        client.chat.completions.create = mocker.AsyncMock(side_effect=error)
+    elif provider == "claude":
+        model = ClaudeLLM("claude-sonnet-4", base_url=None, api_key="k")
+        error = ClaudeStatusError(
+            "vendor detail", response=response(529 if capacity else 429), body=None
+        )
+        client.messages.create = mocker.AsyncMock(side_effect=error)
+    elif provider == "gemini":
+        model = GeminiLLM("gemini-2.5-flash", base_url=None, api_key="k")
+        error = genai_errors.ServerError(
+            503,
+            {
+                "error": {
+                    "status": "UNAVAILABLE",
+                    "message": "This model is currently experiencing high demand"
+                    if capacity
+                    else "Service unavailable",
+                }
+            },
+            response(503),
+        )
+        method = "generate_content_stream" if stream else "generate_content"
+        setattr(client.aio.models, method, mocker.AsyncMock(side_effect=error))
+    else:
+        pytest.importorskip("zai")
+        from zai.core import APIReachLimitError
+
+        model = ZhipuLLM("glm-4", base_url=None, api_key="k")
+        error = APIReachLimitError(
+            "vendor detail",
+            response=response(
+                429, json={"error": {"code": "1305" if capacity else "1302"}}
+            ),
+        )
+        client.chat.completions.create.side_effect = error
+    model._client = client
+    messages = [{"role": "user", "content": "hi"}]
+
+    async def invoke(target):
+        if stream:
+            return [chunk async for chunk in target.stream_chat(messages)]
+        return await target.chat(messages)
+
+    if not capacity:
+        with pytest.raises(RuntimeError) as raised:
+            await invoke(model)
+        assert not isinstance(raised.value, LLMCapacityError)
+        assert not is_capacity_error(raised.value)
+        return
+
+    with pytest.raises(LLMCapacityError, match="Try again.*switch") as raised:
+        await invoke(model)
+    assert raised.value.__cause__ is error
+    assert retry_after_seconds(raised.value) == 3
+    assert retry_on(raised.value)
+    # Strip the SDK cause in this assertion to exercise the type alone.
+    assert RetryBudget(capacity_max_attempts=2).attempt_limit(LLMCapacityError()) == 2
+
+    with pytest.raises(ProviderCallError) as guarded:
+        await invoke(guard_llm_calls(model, call_scope=nullcontext))
+    assert guarded.value.code == PROVIDER_CAPACITY
+    assert guarded.value.__cause__ is None
+    assert guarded.value.__context__ is None
+    assert str(guarded.value) == str(raised.value)

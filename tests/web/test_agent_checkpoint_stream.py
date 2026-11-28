@@ -132,6 +132,19 @@ def test_action_llm_error_maps_to_llm_call_failed() -> None:
     assert get_event_type_mapping(event) == "llm_call_failed"
 
 
+def test_action_llm_capacity_error_maps_to_a_distinct_public_event() -> None:
+    event = TraceEvent(
+        TraceEventType(
+            TraceScope.ACTION, TraceAction.ERROR, TraceCategory.LLM_CAPACITY
+        ),
+        task_id="365",
+        step_id="365",
+        data={"error_type": "provider_capacity", "success": False},
+    )
+
+    assert get_event_type_mapping(event) == "llm_capacity_refusal"
+
+
 def test_workforce_delegation_summary_maps_to_public_stream_event() -> None:
     event = TraceEvent(
         TraceEventType(TraceScope.TASK, TraceAction.UPDATE, TraceCategory.GENERAL),

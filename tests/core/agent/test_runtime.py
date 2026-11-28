@@ -45,10 +45,13 @@ from xagent.core.model.chat.basic.adapter import create_base_llm
 from xagent.core.model.chat.basic.call_boundary import (
     BUDGET_INSENSITIVE_FAILURE_CODES,
     PROVIDER_CALL_FAILURE_CODES,
+    PROVIDER_CAPACITY,
     ProviderCallError,
     guard_llm_calls,
 )
 from xagent.core.model.chat.exceptions import (
+    LLM_CAPACITY_MESSAGE,
+    LLMCapacityError,
     LLMRetryableError,
     ModelProviderError,
 )
@@ -3386,6 +3389,37 @@ class _RecordingEventTracer:
 
     async def trace_event(self, event_type: Any, **kwargs: Any) -> None:
         self.events.append({"event_type": event_type, **kwargs})
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "error",
+    [LLMCapacityError(), ProviderCallError(PROVIDER_CAPACITY), RuntimeError("timeout")],
+)
+async def test_llm_error_emits_one_trace_with_the_call_outcome(
+    error: Exception,
+) -> None:
+    tracer = _RecordingEventTracer()
+    runtime = PatternRuntime(execution_id="run", tracer=tracer)
+    context = ExecutionContext(execution_id="run")
+    error.__cause__ = RuntimeError("private provider response")
+
+    await runtime.on_llm_error(
+        context=context, error=error, metadata={"step_id": "step"}
+    )
+
+    [event] = tracer.events
+    assert event["task_id"] == "run"
+    assert event["step_id"] == "step"
+    assert event["data"]["success"] is False
+    if isinstance(error, (LLMCapacityError, ProviderCallError)):
+        assert event["event_type"].value == "action_error_llm_capacity"
+        assert event["data"]["error_type"] == PROVIDER_CAPACITY
+        assert event["data"]["error_message"] == LLM_CAPACITY_MESSAGE
+    else:
+        assert event["event_type"].value == "action_error_llm"
+        assert event["data"]["error_message"] == "timeout"
+    assert "private provider response" not in repr(event["data"])
 
 
 def _provider_failure() -> ModelProviderError:

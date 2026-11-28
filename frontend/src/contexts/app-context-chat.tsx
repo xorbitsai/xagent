@@ -6233,15 +6233,17 @@ export function AppProvider({
               }
             }
             dispatch({ type: "ADD_TRACE_EVENT", payload: traceEvent })
-          } else if (eventType === "llm_call_failed") {
+          } else if (eventType === "llm_call_failed" || eventType === "llm_capacity_refusal") {
             const stepId = message.step_id || traceEventData.step_id
             const traceEvent: TraceEvent = {
-              event_id: generateMessageId("llm-call-failed"),
+              event_id: message.event_id || traceEventData.event_id || generateMessageId(eventType),
               event_type: eventType,
               step_id: stepId,
               timestamp: message.timestamp,
               data: {
-                action: t('agent.logs.event.actions.llm_call_failed'),
+                action: eventType === "llm_capacity_refusal"
+                  ? t('agent.logs.event.labels.llmCapacityRefusal')
+                  : t('agent.logs.event.actions.llm_call_failed'),
                 ...eventData
               }
             }

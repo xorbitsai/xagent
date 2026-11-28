@@ -895,7 +895,8 @@ export function processTraceEvents(
         });
       }
 
-      if (isFailedDagStep || ['tool_execution_failed', 'llm_call_failed', 'react_task_failed', 'agent_error', 'trace_error'].includes(event.event_type as string)) {
+      const isCapacityRefusal = event.event_type === 'llm_capacity_refusal';
+      if (isFailedDagStep || isCapacityRefusal || ['tool_execution_failed', 'llm_call_failed', 'react_task_failed', 'agent_error', 'trace_error'].includes(event.event_type as string)) {
         const isTerminalFailure =
           isFailedDagStep || ['react_task_failed', 'agent_error', 'trace_error'].includes(event.event_type as string);
         if (isTerminalFailure) {
@@ -952,7 +953,9 @@ export function processTraceEvents(
           errorMessage = errorData;
         }
 
-        if (!errorMessage) {
+        if (isCapacityRefusal) {
+          errorMessage = t('traceEventRenderer.llmCapacityRecovery');
+        } else if (!errorMessage) {
           errorMessage = t('traceEventRenderer.unknownError');
         }
 
@@ -985,22 +988,29 @@ export function processTraceEvents(
               ) || (!errorData.invocation_id ? findLastRunningAction(step, 'tool') : null);
             if (lastTool) runningAction = lastTool;
           }
-        } else if (event.event_type === 'llm_call_failed') {
+        } else if (isCapacityRefusal || event.event_type === 'llm_call_failed') {
           const lastLlm = findLastRunningAction(step, 'llm');
-          if (lastLlm) runningAction = lastLlm;
+          if (isCapacityRefusal || lastLlm) runningAction = lastLlm ?? undefined;
         }
 
+        const failureTitle = isCapacityRefusal
+          ? t('traceEventRenderer.llmCapacityRefusal')
+          : t('traceEventRenderer.executionFailed');
         if (runningAction) {
+          if (isCapacityRefusal) {
+            runningAction.title = failureTitle;
+            runningAction.data.statusLine = true;
+          }
           runningAction.status = 'failed';
           runningAction.data.error = errorMessage;
         } else {
           step.actions.push({
             id: eventId,
             type: 'error',
-            title: t('traceEventRenderer.executionFailed'),
+            title: failureTitle,
             status: 'failed',
             timestamp,
-            data: { error: errorMessage }
+            data: { error: errorMessage, statusLine: isCapacityRefusal }
           });
         }
         if (isFailedDagStep) {

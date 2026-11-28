@@ -674,6 +674,7 @@ class TraceCategory(Enum):
     DAG_PLAN = "dag_plan"  # DAG planning events
     REACT = "react"  # ReAct pattern events
     LLM = "llm"  # LLM call events
+    LLM_CAPACITY = "llm_capacity"  # LLM calls refused for capacity
     TOOL = "tool"  # Tool execution events
     VISUALIZATION = "visualization"  # UI update events
     MESSAGE = "message"  # User/AI message events
@@ -776,6 +777,9 @@ ACTION_START_LLM = TraceEventType(
     TraceScope.ACTION, TraceAction.START, TraceCategory.LLM
 )
 ACTION_END_LLM = TraceEventType(TraceScope.ACTION, TraceAction.END, TraceCategory.LLM)
+ACTION_LLM_CAPACITY_REFUSAL = TraceEventType(
+    TraceScope.ACTION, TraceAction.ERROR, TraceCategory.LLM_CAPACITY
+)
 
 # System-level events
 SYSTEM_VISUALIZATION_UPDATE = TraceEventType(
@@ -1484,7 +1488,10 @@ class Tracer:
             await self.event_writer(event)
             require_persisted = False
             event.require_persisted = False
-            if event.event_type.category == TraceCategory.LLM:
+            if event.event_type.category in {
+                TraceCategory.LLM,
+                TraceCategory.LLM_CAPACITY,
+            }:
                 event.data = normalize_llm_trace_payload(event.data)
 
         # Notify all handlers

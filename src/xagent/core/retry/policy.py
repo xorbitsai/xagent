@@ -87,7 +87,13 @@ def _causes(error: BaseException) -> list[BaseException]:
 
 def is_capacity_error(error: BaseException) -> bool:
     """Recognize a provider capacity/throttling refusal through wrappers."""
-    for current in _causes(error):
+    # Import lazily: the chat package imports this policy when building models.
+    from ..model.chat.exceptions import LLMCapacityError
+
+    causes = _causes(error)
+    if any(isinstance(current, LLMCapacityError) for current in causes):
+        return True
+    for current in causes:
         message = str(current).lower()
         if any(marker in message for marker in _CAPACITY_ERROR_MARKERS):
             return True

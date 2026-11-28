@@ -42,6 +42,7 @@ function LogSummary({ event }: LogEventProps) {
       "dag_step_failed": { icon: <XCircle className="h-4 w-4" />, color: "text-red-500", labelKey: "agent.logs.event.labels.failed" },
       "llm_call_start": { icon: <Bot className="h-4 w-4" />, color: "text-purple-500", labelKey: "agent.logs.event.labels.llmCall" },
       "llm_call_end": { icon: <Bot className="h-4 w-4" />, color: "text-green-500", labelKey: "agent.logs.event.labels.llmCompleted" },
+      "llm_capacity_refusal": { icon: <Bot className="h-4 w-4" />, color: "text-red-500", labelKey: "agent.logs.event.labels.llmCapacityRefusal" },
       "llm_call_failed": { icon: <Bot className="h-4 w-4" />, color: "text-red-500", labelKey: "agent.logs.event.labels.llmFailed" },
       "tool_execution_start": { icon: <Wrench className="h-4 w-4" />, color: "text-orange-500", labelKey: "agent.logs.event.labels.toolCall" },
       "tool_execution_end": { icon: <Wrench className="h-4 w-4" />, color: "text-green-500", labelKey: "agent.logs.event.labels.toolCompleted" },
@@ -460,6 +461,7 @@ function GenericDetails({ data }: { data: Record<string, any> }) {
 // Main log event component
 export function LogEvent({ event }: LogEventProps) {
   const [isExpanded, setIsExpanded] = useState(false)
+  const { t } = useI18n()
   const data = event.data as Record<string, any> || {}
   const action = data.action || event.event_type || null
 
@@ -472,7 +474,9 @@ export function LogEvent({ event }: LogEventProps) {
   const getDetailsComponent = () => {
     const type = event.event_type || ''
 
-    if (type.includes('llm_call')) {
+    if (type === 'llm_capacity_refusal') {
+      return <p>{t('traceEventRenderer.llmCapacityRecovery')}</p>
+    } else if (type.includes('llm_call')) {
       return <LLMCallDetails data={data} />
     } else if (type.includes('tool_execution')) {
       return <ToolCallDetails data={data} />

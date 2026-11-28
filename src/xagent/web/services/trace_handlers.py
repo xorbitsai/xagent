@@ -1259,7 +1259,10 @@ class DatabaseTraceHandler(BaseTraceHandler):
                     # error no longer says whether this row exists.
                     commit_state.start_event_id = str(fact.event_id)
                 data = cast(dict[str, Any], fact.payload["data"])
-                if event.event_type.category == TraceCategory.LLM:
+                if event.event_type.category in {
+                    TraceCategory.LLM,
+                    TraceCategory.LLM_CAPACITY,
+                }:
                     # Keep complete facts, but preserve the legacy projection cap.
                     data = normalize_llm_trace_payload(data)
                 if is_state:

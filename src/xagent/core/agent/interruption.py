@@ -181,6 +181,7 @@ def _guarded_provider_failure(
     """
     from ..model.chat.basic.call_boundary import (
         CREDENTIAL_REJECTED,
+        PROVIDER_CAPACITY,
         PROVIDER_QUOTA,
         PROVIDER_UNAVAILABLE,
         RATE_LIMITED,
@@ -196,6 +197,7 @@ def _guarded_provider_failure(
         if error.transient or error.code in {
             RATE_LIMITED,
             TIMEOUT,
+            PROVIDER_CAPACITY,
             PROVIDER_UNAVAILABLE,
         }:
             return True, InterruptionReason.LLM_UNAVAILABLE

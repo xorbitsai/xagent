@@ -108,7 +108,8 @@ const frontendFilterRules = [
 const moduleDir = path.dirname(fileURLToPath(import.meta.url))
 const packageJsonPath = path.resolve(moduleDir, "../../package.json")
 const workflowPath = path.resolve(moduleDir, "../../../.github/workflows/ci.yml")
-const realWorkflowSource = readFileSync(workflowPath, "utf8")
+// The mutation fixtures use LF markers even when Git checks out the workflow with CRLF.
+const realWorkflowSource = readFileSync(workflowPath, "utf8").replace(/\r\n/g, "\n")
 
 function replaceExactlyOnce(source: string, search: string, replacement: string, owner: string) {
   if (search.length === 0) {

@@ -1,6 +1,10 @@
+import json
 from unittest.mock import Mock
 
 import pytest
+from mcp.shared.memory import create_connected_server_and_client_session
+from PIL import Image
+from requests import Response
 
 from xagent.web.tools.mcp import linkedin
 
@@ -112,7 +116,7 @@ async def test_create_post_with_image_uploads_and_attaches_media(monkeypatch, tm
     monkeypatch.setenv("LINKEDIN_ACCESS_TOKEN", "token")
     monkeypatch.setenv("XAGENT_LINKEDIN_IMAGE_ALLOWED_DIRS", str(tmp_path))
     image_path = tmp_path / "generated.png"
-    image_path.write_bytes(b"png-bytes")
+    Image.new("RGB", (2, 2)).save(image_path)
 
     mock_get = Mock(
         return_value=MockResponse(
@@ -141,7 +145,12 @@ async def test_create_post_with_image_uploads_and_attaches_media(monkeypatch, tm
         raise AssertionError(f"Unexpected POST URL: {url}")
 
     mock_post_fn = Mock(side_effect=mock_post)
-    mock_put = Mock(return_value=MockResponse())
+
+    def upload_bytes(url, **kwargs):
+        assert kwargs["data"].read() == image_path.read_bytes()
+        return MockResponse()
+
+    mock_put = Mock(side_effect=upload_bytes)
 
     monkeypatch.setattr(linkedin.requests, "get", mock_get)
     monkeypatch.setattr(linkedin.requests, "post", mock_post_fn)
@@ -198,15 +207,15 @@ async def test_create_post_rejects_image_outside_allowed_dirs(monkeypatch, tmp_p
     monkeypatch.setattr(linkedin.requests, "post", mock_post)
     monkeypatch.setattr(linkedin.requests, "put", mock_put)
 
-    result = await linkedin.call_tool(
-        "create_post",
-        {
-            "text": "hello with image",
-            "image_path": str(image_path),
-        },
+    result = await _call_over_mcp(
+        "create_post", {"text": "hello with image", "image_path": str(image_path)}
     )
 
-    assert "outside allowed directories" in result[0].text
+    assert result.isError
+    assert "outside allowed directories" in result.content[0].text
+    assert str(image_path) in result.content[0].text
+    assert str(allowed_dir) not in result.content[0].text
+    mock_post.assert_not_called()
     mock_put.assert_not_called()
 
 
@@ -234,3 +243,139 @@ async def test_create_comment_escapes_parentheses_before_publishing(monkeypatch)
     assert result[0].text == "Comment created successfully! ID: comment-1"
     comment_body = mock_post.call_args.kwargs["json"]
     assert comment_body["message"]["text"] == "Nice work \\(team\\)!"
+
+
+async def _call_over_mcp(name, arguments):
+    async with create_connected_server_and_client_session(linkedin.app) as session:
+        return await session.call_tool(name, arguments)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("case", "message"),
+    [
+        ("disguised", "valid JPEG, PNG, or GIF"),
+        ("truncated", "valid JPEG, PNG, or GIF"),
+        ("pixels", "fewer than 36,152,320 pixels"),
+        ("frames", "at most 250 frames"),
+    ],
+)
+async def test_invalid_image_does_not_initialize_upload(
+    monkeypatch, tmp_path, case, message
+):
+    monkeypatch.setenv("LINKEDIN_ACCESS_TOKEN", "token")
+    monkeypatch.setenv("XAGENT_LINKEDIN_IMAGE_ALLOWED_DIRS", str(tmp_path))
+    monkeypatch.setattr(
+        linkedin.requests, "get", Mock(return_value=MockResponse({"sub": "person-1"}))
+    )
+    post = Mock()
+    put = Mock()
+    monkeypatch.setattr(linkedin.requests, "post", post)
+    monkeypatch.setattr(linkedin.requests, "put", put)
+
+    image_path = tmp_path / "image.png"
+    if case == "disguised":
+        Image.new("RGB", (2, 2)).save(image_path, format="BMP")
+    elif case == "truncated":
+        Image.new("RGB", (32, 32)).save(image_path, format="JPEG")
+        image_path.write_bytes(image_path.read_bytes()[:-8])
+    elif case == "pixels":
+        monkeypatch.setattr(linkedin, "_IMAGE_PIXEL_LIMIT", 16)
+        Image.new("RGB", (4, 4)).save(image_path)
+    elif case == "frames":
+        frames = [Image.new("RGB", (2, 2), (i, 0, 0)) for i in range(251)]
+        frames[0].save(
+            image_path, format="GIF", save_all=True, append_images=frames[1:]
+        )
+
+    result = await _call_over_mcp(
+        "create_post", {"text": "hello", "image_path": str(image_path)}
+    )
+
+    assert result.isError
+    assert message in result.content[0].text
+    post.assert_not_called()
+    put.assert_not_called()
+
+
+def test_validate_image_accepts_gif_at_frame_limit(tmp_path):
+    image_path = tmp_path / "animation.gif"
+    frames = [Image.new("RGB", (2, 2), (i, 0, 0)) for i in range(250)]
+    frames[0].save(image_path, save_all=True, append_images=frames[1:])
+
+    with image_path.open("rb") as image_file:
+        assert linkedin._validate_image(image_file) == "image/gif"
+        assert image_file.tell() == 0
+
+
+def _http_error(status):
+    response = Response()
+    response.status_code = status
+    return linkedin.requests.HTTPError("raw LinkedIn response", response=response)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("stage", "exc", "expected_error"),
+    [
+        ("author", linkedin.requests.Timeout(), True),
+        ("publish", _http_error(422), True),
+        ("publish", linkedin.requests.Timeout(), False),
+        ("publish", _http_error(503), False),
+    ],
+)
+async def test_create_post_failure_classification(
+    monkeypatch, stage, exc, expected_error
+):
+    monkeypatch.setenv("LINKEDIN_ACCESS_TOKEN", "token")
+    get = Mock(return_value=MockResponse({"sub": "person-1"}))
+    post = Mock()
+    (get if stage == "author" else post).side_effect = exc
+    monkeypatch.setattr(linkedin.requests, "get", get)
+    monkeypatch.setattr(linkedin.requests, "post", post)
+
+    result = await _call_over_mcp("create_post", {"text": "hello"})
+
+    assert result.isError is expected_error
+    text = result.content[0].text
+    assert "raw LinkedIn response" not in text
+    if not expected_error:
+        payload = json.loads(text)
+        assert payload["status"] == "indeterminate"
+        assert payload["retryable"] is False
+        assert payload["mutation_may_have_completed"] is True
+        assert "Check LinkedIn before retrying" in payload["message"]
+    assert post.call_count == int(stage == "publish")
+
+
+@pytest.mark.asyncio
+async def test_image_upload_failure_prevents_publishing(monkeypatch, tmp_path):
+    monkeypatch.setenv("LINKEDIN_ACCESS_TOKEN", "token")
+    monkeypatch.setenv("XAGENT_LINKEDIN_IMAGE_ALLOWED_DIRS", str(tmp_path))
+    image_path = tmp_path / "image.png"
+    Image.new("RGB", (2, 2)).save(image_path)
+    monkeypatch.setattr(
+        linkedin.requests, "get", Mock(return_value=MockResponse({"sub": "person-1"}))
+    )
+    post = Mock(
+        return_value=MockResponse(
+            {
+                "value": {
+                    "uploadUrl": "https://upload.linkedin.example/image",
+                    "image": "urn:li:image:1",
+                }
+            }
+        )
+    )
+    monkeypatch.setattr(linkedin.requests, "post", post)
+    monkeypatch.setattr(
+        linkedin.requests, "put", Mock(side_effect=linkedin.requests.Timeout())
+    )
+
+    result = await _call_over_mcp(
+        "create_post", {"text": "hello", "image_path": str(image_path)}
+    )
+
+    assert result.isError
+    assert "timed out" in result.content[0].text
+    assert [call.args[0] for call in post.call_args_list] == [linkedin.IMAGES_URL]

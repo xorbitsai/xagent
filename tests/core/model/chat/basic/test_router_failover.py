@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import nullcontext
 from types import SimpleNamespace
 from typing import Any, AsyncIterator
 
@@ -12,8 +13,11 @@ import pytest
 
 from xagent.core.model.chat.basic import router as router_module
 from xagent.core.model.chat.basic.adapter import attach_chat_retry_wrapper
-from xagent.core.model.chat.basic.base import BaseLLM
-from xagent.core.model.chat.basic.call_boundary import ProviderCallError
+from xagent.core.model.chat.basic.base import BaseLLM, ChatRequestIdentity
+from xagent.core.model.chat.basic.call_boundary import (
+    ProviderCallError,
+    guard_llm_calls,
+)
 from xagent.core.model.chat.basic.router import RouterLLM
 from xagent.core.model.chat.exceptions import (
     LLMEmptyContentError,
@@ -1326,3 +1330,30 @@ async def test_error_chunk_after_output_still_starts_the_cooldown(monkeypatch):
     # ...and the next preparation goes to the fallback.
     following = await router.prepare_for_call(MESSAGES)
     assert following.model_name == FALLBACK
+
+
+@pytest.mark.asyncio
+async def test_request_identity_tracks_the_bound_downstream_after_failover(monkeypatch):
+    primary = _FakeLLM(
+        "saved-primary", error=openai.APIConnectionError(request=_REQUEST)
+    )
+    primary._request_identity = ChatRequestIdentity(
+        "openrouter",
+        "deepseek/deepseek-v4-flash",
+        "saved-primary",
+        "openai_chat_completions",
+    )
+    fallback = _FakeLLM("saved-fallback")
+    fallback._request_identity = ChatRequestIdentity(
+        "zhipu", "glm-5", "saved-fallback", "zhipu"
+    )
+    router = _router(monkeypatch, {PRIMARY: primary, FALLBACK: fallback})
+    resolved = await router.prepare_for_call(MESSAGES)
+    wrapped = guard_llm_calls(
+        attach_chat_retry_wrapper(resolved, 1), call_scope=nullcontext
+    )
+
+    assert wrapped.request_identity == primary._request_identity
+    assert await wrapped.chat(MESSAGES) == "saved-fallback"
+    assert resolved.model_name == FALLBACK
+    assert wrapped.request_identity == fallback._request_identity

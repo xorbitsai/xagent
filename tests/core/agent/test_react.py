@@ -42,6 +42,7 @@ from xagent.core.agent.pattern.react.react import (
 from xagent.core.agent.result import tool_result_succeeded
 from xagent.core.agent.runtime import NO_DELIVERABLE_FINAL_ANSWER_REASON
 from xagent.core.file_ref import WORKSPACE_OUTPUT_FILES_TOOL_NAME
+from xagent.core.model.chat.basic.base import ChatRequestIdentity
 from xagent.core.model.chat.basic.router import RouterLLM
 from xagent.core.model.chat.exceptions import LLMToolProtocolError
 from xagent.core.model.chat.tool_protocol import (
@@ -14858,3 +14859,77 @@ def test_react_repeated_guard_leaves_unpaged_runs_unmarked() -> None:
     )
     prompt = messages[-1]["content"]
     assert "paging through a list" not in prompt
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("protocol_retry", [False, True])
+async def test_tool_call_observation_keeps_the_existing_execution_path(
+    protocol_retry: bool,
+) -> None:
+    class PermissiveCalculator(FakeTool):
+        async def run_json_async(self, args: dict[str, Any]) -> Any:
+            self.calls.append(args)
+            return {"result": 4}
+
+    class ObservedLLM(FakeLLM):
+        request_identity = ChatRequestIdentity(
+            "zhipu", "glm-5", "saved-config", "zhipu"
+        )
+
+    work_batch = {
+        "tool_calls": [
+            {
+                "id": "call-work",
+                "function": {"name": "calculator", "arguments": '{"expression":4}'},
+            }
+        ]
+    }
+    final_batch = {
+        "tool_calls": [
+            {
+                "id": "call-final",
+                "function": {
+                    "name": "final_answer",
+                    "arguments": '{"answer":"Four.","response_language":"English","outcome":"completed"}',
+                },
+            }
+        ]
+    }
+    responses = [work_batch, final_batch]
+    if protocol_retry:
+        responses.insert(
+            0,
+            tool_protocol_error_response(
+                ToolProtocolViolation(
+                    provider="zhipu",
+                    code="malformed_tool_arguments",
+                    message="Invalid provider tool protocol.",
+                )
+            ),
+        )
+    llm = ObservedLLM(responses)
+    tool = PermissiveCalculator()
+    context = ExecutionContext()
+    context.add_user_message("Calculate 2+2.")
+    tracer = TraceEventRecorder()
+    result = await ReActPattern(max_iterations=2).run(
+        context=context, tools=[tool], llm=llm, runtime=PatternRuntime(tracer=tracer)
+    )
+
+    assert result["success"] is True
+    assert tool.calls == [{"expression": 4}]
+    observations = [
+        event["data"]["tool_call_observation"]
+        for event in tracer.events
+        if "tool_call_observation" in event["data"]
+    ]
+    assert len(observations) == 2
+    work_observation = observations[0]
+    assert work_observation["finding_count"] == 1
+    assert work_observation["findings"] == [
+        {"call_index": 0, "reason": "schema_mismatch"}
+    ]
+    assert work_observation["offered_tool_count"] == len(
+        llm.calls[int(protocol_retry)]["tools"]
+    )
+    assert observations[1]["finding_count"] == 0

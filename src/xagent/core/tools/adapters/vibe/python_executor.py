@@ -5,6 +5,7 @@ Framework wrapper around the pure Python executor tool
 
 import asyncio
 import logging
+import threading
 from typing import Any, Dict, Mapping, Optional, Type
 
 from pydantic import BaseModel, Field
@@ -74,7 +75,9 @@ class PythonExecutorTool(AbstractBaseTool):
     def return_type(self) -> Type[BaseModel]:
         return PythonExecutorResult
 
-    def run_json_sync(self, args: Mapping[str, Any]) -> Any:
+    def run_json_sync(
+        self, args: Mapping[str, Any], cancel_event: Optional[threading.Event] = None
+    ) -> Any:
         exec_args = PythonExecutorArgs.model_validate(args)
 
         # Determine working directory
@@ -96,7 +99,7 @@ class PythonExecutorTool(AbstractBaseTool):
             files_before = snapshot_generated_artifact_files(working_directory)
             with self._workspace.auto_register_files():
                 result = self._execute(
-                    full_code, exec_args.capture_output, working_directory
+                    full_code, exec_args.capture_output, working_directory, cancel_event
                 )
             if result.get("success"):
                 files_after = snapshot_generated_artifact_files(working_directory)
@@ -110,17 +113,28 @@ class PythonExecutorTool(AbstractBaseTool):
                 )
         else:
             result = self._execute(
-                full_code, exec_args.capture_output, working_directory
+                full_code, exec_args.capture_output, working_directory, cancel_event
             )
 
         return PythonExecutorResult(**result).model_dump()
 
     async def run_json_async(self, args: Mapping[str, Any]) -> Any:
-        return await asyncio.to_thread(self.run_json_sync, args)
+        # Create a cancellation event so that if the awaiting coroutine is
+        # cancelled, the subprocess polling loop can kill the process group
+        # promptly instead of waiting for the full wall-clock timeout.
+        cancel_event = threading.Event()
+        try:
+            return await asyncio.to_thread(self.run_json_sync, args, cancel_event)
+        except asyncio.CancelledError:
+            cancel_event.set()
+            raise
 
     @staticmethod
     def _execute(
-        code: str, capture_output: bool, working_directory: Optional[str]
+        code: str,
+        capture_output: bool,
+        working_directory: Optional[str],
+        cancel_event: Optional[threading.Event] = None,
     ) -> Dict[str, Any]:
         """Run the code on the host under the configured limit, or in-process
         inside the sandbox runner, which the sandbox wrapper bounds."""
@@ -135,6 +149,7 @@ class PythonExecutorTool(AbstractBaseTool):
             capture_output=capture_output,
             working_directory=working_directory,
             timeout_seconds=get_python_executor_timeout_seconds(),
+            cancel_event=cancel_event,
         )
 
     def _get_working_directory(self) -> Optional[str]:

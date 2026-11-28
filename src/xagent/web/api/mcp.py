@@ -7106,6 +7106,7 @@ async def get_mcp_server_tools(
                 detail={
                     "code": "mcp_tools_unavailable",
                     "message": "MCP server could not be started.",
+                    "outcome": listing.outcome.value,
                     "reason": listing.reason,
                     "failures": [],
                 },
@@ -7122,6 +7123,7 @@ async def get_mcp_server_tools(
                     detail={
                         "code": "mcp_tools_unavailable",
                         "message": projection.failure_message,
+                        "outcome": listing.outcome.value,
                         "failures": list(projection.failures),
                     },
                 )

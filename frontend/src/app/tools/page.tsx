@@ -62,6 +62,7 @@ import {
   parseCustomApiDetail,
   parseMcpServerDetail,
   shouldSelfCloseMcpOauthPopup,
+  MCP_OAUTH_STATE_ALREADY_CONSUMED,
   MCP_OAUTH_SUCCESS_PARAM,
   type CustomApiDetail,
   type McpServerDetail,
@@ -210,12 +211,17 @@ function ToolsPageContent() {
   }
 
   useEffect(() => {
+    const oauthErrorCode = searchParams.get("mcp_oauth_error")
     const oauthErrorMessage = searchParams.get("mcp_oauth_error_message")
-    if (!oauthErrorMessage) return
-
-    toast.error(oauthErrorMessage)
+    if (oauthErrorCode === MCP_OAUTH_STATE_ALREADY_CONSUMED) {
+      toast.info(t("tools.oauthLinkAlreadyUsed"))
+    } else if (oauthErrorMessage) {
+      toast.error(oauthErrorMessage)
+    } else {
+      return
+    }
     stripMcpOauthRedirectParams(searchParams)
-  }, [router, searchParams])
+  }, [router, searchParams, t])
 
   useEffect(() => {
     // The MCP OAuth callback redirects the connect popup here after a

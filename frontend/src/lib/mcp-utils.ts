@@ -677,6 +677,7 @@ export async function parseMcpOAuthErrorMessage(response: Response, fallback: st
  * not something this constant's naming implies is already covered. */
 export const MCP_OAUTH_POPUP_WINDOW_NAME = "mcp-oauth"
 export const MCP_OAUTH_SUCCESS_PARAM = "mcp_oauth_success"
+export const MCP_OAUTH_STATE_ALREADY_CONSUMED = "state_already_consumed"
 
 /** Whether the tools page, loaded with these search params under this window
  * name, is the mcp_oauth connect popup landing on a successful callback and

@@ -1317,6 +1317,7 @@ Build when you need.`,
     }
   },
   tools: {
+    oauthLinkAlreadyUsed: "This authorization link was already used. Check the connector’s connection status.",
     configHeader: {
       title: "Tool Configuration",
       description: "Configure web-search credentials and SQL connections",

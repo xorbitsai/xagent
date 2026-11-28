@@ -1315,6 +1315,7 @@ const zh = {
     }
   },
   tools: {
+    oauthLinkAlreadyUsed: "此授权链接已使用。请查看连接器的连接状态。",
     configHeader: {
       title: "工具配置",
       description: "配置网页搜索凭据和数据库连接",

@@ -5,6 +5,8 @@ import io
 import json
 import logging
 import os
+import subprocess
+import sys
 from contextlib import asynccontextmanager
 from pathlib import Path
 from unittest.mock import Mock
@@ -652,7 +654,7 @@ def test_thumbnail_does_not_follow_a_symlink_in_the_output_directory(
     output_dir = tmp_path / "output"
     output_dir.mkdir()
     outside = tmp_path / "outside.png"
-    (output_dir / "slide_s1.png").symlink_to(outside)
+    _symlink_or_skip(output_dir / "slide_s1.png", outside)
 
     result = _call_tool(presentation_id="pres1", slide_id="s1")
 
@@ -664,6 +666,7 @@ def test_thumbnail_does_not_follow_a_symlink_in_the_output_directory(
     assert path.read_bytes() == _PNG_BYTES
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="exercises POSIX os.open flags")
 def test_thumbnail_forced_open_collision_preserves_existing_file(monkeypatch, tmp_path):
     _install_slides_api(monkeypatch)
     _install_http(monkeypatch, lambda index, request, state: _http_response(_PNG_BYTES))
@@ -726,9 +729,93 @@ def test_thumbnail_rejects_a_symlinked_output_directory(monkeypatch, tmp_path):
     _install_http(monkeypatch, lambda index, request, state: _http_response(_PNG_BYTES))
     outside = tmp_path / "outside-dir"
     outside.mkdir()
-    (tmp_path / "output").symlink_to(outside, target_is_directory=True)
+    _symlink_or_skip(tmp_path / "output", outside, directory=True)
 
     result = _call_tool(presentation_id="pres1", slide_id="s1")
 
     assert result["status"] == "error"
     assert not list(outside.glob("*.png"))
+
+
+def _symlink_or_skip(link, target, *, directory=False):
+    try:
+        link.symlink_to(target, target_is_directory=directory)
+    except OSError as exc:
+        if sys.platform == "win32" and exc.winerror == 1314:
+            pytest.skip("Windows symlink creation privilege is unavailable")
+        raise
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="requires Windows junctions")
+def test_thumbnail_rejects_a_junction_output_directory(monkeypatch, tmp_path):
+    _install_slides_api(monkeypatch)
+    _install_http(monkeypatch, lambda index, request, state: _http_response(_PNG_BYTES))
+    outside = tmp_path / "outside-dir"
+    outside.mkdir()
+    # Junctions exercise a directory reparse point even without symlink privileges.
+    junction = tmp_path / "output"
+    subprocess.run(
+        ["cmd.exe", "/d", "/c", "mklink", "/J", "output", "outside-dir"],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+    )
+
+    try:
+        result = _call_tool(presentation_id="pres1", slide_id="s1")
+        assert result["status"] == "error"
+        assert "output directory is not usable" in result["message"]
+        assert not list(outside.iterdir())
+    finally:
+        junction.rmdir()
+
+
+def test_thumbnail_removes_a_partial_write_without_touching_existing_file(
+    monkeypatch, tmp_path
+):
+    _install_slides_api(monkeypatch)
+    _install_http(monkeypatch, lambda index, request, state: _http_response(_PNG_BYTES))
+    output = tmp_path / "output"
+    output.mkdir()
+    existing = output / "slide_s1.png"
+    existing.write_bytes(b"existing output")
+
+    class FailingWrite:
+        def __init__(self, handle):
+            self.handle = handle
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc_info):
+            self.handle.close()
+
+        def write(self, data):
+            self.handle.write(data[:8])
+            self.handle.flush()
+            raise OSError("simulated incomplete thumbnail write")
+
+    original = os.fdopen
+    monkeypatch.setattr(os, "fdopen", lambda *a, **kw: FailingWrite(original(*a, **kw)))
+
+    result = _call_tool(presentation_id="pres1", slide_id="s1")
+
+    assert result["status"] == "error"
+    assert "could not save the thumbnail" in result["message"]
+    assert list(output.iterdir()) == [existing]
+    assert existing.read_bytes() == b"existing output"
+
+
+def test_thumbnail_uses_another_name_when_a_directory_has_the_original_name(
+    monkeypatch, tmp_path
+):
+    _install_slides_api(monkeypatch)
+    _install_http(monkeypatch, lambda index, request, state: _http_response(_PNG_BYTES))
+    occupied = tmp_path / "output" / "slide_s1.png"
+    occupied.mkdir(parents=True)
+
+    result = _call_tool(presentation_id="pres1", slide_id="s1")
+
+    assert result["status"] == "success"
+    assert occupied.is_dir()
+    assert _result_path(result).read_bytes() == _PNG_BYTES

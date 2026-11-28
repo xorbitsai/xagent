@@ -9,6 +9,7 @@ import json
 import logging
 import os
 import re
+import sys
 import uuid
 from collections import Counter
 from pathlib import Path
@@ -33,6 +34,9 @@ from .utils import (
     resolve_google_file_id,
     setup_proxy_env,
 )
+
+if sys.platform == "win32":
+    from . import _windows_thumbnail_output
 
 logging.basicConfig(level=logging.INFO)
 logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -1551,8 +1555,15 @@ def _open_thumbnail_output_directory() -> tuple[Path, int]:
         Path(_require_thumbnail_output_directory()).expanduser().resolve() / "output"
     )
     try:
-        output_dir.mkdir(exist_ok=True)
-        directory_fd = os.open(output_dir, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        if sys.platform == "win32":
+            directory_fd = _windows_thumbnail_output.open_output_directory(
+                output_dir.parent
+            )
+        else:
+            output_dir.mkdir(exist_ok=True)
+            directory_fd = os.open(
+                output_dir, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+            )
     except OSError:
         raise _ThumbnailDownloadError(
             "the task output directory is not usable"
@@ -1573,10 +1584,12 @@ def _thumbnail_filename(*, page_number: int | None, slide_object_id: str) -> str
 
 def _open_thumbnail_output_file(directory_fd: int, filename: str) -> tuple[str, int]:
     """Create a uniquely named file exclusively in the anchored directory."""
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
     for counter in range(_THUMBNAIL_MAX_NAME_ATTEMPTS):
         name = filename if counter == 0 else f"{Path(filename).stem} ({counter}).png"
         try:
+            if sys.platform == "win32":
+                return name, _windows_thumbnail_output.open_new_file(directory_fd, name)
+            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
             return name, os.open(name, flags, 0o600, dir_fd=directory_fd)
         except FileExistsError:
             continue
@@ -1586,12 +1599,20 @@ def _open_thumbnail_output_file(directory_fd: int, filename: str) -> tuple[str, 
 def _write_thumbnail_png(
     data: bytes, *, output_dir: Path, dir_fd: int, filename: str
 ) -> Path:
-    name, descriptor = _open_thumbnail_output_file(dir_fd, filename)
     try:
-        with os.fdopen(descriptor, "wb") as handle:
-            handle.write(data)
+        name, descriptor = _open_thumbnail_output_file(dir_fd, filename)
+        try:
+            with os.fdopen(descriptor, "wb", closefd=False) as handle:
+                handle.write(data)
+        except OSError:
+            if sys.platform == "win32":
+                _windows_thumbnail_output.discard_file(descriptor)
+            else:
+                os.unlink(name, dir_fd=dir_fd)
+            raise
+        finally:
+            os.close(descriptor)
     except OSError:
-        os.unlink(name, dir_fd=dir_fd)
         raise _ThumbnailDownloadError(
             "could not save the thumbnail image in the task workspace"
         ) from None
@@ -1715,7 +1736,10 @@ async def google_slides_get_slide_thumbnail(
                 ),
             )
         finally:
-            os.close(output_dir_fd)
+            if sys.platform == "win32":
+                _windows_thumbnail_output.close_directory(output_dir_fd)
+            else:
+                os.close(output_dir_fd)
         width = thumbnail.get("width")
         height = thumbnail.get("height")
         return json.dumps(

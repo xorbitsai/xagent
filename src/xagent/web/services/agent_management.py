@@ -48,6 +48,7 @@ from ..services.agent_store import (
     invalidate_agent_cache,
 )
 from .agent_team_scope import get_agent_team_scope
+from .agent_versions import ConfigActor
 from .api_keys import (
     AgentApiKeyService,
     AgentKeyMetadata,
@@ -1810,13 +1811,20 @@ class AgentManagementRuntime:
             ]
             if invalid:
                 raise InvalidAgentSkillNamesError(invalid)
-            store.update_agent_fields(
+            updated = store.update_agent_fields(
                 user_id,
                 agent_id,
                 {"skills": requested},
                 team_scope=team_scope,
                 agent=agent,
+                actor=ConfigActor.api_key(user_id, key_prefix),
             )
+            if updated is None:
+                # The write's locked ownership check decides.
+                return None
+            # A reordered list is not a change and is not written; answer
+            # with what is stored.
+            stored = list(updated.skills or [])
         logger.info(
             "personal key agent skills write: key_prefix=%s user_id=%d "
             "agent_id=%d added=%d",
@@ -1825,7 +1833,7 @@ class AgentManagementRuntime:
             agent_id,
             len(added),
         )
-        return tuple(requested), tuple(added)
+        return tuple(stored), tuple(added)
 
     async def get_agent_connectors(
         self,
@@ -1964,18 +1972,22 @@ class AgentManagementRuntime:
                 kept.append(_ALL_MCP_CATEGORY)
             replacement = kept + [f"{_MCP_ENTRY_PREFIX}{name}" for name in requested]
             try:
-                store.update_agent_fields(
+                updated = store.update_agent_fields(
                     user_id,
                     agent_id,
                     {"tool_categories": replacement},
                     team_scope=team_scope,
                     agent=agent,
+                    actor=ConfigActor.api_key(user_id, key_prefix),
                 )
             except UnsharedConnectorsError as exc:
                 raise AgentConnectorsNotSharedError(
                     _relabel_unshared(exc.connectors, names)
                 ) from exc
-            stored = list(agent.tool_categories or [])
+            if updated is None:
+                # The write's locked ownership check decides.
+                return None
+            stored = list(updated.tool_categories or [])
             removed = [name for name in selected if name not in requested]
             logger.info(
                 "personal key agent connectors write: key_prefix=%s user_id=%d "

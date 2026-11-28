@@ -70,6 +70,7 @@ from ..services.agent_team_scope import (
     owned_agent_clause,
     owns_agent,
 )
+from ..services.agent_versions import ConfigActor
 from ..services.api_keys import AgentApiKeyService, KeyRotationConflict
 from ..services.client_error_messages import CLIENT_SAFE_AUTO_MODEL_UNAVAILABLE
 from ..services.execution_budget import budget_policy_provider
@@ -824,7 +825,10 @@ async def create_agent(
             if logo_url:
                 agent = (
                     store.update_agent_fields(
-                        user_id, int(agent.id), {"logo_url": logo_url}
+                        user_id,
+                        int(agent.id),
+                        {"logo_url": logo_url},
+                        actor=ConfigActor.user(user_id, source="web"),
                     )
                     or agent
                 )
@@ -1166,8 +1170,8 @@ async def update_agent(
         store = AgentStore(db)
         user_id = int(current_user.id)
         # Resolve team scope once and reuse it for the read, the name check,
-        # and the write, instead of re-resolving (extra TeamMember query) and
-        # re-SELECTing the agent inside each store call.
+        # and the write instead of re-resolving it (extra TeamMember query).
+        # The write still re-reads the agent under its row lock.
         team_scope = get_agent_team_scope(db, user_id)
         agent = store.get_owned_agent(user_id, agent_id, team_scope)
 
@@ -1255,15 +1259,13 @@ async def update_agent(
             # still raise IntegrityError here (see the matching handling in
             # create_agent above).
             try:
-                agent = (
-                    store.update_agent_fields(
-                        user_id,
-                        agent_id,
-                        updates,
-                        team_scope=team_scope,
-                        agent=agent,
-                    )
-                    or agent
+                updated = store.update_agent_fields(
+                    user_id,
+                    agent_id,
+                    updates,
+                    team_scope=team_scope,
+                    agent=agent,
+                    actor=ConfigActor.user(user_id, source="web"),
                 )
             except IntegrityError as exc:
                 db.rollback()
@@ -1272,6 +1274,11 @@ async def update_agent(
                 raise HTTPException(
                     status_code=400, detail="Agent with this name already exists"
                 ) from exc
+            if updated is None:
+                # Deleted, or no longer manageable by this user, since the
+                # read above; nothing was written.
+                raise HTTPException(status_code=404, detail="Agent not found")
+            agent = updated
 
         logger.info(f"Updated agent {agent_id} for user {current_user.id}")
         return AgentResponse.model_validate(store.agent_to_response_dict(agent))
@@ -1531,7 +1538,10 @@ async def enable_agent_share_link(
         if not agent.share_token:
             updates["share_token"] = _new_share_token()
         updated_agent = store.update_agent_fields(
-            int(current_user.id), agent_id, updates
+            int(current_user.id),
+            agent_id,
+            updates,
+            actor=ConfigActor.user(int(current_user.id), source="web"),
         )
         if updated_agent is None:
             raise HTTPException(status_code=404, detail="Agent not found")
@@ -1562,6 +1572,7 @@ async def rotate_agent_share_link(
                 "share_token": _new_share_token(),
                 "share_updated_at": datetime.now(timezone.utc),
             },
+            actor=ConfigActor.user(int(current_user.id), source="web"),
         )
         if agent is None:
             raise HTTPException(status_code=404, detail="Agent not found")
@@ -1594,6 +1605,7 @@ async def disable_agent_share_link(
                 "share_token": None,
                 "share_updated_at": datetime.now(timezone.utc),
             },
+            actor=ConfigActor.user(int(current_user.id), source="web"),
         )
         if agent is None:
             raise HTTPException(status_code=404, detail="Agent not found")
@@ -1621,7 +1633,10 @@ async def get_agent_widget_key(
             raise HTTPException(status_code=404, detail="Agent not found")
         if not agent.widget_key:
             agent = store.update_agent_fields(
-                user_id, agent_id, {"widget_key": new_widget_key()}
+                user_id,
+                agent_id,
+                {"widget_key": new_widget_key()},
+                actor=ConfigActor.user(user_id, source="web"),
             )
             if agent is None:
                 raise HTTPException(status_code=404, detail="Agent not found")
@@ -1651,7 +1666,10 @@ async def rotate_agent_widget_key(
         if store.get_owned_agent(user_id, agent_id) is None:
             raise HTTPException(status_code=404, detail="Agent not found")
         agent = store.update_agent_fields(
-            user_id, agent_id, {"widget_key": new_widget_key()}
+            user_id,
+            agent_id,
+            {"widget_key": new_widget_key()},
+            actor=ConfigActor.user(user_id, source="web"),
         )
         if agent is None:
             raise HTTPException(status_code=404, detail="Agent not found")
@@ -1721,7 +1739,16 @@ async def upload_agent_logo(
         if not logo_url:
             raise HTTPException(status_code=400, detail="Failed to save logo")
 
-        store.update_agent_fields(user_id, agent_id, {"logo_url": logo_url})
+        updated = store.update_agent_fields(
+            user_id,
+            agent_id,
+            {"logo_url": logo_url},
+            actor=ConfigActor.user(user_id, source="web"),
+        )
+        if updated is None:
+            # Deleted, or no longer manageable by this user, since the read
+            # above; nothing was written.
+            raise HTTPException(status_code=404, detail="Agent not found")
 
         logger.info(f"Updated logo for agent {agent_id}")
         return {"logo_url": logo_url}

@@ -12,6 +12,7 @@ from pydantic import BaseModel, Field, field_validator
 
 from .....config import get_agent_pattern_for_execution_mode, get_uploads_dir
 from .....web.services.agent_store import AgentStore, UnsharedConnectorsError
+from .....web.services.agent_versions import ConfigActor
 from .....web.services.model_service import (
     _get_visible_user_ids,
     _is_model_visible_to_user,
@@ -1466,11 +1467,11 @@ class UpdateAgentTool(AbstractBaseTool):
                         )
 
                 try:
-                    agent = (
-                        AgentStore(db).update_agent_fields(
-                            self._user_id, agent_id, updates
-                        )
-                        or agent
+                    updated = AgentStore(db).update_agent_fields(
+                        self._user_id,
+                        agent_id,
+                        updates,
+                        actor=ConfigActor.user(self._user_id, source="builder_tool"),
                     )
                 except UnsharedConnectorsError as exc:
                     missing = [
@@ -1503,6 +1504,19 @@ class UpdateAgentTool(AbstractBaseTool):
                             "without tool_categories to save the other fields."
                         ),
                     ).model_dump()
+
+                if updated is None:
+                    # Deleted, or no longer manageable by this user, since
+                    # the read above; nothing was written.
+                    return UpdateAgentToolResult(
+                        agent_id=0,
+                        agent_name="",
+                        tool_name="",
+                        markdown_link="",
+                        status="error",
+                        message=f"Error: Agent with ID {agent_id} not found",
+                    ).model_dump()
+                agent = updated
 
                 # Generate the tool name and markdown link
                 agent_name = str(agent.name)

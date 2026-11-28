@@ -207,6 +207,9 @@ on:
       - 'src/xagent/web/services/task_execution.py'
       - 'tests/web/api/test_recovered_delivery_failed_run.py'
       - 'tests/web/api/test_fresh_message_ended_run.py'
+      - 'src/xagent/web/services/agent_versions.py'
+      - 'src/xagent/web/services/agent_store.py'
+      - 'tests/web/services/test_agent_versions.py'
   pull_request:
     branches: [main]
   # An approval starts the migration tests of a pull request that has only had
@@ -534,6 +537,9 @@ jobs:
             src/xagent/web/services/task_execution.py
             tests/web/api/test_recovered_delivery_failed_run.py
             tests/web/api/test_fresh_message_ended_run.py
+            src/xagent/web/services/agent_versions.py
+            src/xagent/web/services/agent_store.py
+            tests/web/services/test_agent_versions.py
           )
 
           case "$EVENT_NAME" in
@@ -774,6 +780,32 @@ jobs:
             exit 1
           fi
           grep -Eq '[1-9][0-9]* passed' pg-shopify.log
+        env:
+          XAGENT_TEST_POSTGRES_URL: postgresql://xagent:xagent@localhost:5432/xagent_test
+
+      - name: Test agent versions migration (Postgres-only)
+        if: needs.detect-migration-changes.outputs.should-test == 'true'
+        shell: bash
+        run: |
+          pytest tests/alembic/test_20261119_add_agent_versions.py -m postgresql 2>&1 | tee pg-agent-versions-migration.log
+          if grep -Eq '(^|[^0-9])[0-9]+ skipped' pg-agent-versions-migration.log; then
+            echo "::error::Postgres-only cells were skipped; skipped is not passed"
+            exit 1
+          fi
+          grep -Eq '[1-9][0-9]* passed' pg-agent-versions-migration.log
+        env:
+          XAGENT_TEST_POSTGRES_URL: postgresql://xagent:xagent@localhost:5432/xagent_test
+
+      - name: Test agent version recording (Postgres-only)
+        if: needs.detect-migration-changes.outputs.should-test == 'true'
+        shell: bash
+        run: |
+          pytest tests/web/services/test_agent_versions.py -m postgresql 2>&1 | tee pg-agent-versions.log
+          if grep -Eq '(^|[^0-9])[0-9]+ skipped' pg-agent-versions.log; then
+            echo "::error::Postgres-only cells were skipped; skipped is not passed"
+            exit 1
+          fi
+          grep -Eq '[1-9][0-9]* passed' pg-agent-versions.log
         env:
           XAGENT_TEST_POSTGRES_URL: postgresql://xagent:xagent@localhost:5432/xagent_test
 

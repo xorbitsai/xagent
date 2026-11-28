@@ -9,7 +9,6 @@ import copy
 import json
 import logging
 import os
-import time
 import uuid
 from pathlib import Path
 from typing import (
@@ -43,6 +42,11 @@ logger = logging.getLogger(__name__)
 # included. Docker reports 128+9, while subprocess-compatible adapters preserve
 # the negative signal return code. Both representations can occur without BoxLite.
 _SIGKILL_EXIT_CODES = (137, -9)
+
+# ``timeout --verbose`` prints this line to stderr just before sending the
+# signal, so its presence distinguishes a real timeout from an OOM kill or
+# other external SIGKILL (issue #3258).
+_TIMEOUT_VERBOSE_SIGNAL = "sending signal KILL to command"
 
 SANDBOX_BASE_DEPENDENCIES = [
     "pydantic>=2.0.0",
@@ -716,14 +720,17 @@ class SandboxedToolWrapper(AbstractBaseTool):
                         # SIGKILL rather than TERM-then-KILL: once the runner dies
                         # `timeout` exits, so a delayed KILL would never reach a
                         # child that ignores SIGTERM.
+                        # --verbose prints "sending signal KILL to command" to
+                        # stderr just before firing, so we can distinguish a
+                        # real timeout from an OOM kill (issue #3258).
                         command = [
                             "timeout",
+                            "-v",
                             "-s",
                             "KILL",
                             str(timeout_seconds),
                             *command,
                         ]
-                    started = time.monotonic()
                     result = await sandbox.exec(
                         command[0], *command[1:], env=self._build_execution_env()
                     )
@@ -731,7 +738,7 @@ class SandboxedToolWrapper(AbstractBaseTool):
                     if (
                         timeout_seconds is not None
                         and result.exit_code in _SIGKILL_EXIT_CODES
-                        and time.monotonic() - started >= timeout_seconds
+                        and _TIMEOUT_VERBOSE_SIGNAL in (result.stderr or "")
                     ):
                         raise RuntimeError(
                             f"Tool execution timed out after {timeout_seconds} seconds "

@@ -2289,7 +2289,9 @@ async def _start_local_runtime_loops(app_instance: FastAPI) -> None:
     # Reopen process-local task admission before any trigger, command, or
     # channel ingress can create background execution work for this lifespan.
     from .services.task_execution import background_task_manager
+    from .services.triggers import accept_host_trigger_runs
 
+    accept_host_trigger_runs()
     if not get_shared_task_execution_enabled():
         background_task_manager.start_accepting()
 
@@ -2361,6 +2363,7 @@ async def _start_shared_task_runtime(app_instance: FastAPI) -> None:
         stop_task_event_bridge,
     )
     from .services.task_execution import background_task_manager
+    from .services.triggers import shutdown_host_trigger_runs
 
     global _task_command_dispatcher_task, _trigger_dispatcher_task
     await start_task_event_bridge(
@@ -2387,6 +2390,7 @@ async def _start_shared_task_runtime(app_instance: FastAPI) -> None:
             _trigger_dispatcher_task = None
         await close_task_coordinators()
         await background_task_manager.shutdown()
+        await shutdown_host_trigger_runs()
         await manager.stop_stream_reconciliation()
         await stop_task_event_bridge()
         raise
@@ -3493,6 +3497,7 @@ async def shutdown_event() -> None:
     from .services.task_coordinator_runtime import close_task_coordinators
     from .services.task_execution import background_task_manager
     from .services.task_lease_service import wait_for_heartbeat_manager_idle
+    from .services.triggers import shutdown_host_trigger_runs
     from .services.turn_settlement import drain_turn_settlement_hooks
 
     # The diagnostics line keeps reporting while execution drains, and is
@@ -3500,6 +3505,7 @@ async def shutdown_event() -> None:
     try:
         await close_task_coordinators()
         await background_task_manager.shutdown()
+        await shutdown_host_trigger_runs()
         await drain_turn_settlement_hooks()
         await wait_for_heartbeat_manager_idle()
         from .api.websocket import manager
@@ -3528,9 +3534,7 @@ async def shutdown_event() -> None:
     shutdown_task_runtime_hook_executor()
     unregister_local_browser_runtime()
 
-    from .services.chrome_mcp_runtime import (
-        shutdown_chrome_execution_session_pool,
-    )
+    from .services.chrome_mcp_runtime import shutdown_chrome_execution_session_pool
 
     try:
         await shutdown_chrome_execution_session_pool()

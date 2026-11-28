@@ -46,9 +46,7 @@ from .connector_runtime import (
     reject_ephemeral_connector_runtime_payload,
 )
 from .conversation_storage_rollout import new_task_conversation_storage_version
-from .routine_history_provenance import (
-    TRIGGER_TURN_ID_CONFIG_KEY,
-)
+from .routine_history_provenance import TRIGGER_TURN_ID_CONFIG_KEY
 from .task_orchestrator import (
     TaskTurnError,
     TaskTurnNotFoundError,
@@ -57,6 +55,11 @@ from .task_orchestrator import (
     TurnKind,
 )
 from .time_utils import coerce_utc as _coerce_utc
+from .trigger_executors import (
+    HostTriggerRun,
+    get_trigger_executor,
+    registered_trigger_executor_kinds,
+)
 from .trigger_providers.base import TriggerConfigError
 from .trigger_providers.registry import maybe_get_trigger_provider
 from .trigger_providers.schemas import (
@@ -142,12 +145,15 @@ def _payload_snapshot(
     event_type: str | None,
     resource_id: str | None,
     received_at: datetime | None = None,
+    force_full_payload: bool = False,
 ) -> dict[str, Any]:
     """Conservative trigger-run snapshot: stable hash plus allow-listed metadata.
 
     Event content (e.g. Gmail sender/subject/snippet/body/headers) is never
     stored by default. Full payload content is stored only when the trigger
     explicitly opts in via store_full_payload, and then only encrypted.
+    Triggers run by a host executor always store it (encrypted): the run may
+    be started later from the database, which needs the original event.
     """
     snapshot: dict[str, Any] = {
         "payload_sha256": _payload_hash(payload),
@@ -158,7 +164,7 @@ def _payload_snapshot(
             "received_at": (received_at or _now()).isoformat(),
         },
     }
-    if _store_full_payload_enabled(trigger):
+    if force_full_payload or _store_full_payload_enabled(trigger):
         snapshot["encrypted_payload"] = encrypt_value(_json_dumps(payload))
     return snapshot
 
@@ -941,6 +947,7 @@ def create_agent_trigger(
     config: dict[str, Any] | None = None,
     prompt_template: str | None = None,
     secret: str | None = None,
+    executor: str | None = None,
 ) -> tuple[AgentTrigger, str | None]:
     agent = get_owned_agent(db, user_id=user_id, agent_id=agent_id)
     if agent is None:
@@ -955,6 +962,7 @@ def create_agent_trigger(
         config=config,
         prompt_template=prompt_template,
         secret=secret,
+        executor=executor,
     )
 
 
@@ -969,6 +977,7 @@ def create_workforce_trigger(
     config: dict[str, Any] | None = None,
     prompt_template: str | None = None,
     secret: str | None = None,
+    executor: str | None = None,
 ) -> tuple[AgentTrigger, str | None]:
     """Create a workforce-owned trigger (workforce access checked by caller).
 
@@ -990,6 +999,7 @@ def create_workforce_trigger(
         config=config,
         prompt_template=prompt_template,
         secret=secret,
+        executor=executor,
     )
 
 
@@ -1005,6 +1015,7 @@ def _create_trigger(
     config: dict[str, Any] | None = None,
     prompt_template: str | None = None,
     secret: str | None = None,
+    executor: str | None = None,
 ) -> tuple[AgentTrigger, str | None]:
     if (agent_id is None) == (workforce_id is None):
         raise TriggerServiceError(
@@ -1050,6 +1061,7 @@ def _create_trigger(
         resource_id=resource_id,
         secret_encrypted=secret_encrypted,
         next_run_at=next_run_at,
+        executor=(executor or "").strip() or None,
     )
     db.add(trigger)
     db.commit()
@@ -1445,6 +1457,7 @@ def _get_or_create_trigger_run(
             if resource_id is not None
             else (str(trigger.resource_id) if trigger.resource_id else None),
             received_at=received_at,
+            force_full_payload=bool(trigger.executor),
         ),
         idempotency_key=idempotency_key,
     )
@@ -1693,6 +1706,11 @@ def prepare_trigger_run(
         resource_id=resource_id,
         received_at=received_at,
     )
+    if trigger.executor:
+        # Host-executed trigger: the run stays PENDING with no engine task;
+        # the host executor runs it once it is started (fire_trigger or the
+        # dispatcher).
+        return run, created
     if not created and run.task_id is not None:
         return run, False
 
@@ -2025,6 +2043,353 @@ async def _start_prepared_trigger_run_id(
     return True
 
 
+# Set once shutdown starts: no new host run is claimed by this process. Runs
+# stay PENDING for the successor, like the release hold's deferral.
+_host_runs_closed = False
+# Delays before each attempt to write a host run's terminal state.
+_HOST_SETTLE_RETRY_DELAYS: tuple[float, ...] = (0.0, 0.5, 2.0)
+
+
+def accept_host_trigger_runs() -> None:
+    """Lift the shutdown fence: this process may claim host runs again."""
+    global _host_runs_closed
+    _host_runs_closed = False
+
+
+def _claim_pending_host_run(run_id: int) -> bool:
+    """Atomically move one PENDING run to RUNNING; True when this call won it."""
+    db = _with_session()
+    try:
+        return _claim_pending_trigger_run(db, run_id)
+    finally:
+        db.close()
+
+
+def _load_host_trigger_run(run_id: int, executor_kind: str) -> HostTriggerRun | None:
+    """Build the executor input of a run this process has claimed (RUNNING)."""
+    db = _with_session()
+    try:
+        run = db.query(TriggerRun).filter(TriggerRun.id == run_id).first()
+        if run is None:
+            return None
+        trigger = (
+            db.query(AgentTrigger)
+            .filter(AgentTrigger.id == int(run.trigger_id))
+            .first()
+        )
+        if trigger is None:
+            return None
+        try:
+            payload = decrypt_trigger_run_payload(run)
+            if not isinstance(payload, dict):
+                raise TriggerServiceError("Stored trigger payload is not an object")
+        except Exception as exc:
+            _mark_run_failed(
+                db,
+                trigger=trigger,
+                run=run,
+                error_message=f"{type(exc).__name__}: {exc}",
+            )
+            return None
+        snapshot = (
+            run.payload_snapshot if isinstance(run.payload_snapshot, dict) else {}
+        )
+        metadata = snapshot.get("metadata")
+        meta: dict[str, Any] = metadata if isinstance(metadata, dict) else {}
+        received_raw = meta.get("received_at")
+        try:
+            received_at = (
+                datetime.fromisoformat(received_raw)
+                if isinstance(received_raw, str)
+                else None
+            )
+        except ValueError:
+            received_at = None
+        test = str(run.idempotency_key).startswith(TEST_TRIGGER_RUN_KEY_PREFIX)
+        source_event_id = run.source_event_id
+        setattr(trigger, "last_run_at", run.started_at or _now())
+        setattr(trigger, "last_error", None)
+        db.add(trigger)
+        db.commit()
+        return HostTriggerRun(
+            run_id=int(run.id),
+            trigger_id=int(trigger.id),
+            user_id=int(trigger.user_id),
+            executor=executor_kind,
+            trigger_type=str(trigger.type),
+            provider=str(trigger.provider) if trigger.provider else None,
+            resource_id=meta.get("resource_id"),
+            event_type=meta.get("event_type"),
+            source_event_id=str(source_event_id) if source_event_id else None,
+            received_at=received_at,
+            payload=payload,
+            prompt=render_trigger_prompt(
+                trigger,
+                event_payload=payload,
+                source_event_id=str(source_event_id) if source_event_id else None,
+                test=test,
+            ),
+            test=test,
+        )
+    finally:
+        db.close()
+
+
+def _finish_host_trigger_run(run_id: int, error_message: str | None) -> None:
+    """Record the host executor's outcome; never overwrite a settled run."""
+    db = _with_session()
+    try:
+        status = (
+            TriggerRunStatus.FAILED.value
+            if error_message is not None
+            else TriggerRunStatus.COMPLETED.value
+        )
+        result = db.execute(
+            update(TriggerRun)
+            .where(TriggerRun.id == run_id)
+            .where(TriggerRun.status == TriggerRunStatus.RUNNING.value)
+            .values(
+                status=status,
+                error_message=error_message,
+                finished_at=_now(),
+            )
+            .execution_options(synchronize_session=False)
+        )
+        if error_message is not None and _rowcount(result) == 1:
+            run = db.query(TriggerRun).filter(TriggerRun.id == run_id).first()
+            if run is not None:
+                db.execute(
+                    update(AgentTrigger)
+                    .where(AgentTrigger.id == int(run.trigger_id))
+                    .values(last_error=error_message)
+                    .execution_options(synchronize_session=False)
+                )
+        db.commit()
+    finally:
+        db.close()
+
+
+async def _settle_host_trigger_run(run_id: int, error_message: str | None) -> None:
+    """Persist a host run's terminal state; never raise, never lose ownership.
+
+    The write is retried on database errors and shielded from cancellation (its
+    worker thread may still commit). When it cannot be confirmed the run is
+    recorded as unsettled in the release ledger: a run left RUNNING with no
+    in-process owner is exactly what a host must not read as settled.
+    """
+    from .release_hold import release_hold
+
+    last: Exception | None = None
+    for delay in _HOST_SETTLE_RETRY_DELAYS:
+        try:
+            if delay:
+                await asyncio.sleep(delay)
+            await asyncio.shield(
+                run_tracked(_finish_host_trigger_run, run_id, error_message)
+            )
+            return
+        except asyncio.CancelledError:
+            release_hold.record_unsettled(
+                "host_trigger_run",
+                f"run:{run_id}",
+                "settlement cancelled before the terminal write was confirmed",
+            )
+            raise
+        except Exception as exc:
+            last = exc
+            logger.warning(
+                "Terminal write for host trigger run %s failed", run_id, exc_info=True
+            )
+    release_hold.record_unsettled(
+        "host_trigger_run",
+        f"run:{run_id}",
+        f"terminal write failed: {type(last).__name__}",
+    )
+
+
+async def _execute_host_trigger_run(host_run: HostTriggerRun) -> None:
+    executor = get_trigger_executor(host_run.executor)
+    error_message: str | None = None
+    try:
+        if executor is None:  # unregistered between claim and execution
+            raise TriggerServiceError(
+                f"Trigger executor {host_run.executor!r} is not registered"
+            )
+        await executor(host_run)
+    except asyncio.CancelledError:
+        await _settle_host_trigger_run(host_run.run_id, "Cancelled: executor stopped")
+        raise
+    except Exception as exc:
+        error_message = f"{type(exc).__name__}: {exc}"
+        logger.exception("Host executor failed for trigger run %s", host_run.run_id)
+    await _settle_host_trigger_run(host_run.run_id, error_message)
+
+
+class _HostStageFailed(Exception):
+    """A claimed host run failed before its executor ran; already settled."""
+
+
+async def _host_stage(run_id: int, fn: Callable[..., Any], *args: Any) -> Any:
+    """Run one database stage of a claimed host run in a worker thread.
+
+    The thread keeps going if this coroutine is cancelled, so a cancellation
+    first waits for the thread and then settles the run by id (a no-op unless
+    the stage left it RUNNING). A failure settles the run FAILED with the
+    error, or records it as unsettled when that write cannot be confirmed.
+    """
+    fut = asyncio.ensure_future(run_tracked(fn, *args))
+    try:
+        return await asyncio.shield(fut)
+    except asyncio.CancelledError:
+        await asyncio.wait({fut})
+        if not fut.cancelled():
+            fut.exception()
+        await _settle_host_trigger_run(run_id, "Cancelled: executor stopped")
+        raise
+    except Exception as exc:
+        await _settle_host_trigger_run(run_id, f"{type(exc).__name__}: {exc}")
+        raise _HostStageFailed from exc
+
+
+async def _claim_host_run(run_id: int) -> bool:
+    """Claim a PENDING run; True only when this process proved it won it.
+
+    A ``RUNNING`` row does not say which process owns it, so cleanup is
+    ownership-aware: after joining a claim thread that cancellation interrupted,
+    the run is settled only when the thread confirmed this process won the
+    conditional update. A lost claim touches nothing (another process's
+    executor may be running it), and an outcome that cannot be established is
+    recorded as unsettled evidence instead of being settled by guess.
+    """
+    from .release_hold import release_hold
+
+    fut = asyncio.ensure_future(run_tracked(_claim_pending_host_run, run_id))
+    try:
+        return bool(await asyncio.shield(fut))
+    except asyncio.CancelledError:
+        await asyncio.wait({fut})
+        if fut.cancelled():
+            raise  # the thread never started: nothing was claimed
+        if fut.exception() is not None:
+            release_hold.record_unsettled(
+                "host_trigger_run",
+                f"run:{run_id}",
+                "claim outcome unknown after cancellation",
+            )
+        elif fut.result() is True:
+            await _settle_host_trigger_run(run_id, "Cancelled: executor stopped")
+        raise
+    except Exception as exc:
+        release_hold.record_unsettled(
+            "host_trigger_run",
+            f"run:{run_id}",
+            f"claim outcome unknown: {type(exc).__name__}",
+        )
+        raise _HostStageFailed from exc
+
+
+async def _host_run_lifecycle(
+    run_id: int, executor_kind: str, started: asyncio.Future[bool]
+) -> None:
+    """Own one run from claim to durable outcome; one task per run.
+
+    Claim, materialize, execute and settle all happen here, so there is a
+    single owner to adopt into the release ledger, to join at shutdown, and to
+    settle or flag as unsettled on every exit path.
+    """
+
+    def signal(value: bool) -> None:
+        if not started.done():
+            started.set_result(value)
+
+    try:
+        try:
+            claimed = await _claim_host_run(run_id)
+            if not claimed:
+                return
+            signal(True)
+            host_run = await _host_stage(
+                run_id, _load_host_trigger_run, run_id, executor_kind
+            )
+        except _HostStageFailed:
+            return
+        if host_run is None:
+            return
+        try:
+            from .quota_hooks import record_trigger
+
+            record_trigger(host_run.user_id)
+        except Exception:
+            logger.debug("Trigger quota record failed", exc_info=True)
+        await _execute_host_trigger_run(host_run)
+    finally:
+        signal(False)
+
+
+# One lifecycle task per run id: a second start of a run already owned here
+# (direct fire racing the dispatcher) is refused instead of racing the claim.
+_host_run_tasks: dict[int, asyncio.Task[None]] = {}
+
+
+async def _start_host_trigger_run_id(
+    run_id: int,
+    executor_kind: str,
+    *,
+    wait_for_completion: bool = False,
+) -> bool:
+    """Hand one PENDING host-executed run to its executor, exactly once.
+
+    A run whose executor kind is not registered in this process stays PENDING
+    for a process that has it, and so does one offered after shutdown started.
+    The lifecycle runs as its own task, so a cancelled caller (a dispatcher
+    being stopped) cannot drop a claim that already committed.
+    """
+    if _host_runs_closed or get_trigger_executor(executor_kind) is None:
+        return False
+    if run_id in _host_run_tasks:
+        return False
+    from .release_hold import release_hold
+
+    started: asyncio.Future[bool] = asyncio.get_running_loop().create_future()
+    task = asyncio.ensure_future(_host_run_lifecycle(run_id, executor_kind, started))
+    _host_run_tasks[run_id] = task
+    release_hold.adopt("host_trigger_run", f"run:{run_id}", task)
+
+    def _forget(done: asyncio.Future[Any]) -> None:
+        if _host_run_tasks.get(run_id) is done:
+            del _host_run_tasks[run_id]
+        if not started.done():
+            # Cancelled before the lifecycle ever ran: nothing was claimed.
+            started.set_result(False)
+        if not done.cancelled():
+            done.exception()
+
+    task.add_done_callback(_forget)
+    if not await asyncio.shield(started):
+        return False
+    if wait_for_completion:
+        await asyncio.shield(task)
+    return True
+
+
+async def shutdown_host_trigger_runs() -> None:
+    """Fence new claims, then cancel and drain every host run lifecycle.
+
+    No new host run is claimed from here on (they stay PENDING for the
+    successor). Each lifecycle is the single owner of its run, claims in
+    flight included: cancelling it waits for a claim thread that is still
+    running and settles the run ("Cancelled"), so nothing launches after this
+    returns and no committed claim is left without an owner. Mirrors how owned
+    agent executions are cancelled and drained at shutdown.
+    """
+    global _host_runs_closed
+    _host_runs_closed = True
+    tasks = list(_host_run_tasks.values())
+    for task in tasks:
+        task.cancel()
+    await asyncio.gather(*tasks, return_exceptions=True)
+
+
 async def start_prepared_trigger_run(
     db: Session,
     *,
@@ -2032,6 +2397,13 @@ async def start_prepared_trigger_run(
     wait_for_completion: bool = False,
 ) -> bool:
     """Start one prepared trigger task from the backend process."""
+    executor_kind = run.trigger.executor if run.trigger is not None else None
+    if executor_kind:
+        return await _start_host_trigger_run_id(
+            int(run.id),
+            str(executor_kind),
+            wait_for_completion=wait_for_completion,
+        )
     return await _start_prepared_trigger_run_id(
         int(run.id),
         wait_for_completion=wait_for_completion,
@@ -2107,6 +2479,28 @@ def _get_pending_trigger_run_ids(limit: int) -> list[int]:
         db.close()
 
 
+def _get_pending_host_trigger_runs(
+    limit: int, kinds: list[str]
+) -> list[tuple[int, str]]:
+    """Pending runs of triggers whose host executor kind is registered here."""
+    db = _with_session()
+    try:
+        rows = (
+            db.query(TriggerRun.id, AgentTrigger.executor)
+            .join(AgentTrigger, TriggerRun.trigger_id == AgentTrigger.id)
+            .filter(
+                TriggerRun.status == TriggerRunStatus.PENDING.value,
+                AgentTrigger.executor.in_(kinds),
+            )
+            .order_by(TriggerRun.created_at.asc(), TriggerRun.id.asc())
+            .limit(limit)
+            .all()
+        )
+        return [(int(row[0]), str(row[1])) for row in rows]
+    finally:
+        db.close()
+
+
 async def dispatch_pending_trigger_runs(
     db: Session,
     *,
@@ -2114,14 +2508,21 @@ async def dispatch_pending_trigger_runs(
     wait_for_completion: bool = False,
 ) -> int:
     """Start prepared trigger tasks from the backend process."""
-    pending_run_ids = await run_tracked(
-        _get_pending_trigger_run_ids,
-        max(1, min(limit, 100)),
-    )
-    if not pending_run_ids:
-        return 0
-
+    batch = max(1, min(limit, 100))
     started_count = 0
+    host_kinds = registered_trigger_executor_kinds()
+    if host_kinds:
+        for run_id, kind in await run_tracked(
+            _get_pending_host_trigger_runs, batch, host_kinds
+        ):
+            if await _start_host_trigger_run_id(
+                run_id, kind, wait_for_completion=wait_for_completion
+            ):
+                started_count += 1
+    pending_run_ids = await run_tracked(_get_pending_trigger_run_ids, batch)
+    if not pending_run_ids:
+        return started_count
+
     for run_id in pending_run_ids:
         if await _start_prepared_trigger_run_id(
             run_id,

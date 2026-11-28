@@ -24,6 +24,7 @@ from .agent_team_scope import (
     validate_team_agent_connectors,
     validate_team_agent_knowledge_bases,
 )
+from .agent_versions import ConfigActor, OwnedBy, apply_agent_change
 
 # Single source of truth for the widget embed credential; re-exported here so
 # existing ``from ..services.agent_store import new_widget_key`` callers keep
@@ -474,55 +475,94 @@ class AgentStore:
         *,
         team_scope: Any = _UNRESOLVED,
         agent: Agent | None = None,
+        actor: ConfigActor | None = None,
     ) -> Agent | None:
+        """Apply ``updates`` to an agent ``user_id`` may manage, and commit.
+
+        The change goes through ``apply_agent_change`` under ``OwnedBy``: the
+        row is locked and re-read with the ownership predicate, and the checks
+        below run against that locked row. Versioned values equal to the
+        stored ones in canonical form, compared as JSON (``same_value``), and
+        other values equal to the stored ones, are not written; a change to a
+        versioned field records a new version attributed to ``actor``
+        (``unspecified`` when omitted). A field callers may not write raises
+        ``ValueError`` whatever its value; the visibility and team-sharing
+        checks run only on values that change.
+
+        ``agent`` is the caller's already loaded object for this id; it is the
+        object returned. Returns ``None`` only when the agent does not exist
+        or ``user_id`` cannot manage it; the session is rolled back first. On
+        any exception the session is rolled back before it propagates.
+        """
         if team_scope is _UNRESOLVED:
             team_scope = get_agent_team_scope(self.db, user_id)
-        if agent is None:
-            agent = self.get_owned_agent(user_id, agent_id, team_scope)
-        if agent is None:
-            return None
-
-        if "visibility" in updates:
-            _assert_can_set_visibility(
-                team_scope,
-                updates.get("visibility"),
-                cast("str | None", agent.visibility),
+        change = dict(updates)
+        if "tool_categories" in change:
+            change["tool_categories"] = normalize_tool_categories(
+                change["tool_categories"]
             )
 
-        # A team agent (team_id set) may only select connectors already shared
-        # with its team. Re-validate when its connector selection changes.
-        if agent.team_id is not None and "tool_categories" in updates:
-            unshared = validate_team_agent_connectors(
+        def validate(row: dict[str, Any], pending: dict[str, Any]) -> None:
+            if "visibility" in pending:
+                _assert_can_set_visibility(
+                    team_scope, pending.get("visibility"), row["visibility"]
+                )
+
+            # A team agent (team_id set) may only select connectors already
+            # shared with its team. Re-validate when its connector selection
+            # changes.
+            if row["team_id"] is not None and "tool_categories" in pending:
+                unshared = validate_team_agent_connectors(
+                    self.db,
+                    user_id,
+                    int(row["team_id"]),
+                    clean_tool_categories(pending.get("tool_categories")),
+                )
+                if unshared:
+                    raise UnsharedConnectorsError(unshared)
+
+            if row["team_id"] is not None and "knowledge_bases" in pending:
+                unshared_kbs = validate_team_agent_knowledge_bases(
+                    self.db,
+                    user_id,
+                    int(row["team_id"]),
+                    ensure_list(pending.get("knowledge_bases")) or [],
+                )
+                if unshared_kbs:
+                    raise UnsharedKnowledgeBasesError(unshared_kbs)
+
+        try:
+            # Every requested field, changed or not, must be one callers may
+            # write.
+            unknown_fields = set(change) - _AGENT_UPDATE_FIELDS
+            if unknown_fields:
+                raise ValueError(
+                    "Unsupported agent update fields: "
+                    f"{', '.join(sorted(unknown_fields))}"
+                )
+            result = apply_agent_change(
                 self.db,
-                user_id,
-                int(agent.team_id),
-                clean_tool_categories(updates.get("tool_categories")),
+                agent_id,
+                change,
+                actor=actor if actor is not None else ConfigActor.unspecified(),
+                authority=OwnedBy(user_id, team_scope),
+                validate=validate,
             )
-            if unshared:
-                raise UnsharedConnectorsError(unshared)
+            if result.status == "not_found":
+                # Ends the transaction the row lock opened (on SQLite it holds
+                # the database write lock); nothing was written.
+                self.db.rollback()
+                return None
+            self.db.commit()
+        except BaseException:
+            self.db.rollback()
+            raise
 
-        if agent.team_id is not None and "knowledge_bases" in updates:
-            unshared_kbs = validate_team_agent_knowledge_bases(
-                self.db,
-                user_id,
-                int(agent.team_id),
-                ensure_list(updates.get("knowledge_bases")) or [],
-            )
-            if unshared_kbs:
-                raise UnsharedKnowledgeBasesError(unshared_kbs)
-
-        unknown_fields = set(updates) - _AGENT_UPDATE_FIELDS
-        if unknown_fields:
-            raise ValueError(
-                f"Unsupported agent update fields: {', '.join(sorted(unknown_fields))}"
-            )
-
-        for field, value in updates.items():
-            if field == "tool_categories":
-                value = normalize_tool_categories(value)
-            setattr(agent, field, value)
-
-        self.db.commit()
+        if agent is None:
+            agent = self.db.get(Agent, agent_id)
+            if agent is None:
+                # Deleted by another transaction after this one committed.
+                return None
         self.db.refresh(agent)
         invalidate_agent_cache(user_id, agent_id, team_id_of(team_scope))
         return agent

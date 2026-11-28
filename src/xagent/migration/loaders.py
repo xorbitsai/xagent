@@ -18,6 +18,7 @@ inherits the same validation and storage the product uses everywhere else:
 
 from __future__ import annotations
 
+import logging
 import re
 from dataclasses import dataclass, field
 from typing import Any
@@ -27,8 +28,12 @@ from sqlalchemy.orm import Session
 from ..web.models.agent import Agent
 from ..web.models.skill import UserSkill
 from ..web.models.user import User
+from ..web.services.agent_store import AgentStore
+from ..web.services.agent_versions import ConfigActor
 from ..web.services.model_service import with_default_general_model
 from .bundle import ArchivedItem, MigrationBundle
+
+logger = logging.getLogger(__name__)
 
 # xagent's scheduled triggers currently fire on a fixed interval only; standard
 # 5-field cron expressions are not yet supported by the scheduler. Until the
@@ -125,8 +130,30 @@ class MigrationLoader:
         if existing is not None:
             if instructions is not None:
                 # Re-import syncs the persona from the source of truth.
-                existing.instructions = instructions  # type: ignore[assignment]
-                self.db.commit()
+                existing_id = int(existing.id)
+                # Read before the write: on a not-found the wrapper rolls back,
+                # and an agent deleted meanwhile could not be reloaded.
+                existing_name = str(existing.name)
+                updated = AgentStore(self.db).update_agent_fields(
+                    self.user_id,
+                    existing_id,
+                    {"instructions": instructions},
+                    agent=existing,
+                    actor=ConfigActor.user(self.user_id, entry_point="import"),
+                )
+                if updated is None:
+                    logger.warning(
+                        "Persona not synced to agent %s: user %s can no longer "
+                        "manage it",
+                        existing_id,
+                        self.user_id,
+                    )
+                    report.agent_name = existing_name
+                    report.errors.append(
+                        f"agent {existing_name}: not updated, the importing "
+                        "user can no longer manage it"
+                    )
+                    return existing
             report.agent_name = str(existing.name)
             report.agent_reused = True
             return existing

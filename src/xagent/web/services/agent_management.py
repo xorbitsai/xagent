@@ -13,7 +13,6 @@ from sqlalchemy import func, or_, select, update
 from sqlalchemy.engine import CursorResult
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, aliased
-from sqlalchemy.orm.attributes import flag_modified
 
 from ...core.tools.adapters.vibe.agent_model_resolution import AGENT_MODEL_KEYS
 from ...core.tools.adapters.vibe.selection_spec import normalize_mcp_server_name
@@ -48,6 +47,12 @@ from ..services.agent_store import (
     invalidate_agent_cache,
 )
 from .agent_team_scope import get_agent_team_scope
+from .agent_versions import (
+    VERSIONED_FIELDS,
+    ConfigActor,
+    model_slot_is_unset,
+    same_value,
+)
 from .api_keys import (
     AgentApiKeyService,
     AgentKeyMetadata,
@@ -1111,8 +1116,9 @@ _MAX_MODEL_PK = 2**31 - 1
 def unresolved_models(db: Session, agent: Agent, user_id: int) -> tuple[str, ...]:
     """Slots of *agent* whose model *user_id* cannot be confirmed to resolve.
 
-    A slot holding null, ``""``, integer 0 or ``false`` is unset: slot
-    resolution returns nothing for it without a query, so it is not listed.
+    A slot holding null, ``""``, integer 0 or ``false`` is unset
+    (:func:`model_slot_is_unset`): slot resolution returns nothing for it
+    without a query, so it is not listed.
     A slot holding a canonical integer id (an ``int``, not a ``bool``, from 1
     to 2**31 - 1) is listed unless the id is one of the models *user_id* can
     put in a slot. Any other stored value is listed: how slot resolution
@@ -1126,21 +1132,13 @@ def unresolved_models(db: Session, agent: Agent, user_id: int) -> tuple[str, ...
     if not isinstance(stored, dict):
         return ()
 
-    def is_unset(value: Any) -> bool:
-        return (
-            value is None
-            or value is False
-            or value == ""
-            or (type(value) is int and value == 0)
-        )
-
     def is_canonical(value: Any) -> bool:
         return type(value) is int and 1 <= value <= _MAX_MODEL_PK
 
     set_slots = {
         slot: stored[slot]
         for slot in AGENT_MODEL_KEYS
-        if slot in stored and not is_unset(stored[slot])
+        if slot in stored and not model_slot_is_unset(stored[slot])
     }
     ids = sorted({value for value in set_slots.values() if is_canonical(value)})
     assignable = (
@@ -1353,6 +1351,20 @@ def _model_snapshots(
     )
 
 
+def _same_stored(field: str, agent: Agent, value: Any) -> bool:
+    """Whether ``update_agent_fields`` would leave ``field`` as stored, for
+    the fields this endpoint accepts.
+
+    Versioned fields are compared with :func:`same_value` (canonical form, as
+    JSON), so for example ``instructions`` that differ only in leading or
+    trailing whitespace count as the stored value; other fields as they are.
+    """
+    stored = getattr(agent, field)
+    if field in VERSIONED_FIELDS:
+        return same_value(field, value, stored)
+    return bool(stored == value)
+
+
 def _changed_slots(
     base: dict[str, Any], requested: dict[str, int | None]
 ) -> dict[str, int | None]:
@@ -1531,6 +1543,7 @@ class AgentManagementRuntime:
         timeout, this fails before reading anything and nothing is written.
         ``None`` is returned when the user cannot see the agent under the
         lock. Only a field whose value differs from the stored one is written,
+        compared as ``update_agent_fields`` compares it (:func:`_same_stored`),
         and nothing is written, cleared from the cache or logged when none
         does.
 
@@ -1539,7 +1552,9 @@ class AgentManagementRuntime:
         (:func:`_changed_slots`) are merged into a new dict. Each slot changed
         to a model id is checked under the lock, after the length and name
         checks (:func:`_check_slot_models`); a refused slot raises
-        :class:`ModelSlotsUnusableError` and nothing is written.
+        :class:`ModelSlotsUnusableError` and nothing is written. If every such
+        slot is unset both as stored and as requested
+        (:func:`model_slot_is_unset`), nothing is merged.
 
         The commit releases the lock, so after a write the agent is read again
         with the visibility rule and team scope of the first read, and the
@@ -1573,16 +1588,25 @@ class AgentManagementRuntime:
             )
             if agent is None:
                 return None
+            # Decided as ``update_agent_fields`` decides it, so a value is
+            # logged as changed only when it is written.
             updates: dict[str, Any] = {
                 field: value
                 for field, value in changes.items()
-                if field != "models" and getattr(agent, field) != value
+                if field != "models" and not _same_stored(field, agent, value)
             }
             # A new dict; a stored value that is not a dict counts as empty.
             base: dict[str, Any] = (
                 dict(agent.models) if isinstance(agent.models, dict) else {}
             )
             changed_slots = _changed_slots(base, changes.get("models") or {})
+            if changed_slots and _same_stored(
+                "models", agent, {**base, **changed_slots}
+            ):
+                # Only slots that are unset either way (model_slot_is_unset),
+                # e.g. a stored ``0`` cleared to ``None``. A stored ``0.0``,
+                # ``[]`` or ``{}`` is not unset, so clearing it is written.
+                changed_slots = {}
             if changed_slots:
                 updates["models"] = {**base, **changed_slots}
             if updates:
@@ -1605,18 +1629,17 @@ class AgentManagementRuntime:
                     f"models[{','.join(changed_slots)}]" if name == "models" else name
                     for name in sorted(updates)
                 )
-                if "models" in updates:
-                    # A stored ``{"general": true}`` compares equal to
-                    # ``{"general": 1}``, so without this the change would be
-                    # dropped at flush and the bad slot could never be fixed.
-                    flag_modified(agent, "models")
                 try:
+                    # update_agent_fields compares versioned values as JSON,
+                    # so replacing a stored {"general": true} with
+                    # {"general": 1} is written.
                     store.update_agent_fields(
                         user_id,
                         agent_id,
                         updates,
                         team_scope=team_scope,
                         agent=agent,
+                        actor=ConfigActor.api_key(user_id, key_prefix),
                     )
                 except BaseException as exc:
                     if isinstance(exc, IntegrityError) and (
@@ -1810,13 +1833,20 @@ class AgentManagementRuntime:
             ]
             if invalid:
                 raise InvalidAgentSkillNamesError(invalid)
-            store.update_agent_fields(
+            updated = store.update_agent_fields(
                 user_id,
                 agent_id,
                 {"skills": requested},
                 team_scope=team_scope,
                 agent=agent,
+                actor=ConfigActor.api_key(user_id, key_prefix),
             )
+            if updated is None:
+                # The write's locked ownership check decides.
+                return None
+            # A reordered list is not a change and is not written; answer
+            # with what is stored.
+            stored = list(updated.skills or [])
         logger.info(
             "personal key agent skills write: key_prefix=%s user_id=%d "
             "agent_id=%d added=%d",
@@ -1825,7 +1855,7 @@ class AgentManagementRuntime:
             agent_id,
             len(added),
         )
-        return tuple(requested), tuple(added)
+        return tuple(stored), tuple(added)
 
     async def get_agent_connectors(
         self,
@@ -1964,18 +1994,22 @@ class AgentManagementRuntime:
                 kept.append(_ALL_MCP_CATEGORY)
             replacement = kept + [f"{_MCP_ENTRY_PREFIX}{name}" for name in requested]
             try:
-                store.update_agent_fields(
+                updated = store.update_agent_fields(
                     user_id,
                     agent_id,
                     {"tool_categories": replacement},
                     team_scope=team_scope,
                     agent=agent,
+                    actor=ConfigActor.api_key(user_id, key_prefix),
                 )
             except UnsharedConnectorsError as exc:
                 raise AgentConnectorsNotSharedError(
                     _relabel_unshared(exc.connectors, names)
                 ) from exc
-            stored = list(agent.tool_categories or [])
+            if updated is None:
+                # The write's locked ownership check decides.
+                return None
+            stored = list(updated.tool_categories or [])
             removed = [name for name in selected if name not in requested]
             logger.info(
                 "personal key agent connectors write: key_prefix=%s user_id=%d "

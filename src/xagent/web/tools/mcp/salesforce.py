@@ -5,6 +5,8 @@ import re
 from typing import Any, NoReturn
 from urllib.parse import urlparse, urlsplit
 
+from mcp.types import ToolAnnotations
+
 from ....config import get_tool_max_output_length
 from ....core.utils import public_requests as requests
 from . import composio_proxy
@@ -452,7 +454,7 @@ def _request(
     )
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
 def salesforce_get_current_user() -> str:
     """
     Get the profile of the Salesforce user this connector is authenticated
@@ -480,7 +482,7 @@ def salesforce_get_current_user() -> str:
         return _error(str(e))
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
 def salesforce_query(soql: str) -> str:
     """
     Run a SOQL (Salesforce Object Query Language) query -- the primary way
@@ -503,7 +505,7 @@ def salesforce_query(soql: str) -> str:
         return _error(str(e))
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
 def salesforce_search(sosl: str) -> str:
     """
     Run a SOSL (Salesforce Object Search Language) search -- full-text
@@ -522,7 +524,7 @@ def salesforce_search(sosl: str) -> str:
         return _error(str(e))
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
 def salesforce_list_sobjects(
     name_contains: str = "",
     offset: int = 0,
@@ -583,7 +585,7 @@ def salesforce_list_sobjects(
         return _error(str(e))
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
 def salesforce_describe_sobject(
     sobject_type: str,
     fields: list[str] | None = None,
@@ -682,7 +684,7 @@ def salesforce_describe_sobject(
         return _error(str(e))
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
 def salesforce_get_record(sobject_type: str, record_id: str, fields: str = "") -> str:
     """
     Get one record's field values by id.

@@ -6,6 +6,7 @@ from typing import Any
 from urllib.parse import quote
 
 from mcp.server.fastmcp import FastMCP
+from mcp.types import ToolAnnotations
 
 from ....core.utils import public_requests as requests
 
@@ -150,7 +151,7 @@ def _conversation_summary(conversation: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
 def intercom_search_contacts(query: str, limit: int = 10) -> str:
     """
     Search Intercom contacts whose name or email contains `query`.
@@ -179,7 +180,7 @@ def intercom_search_contacts(query: str, limit: int = 10) -> str:
         return _error(str(e))
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
 def intercom_get_contact(contact_id: str) -> str:
     """
     Get an Intercom contact by id.
@@ -192,7 +193,7 @@ def intercom_get_contact(contact_id: str) -> str:
         return _error(str(e))
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
 def intercom_list_conversations(
     state: str = "open", limit: int = 20, starting_after: str | None = None
 ) -> str:
@@ -253,7 +254,7 @@ def intercom_list_conversations(
         return _error(str(e))
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
 def intercom_get_conversation(conversation_id: str) -> str:
     """
     Get a full Intercom conversation by id, including the message thread

@@ -14,7 +14,14 @@ import os
 import re
 import threading
 from collections import OrderedDict
-from collections.abc import AsyncIterator, Coroutine, Iterable, Iterator
+from collections.abc import (
+    AsyncIterator,
+    Awaitable,
+    Callable,
+    Coroutine,
+    Iterable,
+    Iterator,
+)
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -531,6 +538,8 @@ _UPLOAD_STAGING_EXECUTOR = ThreadPoolExecutor(
     thread_name_prefix="xagent-mcp-upload",
 )
 
+_GMAIL_ATTACHMENT_ITEMS = "messages[].attachments[]"
+
 # These are host-owned contracts for connectors whose upload APIs require a
 # local path.  Do not infer this from arbitrary argument names: only these
 # built-in tools may turn a durable FileRef into a temporary local path.
@@ -545,6 +554,8 @@ _DURABLE_UPLOAD_FIELDS: dict[tuple[str, str], tuple[str, ...]] = {
     ("jira", "jira_add_attachment"): ("file_path",),
     ("facebook-pages", "facebook_publish_image_post"): ("file_path",),
     ("linkedin", "create_post"): ("image_path",),
+    ("gmail", "gmail_send_messages"): (_GMAIL_ATTACHMENT_ITEMS,),
+    ("google-slides", "google_slides_import_pptx"): ("file_path",),
     # Create-only intake connector: only the ticket this same call creates gets the files.
     ("jira-ticket", "jira_ticket_create"): (
         "attachment_path",
@@ -639,6 +650,12 @@ _DURABLE_UPLOAD_NOT_FOUND = "file_id not found or not accessible."
 
 def _durable_upload_note(fields: tuple[str, ...], *, own_file_id: bool) -> str:
     """The description sentence for a tool that accepts a durable FileRef."""
+    if _GMAIL_ATTACHMENT_ITEMS in fields:
+        return (
+            f" Each item in `{_GMAIL_ATTACHMENT_ITEMS}` may be an absolute local "
+            "path or a registered workspace file (file:<id>). The host stages "
+            "registered files in the current task workspace before sending or drafting."
+        )
     if not own_file_id:
         return _DURABLE_UPLOAD_NOTE
     return (
@@ -653,6 +670,11 @@ def _durable_upload_not_found_message(
     fields: tuple[str, ...], *, own_file_id: bool
 ) -> str:
     """The error for a FileRef that could not be staged; the tool is not called."""
+    if _GMAIL_ATTACHMENT_ITEMS in fields:
+        return (
+            f"{_GMAIL_ATTACHMENT_ITEMS}: a registered attachment (file:<id>) "
+            "was not found or is not accessible. No messages were sent or drafted."
+        )
     if not own_file_id:
         return _DURABLE_UPLOAD_NOT_FOUND
     names = " or ".join(fields)
@@ -2427,7 +2449,7 @@ class MCPToolAdapter(AbstractBaseTool):
                 by structured equality rather than re-parsing the tool name.
             workspace: Current task workspace used to stage durable FileRefs
                 for local-path upload connectors.
-            durable_upload_fields: Host-owned scalar argument names that accept
+            durable_upload_fields: Host-owned argument paths that accept
                 a durable FileRef and need task-local staging.
             durable_upload_own_file_id: Whether the tool's own ``file_id``
                 argument is not a workspace file, so the FileRef wording names
@@ -3456,19 +3478,48 @@ class MCPToolAdapter(AbstractBaseTool):
         staged: list[Any] = []
         staged_sources: dict[str, str] = {}
         prepared = dict(tool_args)
+
+        async def stage_value(value: Any) -> Any:
+            file_id = _file_ref_value(value)
+            if file_id is None:
+                return value
+            staged_path = await self._stage_external_upload_file(file_id)
+            staged.append(staged_path)
+            path = str(staged_path)
+            staged_sources[path] = f"file:{file_id}"
+            return path
+
         try:
             for field_name in self._durable_upload_fields:
-                file_id = _file_ref_value(prepared.get(field_name))
-                if file_id is None:
-                    continue
-                staged_path = await self._stage_external_upload_file(file_id)
-                prepared[field_name] = str(staged_path)
-                staged.append(staged_path)
-                staged_sources[str(staged_path)] = f"file:{file_id}"
+                if field_name == _GMAIL_ATTACHMENT_ITEMS:
+                    messages = prepared.get("messages")
+                    if isinstance(messages, list):
+                        prepared["messages"] = await self._stage_gmail_attachments(
+                            messages, stage_value
+                        )
+                elif field_name in prepared:
+                    prepared[field_name] = await stage_value(prepared[field_name])
             return prepared, staged, staged_sources
         except BaseException:
             await self._discard_external_upload_args(staged)
             raise
+
+    @staticmethod
+    async def _stage_gmail_attachments(
+        messages: list[Any], stage_value: Callable[[Any], Awaitable[Any]]
+    ) -> list[Any]:
+        prepared = []
+        for message in messages:
+            attachments = (
+                message.get("attachments") if isinstance(message, dict) else None
+            )
+            if isinstance(attachments, list):
+                message = {
+                    **message,
+                    "attachments": [await stage_value(value) for value in attachments],
+                }
+            prepared.append(message)
+        return prepared
 
     async def _substitute_external_media_args(
         self, tool_args: Mapping[str, Any]

@@ -151,6 +151,22 @@ class AzureOpenAILLM(OpenAILLM):
             is_streaming=is_streaming,
         )
 
+    def _apply_provider_reasoning_effort(
+        self,
+        completion_params: Dict[str, Any],
+        *,
+        thinking: Optional[Dict[str, Any]],
+    ) -> None:
+        """Set no ``reasoning_effort``, as before ``OpenAILLM`` gained one.
+
+        ``OpenAILLM`` lowers GLM-5.3 reasoning effort for generic
+        OpenAI-compatible servers. Azure deployments are not confirmed to accept that value for
+        GLM models, so Azure keeps the base behavior.
+        """
+        OpenAICompatibleLLM._apply_provider_reasoning_effort(
+            self, completion_params, thinking=thinking
+        )
+
     def _ensure_client(self) -> None:
         """
         Ensure the Azure OpenAI client is initialized.

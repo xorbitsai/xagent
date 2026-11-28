@@ -62,6 +62,31 @@ Publish the teammate, then choose an entry point that fits where your users alre
 
 Teammates can also run on a schedule or respond to webhook events. For jobs that require several specialists, create a Workforce with a manager agent and published teammates.
 
+### Scope guest widget history
+
+On a secure host page (typically HTTPS), add the optional `data-guest-scope`
+attribute to your `data-widget-key` embed snippet. Pass a stable, non-empty
+opaque reference for the active account. Keep names, email addresses, and other
+personal data out of the attribute.
+
+```html
+<script
+  src="https://chat.example.com/widget.js"
+  data-widget-key="YOUR_WIDGET_KEY"
+  data-guest-scope="OPAQUE_ACCOUNT_REFERENCE"
+></script>
+```
+
+The widget stores a separate guest ID for the SHA-256 digest of each scope in
+the host page's local storage. Remount the widget with the new scope when the
+active account changes. Omitting the attribute uses the original guest ID
+storage key. An invalid scope or an unavailable digest or storage prevents the
+scoped widget from opening a conversation.
+
+The scope is unsigned and only separates guest histories in the same browser
+profile. Use signed widget sessions when the host needs to authenticate an
+identity. Signed widget sessions ignore `data-guest-scope`.
+
 ## Operate Xagent
 
 Use **Conversation Logs** to find a conversation by teammate or entry point. Open a run to review its transcript and execution steps, including tool calls when trace data is available. In the Product Support example, you can see the visitor's question, the reply, and the knowledge search behind it.

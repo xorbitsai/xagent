@@ -1,6 +1,11 @@
+import { createHash, webcrypto } from "node:crypto"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 
 import { evaluateWidgetScript, widgetScript } from "@/test-utils/widget-script"
+
+function guestStorageKeys() {
+  return Array.from({ length: localStorage.length }, (_, index) => localStorage.key(index)).sort()
+}
 
 function runWidget(attributes: Record<string, string>, evaluate = evaluateWidgetScript) {
   const script = document.createElement("script")
@@ -46,7 +51,9 @@ describe("widget bootstrap", () => {
     fetchMock.mockReset()
   })
 
-  afterEach(() => {
+  afterEach(async () => {
+    document.body.replaceChildren()
+    await Promise.resolve()
     if (currentScriptDescriptor) {
       Object.defineProperty(document, "currentScript", currentScriptDescriptor)
     } else {
@@ -219,6 +226,93 @@ describe("widget bootstrap", () => {
         `https://chat.example/widget/chat/default?guest_id=${guestId}&agent_id=17&embed_ticket=ticket%2Fone&voice=1`,
       )
     })
+  })
+
+  it("keeps stable and separate guest ids for different scopes on one origin", async () => {
+    vi.stubGlobal("crypto", webcrypto)
+    fetchMock.mockImplementation(async () => Response.json({ ticket: "ticket/one", agent_id: 17 }))
+    const aliceScope = "account-ref-01-\u03bb"
+    const bobScope = "account-ref-02"
+    const scopedKey = (scope: string) => `xagent_guest_id:${createHash("sha256").update(scope).digest("hex")}`
+
+    for (const scope of [aliceScope, bobScope, aliceScope, undefined]) {
+      runWidget({ "data-widget-key": "widget-secret", ...(scope ? { "data-guest-scope": scope } : {}) })
+    }
+
+    const iframes = Array.from(document.querySelectorAll<HTMLIFrameElement>(".xagent-widget-iframe"))
+    await vi.waitFor(() => expect(iframes.map(iframe => iframe.hasAttribute("src"))).toEqual([true, true, true, true]))
+    const [aliceId, bobId, returningAliceId, unscopedId] = iframes.map(iframe => {
+      expect(iframe.src).not.toContain("account-ref")
+      return new URL(iframe.src).searchParams.get("guest_id")
+    })
+
+    expect(aliceId).toMatch(/^guest_/)
+    expect(bobId).toMatch(/^guest_/)
+    expect(bobId).not.toBe(aliceId)
+    expect(returningAliceId).toBe(aliceId)
+    expect(unscopedId).toBe("guest-fixed")
+    expect(aliceId).not.toBe(unscopedId)
+    expect(bobId).not.toBe(unscopedId)
+    expect(localStorage.getItem(scopedKey(aliceScope))).toBe(aliceId)
+    expect(localStorage.getItem(scopedKey(bobScope))).toBe(bobId)
+    expect(guestStorageKeys()).toEqual(["xagent_guest_id", scopedKey(aliceScope), scopedKey(bobScope)].sort())
+    expect(localStorage.getItem("xagent_guest_id")).toBe("guest-fixed")
+    expect(fetchMock.mock.calls.map(([, request]) => request.body)).toEqual(
+      Array(4).fill(JSON.stringify({ widget_key: "widget-secret" })),
+    )
+  })
+
+  it.each([
+    { label: "empty", scope: "", crypto: webcrypto, error: "data-guest-scope must be non-empty" },
+    { label: "lacking Web Crypto", scope: "opaque-ref", crypto: {}, error: "data-guest-scope requires Web Crypto" },
+    {
+      label: "with a failed digest",
+      scope: "opaque-ref",
+      crypto: { subtle: { digest: () => Promise.reject(new Error("opaque-ref")) } },
+      error: "could not initialize data-guest-scope",
+    },
+  ])("does not fall back to the unscoped guest when $label", async ({ scope, crypto, error }) => {
+    vi.stubGlobal("crypto", crypto)
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => undefined)
+
+    runWidget({ "data-widget-key": "widget-secret", "data-guest-scope": scope })
+
+    await vi.waitFor(() => expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining(error)))
+    expect(errorSpy.mock.calls.flat().join(" ")).not.toContain("opaque-ref")
+    expect(fetchMock).not.toHaveBeenCalled()
+    expect(document.querySelector(".xagent-widget-iframe[src]")).toBeNull()
+    expect(guestStorageKeys()).toEqual(["xagent_guest_id"])
+    expect(localStorage.getItem("xagent_guest_id")).toBe("guest-fixed")
+  })
+
+  it("does not request a ticket after a scoped widget is removed during hashing", async () => {
+    let finishDigest!: (value: ArrayBuffer) => void
+    const digest = new Promise<ArrayBuffer>(resolve => { finishDigest = resolve })
+    vi.stubGlobal("crypto", { subtle: { digest: () => digest } })
+
+    runWidget({ "data-widget-key": "widget-secret", "data-guest-scope": "opaque-ref" })
+    document.querySelector(".xagent-widget-container")?.remove()
+    finishDigest(new ArrayBuffer(32))
+    await digest
+
+    expect(fetchMock).not.toHaveBeenCalled()
+    expect(guestStorageKeys()).toEqual(["xagent_guest_id"])
+  })
+
+  it("ignores data-guest-scope in signed session mode", () => {
+    vi.stubGlobal("crypto", {})
+    fetchMock.mockImplementation(() => new Promise(() => {}))
+
+    runWidget({ "data-encrypted-context": "signed-grant-guest-scope-test", "data-guest-scope": "opaque-ref" })
+
+    expect(document.querySelector<HTMLIFrameElement>(".xagent-widget-iframe")?.src).toBe(
+      "https://chat.example/widget/chat/session?voice=1",
+    )
+    expect(fetchMock).toHaveBeenCalledExactlyOnceWith(
+      "https://chat.example/v1/external/chat/sessions",
+      expect.objectContaining({ body: JSON.stringify({ encrypted_context: "signed-grant-guest-scope-test" }) }),
+    )
+    expect(guestStorageKeys()).toEqual(["xagent_guest_id"])
   })
 
   it("loads an embed-ticket iframe URL without exposing the widget key", async () => {

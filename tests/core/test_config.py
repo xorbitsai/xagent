@@ -3226,6 +3226,27 @@ class TestConnectorProbeUsersConfig:
         assert get_connector_probe_users() == frozenset()
 
 
+class TestConnectorSmokeUserFixturesConfig:
+    @pytest.mark.parametrize("value", [None, "", "   "])
+    def test_no_fixture_path_when_unset_or_blank(self, monkeypatch, value):
+        from xagent.config import get_connector_smoke_user_fixtures_path
+
+        if value is None:
+            monkeypatch.delenv("XAGENT_CONNECTOR_SMOKE_USER_FIXTURES", raising=False)
+        else:
+            monkeypatch.setenv("XAGENT_CONNECTOR_SMOKE_USER_FIXTURES", value)
+        assert get_connector_smoke_user_fixtures_path() is None
+
+    def test_expands_home_in_the_configured_path(self, monkeypatch):
+        from xagent.config import get_connector_smoke_user_fixtures_path
+
+        monkeypatch.setenv("XAGENT_CONNECTOR_SMOKE_USER_FIXTURES", "~/smoke/test.json")
+        assert (
+            get_connector_smoke_user_fixtures_path()
+            == Path.home() / "smoke" / "test.json"
+        )
+
+
 class TestConnectorSmokeWriteAppsConfig:
     """#3564: the connectors whose smoke V2 write checks may run."""
 

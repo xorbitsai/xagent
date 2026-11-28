@@ -200,6 +200,7 @@ _STANDARD_OTEL_SERVICE_NAME = "OTEL_SERVICE_NAME"
 MCP_TOOL_INIT_TIMEOUT_SECONDS = "XAGENT_MCP_TOOL_INIT_TIMEOUT_SECONDS"
 MCP_TOOL_DISCOVERY_CACHE_SECONDS = "XAGENT_MCP_TOOL_DISCOVERY_CACHE_SECONDS"
 CONNECTOR_PROBE_USERS = "XAGENT_CONNECTOR_PROBE_USERS"
+CONNECTOR_SMOKE_USER_FIXTURES = "XAGENT_CONNECTOR_SMOKE_USER_FIXTURES"
 CONNECTOR_SMOKE_WRITE_APPS = "XAGENT_CONNECTOR_SMOKE_WRITE_APPS"
 LLM_RETRY_DEADLINE_SECONDS = "XAGENT_LLM_RETRY_DEADLINE_SECONDS"
 LLM_CAPACITY_MAX_ATTEMPTS = "XAGENT_LLM_CAPACITY_MAX_ATTEMPTS"
@@ -4548,6 +4549,17 @@ def get_connector_probe_users() -> frozenset[str]:
         Frozenset of usernames and email addresses; empty when unset or blank.
     """
     return frozenset(_csv_env(CONNECTOR_PROBE_USERS))
+
+
+def get_connector_smoke_user_fixtures_path() -> Path | None:
+    """Get the server-side JSON fixture file for the smoke V2 user identity.
+
+    Priority:
+        1. XAGENT_CONNECTOR_SMOKE_USER_FIXTURES environment variable
+        2. None (no fixtures)
+    """
+    value = os.getenv(CONNECTOR_SMOKE_USER_FIXTURES, "").strip()
+    return Path(value).expanduser() if value else None
 
 
 def get_connector_smoke_write_apps() -> frozenset[str]:

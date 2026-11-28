@@ -18,7 +18,7 @@ import math
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any, Protocol
+from typing import Any, Protocol, TypeGuard
 
 from .codes import is_code
 
@@ -28,6 +28,13 @@ FIXTURE_KEY_PATTERN = re.compile(
 
 # What a resolver may return for a key: a JSON scalar.
 FixtureValue = str | int | float | bool
+
+
+def is_fixture_value(value: Any) -> TypeGuard[FixtureValue]:
+    """Check for a supported JSON scalar, excluding non-finite floats."""
+    return isinstance(value, (str, int, float, bool)) and (
+        not isinstance(value, float) or math.isfinite(value)
+    )
 
 
 @dataclass(frozen=True)
@@ -68,9 +75,7 @@ def resolve_fixtures(value: Any, resolver: FixtureResolver) -> Any:
         resolved = resolver.resolve_fixture(value.key)
         if resolved is None:
             raise FixtureMissing(value.key)
-        if not isinstance(resolved, (str, int, float, bool)) or (
-            isinstance(resolved, float) and not math.isfinite(resolved)
-        ):
+        if not is_fixture_value(resolved):
             raise TypeError(f"fixture {value.key} did not resolve to a JSON scalar")
         return resolved
     if isinstance(value, Mapping):

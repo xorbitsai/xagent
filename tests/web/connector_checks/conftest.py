@@ -19,6 +19,11 @@ def _writes_off(monkeypatch):
     monkeypatch.delenv("XAGENT_CONNECTOR_SMOKE_WRITE_APPS", raising=False)
 
 
+@pytest.fixture(autouse=True)
+def _no_user_fixtures(monkeypatch):
+    monkeypatch.delenv("XAGENT_CONNECTOR_SMOKE_USER_FIXTURES", raising=False)
+
+
 @pytest.fixture()
 def db_users(tmp_path):
     """A database with the seeded catalog, the probe user ``monitor`` and an

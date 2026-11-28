@@ -25,6 +25,7 @@ class TriggerType(str, enum.Enum):
     WEBHOOK = "webhook"
     SCHEDULED = "scheduled"
     GMAIL = "gmail"
+    GITHUB = "github"
 
 
 # Idempotency-key prefix of a manual test fire; the only marker on the run row.

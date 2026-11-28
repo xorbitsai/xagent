@@ -7,6 +7,7 @@ registration results, and the typed trigger config union.
 
 from __future__ import annotations
 
+import re
 from datetime import datetime, time, timezone
 from typing import Annotated, Any, Literal, Union
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -368,8 +369,84 @@ class GmailTriggerConfig(BaseTriggerConfig):
         return value
 
 
+GITHUB_REPOSITORY_PATTERN = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
+
+# Hook-level GitHub events the provider subscribes to and normalizes.
+GITHUB_HOOK_EVENTS: tuple[str, ...] = (
+    "pull_request",
+    "issues",
+    "issue_comment",
+    "pull_request_review",
+    "push",
+    "create",
+    "delete",
+)
+# Events whose GitHub payload carries an ``action``; their normalized type is
+# ``<event>.<action>`` (``pull_request.opened``). The rest are bare names.
+GITHUB_ACTION_EVENTS = frozenset(
+    {"pull_request", "issues", "issue_comment", "pull_request_review"}
+)
+
+
+class GithubTriggerConfig(BaseTriggerConfig):
+    type: Literal["github"] = "github"
+    repository: str
+    """``owner/name`` of the repository whose events fire this trigger."""
+    oauth_account_id: int | None = None
+    """Connected GitHub account used to manage the hook. Defaults to the
+    owner's most recently connected GitHub account."""
+
+    @field_validator("repository")
+    @classmethod
+    def _valid_repository(cls, value: str) -> str:
+        candidate = value.strip()
+        owner, _, name = candidate.partition("/")
+        if (
+            not GITHUB_REPOSITORY_PATTERN.match(candidate)
+            or owner in (".", "..")
+            or name in (".", "..")
+        ):
+            raise ValueError("github trigger repository must be 'owner/name'")
+        return candidate
+
+    @field_validator("oauth_account_id", mode="before")
+    @classmethod
+    def _account_id(cls, value: Any) -> int | None:
+        if value is None:
+            return None
+        if isinstance(value, bool):
+            raise ValueError("oauth_account_id must be a positive integer")
+        if isinstance(value, int) and value > 0:
+            return value
+        if isinstance(value, str) and value.isascii() and value.isdecimal():
+            if int(value) > 0:
+                return int(value)
+        raise ValueError("oauth_account_id must be a positive integer")
+
+    @field_validator("event_types")
+    @classmethod
+    def _valid_event_types(cls, value: list[str] | None) -> list[str] | None:
+        for event_type in value or []:
+            event, dot, action = event_type.partition(".")
+            if event not in GITHUB_HOOK_EVENTS:
+                raise ValueError(f"unsupported github event type: {event_type!r}")
+            if event in GITHUB_ACTION_EVENTS and not (dot and action):
+                raise ValueError(
+                    f"github event type {event_type!r} needs an action, "
+                    f"e.g. '{event}.opened'"
+                )
+            if event not in GITHUB_ACTION_EVENTS and dot:
+                raise ValueError(f"github event {event!r} has no actions")
+        return value
+
+
 TriggerConfig = Annotated[
-    Union[WebhookTriggerConfig, ScheduledTriggerConfig, GmailTriggerConfig],
+    Union[
+        WebhookTriggerConfig,
+        ScheduledTriggerConfig,
+        GmailTriggerConfig,
+        GithubTriggerConfig,
+    ],
     Field(discriminator="type"),
 ]
 

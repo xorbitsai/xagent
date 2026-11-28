@@ -8,6 +8,7 @@ from .base import (
     TriggerProvider,
     TriggerProviderError,
 )
+from .github import GithubProvider, sign_github_payload
 from .gmail import GmailProvider
 from .pipeline import CallbackResult, process_trigger_callback
 from .registry import (
@@ -22,6 +23,7 @@ from .schemas import (
     AckPolicy,
     BaseTriggerConfig,
     ChallengeResponse,
+    GithubTriggerConfig,
     GmailTriggerConfig,
     NormalizedEvent,
     RegistrationResult,
@@ -40,6 +42,8 @@ __all__ = [
     "CallbackRequestContext",
     "CallbackResult",
     "ChallengeResponse",
+    "GithubProvider",
+    "GithubTriggerConfig",
     "GmailTriggerConfig",
     "GmailProvider",
     "NormalizedEvent",
@@ -55,6 +59,7 @@ __all__ = [
     "WebhookProvider",
     "WebhookTriggerConfig",
     "dump_trigger_config",
+    "sign_github_payload",
     "sign_webhook_payload",
     "get_trigger_provider",
     "maybe_get_trigger_provider",

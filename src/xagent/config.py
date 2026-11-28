@@ -3019,6 +3019,15 @@ def get_s2s_api_base_url() -> str | None:
     return _normalized_http_env_url(S2S_API_BASE_URL) or get_public_api_base_url()
 
 
+def get_trigger_callback_base_url() -> str | None:
+    """Base URL external services use to reach trigger callbacks.
+
+    Same resolution as :func:`get_gmail_callback_base_url`, named for the
+    providers (GitHub, ...) that are not Gmail-specific.
+    """
+    return get_gmail_callback_base_url()
+
+
 def get_gmail_callback_base_url() -> str | None:
     """Return the base URL used for Gmail Pub/Sub callbacks.
 

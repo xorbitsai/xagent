@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import calendar
+import contextlib
 import hashlib
 import json
 import logging
@@ -10,7 +11,7 @@ from collections.abc import Callable, Coroutine
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta, timezone, tzinfo
-from typing import Any
+from typing import Any, ContextManager
 from uuid import uuid4
 
 from pydantic import ValidationError
@@ -255,6 +256,8 @@ def _default_trigger_name(trigger_type: str) -> str:
         return "Scheduled trigger"
     if trigger_type == TriggerType.GMAIL.value:
         return "Gmail trigger"
+    if trigger_type == TriggerType.GITHUB.value:
+        return "GitHub trigger"
     return "Agent trigger"
 
 
@@ -734,6 +737,10 @@ def _validate_config(
             user_id=user_id,
             oauth_account_id=getattr(typed, "oauth_account_id", None),
         )
+    if trigger_type == TriggerType.GITHUB.value:
+        # The repository binding; the provider appends "#<hook id>" once the
+        # hook exists.
+        return str(typed.repository).lower()
     return None
 
 
@@ -1040,6 +1047,13 @@ def _create_trigger(
         callback_id = _new_callback_id()
         plain_secret = secret or _new_webhook_secret()
         secret_encrypted = encrypt_value(plain_secret)
+    elif resolved_type == TriggerType.GITHUB.value:
+        # The secret is installed into the GitHub hook by the provider and is
+        # never shown to the caller.
+        if secret:
+            raise TriggerServiceError("github triggers manage their own secret")
+        callback_id = _new_callback_id()
+        secret_encrypted = encrypt_value(_new_webhook_secret())
 
     next_run_at = None
     if resolved_type == TriggerType.SCHEDULED.value and enabled:
@@ -1134,12 +1148,26 @@ def _apply_trigger_updates(
             existing_config=old_config,
         )
         setattr(trigger, "config", config)
+        if (
+            str(trigger.type) == TriggerType.GITHUB.value
+            and old_resource_id
+            and old_resource_id.partition("#")[0] == resource_id
+        ):
+            # Same repository: keep the recorded hook binding so the provider
+            # updates the existing hook instead of orphaning it.
+            resource_id = old_resource_id
         setattr(trigger, "resource_id", resource_id)
     if trigger.provider is None:
         setattr(trigger, "provider", str(trigger.type))
     if str(trigger.type) == TriggerType.WEBHOOK.value and trigger.callback_id is None:
         setattr(trigger, "callback_id", _new_callback_id())
-    if "secret" in updates and updates["secret"]:
+    if str(trigger.type) == TriggerType.GITHUB.value:
+        if updates.get("secret"):
+            raise TriggerServiceError("github triggers manage their own secret")
+        if updates.get("rotate_secret"):
+            # Re-registration below pushes the new secret to the GitHub hook.
+            setattr(trigger, "secret_encrypted", encrypt_value(_new_webhook_secret()))
+    elif "secret" in updates and updates["secret"]:
         plain_secret = str(updates["secret"])
         setattr(trigger, "secret_encrypted", encrypt_value(plain_secret))
     elif updates.get("rotate_secret"):
@@ -1336,13 +1364,30 @@ def delete_workforce_trigger(
     _delete_trigger(db, trigger)
 
 
+def _lifecycle_guard(trigger: AgentTrigger) -> ContextManager[None]:
+    """Serialize deletion with the provider's per-trigger provisioning."""
+    if str(trigger.type) == TriggerType.GITHUB.value:
+        from .github_provisioning import provisioning_lock
+
+        return provisioning_lock(int(trigger.id))
+    return contextlib.nullcontext()
+
+
 def _delete_trigger(db: Session, trigger: AgentTrigger) -> None:
     trigger_type = str(trigger.type)
     trigger_id = trigger.id
-    binding_config = dict(trigger.config or {})
-    binding_resource_id = str(trigger.resource_id) if trigger.resource_id else None
-    db.delete(trigger)
-    db.commit()
+    with _lifecycle_guard(trigger):
+        # Under the guard a concurrent first registration has finished, so the
+        # binding snapshot below includes any hook it created.
+        if trigger_type == TriggerType.GITHUB.value:
+            from .github_provisioning import lock_trigger_row
+
+            if lock_trigger_row(db, int(trigger_id)) is None:
+                return  # already deleted by a concurrent request
+        binding_config = dict(trigger.config or {})
+        binding_resource_id = str(trigger.resource_id) if trigger.resource_id else None
+        db.delete(trigger)
+        db.commit()
     try:
         _unregister_trigger_binding(
             db,
